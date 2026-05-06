@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<root>
+  <?ignored target?>
+  <child>value</child>
+  <tail><![CDATA[done]]></tail>
+</root>

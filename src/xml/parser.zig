@@ -141,6 +141,10 @@ pub const Parser = struct {
         }
     }
 
+    pub fn byteOffset(parser: *const Parser) u64 {
+        return parser.last_byte_offset;
+    }
+
     fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!Event {
         try parser.appendDecodedTextByte(first_byte);
 
@@ -881,4 +885,95 @@ test "parser rejects mismatched end tags" {
     _ = (try parser.next()).?.start_element;
     _ = (try parser.next()).?.start_element;
     try std.testing.expectError(error.MismatchedEndTag, parser.next());
+}
+
+test "parser accepts valid xml fixtures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    try expectFixtureParses(allocator, io, "fixtures/xml/valid/namespaces-and-entities.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/valid/comments-cdata.xml");
+}
+
+test "parser rejects invalid xml fixtures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/mismatched-end-tag.xml", error.MismatchedEndTag);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/unknown-entity.xml", error.UnknownEntity);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/unsupported-doctype.xml", error.UnsupportedMarkup);
+}
+
+test "parser handles xml corpus fixtures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/nested-default-prefix.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/self-closing-mixed.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/processing-instruction-and-tail.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/mzdata/tiny1.mzData1.05.xml");
+}
+
+fn expectFixtureParses(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) !void {
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    var event_count: usize = 0;
+    while (try parser.next()) |_| {
+        event_count += 1;
+    }
+    try std.testing.expect(event_count > 0);
+}
+
+fn expectFixtureError(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8, expected: anyerror) !void {
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    while (true) {
+        const maybe_event = parser.next() catch |err| {
+            try std.testing.expectEqual(expected, err);
+            return;
+        };
+        if (maybe_event == null) break;
+    }
+
+    return error.TestExpectedError;
 }

@@ -1,0 +1,6 @@
+<root>
+  <?skip this?>
+  <child id="1"/>
+  <!-- comment -->
+  <![CDATA[a<b>]]>
+</root>

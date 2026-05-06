@@ -1,0 +1,7 @@
+<root>
+  <empty/>
+  <parent>
+    <nested flag="yes"/>
+    text
+  </parent>
+</root>

@@ -1,0 +1,4 @@
+<?xml version="1.0"?>
+<doc xmlns="urn:root" xmlns:ns="urn:child">
+  <ns:item plain="ok">alpha &amp; beta</ns:item>
+</doc>

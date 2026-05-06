@@ -1,0 +1,7 @@
+<feed xmlns="urn:feed" xmlns:a="urn:a" xmlns:b="urn:b">
+  <entry>
+    <a:item>
+      <b:value code="42">ok</b:value>
+    </a:item>
+  </entry>
+</feed>

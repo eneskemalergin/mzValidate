@@ -25,16 +25,17 @@ pub fn main(init: std.process.Init) !void {
         return fail(io, "error: invalid semantic version: {s}\n", .{new_version});
     };
 
-    try bumpVersion(gpa, io, new_version);
+    const fingerprint = try bumpVersion(gpa, io, new_version);
+    defer gpa.free(fingerprint);
 
     var stdout_buffer: [256]u8 = undefined;
     var stdout_writer = std.Io.File.stdout().writer(io, &stdout_buffer);
     const stdout = &stdout_writer.interface;
-    try stdout.print("updated version to {s}\n", .{new_version});
+    try stdout.print("updated version to {s} with fingerprint {s}\n", .{ new_version, fingerprint });
     try stdout.flush();
 }
 
-fn bumpVersion(gpa: std.mem.Allocator, io: std.Io, new_version: []const u8) !void {
+fn bumpVersion(gpa: std.mem.Allocator, io: std.Io, new_version: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
 
     const manifest_text = try cwd.readFileAlloc(io, "build.zig.zon", gpa, .limited(64 * 1024));
@@ -50,13 +51,14 @@ fn bumpVersion(gpa: std.mem.Allocator, io: std.Io, new_version: []const u8) !voi
     defer gpa.free(updated_version_text);
 
     const fingerprint = try deriveFingerprint(gpa, io, manifest_without_fingerprint);
-    defer gpa.free(fingerprint);
 
     const finalized_manifest = try insertFingerprintAfterVersion(gpa, manifest_without_fingerprint, fingerprint);
     defer gpa.free(finalized_manifest);
 
     try cwd.writeFile(io, .{ .sub_path = "build.zig.zon", .data = finalized_manifest });
     try cwd.writeFile(io, .{ .sub_path = "src/version.zig", .data = updated_version_text });
+
+    return fingerprint;
 }
 
 fn deriveFingerprint(gpa: std.mem.Allocator, io: std.Io, manifest_text: []const u8) ![]u8 {
