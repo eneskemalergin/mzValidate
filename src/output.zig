@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
+const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
@@ -14,32 +15,54 @@ pub const OutputMode = enum {
 
 /// Renders diagnostics in the default human-readable format.
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
+    const summary = diagnostic.summarize(diagnostics);
+
     if (diagnostics.len == 0) {
-        try writer.writeAll("OK\n");
+        try writer.writeAll("OK: no diagnostics emitted\n");
+        try writeSummaryLine(writer, summary);
         return;
     }
 
+    var current_path: ?[]const u8 = null;
     for (diagnostics) |item| {
-        try writer.print("{s} [{s}]", .{ item.severity.label(), item.rule });
-        if (item.path) |path| {
-            try writer.print(" path={s}", .{path});
+        const item_path = item.path;
+        if (item_path) |path| {
+            if (current_path == null or !std.mem.eql(u8, current_path.?, path)) {
+                if (current_path != null) try writer.writeByte('\n');
+                try writer.print("input: {s}\n", .{path});
+                current_path = path;
+            }
         }
-        if (item.location.byte_offset) |byte_offset| {
-            try writer.print(" byte={d}", .{byte_offset});
+
+        try writer.print("  {s} [{s}] {s}\n", .{ item.severity.label(), item.rule, item.message });
+
+        if (item.location.byte_offset != null or item.location.spectrum_index != null) {
+            try writer.writeAll("    location:");
+            if (item.location.byte_offset) |byte_offset| {
+                try writer.print(" byte={d}", .{byte_offset});
+            }
+            if (item.location.spectrum_index) |spectrum_index| {
+                try writer.print(" spectrum={d}", .{spectrum_index});
+            }
+            try writer.writeByte('\n');
         }
-        if (item.location.spectrum_index) |spectrum_index| {
-            try writer.print(" spectrum={d}", .{spectrum_index});
-        }
-        try writer.print(": {s}\n", .{item.message});
     }
+
+    try writer.writeByte('\n');
+    try writeSummaryLine(writer, summary);
 }
 
 /// Renders only the severity totals.
 pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     const summary = diagnostic.summarize(diagnostics);
     try writer.print(
-        "info={d} warnings={d} errors={d}\n",
-        .{ summary.totals.info, summary.totals.warnings, summary.totals.errors },
+        "status={s} info={d} warnings={d} errors={d}\n",
+        .{
+            summary.status().label(),
+            summary.totals.info,
+            summary.totals.warnings,
+            summary.totals.errors,
+        },
     );
 }
 
@@ -98,6 +121,18 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Erro
     try writer.writeByte('"');
 }
 
+fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
+    try writer.print(
+        "summary: {s} (info={d} warnings={d} errors={d})\n",
+        .{
+            summary.status().label(),
+            summary.totals.info,
+            summary.totals.warnings,
+            summary.totals.errors,
+        },
+    );
+}
+
 test "renderSummary_counts severities" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
@@ -109,7 +144,10 @@ test "renderSummary_counts severities" {
     };
 
     try renderSummary(&allocating_writer.writer, &diagnostics);
-    try std.testing.expectEqualStrings("info=1 warnings=1 errors=1\n", allocating_writer.written());
+    try std.testing.expectEqualStrings(
+        "status=errors-present info=1 warnings=1 errors=1\n",
+        allocating_writer.written(),
+    );
 }
 
 test "renderJson_keeps stable keys" {
@@ -139,4 +177,38 @@ test "renderJson_keeps stable keys" {
 
     try renderJson(&allocating_writer.writer, &diagnostics);
     try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
+}
+
+test "renderText_groups diagnostics by input and appends summary" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const diagnostics = [_]Diagnostic{
+        .{
+            .severity = .warning,
+            .rule = diagnostic.RuleId.runtime_stub,
+            .path = "sample-a.mzML",
+            .message = version.validation_not_implemented,
+        },
+        .{
+            .severity = .@"error",
+            .rule = diagnostic.RuleId.runtime_file_open,
+            .path = "sample-b.mzML",
+            .location = .{ .byte_offset = 12 },
+            .message = "unable to open input file",
+        },
+    };
+
+    try renderText(&allocating_writer.writer, &diagnostics);
+    try std.testing.expectEqualStrings(
+        "input: sample-a.mzML\n" ++
+            "  warning [runtime.stub] " ++ version.validation_not_implemented ++ "\n" ++
+            "\n" ++
+            "input: sample-b.mzML\n" ++
+            "  error [runtime.file-open] unable to open input file\n" ++
+            "    location: byte=12\n" ++
+            "\n" ++
+            "summary: errors-present (info=0 warnings=1 errors=1)\n",
+        allocating_writer.written(),
+    );
 }

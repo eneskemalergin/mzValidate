@@ -2,6 +2,7 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
+const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 const RuleId = diagnostic.RuleId;
@@ -11,7 +12,7 @@ pub const CheckOptions = struct {
     skip_binary: bool = false,
 };
 
-/// Opens a file and records the current 0.0.1 stub diagnostic flow.
+/// Opens a file and records the current stub diagnostic flow.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -32,9 +33,9 @@ pub fn checkPath(
     defer file.close(io);
 
     const message = if (options.skip_binary)
-        "validation is not implemented yet in 0.0.1; -skip-binary parsed successfully"
+        version.validation_not_implemented_skip_binary
     else
-        "validation is not implemented yet in 0.0.1";
+        version.validation_not_implemented;
 
     try diagnostics.append(allocator, .{
         .severity = .warning,

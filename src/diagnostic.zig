@@ -58,6 +58,15 @@ pub const ResultStatus = enum {
     clean,
     warnings_only,
     errors_present,
+
+    /// Returns the stable label used in human summaries.
+    pub fn label(status: ResultStatus) []const u8 {
+        return switch (status) {
+            .clean => "clean",
+            .warnings_only => "warnings-only",
+            .errors_present => "errors-present",
+        };
+    }
 };
 
 /// Bundles severity totals with the derived result status.

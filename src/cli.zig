@@ -72,7 +72,8 @@ pub fn run(init: std.process.Init) !u8 {
         error.ConflictingOutputMode,
         => {
             const parse_err: ParseError = @errorCast(err);
-            try stderr.print("error: {s}\n\n", .{parseErrorMessage(parse_err)});
+            try writeParseError(stderr, parse_err, args);
+            try stderr.writeAll("\n\n");
             try writeUsage(stderr);
             return 2;
         },
@@ -164,18 +165,67 @@ fn runCheck(
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
-        "usage: mzValidate check <input.mzML> [more files...] [-json | -summary] [-skip-binary]\n",
+        "mzValidate validates mzML inputs without loading the whole document into memory.\n\n" ++
+            "Usage\n" ++
+            "  mzValidate check <input.mzML> [more files...] [options]\n" ++
+            "  mzValidate --help\n\n" ++
+            "Commands\n" ++
+            "  check        Validate one or more mzML inputs in a single run.\n\n" ++
+            "Options\n" ++
+            "  -json        Emit stable JSON diagnostics for CI and pipelines.\n" ++
+            "  -summary     Emit only aggregate status and severity counts.\n" ++
+            "  -skip-binary Skip binary payload checks. Structural work still runs when implemented.\n" ++
+            "  -h, --help   Show this help text.\n\n" ++
+            "Behavior\n" ++
+            "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
+            "  Text mode groups diagnostics by input path and ends with one aggregate summary.\n" ++
+            "  JSON mode emits one diagnostic object per finding and keeps keys stable.\n" ++
+            "  Summary mode reports the aggregate result for the whole invocation.\n\n" ++
+            "Exit Codes\n" ++
+            "  0  clean\n" ++
+            "  1  warnings only\n" ++
+            "  2  errors present or CLI usage failure\n\n" ++
+            "Examples\n" ++
+            "  mzValidate check sample.mzML\n" ++
+            "  mzValidate check run-a.mzML run-b.mzML -summary\n" ++
+            "  mzValidate check sample.mzML -json -skip-binary\n",
     );
 }
 
-fn parseErrorMessage(err: ParseError) []const u8 {
-    return switch (err) {
-        error.MissingCommand => "missing command",
-        error.MissingInputPath => "missing input path",
-        error.UnsupportedCommand => "unsupported command",
-        error.UnexpectedFlag => "unexpected flag",
-        error.ConflictingOutputMode => "choose either -json or -summary, not both",
-    };
+fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []const u8) std.Io.Writer.Error!void {
+    switch (err) {
+        error.MissingCommand => try writer.writeAll("error: missing command"),
+        error.MissingInputPath => try writer.writeAll("error: missing input path after `check`"),
+        error.UnsupportedCommand => {
+            if (args.len >= 2) {
+                try writer.print("error: unsupported command: {s}", .{args[1]});
+            } else {
+                try writer.writeAll("error: unsupported command");
+            }
+        },
+        error.UnexpectedFlag => {
+            if (findUnexpectedFlag(args[2..])) |flag| {
+                try writer.print("error: unexpected flag: {s}", .{flag});
+            } else {
+                try writer.writeAll("error: unexpected flag");
+            }
+        },
+        error.ConflictingOutputMode => try writer.writeAll("error: choose either -json or -summary, not both"),
+    }
+}
+
+fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
+    for (args) |arg| {
+        if (std.mem.startsWith(u8, arg, "-") and
+            !std.mem.eql(u8, arg, "-skip-binary") and
+            !std.mem.eql(u8, arg, "-json") and
+            !std.mem.eql(u8, arg, "-summary") and
+            !isHelpFlag(arg))
+        {
+            return arg;
+        }
+    }
+    return null;
 }
 
 test "parseArgs_check_parsesFlagsAndInputs" {
@@ -213,4 +263,32 @@ test "parseArgs_rejects_conflicting_output_modes" {
     };
 
     try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
+}
+
+test "writeParseError_names_unexpected_flag" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-wat",
+    };
+
+    try writeParseError(&allocating_writer.writer, error.UnexpectedFlag, &argv);
+    try std.testing.expectEqualStrings("error: unexpected flag: -wat", allocating_writer.written());
+}
+
+test "writeParseError_names_unsupported_command" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const argv = [_][]const u8{
+        "mzValidate",
+        "scan",
+    };
+
+    try writeParseError(&allocating_writer.writer, error.UnsupportedCommand, &argv);
+    try std.testing.expectEqualStrings("error: unsupported command: scan", allocating_writer.written());
 }

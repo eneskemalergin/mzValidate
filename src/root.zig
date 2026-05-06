@@ -8,6 +8,8 @@ pub const cli = @import("cli.zig");
 pub const diagnostic = @import("diagnostic.zig");
 /// Exposes text and JSON rendering helpers.
 pub const output = @import("output.zig");
+/// Exposes the current project version constants.
+pub const version = @import("version.zig");
 /// Exposes the validation entry points.
 pub const validate = @import("validate.zig");
 
