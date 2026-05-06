@@ -16,15 +16,9 @@
   <instrumentConfigurationList count="1">
     <instrumentConfiguration id="IC1">
       <componentList count="3">
-        <source order="1">
-          <cvParam cvRef="MS" accession="MS:1000008" name="ionization type"/>
-        </source>
-        <analyzer order="2">
-          <cvParam cvRef="MS" accession="MS:1000443" name="mass analyzer type"/>
-        </analyzer>
-        <detector order="3">
-          <cvParam cvRef="MS" accession="MS:1000026" name="detector type"/>
-        </detector>
+        <source order="1"><cvParam cvRef="MS" accession="MS:1000008" name="ionization type"/></source>
+        <analyzer order="2"><cvParam cvRef="MS" accession="MS:1000443" name="mass analyzer type"/></analyzer>
+        <detector order="3"><cvParam cvRef="MS" accession="MS:1000026" name="detector type"/></detector>
       </componentList>
     </instrumentConfiguration>
   </instrumentConfigurationList>
@@ -37,22 +31,20 @@
   </dataProcessingList>
   <run id="run-1" defaultInstrumentConfigurationRef="IC1">
     <spectrumList count="1" defaultDataProcessingRef="DP1">
-      <spectrum index="0" id="scan=1" defaultArrayLength="1">
-        <scanList count="1">
-          <scan/>
-        </scanList>
+      <spectrum index="8" id="scan=8" defaultArrayLength="1">
+        <scanList count="1"><scan/></scanList>
         <binaryDataArrayList count="2">
           <binaryDataArray encodedLength="8">
             <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float"/>
-            <cvParam cvRef="MS" accession="MS:1000576" name="no compression"/>
-            <cvParam cvRef="MS" accession="MS:1000514" name="m/z array" unitCvRef="MS" unitAccession="MS:1000040" unitName="m/z"/>
-            <binary>AAAAAA==</binary>
+            <cvParam cvRef="MS" accession="MS:1002312" name="MS-Numpress linear prediction compression"/>
+            <cvParam cvRef="MS" accession="MS:1000514" name="m/z array"/>
+            <binary>AACAPw==</binary>
           </binaryDataArray>
           <binaryDataArray encodedLength="8">
             <cvParam cvRef="MS" accession="MS:1000521" name="32-bit float"/>
             <cvParam cvRef="MS" accession="MS:1000576" name="no compression"/>
-            <cvParam cvRef="MS" accession="MS:1000515" name="intensity array" unitCvRef="MS" unitAccession="MS:1000131" unitName="number of counts"/>
-            <binary>AAAAAA==</binary>
+            <cvParam cvRef="MS" accession="MS:1000515" name="intensity array"/>
+            <binary>AACAPw==</binary>
           </binaryDataArray>
         </binaryDataArrayList>
       </spectrum>

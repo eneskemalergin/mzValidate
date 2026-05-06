@@ -331,3 +331,27 @@ test "writeParseError_names_unsupported_command" {
     try writeParseError(&allocating_writer.writer, error.UnsupportedCommand, &argv);
     try std.testing.expectEqualStrings("error: unsupported command: scan", allocating_writer.written());
 }
+
+test "runCheck_returns_error_exit_code_for_invalid_binary_fixtures" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating_writer.deinit();
+
+    const inputs = [_][]const u8{
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "fixtures/mzml/invalid/invalid-zlib.mzML",
+    };
+
+    const exit_code = try runCheck(allocator, io, &allocating_writer.writer, .{
+        .output_mode = .summary,
+        .inputs = &inputs,
+    });
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqualStrings(
+        "status=errors-present info=0 warnings=0 errors=2\n",
+        allocating_writer.written(),
+    );
+}

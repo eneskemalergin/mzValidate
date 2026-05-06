@@ -16,6 +16,7 @@ const Severity = diagnostic.Severity;
 const StartElement = xml_events.StartElement;
 
 pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+const max_structural_token_bytes = 1024 * 1024;
 
 const TopLevelSlot = enum(u8) {
     cv_list = 1,
@@ -124,6 +125,8 @@ pub const StructuralValidator = struct {
     root_seen: bool = false,
     root_valid: bool = false,
     root_byte_offset: u64 = 0,
+    indexed_mzml_depth: ?usize = null,
+    mzml_depth: ?usize = null,
     cv_list_seen: bool = false,
     file_description_seen: bool = false,
     referenceable_param_group_list_seen: bool = false,
@@ -166,6 +169,22 @@ pub const StructuralValidator = struct {
     spectrum: ?ContainerState = null,
     chromatogram: ?ContainerState = null,
 
+    pub fn init(
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: ?[]const u8,
+    ) StructuralValidator {
+        return .{
+            .allocator = allocator,
+            .diagnostics = diagnostics,
+            .path = path,
+        };
+    }
+
+    pub fn deinit(validator: *StructuralValidator) void {
+        _ = validator;
+    }
+
     pub fn validateReader(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -173,7 +192,8 @@ pub const StructuralValidator = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         path: ?[]const u8,
     ) !void {
-        var token_buffer: [4096]u8 = undefined;
+        const token_buffer = try allocator.alloc(u8, max_structural_token_bytes);
+        defer allocator.free(token_buffer);
         var attributes: [64]Attribute = undefined;
         var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
         var namespace_bytes: [2048]u8 = undefined;
@@ -181,7 +201,7 @@ pub const StructuralValidator = struct {
         var element_bytes: [4096]u8 = undefined;
 
         var parser = xml_parser.Parser.init(reader, .{
-            .token = &token_buffer,
+            .token = token_buffer,
             .attributes = &attributes,
             .namespace_bindings = &namespace_bindings,
             .namespace_bytes = &namespace_bytes,
@@ -189,49 +209,42 @@ pub const StructuralValidator = struct {
             .element_bytes = &element_bytes,
         });
 
-        var validator = StructuralValidator{
-            .allocator = allocator,
-            .diagnostics = diagnostics,
-            .path = path,
-        };
+        var validator = StructuralValidator.init(allocator, diagnostics, path);
         try validator.run(io, &parser);
     }
 
-    fn run(validator: *StructuralValidator, io: std.Io, parser: *xml_parser.Parser) !void {
-        _ = io;
+    pub fn consumeStart(validator: *StructuralValidator, start: StartElement) !void {
+        const element_depth = validator.depth + 1;
+        try validator.handleStart(start, element_depth);
+        validator.depth += 1;
+    }
 
-        while (true) {
-            const maybe_event = parser.next() catch |err| {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_structure_xml,
-                    .location = .{ .byte_offset = parser.byteOffset() },
-                    .path = validator.path,
-                    .message = parseErrorMessage(err),
-                });
-                return;
-            };
-            const event = maybe_event orelse break;
+    pub fn consumeEnd(validator: *StructuralValidator, end: EndElement) !void {
+        const element_depth = validator.depth;
+        try validator.handleEnd(end, element_depth);
+        validator.depth -= 1;
+    }
 
-            switch (event) {
-                .start_element => |start| {
-                    const element_depth = validator.depth + 1;
-                    try validator.handleStart(start, element_depth);
-                    validator.depth += 1;
-                },
-                .end_element => |end| {
-                    const element_depth = validator.depth;
-                    try validator.handleEnd(end, element_depth);
-                    validator.depth -= 1;
-                },
-                .text => |text| try validator.handleText(text.value, text.byte_offset),
-            }
-        }
+    pub fn consumeText(validator: *StructuralValidator, text: xml_events.Text) !void {
+        try validator.handleText(text.value, text.byte_offset);
+    }
 
+    pub fn finish(validator: *StructuralValidator) !void {
         if (!validator.root_seen) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
                 .rule = RuleId.mzml_structure_root,
+                .path = validator.path,
+                .message = "document is missing the mzML root element",
+            });
+            return;
+        }
+
+        if (!validator.root_valid and validator.indexed_mzml_depth != null) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_structure_root,
+                .location = .{ .byte_offset = validator.root_byte_offset },
                 .path = validator.path,
                 .message = "document is missing the mzML root element",
             });
@@ -251,10 +264,40 @@ pub const StructuralValidator = struct {
         try validator.reportMissingTopLevelChildren();
     }
 
+    fn run(validator: *StructuralValidator, io: std.Io, parser: *xml_parser.Parser) !void {
+        _ = io;
+
+        while (true) {
+            const maybe_event = parser.next() catch |err| {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_xml,
+                    .location = .{ .byte_offset = parser.byteOffset() },
+                    .path = validator.path,
+                    .message = parseErrorMessage(err),
+                });
+                return;
+            };
+            const event = maybe_event orelse break;
+
+            switch (event) {
+                .start_element => |start| try validator.consumeStart(start),
+                .end_element => |end| try validator.consumeEnd(end),
+                .text => |text| try validator.consumeText(text),
+            }
+        }
+        try validator.finish();
+    }
+
     fn handleStart(validator: *StructuralValidator, start: StartElement, element_depth: usize) !void {
         if (!validator.root_seen) {
             validator.root_seen = true;
             validator.root_byte_offset = start.byte_offset;
+            if (start.name.matches(mzml_namespace, "indexedmzML")) {
+                validator.indexed_mzml_depth = element_depth;
+                return;
+            }
+
             validator.root_valid = start.name.matches(mzml_namespace, "mzML");
             if (!validator.root_valid) {
                 try validator.appendDiagnostic(.{
@@ -265,12 +308,25 @@ pub const StructuralValidator = struct {
                     .message = "root element must be mzML in the http://psi.hupo.org/ms/mzml namespace",
                 });
             } else {
+                validator.mzml_depth = element_depth;
                 try validator.requireAttribute(start, "version", "mzML is missing required attribute version");
             }
             return;
         }
 
-        if (!validator.rootValidName(start.name)) return;
+        if (!validator.root_valid and validator.indexed_mzml_depth != null and start.name.matches(mzml_namespace, "mzML")) {
+            if (element_depth != validator.indexed_mzml_depth.? + 1) {
+                try validator.nestingError(start.byte_offset, "mzML must be a direct child of indexedmzML");
+                return;
+            }
+            validator.root_valid = true;
+            validator.root_byte_offset = start.byte_offset;
+            validator.mzml_depth = element_depth;
+            try validator.requireAttribute(start, "version", "mzML is missing required attribute version");
+            return;
+        }
+
+        if (!validator.isWithinMzmlStartScope()) return;
 
         if (start.name.matches(mzml_namespace, "cvList")) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
@@ -328,7 +384,7 @@ pub const StructuralValidator = struct {
         }
 
         if (start.name.matches(mzml_namespace, "run")) {
-            if (element_depth != 2) {
+            if (element_depth != validator.topLevelChildDepth()) {
                 try validator.nestingError(start.byte_offset, "run must be a direct child of mzML");
                 return;
             }
@@ -584,19 +640,35 @@ pub const StructuralValidator = struct {
         }
 
         if (start.name.matches(mzml_namespace, "precursor")) {
-            if (validator.chromatogram == null) {
-                try validator.nestingError(start.byte_offset, "precursor must be a child of chromatogram");
+            if (validator.chromatogram) |state| {
+                if (state.depth + 1 == element_depth) {
+                    try validator.noteChromatogramChild(start.byte_offset, .precursor);
+                }
+                return;
             }
-            try validator.noteChromatogramChild(start.byte_offset, .precursor);
-            return;
+            if (validator.spectrum != null) {
+                return;
+            }
+            {
+                try validator.nestingError(start.byte_offset, "precursor must be a child of chromatogram");
+                return;
+            }
         }
 
         if (start.name.matches(mzml_namespace, "product")) {
-            if (validator.chromatogram == null) {
-                try validator.nestingError(start.byte_offset, "product must be a child of chromatogram");
+            if (validator.chromatogram) |state| {
+                if (state.depth + 1 == element_depth) {
+                    try validator.noteChromatogramChild(start.byte_offset, .product);
+                }
+                return;
             }
-            try validator.noteChromatogramChild(start.byte_offset, .product);
-            return;
+            if (validator.spectrum != null) {
+                return;
+            }
+            {
+                try validator.nestingError(start.byte_offset, "product must be a child of chromatogram");
+                return;
+            }
         }
 
         if (start.name.matches(mzml_namespace, "scan")) {
@@ -628,7 +700,12 @@ pub const StructuralValidator = struct {
     }
 
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
-        if (!validator.rootValidName(end.name)) return;
+        if (!validator.isWithinMzmlEndScope(element_depth)) return;
+
+        if (end.name.matches(mzml_namespace, "mzML") and validator.mzml_depth == element_depth) {
+            validator.mzml_depth = null;
+            return;
+        }
 
         if (end.name.matches(mzml_namespace, "run")) {
             if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
@@ -1003,7 +1080,7 @@ pub const StructuralValidator = struct {
         element_name: []const u8,
         slot: TopLevelSlot,
     ) !void {
-        if (element_depth != 2) {
+        if (element_depth != validator.topLevelChildDepth()) {
             try validator.nestingError(byte_offset, topLevelDirectChildMessage(element_name));
             return;
         }
@@ -1045,9 +1122,20 @@ pub const StructuralValidator = struct {
         });
     }
 
-    fn rootValidName(validator: *StructuralValidator, name: QName) bool {
-        _ = name;
-        return validator.root_valid;
+    fn topLevelChildDepth(validator: *StructuralValidator) usize {
+        return if (validator.mzml_depth) |depth| depth + 1 else 2;
+    }
+
+    fn isWithinMzmlStartScope(validator: *StructuralValidator) bool {
+        if (!validator.root_valid) return false;
+        if (validator.mzml_depth == null) return false;
+        return validator.depth >= validator.mzml_depth.?;
+    }
+
+    fn isWithinMzmlEndScope(validator: *StructuralValidator, element_depth: usize) bool {
+        if (!validator.root_valid) return false;
+        if (validator.mzml_depth == null) return false;
+        return element_depth >= validator.mzml_depth.?;
     }
 
     fn requireSpectrumLikeAttributes(validator: *StructuralValidator, start: StartElement, kind: ContainerKind) !void {
@@ -1259,6 +1347,20 @@ test "structural validator accepts realistic one-spectrum mzML fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/clean-single-spectrum.mzML");
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "structural validator accepts indexed mzML PSI tiny fixture" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try readFixtureAlloc(allocator, io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
