@@ -1,0 +1,21 @@
+# Zig build artifacts
+zig-out/
+zig-cache/
+.zig-cache/
+
+# Local Zig installation (download separately)
+zig-*/
+
+# Local zig wrapper (uses project-local zig installation)
+/zig
+
+# Editor
+.vscode/
+*.swp
+*~
+
+# Ignored folders (dev only)
+ref/
+plan/
+assets/
+experiments/
