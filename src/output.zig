@@ -5,12 +5,14 @@ const diagnostic = @import("diagnostic.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
+/// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,
     json,
     summary,
 };
 
+/// Renders diagnostics in the default human-readable format.
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     if (diagnostics.len == 0) {
         try writer.writeAll("OK\n");
@@ -32,14 +34,16 @@ pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.I
     }
 }
 
+/// Renders only the severity totals.
 pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    const totals = diagnostic.count(diagnostics);
+    const summary = diagnostic.summarize(diagnostics);
     try writer.print(
         "info={d} warnings={d} errors={d}\n",
-        .{ totals.info, totals.warnings, totals.errors },
+        .{ summary.totals.info, summary.totals.warnings, summary.totals.errors },
     );
 }
 
+/// Renders diagnostics in a stable JSON shape for automation.
 pub fn renderJson(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     try writer.writeAll("[\n");
     for (diagnostics, 0..) |item, index| {
@@ -95,8 +99,8 @@ fn writeJsonString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Erro
 }
 
 test "renderSummary_counts severities" {
-    var aw: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer aw.deinit();
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
 
     const diagnostics = [_]Diagnostic{
         .{ .severity = .info, .rule = "one", .message = "one" },
@@ -104,6 +108,35 @@ test "renderSummary_counts severities" {
         .{ .severity = .@"error", .rule = "three", .message = "three" },
     };
 
-    try renderSummary(&aw.writer, &diagnostics);
-    try std.testing.expectEqualStrings("info=1 warnings=1 errors=1\n", aw.written());
+    try renderSummary(&allocating_writer.writer, &diagnostics);
+    try std.testing.expectEqualStrings("info=1 warnings=1 errors=1\n", allocating_writer.written());
+}
+
+test "renderJson_keeps stable keys" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .@"error",
+        .rule = diagnostic.RuleId.mzml_binary_length_mismatch,
+        .location = .{ .byte_offset = 99, .spectrum_index = 7 },
+        .path = "sample.mzML",
+        .message = "decoded array length does not match defaultArrayLength",
+    }};
+    const expected_json =
+        "[\n" ++
+        "  {\n" ++
+        "    \"severity\": \"error\",\n" ++
+        "    \"rule\": \"mzml.binary.length-mismatch\",\n" ++
+        "    \"path\": \"sample.mzML\",\n" ++
+        "    \"location\": {\n" ++
+        "      \"byte_offset\": 99,\n" ++
+        "      \"spectrum_index\": 7\n" ++
+        "    },\n" ++
+        "    \"message\": \"decoded array length does not match defaultArrayLength\"\n" ++
+        "  }\n" ++
+        "]\n";
+
+    try renderJson(&allocating_writer.writer, &diagnostics);
+    try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
 }

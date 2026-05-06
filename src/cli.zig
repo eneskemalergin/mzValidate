@@ -7,20 +7,24 @@ const validate = @import("validate.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
+/// Stores the parsed state for the `check` command.
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
     inputs: []const []const u8,
 
+    /// Frees command-owned allocations after dispatch.
     pub fn deinit(command: *CheckCommand, allocator: std.mem.Allocator) void {
         allocator.free(command.inputs);
         command.* = undefined;
     }
 };
 
+/// Represents the supported top-level CLI commands.
 pub const Command = union(enum) {
     check: CheckCommand,
 
+    /// Frees command-owned allocations regardless of the active variant.
     pub fn deinit(command: *Command, allocator: std.mem.Allocator) void {
         switch (command.*) {
             .check => |*check| check.deinit(allocator),
@@ -38,9 +42,11 @@ const ParseError = error{
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
+/// Parses arguments, runs the selected command, and returns the process exit code.
 pub fn run(init: std.process.Init) !u8 {
-    const arena = init.arena.allocator();
-    const args = try init.minimal.args.toSlice(arena);
+    const gpa = init.gpa;
+    const args = try init.minimal.args.toSlice(gpa);
+    defer gpa.free(args);
 
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
@@ -57,7 +63,7 @@ pub fn run(init: std.process.Init) !u8 {
         return 0;
     }
 
-    const command = parseArgs(arena, args) catch |err| switch (err) {
+    var command = parseArgs(gpa, args) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MissingCommand,
         error.MissingInputPath,
@@ -71,12 +77,14 @@ pub fn run(init: std.process.Init) !u8 {
             return 2;
         },
     };
+    defer command.deinit(gpa);
 
     return switch (command) {
-        .check => |check| try runCheck(arena, init.io, stdout, check),
+        .check => |check| try runCheck(gpa, init.io, stdout, check),
     };
 }
 
+/// Parses CLI arguments into a command structure with owned inputs.
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseArgsError!Command {
     if (args.len < 2) return error.MissingCommand;
     if (!std.mem.eql(u8, args[1], "check")) return error.UnsupportedCommand;

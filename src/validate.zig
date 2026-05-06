@@ -4,11 +4,14 @@ const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
+const RuleId = diagnostic.RuleId;
 
+/// Controls which validation layers run for a check command.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
 };
 
+/// Opens a file and records the current 0.0.1 stub diagnostic flow.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -20,7 +23,7 @@ pub fn checkPath(
     var file = cwd.openFile(io, path, .{}) catch {
         try diagnostics.append(allocator, .{
             .severity = .@"error",
-            .rule = "runtime.file-open",
+            .rule = RuleId.runtime_file_open,
             .path = path,
             .message = "unable to open input file",
         });
@@ -35,7 +38,7 @@ pub fn checkPath(
 
     try diagnostics.append(allocator, .{
         .severity = .warning,
-        .rule = "runtime.stub",
+        .rule = RuleId.runtime_stub,
         .path = path,
         .message = message,
     });
@@ -51,22 +54,22 @@ test "checkPath_missingFile_reportsOpenError" {
     try checkPath(allocator, io, &diagnostics, "definitely-missing-file.mzML", .{});
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.@"error", diagnostics.items[0].severity);
-    try std.testing.expectEqualStrings("runtime.file-open", diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }
 
 test "checkPath_existingFile_reportsStubWarning" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
 
-    try tmp.dir.writeFile(io, .{ .sub_path = "sample.mzML", .data = "<mzML/>" });
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "sample.mzML", .data = "<mzML/>" });
 
     const path = try std.fs.path.join(allocator, &.{
         ".zig-cache",
         "tmp",
-        tmp.sub_path[0..],
+        temp_dir.sub_path[0..],
         "sample.mzML",
     });
     defer allocator.free(path);
@@ -77,5 +80,5 @@ test "checkPath_existingFile_reportsStubWarning" {
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true });
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.warning, diagnostics.items[0].severity);
-    try std.testing.expectEqualStrings("runtime.stub", diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings(RuleId.runtime_stub, diagnostics.items[0].rule);
 }
