@@ -11,6 +11,7 @@ pub const RuleId = struct {
     pub const mzml_structure_xml = "mzml.structure.xml";
     pub const mzml_structure_nesting = "mzml.structure.nesting";
     pub const mzml_structure_attribute = "mzml.structure.attribute";
+    pub const mzml_structure_count = "mzml.structure.count";
     pub const mzml_structure_missing_child = "mzml.structure.missing-child";
     pub const mzml_binary_base64 = "mzml.binary.base64";
     pub const mzml_binary_decompress = "mzml.binary.decompress";

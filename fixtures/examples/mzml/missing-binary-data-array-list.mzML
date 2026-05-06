@@ -1,7 +1,42 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">
-  <run id="run-1">
-    <spectrumList count="1">
+  <cvList count="1">
+    <cv id="MS" fullName="Proteomics Standards Initiative Mass Spectrometry Ontology" version="4.1.0" URI="https://raw.githubusercontent.com/HUPO-PSI/psi-ms-CV/master/psi-ms.obo"/>
+  </cvList>
+  <fileDescription>
+    <fileContent>
+      <cvParam cvRef="MS" accession="MS:1000579" name="MS1 spectrum"/>
+    </fileContent>
+  </fileDescription>
+  <softwareList count="1">
+    <software id="SW1" version="0.0.2">
+      <cvParam cvRef="MS" accession="MS:1000531" name="software"/>
+    </software>
+  </softwareList>
+  <instrumentConfigurationList count="1">
+    <instrumentConfiguration id="IC1">
+      <componentList count="3">
+        <source order="1">
+          <cvParam cvRef="MS" accession="MS:1000008" name="ionization type"/>
+        </source>
+        <analyzer order="2">
+          <cvParam cvRef="MS" accession="MS:1000443" name="mass analyzer type"/>
+        </analyzer>
+        <detector order="3">
+          <cvParam cvRef="MS" accession="MS:1000026" name="detector type"/>
+        </detector>
+      </componentList>
+    </instrumentConfiguration>
+  </instrumentConfigurationList>
+  <dataProcessingList count="1">
+    <dataProcessing id="DP1">
+      <processingMethod order="0" softwareRef="SW1">
+        <cvParam cvRef="MS" accession="MS:1000544" name="Conversion to mzML"/>
+      </processingMethod>
+    </dataProcessing>
+  </dataProcessingList>
+  <run id="run-1" defaultInstrumentConfigurationRef="IC1">
+    <spectrumList count="1" defaultDataProcessingRef="DP1">
       <spectrum index="0" id="scan=1" defaultArrayLength="2">
         <scanList count="1">
           <scan/>
