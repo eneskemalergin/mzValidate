@@ -265,6 +265,45 @@ test "parseArgs_rejects_conflicting_output_modes" {
     try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
 }
 
+test "parseArgs_rejects_check_without_inputs_even_when_flags_are_present" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "-skip-binary",
+        "-summary",
+    };
+
+    try std.testing.expectError(error.MissingInputPath, parseArgs(std.testing.allocator, &argv));
+}
+
+test "parseArgs_rejects_unknown_flag_before_any_input" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "-xml",
+        "sample.mzML",
+    };
+
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
+}
+
+test "wantsHelp_only_matches_supported_help_positions" {
+    try std.testing.expect(wantsHelp(&.{"mzValidate"}));
+    try std.testing.expect(wantsHelp(&.{ "mzValidate", "--help" }));
+    try std.testing.expect(wantsHelp(&.{ "mzValidate", "check", "-h" }));
+
+    try std.testing.expect(!wantsHelp(&.{ "mzValidate", "check", "sample.mzML" }));
+    try std.testing.expect(!wantsHelp(&.{ "mzValidate", "check", "sample.mzML", "--help" }));
+}
+
+test "writeParseError_names_missing_input_path" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try writeParseError(&allocating_writer.writer, error.MissingInputPath, &.{ "mzValidate", "check" });
+    try std.testing.expectEqualStrings("error: missing input path after `check`", allocating_writer.written());
+}
+
 test "writeParseError_names_unexpected_flag" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();

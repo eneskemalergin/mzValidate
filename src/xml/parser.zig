@@ -887,12 +887,260 @@ test "parser rejects mismatched end tags" {
     try std.testing.expectError(error.MismatchedEndTag, parser.next());
 }
 
+test "xml10 declaration fixture asserts root child and text behavior" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/valid/xml10-declaration-basic.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    const root = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(root.name.matches("urn:mzvalidate:test", "root"));
+    try std.testing.expectEqual(@as(usize, 1), root.attributes.len);
+    try std.testing.expect(root.attributes[0].is_namespace_declaration);
+
+    const child = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(child.name.matches("urn:mzvalidate:test", "child"));
+    try std.testing.expectEqual(@as(usize, 1), child.attributes.len);
+    try std.testing.expectEqualStrings("attr", child.attributes[0].name.local_name);
+    try std.testing.expectEqual(@as(?[]const u8, null), child.attributes[0].name.namespace_uri);
+    try std.testing.expectEqualStrings("value", child.attributes[0].value);
+
+    const text = (try nextSignificantEvent(&parser)).?.text;
+    try std.testing.expectEqualStrings("plain-text", text.value);
+    try std.testing.expect(!text.from_cdata);
+
+    const child_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(child_end.name.matches("urn:mzvalidate:test", "child"));
+    const root_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(root_end.name.matches("urn:mzvalidate:test", "root"));
+    try std.testing.expectEqual(@as(?Event, null), try nextSignificantEvent(&parser));
+}
+
+test "xml11 declaration fixture asserts pi skipping and cdata text behavior" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/valid/xml11-declaration-basic.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    const root = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(root.name.matches(null, "root"));
+
+    const child = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(child.name.matches(null, "child"));
+
+    const text = (try nextSignificantEvent(&parser)).?.text;
+    try std.testing.expect(text.from_cdata);
+    try std.testing.expectEqualStrings("a<b>", text.value);
+
+    const child_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(child_end.name.matches(null, "child"));
+    const root_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(root_end.name.matches(null, "root"));
+    try std.testing.expectEqual(@as(?Event, null), try nextSignificantEvent(&parser));
+}
+
+test "w3c prolog corpus fixture asserts declaration comment pi and namespaced child flow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/w3c-versioned-prolog.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    const root = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(root.name.matches(null, "root"));
+    try std.testing.expectEqual(@as(usize, 1), root.attributes.len);
+    try std.testing.expect(root.attributes[0].is_namespace_declaration);
+
+    const child = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(child.self_closing);
+    try std.testing.expect(child.name.matches("urn:w3c-prolog", "child"));
+    const child_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(child_end.name.matches("urn:w3c-prolog", "child"));
+    const root_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(root_end.name.matches(null, "root"));
+    try std.testing.expectEqual(@as(?Event, null), try nextSignificantEvent(&parser));
+}
+
+test "libxml2 namespace rebinding corpus fixture asserts nested namespace resolution" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/libxml2-namespace-rebind.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    const root = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(root.name.matches("urn:outer", "root"));
+
+    const branch = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(branch.name.matches("urn:inner", "branch"));
+
+    const first_leaf = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(first_leaf.self_closing);
+    try std.testing.expect(first_leaf.name.matches("urn:a1", "leaf"));
+    try std.testing.expectEqual(@as(usize, 1), first_leaf.attributes.len);
+    try std.testing.expectEqualStrings("id", first_leaf.attributes[0].name.local_name);
+    try std.testing.expectEqualStrings("urn:a1", first_leaf.attributes[0].name.namespace_uri.?);
+    try std.testing.expectEqualStrings("one", first_leaf.attributes[0].value);
+    const first_leaf_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(first_leaf_end.name.matches("urn:a1", "leaf"));
+
+    const branch_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(branch_end.name.matches("urn:inner", "branch"));
+
+    const second_leaf = (try nextSignificantEvent(&parser)).?.start_element;
+    try std.testing.expect(second_leaf.self_closing);
+    try std.testing.expect(second_leaf.name.matches("urn:a2", "leaf"));
+    try std.testing.expectEqual(@as(usize, 2), second_leaf.attributes.len);
+    try std.testing.expect(second_leaf.attributes[0].is_namespace_declaration);
+    try std.testing.expectEqualStrings("id", second_leaf.attributes[1].name.local_name);
+    try std.testing.expectEqualStrings("urn:a2", second_leaf.attributes[1].name.namespace_uri.?);
+    try std.testing.expectEqualStrings("two", second_leaf.attributes[1].value);
+    const second_leaf_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(second_leaf_end.name.matches("urn:a2", "leaf"));
+
+    const root_end = (try nextSignificantEvent(&parser)).?.end_element;
+    try std.testing.expect(root_end.name.matches("urn:outer", "root"));
+    try std.testing.expectEqual(@as(?Event, null), try nextSignificantEvent(&parser));
+}
+
+test "namespace misuse fixture fails immediately with malformed xml" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/invalid/namespace-empty-prefix-declaration.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    try std.testing.expectError(error.MalformedXml, parser.next());
+}
+
+test "malformed processing instruction fixture fails before emitting any event" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/invalid/malformed-processing-instruction.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    const token_capacity = @max(@as(usize, 1024), fixture.len);
+    const token_buffer = try allocator.alloc(u8, token_capacity);
+    defer allocator.free(token_buffer);
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]NamespaceBinding = undefined;
+    var namespace_bytes: [512]u8 = undefined;
+    var element_stack: [32]ElementFrame = undefined;
+    var element_bytes: [512]u8 = undefined;
+
+    var parser = Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    try std.testing.expectError(error.UnexpectedEof, parser.next());
+}
+
 test "parser accepts valid xml fixtures" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
     try expectFixtureParses(allocator, io, "fixtures/xml/valid/namespaces-and-entities.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/valid/comments-cdata.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/valid/xml10-declaration-basic.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/valid/xml11-declaration-basic.xml");
 }
 
 test "parser rejects invalid xml fixtures" {
@@ -902,6 +1150,9 @@ test "parser rejects invalid xml fixtures" {
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/mismatched-end-tag.xml", error.MismatchedEndTag);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/unknown-entity.xml", error.UnknownEntity);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/unsupported-doctype.xml", error.UnsupportedMarkup);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/namespace-empty-prefix-declaration.xml", error.MalformedXml);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/malformed-processing-instruction.xml", error.UnexpectedEof);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/xml11-unclosed-declaration.xml", error.UnexpectedEof);
 }
 
 test "parser handles xml corpus fixtures" {
@@ -911,6 +1162,8 @@ test "parser handles xml corpus fixtures" {
     try expectFixtureParses(allocator, io, "fixtures/xml/corpus/nested-default-prefix.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/corpus/self-closing-mixed.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/corpus/processing-instruction-and-tail.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/w3c-versioned-prolog.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/corpus/libxml2-namespace-rebind.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/corpus/mzdata/tiny1.mzData1.05.xml");
 }
 
@@ -942,6 +1195,31 @@ fn expectFixtureParses(allocator: std.mem.Allocator, io: std.Io, sub_path: []con
         event_count += 1;
     }
     try std.testing.expect(event_count > 0);
+}
+
+fn nextSignificantEvent(parser: *Parser) ParseError!?Event {
+    while (try parser.next()) |event| {
+        switch (event) {
+            .text => |text| {
+                if (isWhitespaceOnly(text.value)) continue;
+                return event;
+            },
+            else => return event,
+        }
+    }
+
+    return null;
+}
+
+fn isWhitespaceOnly(bytes: []const u8) bool {
+    for (bytes) |byte| {
+        switch (byte) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return false,
+        }
+    }
+
+    return true;
 }
 
 fn expectFixtureError(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8, expected: anyerror) !void {

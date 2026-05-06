@@ -1,0 +1,6 @@
+<?xml version="1.0"?>
+<!-- prolog comment -->
+<?meta fixture?>
+<root xmlns:p="urn:w3c-prolog">
+  <p:child/>
+</root>

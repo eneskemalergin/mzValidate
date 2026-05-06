@@ -1,0 +1,6 @@
+<root xmlns="urn:outer" xmlns:a="urn:a0">
+  <branch xmlns="urn:inner" xmlns:a="urn:a1">
+    <a:leaf a:id="one"/>
+  </branch>
+  <a:leaf xmlns:a="urn:a2" a:id="two"/>
+</root>

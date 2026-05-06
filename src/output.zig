@@ -212,3 +212,49 @@ test "renderText_groups diagnostics by input and appends summary" {
         allocating_writer.written(),
     );
 }
+
+test "renderText_handles_pathless_diagnostic_without_input_header" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .info,
+        .rule = "meta.note",
+        .message = "standalone note",
+    }};
+
+    try renderText(&allocating_writer.writer, &diagnostics);
+    try std.testing.expectEqualStrings(
+        "  info [meta.note] standalone note\n" ++
+            "\n" ++
+            "summary: clean (info=1 warnings=0 errors=0)\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderJson_escapes_quotes_backslashes_and_control_characters" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .warning,
+        .rule = "runtime.escape-test",
+        .message = "quote=\" slash=\\ line=\n tab=\t raw=\x01",
+    }};
+
+    const expected_json =
+        "[\n" ++
+        "  {\n" ++
+        "    \"severity\": \"warning\",\n" ++
+        "    \"rule\": \"runtime.escape-test\",\n" ++
+        "    \"location\": {\n" ++
+        "      \"byte_offset\": null,\n" ++
+        "      \"spectrum_index\": null\n" ++
+        "    },\n" ++
+        "    \"message\": \"quote=\\\" slash=\\\\ line=\\n tab=\\t raw=\\u0001\"\n" ++
+        "  }\n" ++
+        "]\n";
+
+    try renderJson(&allocating_writer.writer, &diagnostics);
+    try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
+}

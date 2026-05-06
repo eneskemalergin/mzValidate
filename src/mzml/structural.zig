@@ -428,6 +428,44 @@ test "structural validator reports missing binaryDataArrayList" {
     try std.testing.expectEqualStrings(RuleId.mzml_structure_missing_child, diagnostics.items[0].rule);
 }
 
+test "structural validator reports mzml missing run child" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"></mzML>";
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_missing_child, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("mzML is missing required child run", diagnostics.items[0].message);
+}
+
+test "structural validator reports binaryDataArrayList nested directly under run" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\">" ++
+        "<run>" ++
+        "<binaryDataArrayList count=\"1\"/>" ++
+        "</run>" ++
+        "</mzML>";
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_nesting, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("binaryDataArrayList must be a child of spectrum or chromatogram", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_missing_child, diagnostics.items[1].rule);
+    try std.testing.expectEqualStrings("run must contain spectrumList or chromatogramList", diagnostics.items[1].message);
+}
+
 fn readFixtureAlloc(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
 }
