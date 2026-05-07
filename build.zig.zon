@@ -1,7 +1,7 @@
 .{
     .name = .mzvalidate,
-    .version = "0.0.4",
-    .fingerprint = 0x852e43c07fd62a5d,
+    .version = "0.1.0",
+    .fingerprint = 0x852e43c03f8a10d3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},
     .paths = .{
@@ -12,6 +12,8 @@
         "tools/bump_version.zig",
     },
 }
+
+
 
 
 
