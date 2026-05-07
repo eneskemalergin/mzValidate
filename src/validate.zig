@@ -3,6 +3,7 @@
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
+const mzml_index = @import("mzml/index.zig");
 const structural = @import("mzml/structural.zig");
 const xml_events = @import("xml/events.zig");
 const xml_parser = @import("xml/parser.zig");
@@ -16,6 +17,7 @@ const max_validation_token_bytes = 1024 * 1024;
 /// Controls which validation layers run for a check command.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
+    skip_index: bool = false,
 };
 
 /// Opens a file and runs the shared validation flow for one input path.
@@ -40,7 +42,7 @@ pub fn checkPath(
 
     var read_buffer: [4096]u8 = undefined;
     var reader = file.readerStreaming(io, &read_buffer);
-    try checkReader(allocator, io, &reader.interface, diagnostics, path, options);
+    try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
 }
 
 /// Runs structural and binary validation over one reader-backed XML stream.
@@ -54,6 +56,7 @@ pub fn checkReader(
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
     options: CheckOptions,
+    file_bytes: ?[]const u8,
 ) !void {
     _ = io;
 
@@ -86,6 +89,11 @@ pub fn checkReader(
     var binary_validator = if (options.skip_binary) null else binary.BinaryValidator.init(allocator, diagnostics, path);
     defer if (binary_validator) |*validator| validator.deinit();
 
+    var index_validator = if (options.skip_index) null else mzml_index.IndexValidator.init(allocator, diagnostics, path);
+    defer if (index_validator) |*validator| validator.deinit();
+
+    var element_depth: usize = 0;
+
     while (true) {
         const maybe_event = parser.next() catch |err| {
             try diagnostics.append(allocator, .{
@@ -97,20 +105,28 @@ pub fn checkReader(
             });
             return;
         };
-        const event = maybe_event orelse break;
+        const event = maybe_event orelse {
+            if (index_validator) |*iv| iv.finish(file_bytes);
+            break;
+        };
 
         switch (event) {
             .start_element => |start| {
+                element_depth += 1;
                 try structural_validator.consumeStart(start);
                 if (binary_validator) |*validator| try validator.consumeStart(start);
+                if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
             },
             .end_element => |end| {
                 try structural_validator.consumeEnd(end);
                 if (binary_validator) |*validator| try validator.consumeEnd(end);
+                if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
+                element_depth -= 1;
             },
             .text => |text| {
                 try structural_validator.consumeText(text);
                 if (binary_validator) |*validator| try validator.consumeText(text);
+                if (index_validator) |*validator| try validator.consumeText(text, element_depth);
             },
         }
     }
@@ -247,6 +263,36 @@ test "checkPath_largeIndexedMzMLFixture_runsStructuralValidationWhenSkippingBina
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "checkPath_indexedMzMLFixture_runsCleanWithIndexValidationEnabled" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true });
+
+    // Assert.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
+
+    // Assert.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
 test "checkPath_validMzMLCorpus_runsStructuralValidationWhenSkippingBinary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -332,7 +378,7 @@ test "checkReader_truncated_xml_reports_exact_structure_xml_diagnostic" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-truncated.mzML", .{});
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-truncated.mzML", .{}, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -355,7 +401,7 @@ test "checkReader_broken_attribute_quote_reports_malformed_xml_diagnostic" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-broken-quote.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-broken-quote.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -382,7 +428,7 @@ test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-mismatched-end-tag.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-mismatched-end-tag.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -413,7 +459,7 @@ test "checkReader_invalid_utf8_reports_exact_structure_xml_diagnostic" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-invalid-utf8.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-invalid-utf8.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -440,7 +486,7 @@ test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-wrong-namespace.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-wrong-namespace.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -472,7 +518,7 @@ test "checkReader_prefixed_psi_namespace_root_runs_clean_when_skipping_binary" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-prefixed-root.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-prefixed-root.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -527,7 +573,7 @@ test "checkReader_repeated_clean_runs_do_not_accumulate_state" {
     for (0..32) |_| {
         diagnostics.clearRetainingCapacity();
         var reader = std.Io.Reader.fixed(xml);
-        try checkReader(allocator, io, &reader, &diagnostics, "inline-repeated-clean.mzML", .{});
+        try checkReader(allocator, io, &reader, &diagnostics, "inline-repeated-clean.mzML", .{}, null);
 
         // Assert.
         try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -545,7 +591,7 @@ test "checkReader_empty_spectrum_list_is_clean_when_skipping_binary" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-spectrum-list.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-spectrum-list.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -567,7 +613,7 @@ test "checkReader_multiple_spectra_are_clean_when_structure_is_valid" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-multiple-spectra.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-multiple-spectra.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -590,7 +636,7 @@ test "checkReader_missing_binary_data_array_list_reports_exact_structure_rule" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-missing-binary-list.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-missing-binary-list.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -620,7 +666,7 @@ test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-out-of-order-top-level.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-out-of-order-top-level.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -642,7 +688,7 @@ test "checkReader_oversized_text_token_maps_parser_limit_to_structure_xml_diagno
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-oversized-text.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-oversized-text.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -664,7 +710,7 @@ test "checkReader_excessive_attribute_count_maps_parser_limit_to_structure_xml_d
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-attributes.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-attributes.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -686,7 +732,7 @@ test "checkReader_excessive_namespace_bindings_map_parser_limit_to_structure_xml
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-namespaces.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-namespaces.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -708,7 +754,7 @@ test "checkReader_excessive_nesting_maps_parser_limit_to_structure_xml_diagnosti
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-deep.mzML", .{ .skip_binary = true });
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-too-deep.mzML", .{ .skip_binary = true }, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -832,7 +878,7 @@ test "checkReader_empty_binary_payload_reports_exact_length_mismatch" {
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-binary.mzML", .{});
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-binary.mzML", .{}, null);
 
     // Assert.
     try expectSingleDiagnostic(
@@ -853,7 +899,7 @@ test "checkReader_valid_zlib_payload_with_wrong_declared_length_reports_exact_le
     var reader = std.Io.Reader.fixed(xml);
 
     // Act.
-    try checkReader(allocator, io, &reader, &diagnostics, "inline-zlib-length-mismatch.mzML", .{});
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-zlib-length-mismatch.mzML", .{}, null);
 
     // Assert.
     try expectSingleDiagnostic(

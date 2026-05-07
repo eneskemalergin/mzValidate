@@ -28,6 +28,17 @@ pub const RuleId = struct {
     pub const mzml_binary_decompress = "mzml.binary.decompress";
     pub const mzml_binary_length_mismatch = "mzml.binary.length-mismatch";
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
+
+    // Index and checksum rules (Phase 2).
+    /// Declared indexListOffset does not match the actual byte offset of indexList.
+    pub const mzml_index_offset_list = "mzml.index.offset-list";
+    /// Index offset does not match the recorded spectrum/chromatogram position,
+    /// or references a non-existent element.
+    pub const mzml_index_offset = "mzml.index.offset";
+    /// Index offset points past the end of the file (truncated file).
+    pub const mzml_index_truncated = "mzml.index.truncated";
+    /// fileChecksum SHA-1 digest does not match the recomputed value.
+    pub const mzml_index_checksum = "mzml.index.checksum";
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.

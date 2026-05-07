@@ -27,6 +27,7 @@ pub const xml = struct {
 pub const mzml = struct {
     pub const structural = @import("mzml/structural.zig");
     pub const binary = @import("mzml/binary.zig");
+    pub const index = @import("mzml/index.zig");
 };
 
 // --- Re-exports for convenience ---
@@ -52,5 +53,6 @@ test {
     _ = @import("xml/parser.zig");
     _ = @import("mzml/structural.zig");
     _ = @import("mzml/binary.zig");
+    _ = @import("mzml/index.zig");
     _ = @import("validate.zig");
 }
