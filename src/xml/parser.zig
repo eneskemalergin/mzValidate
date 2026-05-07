@@ -135,7 +135,10 @@ pub const Parser = struct {
             const start_offset = parser.last_byte_offset;
 
             if (first_byte != '<') {
-                return try parser.parseText(start_offset, first_byte, false);
+                if (try parser.parseText(start_offset, first_byte, false)) |event| {
+                    return event;
+                }
+                continue;
             }
 
             const markup = try parser.takeRequiredByte();
@@ -159,7 +162,7 @@ pub const Parser = struct {
         return parser.last_byte_offset;
     }
 
-    fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!Event {
+    fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!?Event {
         try parser.appendDecodedTextByte(first_byte);
 
         while (true) {
@@ -170,6 +173,7 @@ pub const Parser = struct {
         }
 
         const value = parser.currentToken();
+        if (!from_cdata and isWhitespaceOnly(value)) return null;
         if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
 
         return .{ .text = .{
@@ -804,6 +808,31 @@ test "parser skips comments and processing instructions and emits cdata as text"
 
     const terminal = try harness.parser.next();
     try std.testing.expectEqual(@as(?Event, null), terminal);
+}
+
+test "parser skips whitespace-only text between elements" {
+    const xml =
+        "<root>\n" ++
+        "  <child/>\n" ++
+        "</root>";
+
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
+
+    const root_start = (try harness.parser.next()).?.start_element;
+    try std.testing.expect(root_start.name.matches(null, "root"));
+
+    const child_start = (try harness.parser.next()).?.start_element;
+    try std.testing.expect(child_start.name.matches(null, "child"));
+    try std.testing.expect(child_start.self_closing);
+
+    const child_end = (try harness.parser.next()).?.end_element;
+    try std.testing.expect(child_end.name.matches(null, "child"));
+
+    const root_end = (try harness.parser.next()).?.end_element;
+    try std.testing.expect(root_end.name.matches(null, "root"));
+
+    try std.testing.expectEqual(@as(?Event, null), try harness.parser.next());
 }
 
 test "parser resolves prefixed attributes without applying the default namespace" {

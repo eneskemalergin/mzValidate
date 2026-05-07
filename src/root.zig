@@ -18,6 +18,16 @@ pub const output = @import("output.zig");
 pub const version = @import("version.zig");
 /// Validation entry points.
 pub const validate = @import("validate.zig");
+/// XML parser surface for focused tooling.
+pub const xml = struct {
+    pub const events = @import("xml/events.zig");
+    pub const parser = @import("xml/parser.zig");
+};
+/// mzML validators for focused tooling.
+pub const mzml = struct {
+    pub const structural = @import("mzml/structural.zig");
+    pub const binary = @import("mzml/binary.zig");
+};
 
 // --- Re-exports for convenience ---
 

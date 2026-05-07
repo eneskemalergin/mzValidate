@@ -5,6 +5,8 @@
 //!   cli-contract  - run the binary against valid and expected-invalid fixtures
 //!   ci            - test + cli-contract (what CI runs)
 //!   resource-check - profile representative workloads with zebrac and gate peak RSS
+//!   throughput-baseline - record and gate representative throughput metrics with zebrac
+//!   fuzz-smoke    - run deterministic random and mutation-based smoke fuzzing
 //!   bump-version  - rewrite version.zig and build.zig.zon
 //!   run           - execute the binary directly
 
@@ -35,6 +37,24 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const throughput_baseline_tool = b.addExecutable(.{
+        .name = "throughput_baseline",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/throughput_baseline.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    const fuzz_smoke_tool = b.addExecutable(.{
+        .name = "fuzz_smoke",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/fuzz_smoke.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
     // --- Library and executable ---
 
     const mzvalidate_mod = b.addModule("mzvalidate", .{
@@ -43,12 +63,48 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    const xml_fuzz_target = b.addExecutable(.{
+        .name = "xml_fuzz_target",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/xml_fuzz_target.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "mzvalidate", .module = mzvalidate_mod },
+            },
+        }),
+    });
+
+    const binary_fuzz_target = b.addExecutable(.{
+        .name = "binary_fuzz_target",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/binary_fuzz_target.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+            .imports = &.{
+                .{ .name = "mzvalidate", .module = mzvalidate_mod },
+            },
+        }),
+    });
+
     const exe = b.addExecutable(.{
         .name = "mzValidate",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "mzvalidate", .module = mzvalidate_mod },
+            },
+        }),
+    });
+
+    const throughput_bench_exe = b.addExecutable(.{
+        .name = "mzValidate_throughput",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/main.zig"),
+            .target = target,
+            .optimize = .ReleaseFast,
             .imports = &.{
                 .{ .name = "mzvalidate", .module = mzvalidate_mod },
             },
@@ -121,6 +177,30 @@ pub fn build(b: *std.Build) void {
     const resource_check_cmd = b.addRunArtifact(resource_check_tool);
     resource_check_cmd.step.dependOn(b.getInstallStep());
     resource_check_step.dependOn(&resource_check_cmd.step);
+
+    const throughput_baseline_step = b.step("throughput-baseline", "Record and gate representative throughput baselines with zebrac");
+    const throughput_baseline_cmd = b.addRunArtifact(throughput_baseline_tool);
+    throughput_baseline_cmd.addArtifactArg(throughput_bench_exe);
+    throughput_baseline_step.dependOn(&throughput_baseline_cmd.step);
+
+    const xml_fuzz_target_step = b.step("xml-fuzz-target", "Build the focused XML fuzz-entry executable");
+    xml_fuzz_target_step.dependOn(&xml_fuzz_target.step);
+
+    const binary_fuzz_target_step = b.step("binary-fuzz-target", "Build the focused binary fuzz-entry executable");
+    binary_fuzz_target_step.dependOn(&binary_fuzz_target.step);
+
+    const fuzz_targets_step = b.step("fuzz-targets", "Build all focused fuzz-entry executables");
+    fuzz_targets_step.dependOn(xml_fuzz_target_step);
+    fuzz_targets_step.dependOn(binary_fuzz_target_step);
+
+    const fuzz_smoke_step = b.step("fuzz-smoke", "Run deterministic random and mutation-based smoke fuzzing");
+    const fuzz_smoke_cmd = b.addRunArtifact(fuzz_smoke_tool);
+    fuzz_smoke_cmd.addArtifactArg(xml_fuzz_target);
+    fuzz_smoke_cmd.addArtifactArg(binary_fuzz_target);
+    fuzz_smoke_step.dependOn(&fuzz_smoke_cmd.step);
+
+    ci_step.dependOn(fuzz_smoke_step);
+    ci_step.dependOn(throughput_baseline_step);
 
     const bump_version_step = b.step("bump-version", "Update the project version and manifest fingerprint");
     const bump_version_cmd = b.addRunArtifact(version_tool);
