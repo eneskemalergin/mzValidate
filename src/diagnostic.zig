@@ -28,6 +28,8 @@ pub const RuleId = struct {
     pub const mzml_binary_decompress = "mzml.binary.decompress";
     pub const mzml_binary_length_mismatch = "mzml.binary.length-mismatch";
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
+    /// Binary payload encodedLength exceeds the -max-binary-size limit.
+    pub const mzml_binary_oversized = "mzml.binary.oversized";
 
     // Index and checksum rules (Phase 2).
     /// Declared indexListOffset does not match the actual byte offset of indexList.

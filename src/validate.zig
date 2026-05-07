@@ -19,6 +19,8 @@ const max_validation_token_bytes = 1024 * 1024;
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
+    mmap: bool = false,
+    max_binary_size: ?usize = null,
 };
 
 /// Opens a file and runs the shared validation flow for one input path.
@@ -41,9 +43,38 @@ pub fn checkPath(
     };
     defer file.close(io);
 
-    var read_buffer: [4096]u8 = undefined;
-    var reader = file.readerStreaming(io, &read_buffer);
-    try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
+    if (options.mmap) {
+        // Memory-map for random-access SHA-1 and truncation verification.
+        const stat = file.stat(io) catch {
+            try diagnostics.append(allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "unable to stat input file",
+            });
+            return;
+        };
+        const len = @as(usize, @intCast(stat.size));
+        var mm = std.Io.File.MemoryMap.create(io, file, .{
+            .len = len,
+            .protection = .{ .read = true },
+        }) catch {
+            // Fall back to streaming if mmap is unavailable
+            // (e.g. 32-bit address space, certain filesystems).
+            var read_buffer: [4096]u8 = undefined;
+            var reader = file.readerStreaming(io, &read_buffer);
+            try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
+            return;
+        };
+        defer mm.destroy(io);
+
+        var reader = std.Io.Reader.fixed(mm.memory);
+        try checkReader(allocator, io, &reader, diagnostics, path, options, mm.memory);
+    } else {
+        var read_buffer: [4096]u8 = undefined;
+        var reader = file.readerStreaming(io, &read_buffer);
+        try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
+    }
 }
 
 /// Runs structural and binary validation over one reader-backed XML stream.
@@ -95,7 +126,12 @@ pub fn checkReader(
     var structural_validator = structural.StructuralValidator.init(allocator, diagnostics, path);
     defer structural_validator.deinit();
 
-    var binary_validator = if (options.skip_binary) null else binary.BinaryValidator.init(allocator, diagnostics, path);
+    var binary_validator = if (options.skip_binary) null else binary.BinaryValidator{
+        .allocator = allocator,
+        .diagnostics = diagnostics,
+        .path = path,
+        .max_binary_size = options.max_binary_size,
+    };
     defer if (binary_validator) |*validator| validator.deinit();
 
     var index_validator = if (options.skip_index) null else mzml_index.IndexValidator.init(allocator, diagnostics, path);
@@ -325,6 +361,37 @@ test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_mmap_runsCleanOnValidIndexedFixture" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act — use mmap on a valid indexed fixture.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .mmap = true });
+
+    // Assert — mmap should produce the same clean result as streaming.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_mmap_fallsBackToStreamingOnMissingFile" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act — mmap on a missing file: openFile fails before mmap even starts.
+    try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .mmap = true });
+
+    // Assert — should report file open error, not mmap error.
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }
 
 test "checkPath_validMzMLCorpus_runsStructuralValidationWhenSkippingBinary" {

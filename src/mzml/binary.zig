@@ -116,6 +116,7 @@ const BinaryArrayState = struct {
     binary_byte_offset: ?u64 = null,
     payload: std.ArrayList(u8) = .empty,
     base64_stream: StreamingBase64Counter = .{},
+    skipped: bool = false,
 
     fn init(
         allocator: std.mem.Allocator,
@@ -146,6 +147,7 @@ pub const BinaryValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
+    max_binary_size: ?usize = null,
 
     // Binary validation retains only the current owner metadata plus one active
     // binaryDataArray payload and its declarations. This bounds retained state to the
@@ -350,8 +352,22 @@ pub const BinaryValidator = struct {
                 if (element_depth == state.depth + 1) {
                     state.binary_depth = element_depth;
                     state.binary_byte_offset = start.byte_offset;
-                    if (state.saw_zlib_compression) {
-                        if (state.encoded_length) |encoded_length| {
+                    if (state.encoded_length) |encoded_length| {
+                        if (validator.max_binary_size) |max_size| {
+                            if (encoded_length > max_size) {
+                                try validator.appendDiagnostic(.{
+                                    .severity = .@"error",
+                                    .rule = RuleId.mzml_binary_oversized,
+                                    .location = .{ .byte_offset = start.byte_offset },
+                                    .path = validator.path,
+                                    .message = "binary payload exceeds -max-binary-size limit",
+                                });
+                                state.skipped = true;
+                                state.binary_depth = null;
+                                return;
+                            }
+                        }
+                        if (state.saw_zlib_compression) {
                             try state.payload.ensureTotalCapacity(validator.allocator, encoded_length);
                             state.encoded_length = null;
                         }
@@ -417,6 +433,7 @@ pub const BinaryValidator = struct {
     }
 
     fn validateBinaryArray(validator: *BinaryValidator, state: *const BinaryArrayState) !void {
+        if (state.skipped) return;
         const location: diagnostic.Location = .{
             .byte_offset = state.binary_byte_offset orelse state.byte_offset,
             .spectrum_index = state.owner_spectrum_index,
@@ -987,6 +1004,103 @@ fn expectSingleBinaryDiagnostic(diagnostics: []const Diagnostic, expected_rule: 
     if (expected_message) |message| {
         try std.testing.expectEqualStrings(message, diagnostics[0].message);
     }
+}
+
+test "binary validator oversized payload produces diagnostic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Fixture with encodedLength=8 but limit of 1.
+    const xml = minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576");
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = BinaryValidator{
+        .allocator = allocator,
+        .diagnostics = &diagnostics,
+        .path = "fixture",
+        .max_binary_size = 1,
+    };
+    defer validator.deinit();
+
+    var reader = std.Io.Reader.fixed(xml);
+    const token_buffer = try allocator.alloc(u8, max_binary_token_bytes);
+    defer allocator.free(token_buffer);
+
+    var attributes: [64]Attribute = undefined;
+    var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
+    var namespace_bytes: [2048]u8 = undefined;
+    var element_stack: [128]xml_parser.ElementFrame = undefined;
+    var element_bytes: [4096]u8 = undefined;
+
+    var parser = xml_parser.Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    try validator.run(io, &parser);
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_binary_oversized, diagnostics.items[0].rule);
+}
+
+test "binary validator oversized limit is inclusive" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // encodedLength=8 exactly equals limit of 8 → should pass.
+    const xml = minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576");
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = BinaryValidator{
+        .allocator = allocator,
+        .diagnostics = &diagnostics,
+        .path = "fixture",
+        .max_binary_size = 8,
+    };
+    defer validator.deinit();
+
+    var reader = std.Io.Reader.fixed(xml);
+    const token_buffer = try allocator.alloc(u8, max_binary_token_bytes);
+    defer allocator.free(token_buffer);
+
+    var attributes: [64]Attribute = undefined;
+    var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
+    var namespace_bytes: [2048]u8 = undefined;
+    var element_stack: [128]xml_parser.ElementFrame = undefined;
+    var element_bytes: [4096]u8 = undefined;
+
+    var parser = xml_parser.Parser.init(&reader, .{
+        .token = token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    try validator.run(io, &parser);
+
+    // At limit, no oversized diagnostic.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "binary validator unlimited default does not reject large payloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Default max_binary_size=null → no limit.
+    var diagnostics = try runBinaryValidation(allocator, io, minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576"));
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 fn minimalChromatogramMzml(comptime first_payload: []const u8, comptime second_payload: []const u8) []const u8 {

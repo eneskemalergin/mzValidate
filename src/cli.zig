@@ -11,6 +11,8 @@ const Diagnostic = diagnostic.Diagnostic;
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
+    mmap: bool = false,
+    max_binary_size: ?usize = null,
     inputs: []const []const u8,
 
     /// Frees command-owned allocations after dispatch.
@@ -38,6 +40,9 @@ const ParseError = error{
     UnsupportedCommand,
     UnexpectedFlag,
     ConflictingOutputMode,
+    MissingValue,
+    InvalidValue,
+    Overflow,
 };
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
@@ -84,6 +89,9 @@ pub fn runArgs(
         error.UnsupportedCommand,
         error.UnexpectedFlag,
         error.ConflictingOutputMode,
+        error.MissingValue,
+        error.InvalidValue,
+        error.Overflow,
         => {
             const parse_err: ParseError = @errorCast(err);
             try writeParseError(stderr, parse_err, args);
@@ -110,10 +118,24 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var output_mode: output.OutputMode = .text;
     var output_mode_set = false;
     var skip_binary = false;
+    var mmap = false;
+    var max_binary_size: ?usize = null;
 
-    for (args[2..]) |arg| {
+    var i: usize = 2;
+    while (i < args.len) : (i += 1) {
+        const arg = args[i];
+        if (std.mem.eql(u8, arg, "-max-binary-size")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            max_binary_size = try parseSize(args[i]);
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-skip-binary")) {
             skip_binary = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-mmap")) {
+            mmap = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "-json")) {
@@ -138,6 +160,8 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     return .{ .check = .{
         .output_mode = output_mode,
         .skip_binary = skip_binary,
+        .mmap = mmap,
+        .max_binary_size = max_binary_size,
         .inputs = try input_paths.toOwnedSlice(allocator),
     } };
 }
@@ -165,6 +189,8 @@ fn runCheck(
     for (check.inputs) |path| {
         try validate.checkPath(allocator, io, &diagnostics, path, .{
             .skip_binary = check.skip_binary,
+            .mmap = check.mmap,
+            .max_binary_size = check.max_binary_size,
         });
     }
 
@@ -191,6 +217,10 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -json        Emit stable JSON diagnostics for CI and pipelines.\n" ++
             "  -summary     Emit only aggregate status and severity counts.\n" ++
             "  -skip-binary Skip binary payload checks. Structural work still runs when implemented.\n" ++
+            "  -mmap        Memory-map the input for random-access SHA-1 verification.\n" ++
+            "  -max-binary-size N\n" ++
+            "               Reject any binary array whose encodedLength exceeds N.\n" ++
+            "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
             "  -h, --help   Show this help text.\n\n" ++
             "Behavior\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
@@ -227,6 +257,9 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
             }
         },
         error.ConflictingOutputMode => try writer.writeAll("error: choose either -json or -summary, not both"),
+        error.MissingValue => try writer.writeAll("error: -max-binary-size requires a value"),
+        error.InvalidValue => try writer.writeAll("error: invalid -max-binary-size value"),
+        error.Overflow => try writer.writeAll("error: -max-binary-size value overflow (too large)"),
     }
 }
 
@@ -234,6 +267,8 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "-") and
             !std.mem.eql(u8, arg, "-skip-binary") and
+            !std.mem.eql(u8, arg, "-mmap") and
+            !std.mem.eql(u8, arg, "-max-binary-size") and
             !std.mem.eql(u8, arg, "-json") and
             !std.mem.eql(u8, arg, "-summary") and
             !isHelpFlag(arg))
@@ -242,6 +277,40 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
         }
     }
     return null;
+}
+
+/// Parses a byte-size string with optional binary suffix (K, M, G, T).
+/// Examples: "1024", "1K" (1024), "2M" (2 MiB), "1G" (1 GiB).
+fn parseSize(s: []const u8) error{Overflow, InvalidValue}!usize {
+    if (s.len == 0) return error.InvalidValue;
+
+    var i: usize = 0;
+    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {}
+
+    if (i == 0) return error.InvalidValue;
+
+    const num = std.fmt.parseUnsigned(usize, s[0..i], 10) catch return error.InvalidValue;
+    if (i == s.len) return num;
+
+    const suffix = s[i..];
+    const multiplier = if (std.ascii.eqlIgnoreCase(suffix, "K") or std.ascii.eqlIgnoreCase(suffix, "Ki"))
+        @as(usize, 1024)
+    else if (std.ascii.eqlIgnoreCase(suffix, "M") or std.ascii.eqlIgnoreCase(suffix, "Mi"))
+        @as(usize, 1024 * 1024)
+    else if (std.ascii.eqlIgnoreCase(suffix, "G") or std.ascii.eqlIgnoreCase(suffix, "Gi"))
+        @as(usize, 1024 * 1024 * 1024)
+    else if (std.ascii.eqlIgnoreCase(suffix, "T") or std.ascii.eqlIgnoreCase(suffix, "Ti"))
+        @as(usize, 1024 * 1024 * 1024 * 1024)
+    else if (std.ascii.eqlIgnoreCase(suffix, "KB"))
+        @as(usize, 1000)
+    else if (std.ascii.eqlIgnoreCase(suffix, "MB"))
+        @as(usize, 1000 * 1000)
+    else if (std.ascii.eqlIgnoreCase(suffix, "GB"))
+        @as(usize, 1000 * 1000 * 1000)
+    else
+        return error.InvalidValue;
+
+    return std.math.mul(usize, num, multiplier) catch error.Overflow;
 }
 
 // Tests: argument parsing.
@@ -254,6 +323,7 @@ test "parseArgs_check_parsesFlagsAndInputs" {
         "sample-a.mzML",
         "-json",
         "-skip-binary",
+        "-mmap",
         "sample-b.mzML",
     };
 
@@ -268,6 +338,7 @@ test "parseArgs_check_parsesFlagsAndInputs" {
         .check => |check| {
             try std.testing.expectEqual(output.OutputMode.json, check.output_mode);
             try std.testing.expect(check.skip_binary);
+            try std.testing.expect(check.mmap);
             try std.testing.expectEqual(@as(usize, 2), check.inputs.len);
             try std.testing.expectEqualStrings("sample-a.mzML", check.inputs[0]);
             try std.testing.expectEqualStrings("sample-b.mzML", check.inputs[1]);
@@ -321,7 +392,129 @@ test "parseArgs_rejects_unknown_flag_before_any_input" {
     try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 
-// Tests: public CLI execution.
+test "parseArgs_max_binary_size_parses_byte_value" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-max-binary-size",
+        "1048576",
+    };
+
+    var command = try parseArgs(std.testing.allocator, &argv);
+    defer command.deinit(std.testing.allocator);
+
+    switch (command) {
+        .check => |check| {
+            try std.testing.expectEqual(@as(?usize, 1048576), check.max_binary_size);
+        },
+    }
+}
+
+test "parseArgs_max_binary_size_parses_suffix" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-max-binary-size",
+        "1M",
+    };
+
+    var command = try parseArgs(std.testing.allocator, &argv);
+    defer command.deinit(std.testing.allocator);
+
+    switch (command) {
+        .check => |check| {
+            try std.testing.expectEqual(@as(?usize, 1024 * 1024), check.max_binary_size);
+        },
+    }
+}
+
+test "parseArgs_max_binary_size_rejects_missing_value" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-max-binary-size",
+    };
+
+    try std.testing.expectError(error.MissingValue, parseArgs(std.testing.allocator, &argv));
+}
+
+test "parseArgs_max_binary_size_rejects_invalid_suffix" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-max-binary-size",
+        "1X",
+    };
+
+    try std.testing.expectError(error.InvalidValue, parseArgs(std.testing.allocator, &argv));
+}
+
+// Tests: size parsing.
+
+test "parseSize_understands_raw_bytes" {
+    try std.testing.expectEqual(@as(usize, 0), try parseSize("0"));
+    try std.testing.expectEqual(@as(usize, 1), try parseSize("1"));
+    try std.testing.expectEqual(@as(usize, 999), try parseSize("999"));
+}
+
+test "parseSize_understands_binary_suffixes" {
+    try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1K"));
+    try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), try parseSize("2M"));
+    try std.testing.expectEqual(@as(usize, 3 * 1024 * 1024 * 1024), try parseSize("3G"));
+}
+
+test "parseSize_understands_decimal_suffixes" {
+    try std.testing.expectEqual(@as(usize, 1 * 1000), try parseSize("1KB"));
+    try std.testing.expectEqual(@as(usize, 2 * 1000 * 1000), try parseSize("2MB"));
+    try std.testing.expectEqual(@as(usize, 3 * 1000 * 1000 * 1000), try parseSize("3GB"));
+}
+
+test "parseSize_rejects_empty" {
+    try std.testing.expectError(error.InvalidValue, parseSize(""));
+}
+
+test "parseSize_rejects_non_numeric_prefix" {
+    try std.testing.expectError(error.InvalidValue, parseSize("abc"));
+}
+
+test "parseSize_rejects_unknown_suffix" {
+    try std.testing.expectError(error.InvalidValue, parseSize("1X"));
+}
+
+test "parseSize_is_case_insensitive" {
+    try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1k"));
+    try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1K"));
+    try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1ki"));
+    try std.testing.expectEqual(@as(usize, 1 * 1024 * 1024), try parseSize("1m"));
+    try std.testing.expectEqual(@as(usize, 1 * 1024 * 1024 * 1024), try parseSize("1g"));
+}
+
+test "parseArgs_mmap_flag_is_parsed" {
+    const allocator = std.testing.allocator;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-mmap",
+    };
+
+    // Act.
+    var command = try parseArgs(allocator, &argv);
+    defer command.deinit(allocator);
+
+    // Assert.
+    switch (command) {
+        .check => |check| {
+            try std.testing.expect(check.mmap);
+            try std.testing.expect(!check.skip_binary);
+            try std.testing.expectEqual(@as(usize, 1), check.inputs.len);
+        },
+    }
+}
 
 test "runArgs_help_flag_writes_usage_to_stdout_and_returns_zero" {
     const allocator = std.testing.allocator;
