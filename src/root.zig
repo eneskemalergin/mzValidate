@@ -23,6 +23,10 @@ pub const xml = struct {
     pub const events = @import("xml/events.zig");
     pub const parser = @import("xml/parser.zig");
 };
+/// I/O utilities (e.g. HashingReader).
+pub const io = struct {
+    pub const hash_reader = @import("io/hash_reader.zig");
+};
 /// mzML validators for focused tooling.
 pub const mzml = struct {
     pub const structural = @import("mzml/structural.zig");

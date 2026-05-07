@@ -75,6 +75,13 @@ pub const IndexValidator = struct {
         return validator.saw_index_elements;
     }
 
+    /// Returns the declared fileChecksum value parsed from `<fileChecksum>`.
+    /// Returns null if no fileChecksum was encountered.
+    pub fn declaredChecksum(validator: *const IndexValidator) ?[20]u8 {
+        if (!validator.file_checksum_ok) return null;
+        return validator.file_checksum_raw;
+    }
+
     pub fn init(
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),

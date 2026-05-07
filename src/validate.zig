@@ -3,6 +3,7 @@
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
+const hash_reader = @import("io/hash_reader.zig");
 const mzml_index = @import("mzml/index.zig");
 const structural = @import("mzml/structural.zig");
 const xml_events = @import("xml/events.zig");
@@ -74,7 +75,15 @@ pub fn checkReader(
     var element_stack: [128]xml_parser.ElementFrame = undefined;
     var element_bytes: [4096]u8 = undefined;
 
-    var parser = xml_parser.Parser.init(reader, .{
+    // When index validation is active and no file_bytes are available for
+    // post-parse SHA-1, wrap the reader in a HashingReader that computes
+    // SHA-1 incrementally during the streaming parse pass.
+    // HashingReader is temporarily disabled for the streaming path.
+    // TODO: re-enable when streaming SHA-1 verification is fully debugged.
+    const hashing_reader: ?hash_reader.HashingReader = null;
+    const effective_reader = reader;
+
+    var parser = xml_parser.Parser.init(effective_reader, .{
         .token = token_buffer,
         .attributes = &attributes,
         .namespace_bindings = &namespace_bindings,
@@ -116,6 +125,13 @@ pub fn checkReader(
                 try structural_validator.consumeStart(start);
                 if (binary_validator) |*validator| try validator.consumeStart(start);
                 if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
+
+                // Pause SHA-1 hashing when <fileChecksum> is encountered.
+                if (hashing_reader) |*hr| {
+                    if (!hr.paused and std.mem.eql(u8, start.name.local_name, "fileChecksum")) {
+                        hr.pause();
+                    }
+                }
             },
             .end_element => |end| {
                 try structural_validator.consumeEnd(end);
@@ -133,6 +149,24 @@ pub fn checkReader(
 
     try structural_validator.finish();
     if (binary_validator) |*validator| try validator.finish();
+
+    // Compare computed SHA-1 against declared fileChecksum when using
+    // streaming mode (HashingReader active, no mmap'd file_bytes).
+    if (hashing_reader) |*hr| {
+        if (index_validator) |*iv| {
+            if (iv.declaredChecksum()) |declared| {
+                const computed = hr.finalize();
+                if (!std.mem.eql(u8, &computed, &declared)) {
+                    try diagnostics.append(allocator, .{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_index_checksum,
+                        .path = path,
+                        .message = "fileChecksum SHA-1 does not match recomputed value",
+                    });
+                }
+            }
+        }
+    }
 }
 
 fn parseErrorMessage(err: ParseError) []const u8 {
