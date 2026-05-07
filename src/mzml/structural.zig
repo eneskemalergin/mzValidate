@@ -29,6 +29,12 @@ const TopLevelSlot = enum(u8) {
     instrument_configuration_list = 7,
     data_processing_list = 8,
     run = 9,
+    // Index and checksum elements are optional and appear after run.
+    // They are validated at the structural level only for ordering and duplication;
+    // deep index cross-checks live in the IndexValidator (index.zig).
+    index_list = 10,
+    index_list_offset = 11,
+    file_checksum = 12,
 };
 
 const ContainerKind = enum {
@@ -147,6 +153,11 @@ pub const StructuralValidator = struct {
     run_has_spectrum_list: bool = false,
     run_has_chromatogram_list: bool = false,
     run_last_child_slot: u8 = 0,
+
+    // Index and checksum elements (optional, post-run top-level children of mzML).
+    index_list_seen: bool = false,
+    index_list_offset_seen: bool = false,
+    file_checksum_seen: bool = false,
 
     file_description: ?FileDescriptionState = null,
 
@@ -408,6 +419,39 @@ pub const StructuralValidator = struct {
             validator.run_last_child_slot = 0;
             try validator.requireAttribute(start, "id", "run is missing required attribute id");
             try validator.requireAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
+            return;
+        }
+
+        // Index and checksum elements. These are optional post-run top-level children.
+        // They must appear after <run> and follow their own ordering:
+        //   indexList → indexListOffset → fileChecksum
+        // Deep index content validation is done by IndexValidator (index.zig).
+
+        if (start.name.matches(mzml_namespace, "indexList")) {
+            if (!validator.run_seen) {
+                try validator.nestingError(start.byte_offset, "indexList must appear after run");
+                return;
+            }
+            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_seen, "indexList", .index_list);
+            try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
+            return;
+        }
+
+        if (start.name.matches(mzml_namespace, "indexListOffset")) {
+            if (!validator.run_seen) {
+                try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
+                return;
+            }
+            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_offset_seen, "indexListOffset", .index_list_offset);
+            return;
+        }
+
+        if (start.name.matches(mzml_namespace, "fileChecksum")) {
+            if (!validator.run_seen) {
+                try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
+                return;
+            }
+            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_checksum_seen, "fileChecksum", .file_checksum);
             return;
         }
 
