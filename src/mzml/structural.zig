@@ -1,4 +1,4 @@
-//! Phase 1 streaming mzML structural validation.
+//! One-pass Phase 1 structural validation for mzML documents.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -15,6 +15,7 @@ const RuleId = diagnostic.RuleId;
 const Severity = diagnostic.Severity;
 const StartElement = xml_events.StartElement;
 
+/// Namespace matched by the streaming mzML validators.
 pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
 const max_structural_token_bytes = 1024 * 1024;
 
@@ -121,6 +122,9 @@ pub const StructuralValidator = struct {
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
 
+    // Structural validation retains only the current nesting depth, top-level ordering,
+    // and active local container/list state needed to validate the current branch.
+    // Completed spectra and chromatograms are discarded as soon as their end element is seen.
     depth: usize = 0,
     root_seen: bool = false,
     root_valid: bool = false,
@@ -169,6 +173,7 @@ pub const StructuralValidator = struct {
     spectrum: ?ContainerState = null,
     chromatogram: ?ContainerState = null,
 
+    /// Creates a validator that appends structural diagnostics to the shared list.
     pub fn init(
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
@@ -181,10 +186,12 @@ pub const StructuralValidator = struct {
         };
     }
 
+    /// Structural validation does not own long-lived allocations today.
     pub fn deinit(validator: *StructuralValidator) void {
         _ = validator;
     }
 
+    /// Runs the standalone structural validator over a reader-backed XML stream.
     pub fn validateReader(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -213,22 +220,26 @@ pub const StructuralValidator = struct {
         try validator.run(io, &parser);
     }
 
+    /// Consumes one start-element event from the shared XML traversal.
     pub fn consumeStart(validator: *StructuralValidator, start: StartElement) !void {
         const element_depth = validator.depth + 1;
         try validator.handleStart(start, element_depth);
         validator.depth += 1;
     }
 
+    /// Consumes one end-element event from the shared XML traversal.
     pub fn consumeEnd(validator: *StructuralValidator, end: EndElement) !void {
         const element_depth = validator.depth;
         try validator.handleEnd(end, element_depth);
         validator.depth -= 1;
     }
 
+    /// Consumes one text event from the shared XML traversal.
     pub fn consumeText(validator: *StructuralValidator, text: xml_events.Text) !void {
         try validator.handleText(text.value, text.byte_offset);
     }
 
+    /// Emits any root or container diagnostics that can only be decided at end of stream.
     pub fn finish(validator: *StructuralValidator) !void {
         if (!validator.root_seen) {
             try validator.appendDiagnostic(.{
@@ -1343,6 +1354,8 @@ fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
+// Tests: valid fixtures.
+
 test "structural validator accepts realistic one-spectrum mzML fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1370,6 +1383,28 @@ test "structural validator accepts indexed mzML PSI tiny fixture" {
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
+
+test "structural validator accepts valid chromatogram fixture" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalChromatogramMzml(
+        "<precursor/>" ++
+            "<product/>" ++
+            "<binaryDataArrayList count=\"2\">" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "</binaryDataArrayList>",
+    );
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// Tests: required children and attributes.
 
 test "structural validator reports missing required top-level mzML children" {
     const allocator = std.testing.allocator;
@@ -1426,6 +1461,8 @@ test "structural validator reports missing required run and spectrumList attribu
     try std.testing.expectEqualStrings("run is missing required attribute defaultInstrumentConfigurationRef", diagnostics.items[1].message);
     try std.testing.expectEqualStrings("spectrumList is missing required attribute defaultDataProcessingRef", diagnostics.items[2].message);
 }
+
+// Tests: ordering and nesting rules.
 
 test "structural validator reports out of order top-level child" {
     const allocator = std.testing.allocator;
@@ -1732,6 +1769,93 @@ test "structural validator reports binaryDataArrayList nested directly under run
     try std.testing.expectEqualStrings("run must contain spectrumList or chromatogramList", diagnostics.items[1].message);
 }
 
+test "structural validator reports chromatogram child ordering violations" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalChromatogramMzml(
+        "<product/>" ++
+            "<precursor/>" ++
+            "<binaryDataArrayList count=\"2\">" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "</binaryDataArrayList>",
+    );
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "precursor appears out of order under chromatogram",
+    );
+}
+
+test "structural validator repeated clean and broken runs do not accumulate diagnostics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const clean_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/clean-single-spectrum.mzML");
+    defer allocator.free(clean_fixture);
+    const broken_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/wrong-namespace.mzML");
+    defer allocator.free(broken_fixture);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act.
+    for (0..24) |index| {
+        const fixture = if (index % 2 == 0) clean_fixture else broken_fixture;
+        try runStructuralValidationInto(allocator, io, fixture, &diagnostics);
+
+        // Assert.
+        if (index % 2 == 0) {
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+        } else {
+            try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_root, null);
+        }
+    }
+}
+
+fn runStructuralValidationInto(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    diagnostics.clearRetainingCapacity();
+    var reader = std.Io.Reader.fixed(fixture);
+    try StructuralValidator.validateReader(allocator, io, &reader, diagnostics, "fixture");
+}
+
+fn expectSingleStructuralDiagnostic(diagnostics: []const Diagnostic, expected_rule: []const u8, expected_message: ?[]const u8) !void {
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings(expected_rule, diagnostics[0].rule);
+    if (expected_message) |message| {
+        try std.testing.expectEqualStrings(message, diagnostics[0].message);
+    }
+}
+
 fn readFixtureAlloc(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
     return try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
+}
+
+fn minimalChromatogramMzml(comptime chromatogram_inner: []const u8) []const u8 {
+    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"https://example.invalid/psi-ms.obo\"/></cvList>" ++
+        "<fileDescription><fileContent/></fileDescription>" ++
+        "<softwareList count=\"1\"><software id=\"SW1\" version=\"1.0\"/></softwareList>" ++
+        "<instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"IC1\"/></instrumentConfigurationList>" ++
+        "<dataProcessingList count=\"1\"><dataProcessing id=\"DP1\"><processingMethod order=\"0\" softwareRef=\"SW1\"/></dataProcessing></dataProcessingList>" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<chromatogramList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<chromatogram index=\"0\" id=\"tic=1\" defaultArrayLength=\"1\">" ++
+        chromatogram_inner ++
+        "</chromatogram>" ++
+        "</chromatogramList>" ++
+        "</run>" ++
+        "</mzML>";
 }

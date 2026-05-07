@@ -1,9 +1,22 @@
+//! Build script for mzValidate.
+//!
+//! Key steps:
+//!   test          - run all unit tests
+//!   cli-contract  - run the binary against valid and expected-invalid fixtures
+//!   ci            - test + cli-contract (what CI runs)
+//!   resource-check - profile representative workloads with zebrac and gate peak RSS
+//!   bump-version  - rewrite version.zig and build.zig.zon
+//!   run           - execute the binary directly
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const release_version = b.option([]const u8, "release-version", "Semantic version for the bump-version step, for example 0.0.3");
+
+    // --- Version tool ---
+
     const version_tool = b.addExecutable(.{
         .name = "bump_version",
         .root_module = b.createModule(.{
@@ -12,6 +25,17 @@ pub fn build(b: *std.Build) void {
             .optimize = .Debug,
         }),
     });
+
+    const resource_check_tool = b.addExecutable(.{
+        .name = "resource_check",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("tools/resource_check.zig"),
+            .target = b.graph.host,
+            .optimize = .Debug,
+        }),
+    });
+
+    // --- Library and executable ---
 
     const mzvalidate_mod = b.addModule("mzvalidate", .{
         .root_source_file = b.path("src/root.zig"),
@@ -33,6 +57,8 @@ pub fn build(b: *std.Build) void {
 
     b.installArtifact(exe);
 
+    // --- Run step ---
+
     const run_step = b.step("run", "Run mzValidate");
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
@@ -40,6 +66,8 @@ pub fn build(b: *std.Build) void {
     if (b.args) |args| {
         run_cmd.addArgs(args);
     }
+
+    // --- Unit tests ---
 
     const mod_tests = b.addTest(.{
         .root_module = mzvalidate_mod,
@@ -50,6 +78,8 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    // --- CLI contract ---
 
     const valid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/valid") catch @panic("failed to collect valid mzML fixtures");
     const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch @panic("failed to collect invalid mzML fixtures");
@@ -70,6 +100,8 @@ pub fn build(b: *std.Build) void {
     cli_invalid_cmd.expectExitCode(2);
     cli_invalid_cmd.expectStdOutMatch("status=errors-present info=0 warnings=0 errors=");
 
+    // --- Build steps ---
+
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
@@ -85,16 +117,24 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
 
+    const resource_check_step = b.step("resource-check", "Profile representative workloads and gate peak RSS with zebrac");
+    const resource_check_cmd = b.addRunArtifact(resource_check_tool);
+    resource_check_cmd.step.dependOn(b.getInstallStep());
+    resource_check_step.dependOn(&resource_check_cmd.step);
+
     const bump_version_step = b.step("bump-version", "Update the project version and manifest fingerprint");
     const bump_version_cmd = b.addRunArtifact(version_tool);
     bump_version_cmd.addArg(release_version orelse "--help");
     bump_version_step.dependOn(&bump_version_cmd.step);
 }
 
+/// Appends each fixture path as a CLI argument to `run`.
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
     for (fixtures) |fixture| run.addArg(fixture);
 }
 
+/// Walks `root`, collects paths of all `.mzML` files, and returns them sorted.
+/// Build allocator owns all strings; no cleanup needed.
 fn collectMzmlFixturePaths(b: *std.Build, root: []const u8) ![]const []const u8 {
     const io = b.graph.io;
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });

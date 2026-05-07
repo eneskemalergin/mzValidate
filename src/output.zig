@@ -1,11 +1,15 @@
-//! Diagnostic renderers shared by text, JSON, and summary modes.
+//! Diagnostic renderers for text, JSON, and summary output modes.
+//!
+//! Three public render functions cover the three modes. Each writes directly
+//! to a `std.Io.Writer`, so callers can redirect to stdout, a buffer, or a
+//! file without extra allocation.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
-const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
+// --- Types ---
 /// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,
@@ -133,7 +137,10 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     );
 }
 
-test "renderSummary_counts severities" {
+// --- Tests ---
+
+test "renderSummary counts severities" {
+    // Arrange.
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -143,14 +150,18 @@ test "renderSummary_counts severities" {
         .{ .severity = .@"error", .rule = "three", .message = "three" },
     };
 
+    // Act.
     try renderSummary(&allocating_writer.writer, &diagnostics);
+
+    // Assert.
     try std.testing.expectEqualStrings(
         "status=errors-present info=1 warnings=1 errors=1\n",
         allocating_writer.written(),
     );
 }
 
-test "renderJson_keeps stable keys" {
+test "renderJson keeps stable keys" {
+    // Arrange.
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -175,11 +186,15 @@ test "renderJson_keeps stable keys" {
         "  }\n" ++
         "]\n";
 
+    // Act.
     try renderJson(&allocating_writer.writer, &diagnostics);
+
+    // Assert.
     try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
 }
 
-test "renderText_groups diagnostics by input and appends summary" {
+test "renderText groups diagnostics by input and appends summary" {
+    // Arrange.
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -188,7 +203,7 @@ test "renderText_groups diagnostics by input and appends summary" {
             .severity = .warning,
             .rule = diagnostic.RuleId.runtime_stub,
             .path = "sample-a.mzML",
-            .message = version.validation_not_implemented,
+            .message = "stubbed warning message",
         },
         .{
             .severity = .@"error",
@@ -199,10 +214,13 @@ test "renderText_groups diagnostics by input and appends summary" {
         },
     };
 
+    // Act.
     try renderText(&allocating_writer.writer, &diagnostics);
+
+    // Assert.
     try std.testing.expectEqualStrings(
         "input: sample-a.mzML\n" ++
-            "  warning [runtime.stub] " ++ version.validation_not_implemented ++ "\n" ++
+            "  warning [runtime.stub] stubbed warning message\n" ++
             "\n" ++
             "input: sample-b.mzML\n" ++
             "  error [runtime.file-open] unable to open input file\n" ++
@@ -213,7 +231,8 @@ test "renderText_groups diagnostics by input and appends summary" {
     );
 }
 
-test "renderText_handles_pathless_diagnostic_without_input_header" {
+test "renderText handles pathless diagnostic without input header" {
+    // Arrange.
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -223,7 +242,10 @@ test "renderText_handles_pathless_diagnostic_without_input_header" {
         .message = "standalone note",
     }};
 
+    // Act.
     try renderText(&allocating_writer.writer, &diagnostics);
+
+    // Assert.
     try std.testing.expectEqualStrings(
         "  info [meta.note] standalone note\n" ++
             "\n" ++
@@ -232,7 +254,8 @@ test "renderText_handles_pathless_diagnostic_without_input_header" {
     );
 }
 
-test "renderJson_escapes_quotes_backslashes_and_control_characters" {
+test "renderJson escapes quotes backslashes and control characters" {
+    // Arrange.
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -255,6 +278,9 @@ test "renderJson_escapes_quotes_backslashes_and_control_characters" {
         "  }\n" ++
         "]\n";
 
+    // Act.
     try renderJson(&allocating_writer.writer, &diagnostics);
+
+    // Assert.
     try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
 }

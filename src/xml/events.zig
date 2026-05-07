@@ -1,8 +1,14 @@
-//! Streaming XML event types shared by the tokenizer and future validators.
+//! XML event types produced by the streaming parser.
+//!
+//! All slice fields borrow from the parser's caller-supplied buffers and
+//! are only valid until the next `Parser.next()` call. Consumers that need
+//! to retain a value across calls must copy it.
 
 const std = @import("std");
 
-/// Identifies the namespace-expanded name of an element or attribute.
+// --- Types ---
+
+/// Namespace-expanded element or attribute name.
 pub const QName = struct {
     prefix: ?[]const u8 = null,
     local_name: []const u8,
@@ -29,7 +35,7 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
-/// Start tag plus borrowed attribute views.
+/// Start tag with borrowed attribute views. Valid until the next `Parser.next()` call.
 pub const StartElement = struct {
     byte_offset: u64,
     name: QName,
@@ -43,7 +49,8 @@ pub const EndElement = struct {
     name: QName,
 };
 
-/// Text node payload. CDATA is normalized into the same event kind.
+/// Text node or decoded CDATA section. Both surfaces as the same event kind.
+/// `from_cdata` lets validators warn about CDATA if the schema prohibits it.
 pub const Text = struct {
     byte_offset: u64,
     value: []const u8,

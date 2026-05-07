@@ -1,4 +1,4 @@
-//! Phase 1 binary integrity validation for mzML payloads.
+//! One-pass Phase 1 binary integrity checks for mzML payloads.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -13,6 +13,7 @@ const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
 
+/// Namespace matched by the streaming mzML validators.
 pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
 const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
@@ -92,6 +93,9 @@ pub const BinaryValidator = struct {
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
 
+    // Binary validation retains only the current owner metadata plus one active
+    // binaryDataArray payload and its declarations. This bounds retained state to the
+    // current spectrum or chromatogram and one decoded workspace rather than the full file.
     depth: usize = 0,
     indexed_mzml_depth: ?usize = null,
     mzml_depth: ?usize = null,
@@ -99,6 +103,7 @@ pub const BinaryValidator = struct {
     chromatogram: ?OwnerState = null,
     binary_array: ?BinaryArrayState = null,
 
+    /// Creates a validator that appends diagnostics to the shared result list.
     pub fn init(
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
@@ -111,10 +116,12 @@ pub const BinaryValidator = struct {
         };
     }
 
+    /// Releases any active binary array workspace owned by the validator.
     pub fn deinit(validator: *BinaryValidator) void {
         if (validator.binary_array) |*state| state.deinit();
     }
 
+    /// Runs the standalone binary validator over a reader-backed XML stream.
     pub fn validateReader(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -145,22 +152,26 @@ pub const BinaryValidator = struct {
         try validator.run(io, &parser);
     }
 
+    /// Consumes one start-element event from the shared XML traversal.
     pub fn consumeStart(validator: *BinaryValidator, start: StartElement) !void {
         const element_depth = validator.depth + 1;
         try validator.handleStart(start, element_depth);
         validator.depth += 1;
     }
 
+    /// Consumes one end-element event from the shared XML traversal.
     pub fn consumeEnd(validator: *BinaryValidator, end: EndElement) !void {
         const element_depth = validator.depth;
         try validator.handleEnd(end, element_depth);
         validator.depth -= 1;
     }
 
+    /// Consumes one text event from the shared XML traversal.
     pub fn consumeText(validator: *BinaryValidator, text: xml_events.Text) !void {
         try validator.handleText(text.value);
     }
 
+    /// Finalizes one-pass binary validation after the last XML event.
     pub fn finish(validator: *BinaryValidator) !void {
         _ = validator;
     }
@@ -551,45 +562,73 @@ fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
+// Tests: valid fixtures.
+
 test "binary validator accepts clean single spectrum fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "binary validator accepts valid zlib PSI fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML", allocator, .limited(6 * 1024 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
+
+test "binary validator accepts valid chromatogram payloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const fixture = minimalChromatogramMzml(
+        "AAAAAA==",
+        "AAAAAA==",
+    );
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+// Tests: invalid payloads and declarations.
 
 test "binary validator reports invalid base64 payload" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_base64, diagnostics.items[0].rule);
     try std.testing.expectEqual(@as(?usize, 7), diagnostics.items[0].location.spectrum_index);
@@ -598,14 +637,16 @@ test "binary validator reports invalid base64 payload" {
 test "binary validator reports invalid zlib payload" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-zlib.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
 }
@@ -613,14 +654,16 @@ test "binary validator reports invalid zlib payload" {
 test "binary validator reports precision mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/conflicting-precision.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_precision_mismatch, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("binaryDataArray declares conflicting 32-bit and 64-bit precision", diagnostics.items[0].message);
@@ -629,6 +672,8 @@ test "binary validator reports precision mismatch" {
 test "binary validator reports defaultArrayLength mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture =
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
         "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
@@ -647,27 +692,67 @@ test "binary validator reports defaultArrayLength mismatch" {
         "</run>" ++
         "</mzML>";
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_length_mismatch, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("decoded array length does not match defaultArrayLength", diagnostics.items[0].message);
 }
 
+test "binary validator reports empty binary payload when declared length is nonzero" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const fixture = minimalSpectrumMzml("", 1, "MS:1000576");
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "decoded array length does not match defaultArrayLength",
+    );
+}
+
+test "binary validator reports decoded length mismatch after valid zlib decompression" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const fixture = minimalSpectrumMzml("eJxjYGBgAAAABAAB", 2, "MS:1000574");
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "decoded array length does not match defaultArrayLength",
+    );
+}
+
 test "binary validator reports conflicting compression terms" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/conflicting-compression.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("binaryDataArray declares conflicting compression terms", diagnostics.items[0].message);
@@ -676,15 +761,189 @@ test "binary validator reports conflicting compression terms" {
 test "binary validator reports unsupported compression terms" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
+
+    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/unsupported-compression.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
     defer diagnostics.deinit(allocator);
 
-    try BinaryValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("binaryDataArray declares unsupported compression terms", diagnostics.items[0].message);
+}
+
+test "binary validator reports invalid chromatogram payload without spectrum index" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const fixture = minimalChromatogramMzml(
+        "%%%%",
+        "AAAAAA==",
+    );
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_base64,
+        "binary payload is not valid base64",
+    );
+    try std.testing.expectEqual(@as(?usize, null), diagnostics.items[0].location.spectrum_index);
+}
+
+test "binary validator rejects short and mutated invalid base64 payload matrix" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const payloads = [_][]const u8{
+        "%",
+        "A",
+        "AA=A",
+        "A===",
+        "AA!A",
+        "~!@#",
+    };
+
+    // Act.
+    inline for (payloads) |payload| {
+        const fixture = minimalSpectrumMzml(payload, 1, "MS:1000576");
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        // Assert.
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_base64,
+            "binary payload is not valid base64",
+        );
+    }
+}
+
+test "binary validator rejects truncated and high entropy zlib payload matrix" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const payloads = [_][]const u8{
+        "eJxjYGBgAAAA",
+        "QUJDREVGR0hJSktM",
+        "////////////////",
+    };
+
+    // Act.
+    inline for (payloads) |payload| {
+        const fixture = minimalSpectrumMzml(payload, 1, "MS:1000574");
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        // Assert.
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_decompress,
+            "binary payload is not valid zlib data",
+        );
+    }
+}
+
+test "binary validator repeated clean and corrupt runs do not accumulate diagnostics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange.
+    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(clean_fixture);
+    const corrupt_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(corrupt_fixture);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act.
+    for (0..24) |index| {
+        const fixture = if (index % 2 == 0) clean_fixture else corrupt_fixture;
+        try runBinaryValidationInto(allocator, io, fixture, &diagnostics);
+
+        // Assert.
+        if (index % 2 == 0) {
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+        } else {
+            try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_base64, null);
+        }
+    }
+}
+
+fn runBinaryValidation(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) !std.ArrayList(Diagnostic) {
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try runBinaryValidationInto(allocator, io, fixture, &diagnostics);
+    return diagnostics;
+}
+
+fn runBinaryValidationInto(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+) !void {
+    diagnostics.clearRetainingCapacity();
+    var reader = std.Io.Reader.fixed(fixture);
+    try BinaryValidator.validateReader(allocator, io, &reader, diagnostics, "fixture");
+}
+
+fn expectSingleBinaryDiagnostic(diagnostics: []const Diagnostic, expected_rule: []const u8, expected_message: ?[]const u8) !void {
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings(expected_rule, diagnostics[0].rule);
+    if (expected_message) |message| {
+        try std.testing.expectEqualStrings(message, diagnostics[0].message);
+    }
+}
+
+fn minimalChromatogramMzml(comptime first_payload: []const u8, comptime second_payload: []const u8) []const u8 {
+    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<chromatogramList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<chromatogram index=\"0\" id=\"tic=1\" defaultArrayLength=\"1\">" ++
+        "<precursor/>" ++
+        "<product/>" ++
+        "<binaryDataArrayList count=\"2\">" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000595\"/>" ++
+        "<binary>" ++ first_payload ++ "</binary>" ++
+        "</binaryDataArray>" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>" ++ second_payload ++ "</binary>" ++
+        "</binaryDataArray>" ++
+        "</binaryDataArrayList>" ++
+        "</chromatogram>" ++
+        "</chromatogramList>" ++
+        "</run>" ++
+        "</mzML>";
+}
+
+fn minimalSpectrumMzml(comptime payload: []const u8, comptime default_array_length: usize, comptime compression_accession: []const u8) []const u8 {
+    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"" ++ std.fmt.comptimePrint("{d}", .{default_array_length}) ++ "\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"" ++ std.fmt.comptimePrint("{d}", .{payload.len}) ++ "\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"" ++ compression_accession ++ "\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>" ++ payload ++ "</binary>" ++
+        "</binaryDataArray>" ++
+        "</binaryDataArrayList>" ++
+        "</spectrum>" ++
+        "</spectrumList>" ++
+        "</run>" ++
+        "</mzML>";
 }

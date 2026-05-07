@@ -1,10 +1,23 @@
+//! Version bump tool: rewrites `src/version.zig` and `build.zig.zon` atomically.
+//!
+//! Usage: `./zig build bump-version -Drelease-version=<major.minor.patch>`
+//!
+//! The tool computes the manifest fingerprint by running a minimal `zig build test`
+//! in a temporary copy of the repo, then inserts the computed hash back into
+//! `build.zig.zon`. This keeps the manifest self-consistent without requiring a
+//! published package server.
+
 const std = @import("std");
+
+// --- Constants ---
 
 const usage =
     "usage: ./zig build bump-version -Drelease-version=<major.minor.patch>\n";
 
 const fingerprint_marker = "suggested value: ";
 const temp_work_subpath = ".zig-cache/tmp/bump-version-work";
+
+// --- Entry point ---
 
 pub fn main(init: std.process.Init) !void {
     const gpa = init.gpa;
@@ -35,6 +48,10 @@ pub fn main(init: std.process.Init) !void {
     try stdout.flush();
 }
 
+// --- Implementation ---
+
+/// Rewrites both version files and returns the computed fingerprint string.
+/// Caller owns the returned slice and must free it.
 fn bumpVersion(gpa: std.mem.Allocator, io: std.Io, new_version: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
 
@@ -61,6 +78,8 @@ fn bumpVersion(gpa: std.mem.Allocator, io: std.Io, new_version: []const u8) ![]u
     return fingerprint;
 }
 
+/// Runs `zig build test` in a scratch directory to extract the manifest fingerprint.
+/// The Zig toolchain prints "suggested value: <hash>" to stderr on a fingerprint mismatch.
 fn deriveFingerprint(gpa: std.mem.Allocator, io: std.Io, manifest_text: []const u8) ![]u8 {
     const cwd = std.Io.Dir.cwd();
     cwd.deleteTree(io, temp_work_subpath) catch {};
@@ -98,6 +117,7 @@ fn deriveFingerprint(gpa: std.mem.Allocator, io: std.Io, manifest_text: []const 
     return error.UnexpectedFingerprintOutput;
 }
 
+/// Copies build inputs into the temporary scratch directory.
 fn copyRepoInputs(gpa: std.mem.Allocator, io: std.Io) !void {
     const cwd = std.Io.Dir.cwd();
     try cwd.copyFile("build.zig", cwd, temp_work_subpath ++ "/build.zig", io, .{ .make_path = true, .replace = true });
@@ -105,6 +125,7 @@ fn copyRepoInputs(gpa: std.mem.Allocator, io: std.Io) !void {
     try copyTree(gpa, io, "src", temp_work_subpath ++ "/src");
 }
 
+/// Recursively copies a source directory tree into the destination path.
 fn copyTree(gpa: std.mem.Allocator, io: std.Io, source_subpath: []const u8, dest_subpath: []const u8) !void {
     const cwd = std.Io.Dir.cwd();
     var source_dir = try cwd.openDir(io, source_subpath, .{ .iterate = true });
@@ -124,6 +145,8 @@ fn copyTree(gpa: std.mem.Allocator, io: std.Io, source_subpath: []const u8, dest
     }
 }
 
+/// Rewrites the `.version` field and removes the `.fingerprint` line.
+/// Returns the stripped manifest text; caller owns it.
 fn rewriteManifestWithoutFingerprint(gpa: std.mem.Allocator, manifest_text: []const u8, new_version: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(gpa);
@@ -152,6 +175,7 @@ fn rewriteManifestWithoutFingerprint(gpa: std.mem.Allocator, manifest_text: []co
     return output.toOwnedSlice(gpa);
 }
 
+/// Inserts the `.fingerprint` line immediately after the `.version` line.
 fn insertFingerprintAfterVersion(gpa: std.mem.Allocator, manifest_text: []const u8, fingerprint: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(gpa);
@@ -176,6 +200,7 @@ fn insertFingerprintAfterVersion(gpa: std.mem.Allocator, manifest_text: []const 
     return output.toOwnedSlice(gpa);
 }
 
+/// Rewrites the `pub const semantic` line in `src/version.zig`.
 fn rewriteVersionFile(gpa: std.mem.Allocator, version_text: []const u8, new_version: []const u8) ![]u8 {
     var output: std.ArrayList(u8) = .empty;
     defer output.deinit(gpa);
@@ -196,6 +221,7 @@ fn rewriteVersionFile(gpa: std.mem.Allocator, version_text: []const u8, new_vers
     return output.toOwnedSlice(gpa);
 }
 
+/// Replaces the quoted value between `marker` and `suffix` on a single line.
 fn appendLineReplacingQuotedValue(
     gpa: std.mem.Allocator,
     output: *std.ArrayList(u8),
@@ -213,6 +239,8 @@ fn appendLineReplacingQuotedValue(
     try output.appendSlice(gpa, line[suffix_index..]);
 }
 
+/// Scans `output` for the fingerprint marker and returns the hash slice.
+/// Returns null when the toolchain output does not contain the expected line.
 fn findFingerprint(output: []const u8) ?[]const u8 {
     const start = std.mem.indexOf(u8, output, fingerprint_marker) orelse return null;
     const fingerprint_start = start + fingerprint_marker.len;
@@ -221,6 +249,7 @@ fn findFingerprint(output: []const u8) ?[]const u8 {
     return rest[0..fingerprint_len];
 }
 
+/// Writes an error to stderr and exits with code 2.
 fn fail(io: std.Io, comptime format: []const u8, args: anytype) !void {
     var stderr_buffer: [256]u8 = undefined;
     var stderr_writer = std.Io.File.stderr().writer(io, &stderr_buffer);

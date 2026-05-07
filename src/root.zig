@@ -1,25 +1,33 @@
-//! Public API surface for mzValidate.
+//! Public API surface for the mzValidate library.
+//!
+//! Import this module as `mzvalidate` from executables or integration tests.
+//! Submodule namespaces (`cli`, `diagnostic`, `output`) are re-exported so
+//! callers can reach individual helpers without knowing the internal layout.
 
 const std = @import("std");
 
-/// Exposes CLI parsing and dispatch for embedding tests.
+// --- Submodule exports ---
+
+/// CLI parsing and dispatch.
 pub const cli = @import("cli.zig");
-/// Exposes shared diagnostic types and helpers.
+/// Shared diagnostic types and helpers.
 pub const diagnostic = @import("diagnostic.zig");
-/// Exposes text and JSON rendering helpers.
+/// Text and JSON rendering helpers.
 pub const output = @import("output.zig");
-/// Exposes the current project version constants.
+/// Project version constants.
 pub const version = @import("version.zig");
-/// Exposes the validation entry points.
+/// Validation entry points.
 pub const validate = @import("validate.zig");
 
-/// Re-exports the shared diagnostic type from the library root.
+// --- Re-exports for convenience ---
+
+/// Shared diagnostic record. Avoid reaching through `diagnostic.Diagnostic`.
 pub const Diagnostic = diagnostic.Diagnostic;
-/// Re-exports severity so callers do not need to reach through submodules.
+/// Severity levels. Avoid reaching through `diagnostic.Severity`.
 pub const Severity = diagnostic.Severity;
-/// Re-exports output mode for CLI-adjacent tests.
+/// Output mode selector. Avoid reaching through `output.OutputMode`.
 pub const OutputMode = output.OutputMode;
-/// Re-exports check options for library callers.
+/// Check options. Avoid reaching through `validate.CheckOptions`.
 pub const CheckOptions = validate.CheckOptions;
 
 /// Runs the top-level CLI through the library entry point.
@@ -27,9 +35,12 @@ pub fn run(init: std.process.Init) !u8 {
     return cli.run(init);
 }
 
+// --- Tests ---
+
 test {
     _ = @import("xml/events.zig");
     _ = @import("xml/parser.zig");
     _ = @import("mzml/structural.zig");
     _ = @import("mzml/binary.zig");
+    _ = @import("validate.zig");
 }

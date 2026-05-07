@@ -1,10 +1,20 @@
-//! Shared diagnostic types and exit-code mapping.
+//! Diagnostic types, stable rule IDs, severity levels, and exit-code mapping.
+//!
+//! Every public symbol here is part of the external contract between the validator
+//! and consumers (CLI, tests, JSON output). Change them carefully.
 
 const std = @import("std");
 
-/// Defines the stable rule IDs used in diagnostics and serialized output.
+// --- Types ---
+
+/// Stable rule IDs emitted in diagnostics and serialized output.
+///
+/// Naming convention: `domain.category.slug`. The slug appears verbatim in JSON
+/// so it is a breaking change to rename or remove an existing entry.
 pub const RuleId = struct {
+    /// File could not be opened. Carries the OS error in the message.
     pub const runtime_file_open = "runtime.file-open";
+    /// Reserved placeholder. Used in tests and output contract assertions.
     pub const runtime_stub = "runtime.stub";
 
     pub const mzml_structure_root = "mzml.structure.root";
@@ -105,6 +115,8 @@ pub fn summarize(diagnostics: []const Diagnostic) Summary {
 }
 
 /// Maps diagnostics to the process exit code contract.
+///
+/// 0 = clean, 1 = warnings only, 2 = any errors present.
 pub fn exitCode(diagnostics: []const Diagnostic) u8 {
     return switch (summarize(diagnostics).status()) {
         .clean => 0,
@@ -113,17 +125,26 @@ pub fn exitCode(diagnostics: []const Diagnostic) u8 {
     };
 }
 
+// --- Tests ---
+
 test "exitCode prefers errors over warnings" {
+    // Arrange.
     const diagnostics = [_]Diagnostic{
         .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
 
+    // Act.
+    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exitCode(&diagnostics));
 }
 
 test "summarize distinguishes clean warnings and errors" {
+    // Arrange.
     const clean_summary = summarize(&.{});
+
+    // Act.
+    // Assert.
     try std.testing.expectEqual(ResultStatus.clean, clean_summary.status());
 
     const warning_diagnostics = [_]Diagnostic{

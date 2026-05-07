@@ -1,11 +1,6 @@
-//! Single source of truth for the current project version in Zig code.
+//! Single source of truth for the project version in Zig code.
+//!
+//! `semantic` is kept in sync with `build.zig.zon` by the `bump-version` build step.
 
+/// Current semantic version string. Matches the `.version` field in `build.zig.zon`.
 pub const semantic = "0.0.3";
-
-pub const validation_not_implemented = "validation is not implemented yet in " ++ semantic;
-pub const validation_not_implemented_skip_binary = validation_not_implemented ++ "; -skip-binary parsed successfully";
-
-
-
-
-

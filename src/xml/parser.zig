@@ -1,12 +1,13 @@
-//! Single-pass XML event parser for Phase 1 mzML validation.
+//! Single-pass streaming XML parser for mzML validation.
 //!
 //! Design notes:
-//! - Input is consumed from `std.Io.Reader` one pass at a time.
-//! - Event slices borrow caller-provided buffers and stay valid until the next `next()` call.
-//! - Comments and processing instructions are skipped.
-//! - CDATA is surfaced as `text` with `from_cdata = true`.
-//! - Built-in XML entities plus numeric character references are decoded.
-//! - DTD and other `<!...>` declarations are rejected for now because mzML does not require them.
+//! - Input is consumed from `std.Io.Reader` in a single forward pass.
+//! - Event slices borrow caller-provided buffers and are only valid until
+//!   the next `next()` call. Copy any value you need to keep.
+//! - Comments and processing instructions are skipped silently.
+//! - CDATA sections surface as `text` with `from_cdata = true`.
+//! - Built-in XML entities and numeric character references are decoded.
+//! - DTD declarations (`<!...>`) are rejected: mzML does not need them.
 
 const std = @import("std");
 const events = @import("events.zig");
@@ -17,6 +18,8 @@ const Event = events.Event;
 const QName = events.QName;
 const StartElement = events.StartElement;
 const Text = events.Text;
+
+// --- Public types ---
 
 pub const ParseError = error{
     UnexpectedEof,
@@ -34,6 +37,9 @@ pub const ParseError = error{
     MismatchedEndTag,
 } || error{ReadFailed};
 
+// --- Private types ---
+
+// Byte range within a flat backing buffer.
 const Range = struct {
     start: usize,
     len: usize,
@@ -43,6 +49,7 @@ const Range = struct {
     }
 };
 
+// Prefix + local name positions within the token buffer before namespace resolution.
 const NameParts = struct {
     prefix: ?Range,
     local_name: Range,
@@ -72,6 +79,8 @@ pub const Buffers = struct {
     element_bytes: []u8,
 };
 
+// --- Parser ---
+
 pub const Parser = struct {
     reader: *std.Io.Reader,
     token_buffer: []u8,
@@ -94,6 +103,10 @@ pub const Parser = struct {
     last_byte_offset: u64 = 0,
     pending_self_closing_end: bool = false,
 
+    /// Constructs a parser from a reader and caller-supplied buffers.
+    ///
+    /// All buffers are borrowed. Size them for worst-case document depth and
+    /// attribute counts before calling `next` in a loop.
     pub fn init(reader: *std.Io.Reader, buffers: Buffers) Parser {
         return .{
             .reader = reader,
@@ -141,6 +154,7 @@ pub const Parser = struct {
         }
     }
 
+    /// Current byte offset of the last consumed byte. Useful for diagnostics.
     pub fn byteOffset(parser: *const Parser) u64 {
         return parser.last_byte_offset;
     }
@@ -683,6 +697,8 @@ pub const Parser = struct {
     }
 };
 
+// --- Helpers ---
+
 fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
     if (left) |left_bytes| {
         if (right) |right_bytes| {
@@ -726,6 +742,8 @@ fn parseCharacterReference(bytes: []const u8) ParseError!u21 {
     return @intCast(value);
 }
 
+// --- Tests: inline smoke ---
+
 test "parser emits elements text attributes and namespaces" {
     const xml =
         "<?xml version=\"1.0\"?>" ++
@@ -733,146 +751,146 @@ test "parser emits elements text attributes and namespaces" {
         "<run id=\"main\">hello &amp; goodbye</run>" ++
         "</mzML>";
 
-    var reader = std.Io.Reader.fixed(xml);
-    var token_buffer: [512]u8 = undefined;
-    var attributes: [8]Attribute = undefined;
-    var namespace_bindings: [8]NamespaceBinding = undefined;
-    var namespace_bytes: [256]u8 = undefined;
-    var element_stack: [8]ElementFrame = undefined;
-    var element_bytes: [256]u8 = undefined;
+    // Arrange.
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
 
-    var parser = Parser.init(&reader, .{
-        .token = &token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
-
-    const event_1 = (try parser.next()).?.start_element;
+    // Act and assert.
+    const event_1 = (try harness.parser.next()).?.start_element;
     try std.testing.expect(event_1.name.matches("urn:psi:ms:mzml", "mzML"));
     try std.testing.expectEqual(@as(usize, 1), event_1.attributes.len);
     try std.testing.expect(event_1.attributes[0].is_namespace_declaration);
 
-    const event_2 = (try parser.next()).?.start_element;
+    const event_2 = (try harness.parser.next()).?.start_element;
     try std.testing.expect(event_2.name.matches("urn:psi:ms:mzml", "run"));
     try std.testing.expectEqualStrings("main", event_2.attributes[0].value);
 
-    const event_3 = (try parser.next()).?.text;
+    const event_3 = (try harness.parser.next()).?.text;
     try std.testing.expectEqualStrings("hello & goodbye", event_3.value);
     try std.testing.expect(!event_3.from_cdata);
 
-    const event_4 = (try parser.next()).?.end_element;
+    const event_4 = (try harness.parser.next()).?.end_element;
     try std.testing.expect(event_4.name.matches("urn:psi:ms:mzml", "run"));
 
-    const event_5 = (try parser.next()).?.end_element;
+    const event_5 = (try harness.parser.next()).?.end_element;
     try std.testing.expect(event_5.name.matches("urn:psi:ms:mzml", "mzML"));
 
-    try std.testing.expectEqual(@as(?Event, null), try parser.next());
+    const terminal = try harness.parser.next();
+    try std.testing.expectEqual(@as(?Event, null), terminal);
 }
 
 test "parser skips comments and processing instructions and emits cdata as text" {
     const xml =
         "<root><?ignored test?><child/><!--comment--><![CDATA[a<b>]]></root>";
 
-    var reader = std.Io.Reader.fixed(xml);
-    var token_buffer: [256]u8 = undefined;
-    var attributes: [4]Attribute = undefined;
-    var namespace_bindings: [4]NamespaceBinding = undefined;
-    var namespace_bytes: [128]u8 = undefined;
-    var element_stack: [8]ElementFrame = undefined;
-    var element_bytes: [128]u8 = undefined;
+    // Arrange.
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
 
-    var parser = Parser.init(&reader, .{
-        .token = &token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
-
-    _ = (try parser.next()).?.start_element;
-    const child_start = (try parser.next()).?.start_element;
+    // Act and assert.
+    _ = (try harness.parser.next()).?.start_element;
+    const child_start = (try harness.parser.next()).?.start_element;
     try std.testing.expect(child_start.self_closing);
-    const child_end = (try parser.next()).?.end_element;
+
+    const child_end = (try harness.parser.next()).?.end_element;
     try std.testing.expect(child_end.name.matches(null, "child"));
 
-    const text = (try parser.next()).?.text;
+    const text = (try harness.parser.next()).?.text;
     try std.testing.expect(text.from_cdata);
     try std.testing.expectEqualStrings("a<b>", text.value);
 
-    const root_end = (try parser.next()).?.end_element;
+    const root_end = (try harness.parser.next()).?.end_element;
     try std.testing.expect(root_end.name.matches(null, "root"));
-    try std.testing.expectEqual(@as(?Event, null), try parser.next());
+
+    const terminal = try harness.parser.next();
+    try std.testing.expectEqual(@as(?Event, null), terminal);
 }
 
 test "parser resolves prefixed attributes without applying the default namespace" {
     const xml =
         "<doc xmlns=\"urn:default\" xmlns:ms=\"urn:ms\" ms:scan=\"7\" plain=\"ok\"/>";
 
-    var reader = std.Io.Reader.fixed(xml);
-    var token_buffer: [256]u8 = undefined;
-    var attributes: [8]Attribute = undefined;
-    var namespace_bindings: [8]NamespaceBinding = undefined;
-    var namespace_bytes: [128]u8 = undefined;
-    var element_stack: [8]ElementFrame = undefined;
-    var element_bytes: [128]u8 = undefined;
+    // Arrange.
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
 
-    var parser = Parser.init(&reader, .{
-        .token = &token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
-
-    const event = (try parser.next()).?.start_element;
+    // Act and assert.
+    const event = (try harness.parser.next()).?.start_element;
     try std.testing.expect(event.name.matches("urn:default", "doc"));
     try std.testing.expectEqual(@as(usize, 4), event.attributes.len);
     try std.testing.expectEqual(@as(?[]const u8, null), event.attributes[3].name.namespace_uri);
     try std.testing.expectEqualStrings("urn:ms", event.attributes[2].name.namespace_uri.?);
-    _ = (try parser.next()).?.end_element;
-    try std.testing.expectEqual(@as(?Event, null), try parser.next());
+
+    const terminal_end = (try harness.parser.next()).?.end_element;
+    try std.testing.expect(terminal_end.name.matches("urn:default", "doc"));
+
+    const terminal = try harness.parser.next();
+    try std.testing.expectEqual(@as(?Event, null), terminal);
 }
 
 test "parser rejects invalid utf8 text" {
     const xml = "<root>\xc0</root>";
 
-    var reader = std.Io.Reader.fixed(xml);
-    var token_buffer: [128]u8 = undefined;
-    var attributes: [4]Attribute = undefined;
-    var namespace_bindings: [4]NamespaceBinding = undefined;
-    var namespace_bytes: [64]u8 = undefined;
-    var element_stack: [4]ElementFrame = undefined;
-    var element_bytes: [64]u8 = undefined;
+    // Arrange.
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
 
-    var parser = Parser.init(&reader, .{
-        .token = &token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
+    // Act.
+    _ = (try harness.parser.next()).?.start_element;
 
-    _ = (try parser.next()).?.start_element;
-    try std.testing.expectError(error.InvalidUtf8, parser.next());
+    // Assert.
+    try std.testing.expectError(error.InvalidUtf8, harness.parser.next());
 }
 
 test "parser rejects mismatched end tags" {
     const xml = "<root><child></root>";
 
+    // Arrange.
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
+
+    // Act.
+    _ = (try harness.parser.next()).?.start_element;
+    _ = (try harness.parser.next()).?.start_element;
+
+    // Assert.
+    try std.testing.expectError(error.MismatchedEndTag, harness.parser.next());
+}
+
+test "parser repeated clean inline parses keep event count stable" {
+    const xml =
+        "<?xml version=\"1.0\"?>" ++
+        "<mzML xmlns=\"urn:psi:ms:mzml\"><run id=\"main\">hello &amp; goodbye</run></mzML>";
+
+    // Arrange.
+
+    // Act.
+    for (0..32) |_| {
+        var harness: InlineParserHarness = undefined;
+        harness.init(xml);
+        var event_count: usize = 0;
+        while (try harness.parser.next()) |_| {
+            event_count += 1;
+        }
+
+        // Assert.
+        try std.testing.expectEqual(@as(usize, 5), event_count);
+    }
+}
+
+// --- Tests: limit pressure ---
+
+test "parser accepts text token at exact buffer boundary" {
+    const xml = "<root>abcdefghijklmnop</root>";
+
+    // Arrange.
     var reader = std.Io.Reader.fixed(xml);
-    var token_buffer: [128]u8 = undefined;
+    var token_buffer: [16]u8 = undefined;
     var attributes: [4]Attribute = undefined;
     var namespace_bindings: [4]NamespaceBinding = undefined;
     var namespace_bytes: [64]u8 = undefined;
-    var element_stack: [8]ElementFrame = undefined;
+    var element_stack: [4]ElementFrame = undefined;
     var element_bytes: [64]u8 = undefined;
-
     var parser = Parser.init(&reader, .{
         .token = &token_buffer,
         .attributes = &attributes,
@@ -882,10 +900,296 @@ test "parser rejects mismatched end tags" {
         .element_bytes = &element_bytes,
     });
 
+    // Act and assert.
     _ = (try parser.next()).?.start_element;
-    _ = (try parser.next()).?.start_element;
-    try std.testing.expectError(error.MismatchedEndTag, parser.next());
+    const text = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("abcdefghijklmnop", text.value);
+    _ = (try parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try parser.next());
 }
+
+test "parser rejects text token that exceeds buffer boundary by one byte" {
+    const xml = "<root>abcdefghijklmnopq</root>";
+
+    // Arrange.
+    var reader = std.Io.Reader.fixed(xml);
+    var token_buffer: [16]u8 = undefined;
+    var attributes: [4]Attribute = undefined;
+    var namespace_bindings: [4]NamespaceBinding = undefined;
+    var namespace_bytes: [64]u8 = undefined;
+    var element_stack: [4]ElementFrame = undefined;
+    var element_bytes: [64]u8 = undefined;
+    var parser = Parser.init(&reader, .{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    // Act.
+    _ = (try parser.next()).?.start_element;
+
+    // Assert.
+    try std.testing.expectError(error.TokenTooLong, parser.next());
+}
+
+test "parser accepts exact attribute count and rejects one more" {
+    const exact_xml = "<root a=\"1\" b=\"2\"/>";
+    const overflow_xml = "<root a=\"1\" b=\"2\" c=\"3\"/>";
+
+    // Arrange.
+    var exact_reader = std.Io.Reader.fixed(exact_xml);
+    var token_buffer: [128]u8 = undefined;
+    var exact_attributes: [2]Attribute = undefined;
+    var exact_namespace_bindings: [4]NamespaceBinding = undefined;
+    var exact_namespace_bytes: [64]u8 = undefined;
+    var exact_element_stack: [4]ElementFrame = undefined;
+    var exact_element_bytes: [64]u8 = undefined;
+    var exact_parser = Parser.init(&exact_reader, .{
+        .token = &token_buffer,
+        .attributes = &exact_attributes,
+        .namespace_bindings = &exact_namespace_bindings,
+        .namespace_bytes = &exact_namespace_bytes,
+        .element_stack = &exact_element_stack,
+        .element_bytes = &exact_element_bytes,
+    });
+
+    // Act and assert.
+    const exact_start = (try exact_parser.next()).?.start_element;
+    try std.testing.expectEqual(@as(usize, 2), exact_start.attributes.len);
+    _ = (try exact_parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try exact_parser.next());
+
+    var overflow_reader = std.Io.Reader.fixed(overflow_xml);
+    var overflow_attributes: [2]Attribute = undefined;
+    var overflow_namespace_bindings: [4]NamespaceBinding = undefined;
+    var overflow_namespace_bytes: [64]u8 = undefined;
+    var overflow_element_stack: [4]ElementFrame = undefined;
+    var overflow_element_bytes: [64]u8 = undefined;
+    var overflow_parser = Parser.init(&overflow_reader, .{
+        .token = &token_buffer,
+        .attributes = &overflow_attributes,
+        .namespace_bindings = &overflow_namespace_bindings,
+        .namespace_bytes = &overflow_namespace_bytes,
+        .element_stack = &overflow_element_stack,
+        .element_bytes = &overflow_element_bytes,
+    });
+    try std.testing.expectError(error.TooManyAttributes, overflow_parser.next());
+}
+
+test "parser accepts exact namespace binding capacity and rejects one more" {
+    const exact_xml = "<root xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" a:x=\"1\" b:y=\"2\"/>";
+    const overflow_xml = "<root xmlns:a=\"urn:a\" xmlns:b=\"urn:b\" xmlns:c=\"urn:c\" a:x=\"1\"/>";
+
+    // Arrange.
+    var exact_reader = std.Io.Reader.fixed(exact_xml);
+    var token_buffer: [256]u8 = undefined;
+    var exact_attributes: [6]Attribute = undefined;
+    var exact_namespace_bindings: [2]NamespaceBinding = undefined;
+    var exact_namespace_bytes: [64]u8 = undefined;
+    var exact_element_stack: [4]ElementFrame = undefined;
+    var exact_element_bytes: [64]u8 = undefined;
+    var exact_parser = Parser.init(&exact_reader, .{
+        .token = &token_buffer,
+        .attributes = &exact_attributes,
+        .namespace_bindings = &exact_namespace_bindings,
+        .namespace_bytes = &exact_namespace_bytes,
+        .element_stack = &exact_element_stack,
+        .element_bytes = &exact_element_bytes,
+    });
+
+    // Act and assert.
+    const exact_start = (try exact_parser.next()).?.start_element;
+    try std.testing.expect(exact_start.name.matches(null, "root"));
+    _ = (try exact_parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try exact_parser.next());
+
+    var overflow_reader = std.Io.Reader.fixed(overflow_xml);
+    var overflow_attributes: [6]Attribute = undefined;
+    var overflow_namespace_bindings: [2]NamespaceBinding = undefined;
+    var overflow_namespace_bytes: [64]u8 = undefined;
+    var overflow_element_stack: [4]ElementFrame = undefined;
+    var overflow_element_bytes: [64]u8 = undefined;
+    var overflow_parser = Parser.init(&overflow_reader, .{
+        .token = &token_buffer,
+        .attributes = &overflow_attributes,
+        .namespace_bindings = &overflow_namespace_bindings,
+        .namespace_bytes = &overflow_namespace_bytes,
+        .element_stack = &overflow_element_stack,
+        .element_bytes = &overflow_element_bytes,
+    });
+    try std.testing.expectError(error.TooManyNamespaces, overflow_parser.next());
+}
+
+test "parser accepts exact namespace byte capacity and rejects overflow" {
+    const exact_xml = "<root xmlns=\"12345678\"/>";
+    const overflow_xml = "<root xmlns=\"123456789\"/>";
+
+    // Arrange.
+    var exact_reader = std.Io.Reader.fixed(exact_xml);
+    var token_buffer: [128]u8 = undefined;
+    var exact_attributes: [2]Attribute = undefined;
+    var exact_namespace_bindings: [2]NamespaceBinding = undefined;
+    var exact_namespace_bytes: [8]u8 = undefined;
+    var exact_element_stack: [4]ElementFrame = undefined;
+    var exact_element_bytes: [64]u8 = undefined;
+    var exact_parser = Parser.init(&exact_reader, .{
+        .token = &token_buffer,
+        .attributes = &exact_attributes,
+        .namespace_bindings = &exact_namespace_bindings,
+        .namespace_bytes = &exact_namespace_bytes,
+        .element_stack = &exact_element_stack,
+        .element_bytes = &exact_element_bytes,
+    });
+
+    // Act and assert.
+    const exact_start = (try exact_parser.next()).?.start_element;
+    try std.testing.expect(exact_start.name.matches("12345678", "root"));
+    _ = (try exact_parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try exact_parser.next());
+
+    var overflow_reader = std.Io.Reader.fixed(overflow_xml);
+    var overflow_attributes: [2]Attribute = undefined;
+    var overflow_namespace_bindings: [2]NamespaceBinding = undefined;
+    var overflow_namespace_bytes: [8]u8 = undefined;
+    var overflow_element_stack: [4]ElementFrame = undefined;
+    var overflow_element_bytes: [64]u8 = undefined;
+    var overflow_parser = Parser.init(&overflow_reader, .{
+        .token = &token_buffer,
+        .attributes = &overflow_attributes,
+        .namespace_bindings = &overflow_namespace_bindings,
+        .namespace_bytes = &overflow_namespace_bytes,
+        .element_stack = &overflow_element_stack,
+        .element_bytes = &overflow_element_bytes,
+    });
+    try std.testing.expectError(error.NamespaceStorageExceeded, overflow_parser.next());
+}
+
+test "parser accepts exact element nesting depth and rejects one more" {
+    const exact_xml = "<a><b/></a>";
+    const overflow_xml = "<a><b/></a>";
+
+    // Arrange.
+    var exact_reader = std.Io.Reader.fixed(exact_xml);
+    var token_buffer: [128]u8 = undefined;
+    var exact_attributes: [2]Attribute = undefined;
+    var exact_namespace_bindings: [2]NamespaceBinding = undefined;
+    var exact_namespace_bytes: [32]u8 = undefined;
+    var exact_element_stack: [2]ElementFrame = undefined;
+    var exact_element_bytes: [32]u8 = undefined;
+    var exact_parser = Parser.init(&exact_reader, .{
+        .token = &token_buffer,
+        .attributes = &exact_attributes,
+        .namespace_bindings = &exact_namespace_bindings,
+        .namespace_bytes = &exact_namespace_bytes,
+        .element_stack = &exact_element_stack,
+        .element_bytes = &exact_element_bytes,
+    });
+
+    // Act and assert.
+    _ = (try exact_parser.next()).?.start_element;
+    const child = (try exact_parser.next()).?.start_element;
+    try std.testing.expect(child.self_closing);
+    _ = (try exact_parser.next()).?.end_element;
+    _ = (try exact_parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try exact_parser.next());
+
+    var overflow_reader = std.Io.Reader.fixed(overflow_xml);
+    var overflow_attributes: [2]Attribute = undefined;
+    var overflow_namespace_bindings: [2]NamespaceBinding = undefined;
+    var overflow_namespace_bytes: [32]u8 = undefined;
+    var overflow_element_stack: [1]ElementFrame = undefined;
+    var overflow_element_bytes: [32]u8 = undefined;
+    var overflow_parser = Parser.init(&overflow_reader, .{
+        .token = &token_buffer,
+        .attributes = &overflow_attributes,
+        .namespace_bindings = &overflow_namespace_bindings,
+        .namespace_bytes = &overflow_namespace_bytes,
+        .element_stack = &overflow_element_stack,
+        .element_bytes = &overflow_element_bytes,
+    });
+    _ = (try overflow_parser.next()).?.start_element;
+    try std.testing.expectError(error.ElementNestingTooDeep, overflow_parser.next());
+}
+
+test "parser accepts exact element name storage and rejects overflow" {
+    const exact_xml = "<abcdefgh></abcdefgh>";
+    const overflow_xml = "<abcdefghi></abcdefghi>";
+
+    // Arrange.
+    var exact_reader = std.Io.Reader.fixed(exact_xml);
+    var token_buffer: [128]u8 = undefined;
+    var exact_attributes: [2]Attribute = undefined;
+    var exact_namespace_bindings: [2]NamespaceBinding = undefined;
+    var exact_namespace_bytes: [32]u8 = undefined;
+    var exact_element_stack: [2]ElementFrame = undefined;
+    var exact_element_bytes: [8]u8 = undefined;
+    var exact_parser = Parser.init(&exact_reader, .{
+        .token = &token_buffer,
+        .attributes = &exact_attributes,
+        .namespace_bindings = &exact_namespace_bindings,
+        .namespace_bytes = &exact_namespace_bytes,
+        .element_stack = &exact_element_stack,
+        .element_bytes = &exact_element_bytes,
+    });
+
+    // Act and assert.
+    const exact_start = (try exact_parser.next()).?.start_element;
+    try std.testing.expect(exact_start.name.matches(null, "abcdefgh"));
+    const exact_end = (try exact_parser.next()).?.end_element;
+    try std.testing.expect(exact_end.name.matches(null, "abcdefgh"));
+    try std.testing.expectEqual(@as(?Event, null), try exact_parser.next());
+
+    var overflow_reader = std.Io.Reader.fixed(overflow_xml);
+    var overflow_attributes: [2]Attribute = undefined;
+    var overflow_namespace_bindings: [2]NamespaceBinding = undefined;
+    var overflow_namespace_bytes: [32]u8 = undefined;
+    var overflow_element_stack: [2]ElementFrame = undefined;
+    var overflow_element_bytes: [8]u8 = undefined;
+    var overflow_parser = Parser.init(&overflow_reader, .{
+        .token = &token_buffer,
+        .attributes = &overflow_attributes,
+        .namespace_bindings = &overflow_namespace_bindings,
+        .namespace_bytes = &overflow_namespace_bytes,
+        .element_stack = &overflow_element_stack,
+        .element_bytes = &overflow_element_bytes,
+    });
+    try std.testing.expectError(error.ElementStorageExceeded, overflow_parser.next());
+}
+
+test "parser repeats boundary failures without changing error kind" {
+    const xml = "<root>abcdefghijklmnopq</root>";
+
+    // Arrange.
+
+    // Act.
+    for (0..32) |_| {
+        var reader = std.Io.Reader.fixed(xml);
+        var token_buffer: [16]u8 = undefined;
+        var attributes: [4]Attribute = undefined;
+        var namespace_bindings: [4]NamespaceBinding = undefined;
+        var namespace_bytes: [64]u8 = undefined;
+        var element_stack: [4]ElementFrame = undefined;
+        var element_bytes: [64]u8 = undefined;
+        var parser = Parser.init(&reader, .{
+            .token = &token_buffer,
+            .attributes = &attributes,
+            .namespace_bindings = &namespace_bindings,
+            .namespace_bytes = &namespace_bytes,
+            .element_stack = &element_stack,
+            .element_bytes = &element_bytes,
+        });
+
+        _ = (try parser.next()).?.start_element;
+
+        // Assert.
+        try std.testing.expectError(error.TokenTooLong, parser.next());
+    }
+}
+
+// --- Tests: fixture corpus ---
 
 test "xml10 declaration fixture asserts root child and text behavior" {
     const allocator = std.testing.allocator;
@@ -1077,6 +1381,109 @@ test "libxml2 namespace rebinding corpus fixture asserts nested namespace resolu
     try std.testing.expectEqual(@as(?Event, null), try nextSignificantEvent(&parser));
 }
 
+test "nested default prefix corpus fixture asserts nested namespaced text flow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/nested-default-prefix.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
+
+    const feed = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(feed.name.matches("urn:feed", "feed"));
+    const entry = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(entry.name.matches("urn:feed", "entry"));
+    const item = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(item.name.matches("urn:a", "item"));
+    const value = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(value.name.matches("urn:b", "value"));
+    try std.testing.expectEqualStrings("42", value.attributes[0].value);
+    const text = (try nextSignificantEvent(&parser.parser)).?.text;
+    try std.testing.expectEqualStrings("ok", text.value);
+    try std.testing.expectEqual(@as(usize, 9), try countRemainingSignificantEvents(&parser.parser, 5));
+}
+
+test "self closing mixed corpus fixture asserts self closing nested and text flow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/self-closing-mixed.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
+
+    const root = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(root.name.matches(null, "root"));
+    const empty = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(empty.self_closing);
+    try std.testing.expect(empty.name.matches(null, "empty"));
+    const empty_end = (try nextSignificantEvent(&parser.parser)).?.end_element;
+    try std.testing.expect(empty_end.name.matches(null, "empty"));
+    const parent = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(parent.name.matches(null, "parent"));
+    const nested = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(nested.self_closing);
+    try std.testing.expectEqualStrings("yes", nested.attributes[0].value);
+    const nested_end = (try nextSignificantEvent(&parser.parser)).?.end_element;
+    try std.testing.expect(nested_end.name.matches(null, "nested"));
+    const text = (try nextSignificantEvent(&parser.parser)).?.text;
+    try std.testing.expectEqualStrings("text", std.mem.trim(u8, text.value, &std.ascii.whitespace));
+    try std.testing.expectEqual(@as(usize, 9), try countRemainingSignificantEvents(&parser.parser, 7));
+}
+
+test "processing instruction and tail corpus fixture asserts child and cdata tail flow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/processing-instruction-and-tail.xml", allocator, .limited(64 * 1024));
+    defer allocator.free(fixture);
+
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
+
+    const root = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(root.name.matches(null, "root"));
+    const child = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(child.name.matches(null, "child"));
+    const child_text = (try nextSignificantEvent(&parser.parser)).?.text;
+    try std.testing.expectEqualStrings("value", child_text.value);
+    const child_end = (try nextSignificantEvent(&parser.parser)).?.end_element;
+    try std.testing.expect(child_end.name.matches(null, "child"));
+    const tail = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(tail.name.matches(null, "tail"));
+    const tail_text = (try nextSignificantEvent(&parser.parser)).?.text;
+    try std.testing.expect(tail_text.from_cdata);
+    try std.testing.expectEqualStrings("done", tail_text.value);
+    try std.testing.expectEqual(@as(usize, 8), try countRemainingSignificantEvents(&parser.parser, 6));
+}
+
+test "mzdata corpus fixture reaches second spectrum and drains cleanly" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/xml/corpus/mzdata/tiny1.mzData1.05.xml", allocator, .limited(512 * 1024));
+    defer allocator.free(fixture);
+
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
+
+    const root = (try nextSignificantEvent(&parser.parser)).?.start_element;
+    try std.testing.expect(root.name.matches(null, "mzData"));
+
+    var spectrum_count: usize = 0;
+    while (try nextSignificantEvent(&parser.parser)) |event| {
+        switch (event) {
+            .start_element => |start| {
+                if (start.name.matches(null, "spectrum")) {
+                    spectrum_count += 1;
+                }
+            },
+            else => {},
+        }
+    }
+
+    try std.testing.expect(spectrum_count >= 2);
+}
+
 test "namespace misuse fixture fails immediately with malformed xml" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1133,6 +1540,8 @@ test "malformed processing instruction fixture fails before emitting any event" 
     try std.testing.expectError(error.UnexpectedEof, parser.next());
 }
 
+// --- Tests: fixture sweep ---
+
 test "parser accepts valid xml fixtures" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1167,34 +1576,58 @@ test "parser handles xml corpus fixtures" {
     try expectFixtureParses(allocator, io, "fixtures/xml/corpus/mzdata/tiny1.mzData1.05.xml");
 }
 
+// --- Test helpers ---
+
+const InlineParserHarness = struct {
+    reader: std.Io.Reader,
+    token_buffer: [512]u8 = undefined,
+    attributes: [8]Attribute = undefined,
+    namespace_bindings: [8]NamespaceBinding = undefined,
+    namespace_bytes: [256]u8 = undefined,
+    element_stack: [8]ElementFrame = undefined,
+    element_bytes: [256]u8 = undefined,
+    parser: Parser = undefined,
+
+    fn init(harness: *InlineParserHarness, xml: []const u8) void {
+        harness.reader = std.Io.Reader.fixed(xml);
+        harness.parser = Parser.init(&harness.reader, .{
+            .token = &harness.token_buffer,
+            .attributes = &harness.attributes,
+            .namespace_bindings = &harness.namespace_bindings,
+            .namespace_bytes = &harness.namespace_bytes,
+            .element_stack = &harness.element_stack,
+            .element_bytes = &harness.element_bytes,
+        });
+    }
+};
+
 fn expectFixtureParses(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) !void {
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    const token_capacity = @max(@as(usize, 1024), fixture.len);
-    const token_buffer = try allocator.alloc(u8, token_capacity);
-    defer allocator.free(token_buffer);
-    var attributes: [16]Attribute = undefined;
-    var namespace_bindings: [16]NamespaceBinding = undefined;
-    var namespace_bytes: [512]u8 = undefined;
-    var element_stack: [32]ElementFrame = undefined;
-    var element_bytes: [512]u8 = undefined;
-
-    var parser = Parser.init(&reader, .{
-        .token = token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
 
     var event_count: usize = 0;
-    while (try parser.next()) |_| {
+    var significant_event_count: usize = 0;
+    var start_count: usize = 0;
+    var end_count: usize = 0;
+    while (try parser.parser.next()) |event| {
         event_count += 1;
+        switch (event) {
+            .start_element => start_count += 1,
+            .end_element => end_count += 1,
+            .text => |text| {
+                if (!isWhitespaceOnly(text.value)) significant_event_count += 1;
+                continue;
+            },
+        }
+        significant_event_count += 1;
     }
     try std.testing.expect(event_count > 0);
+    try std.testing.expect(significant_event_count > 0);
+    try std.testing.expect(start_count > 0);
+    try std.testing.expectEqual(start_count, end_count);
 }
 
 fn nextSignificantEvent(parser: *Parser) ParseError!?Event {
@@ -1209,6 +1642,14 @@ fn nextSignificantEvent(parser: *Parser) ParseError!?Event {
     }
 
     return null;
+}
+
+fn countRemainingSignificantEvents(parser: *Parser, already_seen: usize) !usize {
+    var count = already_seen;
+    while (try nextSignificantEvent(parser)) |_| {
+        count += 1;
+    }
+    return count;
 }
 
 fn isWhitespaceOnly(bytes: []const u8) bool {
@@ -1226,27 +1667,11 @@ fn expectFixtureError(allocator: std.mem.Allocator, io: std.Io, sub_path: []cons
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
-    var reader = std.Io.Reader.fixed(fixture);
-    const token_capacity = @max(@as(usize, 1024), fixture.len);
-    const token_buffer = try allocator.alloc(u8, token_capacity);
-    defer allocator.free(token_buffer);
-    var attributes: [16]Attribute = undefined;
-    var namespace_bindings: [16]NamespaceBinding = undefined;
-    var namespace_bytes: [512]u8 = undefined;
-    var element_stack: [32]ElementFrame = undefined;
-    var element_bytes: [512]u8 = undefined;
-
-    var parser = Parser.init(&reader, .{
-        .token = token_buffer,
-        .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
-    });
+    var parser = try initFixtureParser(allocator, fixture);
+    defer parser.deinit(allocator);
 
     while (true) {
-        const maybe_event = parser.next() catch |err| {
+        const maybe_event = parser.parser.next() catch |err| {
             try std.testing.expectEqual(expected, err);
             return;
         };
@@ -1254,4 +1679,35 @@ fn expectFixtureError(allocator: std.mem.Allocator, io: std.Io, sub_path: []cons
     }
 
     return error.TestExpectedError;
+}
+
+const FixtureParser = struct {
+    reader: std.Io.Reader,
+    token_buffer: []u8,
+    attributes: [16]Attribute = undefined,
+    namespace_bindings: [16]NamespaceBinding = undefined,
+    namespace_bytes: [512]u8 = undefined,
+    element_stack: [32]ElementFrame = undefined,
+    element_bytes: [512]u8 = undefined,
+    parser: Parser = undefined,
+
+    fn deinit(fixture_parser: *FixtureParser, allocator: std.mem.Allocator) void {
+        allocator.free(fixture_parser.token_buffer);
+    }
+};
+
+fn initFixtureParser(allocator: std.mem.Allocator, fixture: []const u8) !FixtureParser {
+    var fixture_parser: FixtureParser = .{
+        .reader = std.Io.Reader.fixed(fixture),
+        .token_buffer = try allocator.alloc(u8, @max(@as(usize, 1024), fixture.len)),
+    };
+    fixture_parser.parser = Parser.init(&fixture_parser.reader, .{
+        .token = fixture_parser.token_buffer,
+        .attributes = &fixture_parser.attributes,
+        .namespace_bindings = &fixture_parser.namespace_bindings,
+        .namespace_bytes = &fixture_parser.namespace_bytes,
+        .element_stack = &fixture_parser.element_stack,
+        .element_bytes = &fixture_parser.element_bytes,
+    });
+    return fixture_parser;
 }
