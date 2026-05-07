@@ -109,10 +109,12 @@ pub fn checkReader(
     // When index validation is active and no file_bytes are available for
     // post-parse SHA-1, wrap the reader in a HashingReader that computes
     // SHA-1 incrementally during the streaming parse pass.
-    // HashingReader is temporarily disabled for the streaming path.
-    // TODO: re-enable when streaming SHA-1 verification is fully debugged.
-    const hashing_reader: ?hash_reader.HashingReader = null;
-    const effective_reader = reader;
+    var hashing_reader: ?hash_reader.HashingReader = null;
+    var hr_read_buf: [8192]u8 = undefined;
+    if (!options.skip_index and file_bytes == null) {
+        hashing_reader = hash_reader.HashingReader.init(reader, &hr_read_buf);
+    }
+    const effective_reader = if (hashing_reader) |*hr| &hr.reader else reader;
 
     var parser = xml_parser.Parser.init(effective_reader, .{
         .token = token_buffer,

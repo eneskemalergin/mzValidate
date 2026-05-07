@@ -135,6 +135,15 @@ fn buildScenarios(
         .max_peak_rss_bytes = 16 * 1024 * 1024,
     });
     try scenarios.append(allocator, .{
+        .name = "level1_stream_many_spectra_mmap",
+        .command = try std.fmt.allocPrint(
+            allocator,
+            "{s} check {s} -summary -skip-binary -mmap",
+            .{ mzvalidate_path, stream_fixture_path },
+        ),
+        .max_peak_rss_bytes = 64 * 1024 * 1024,
+    });
+    try scenarios.append(allocator, .{
         .name = "level2_stream_many_spectra",
         .command = try std.fmt.allocPrint(
             allocator,
@@ -142,6 +151,15 @@ fn buildScenarios(
             .{ mzvalidate_path, stream_fixture_path },
         ),
         .max_peak_rss_bytes = 16 * 1024 * 1024,
+    });
+    try scenarios.append(allocator, .{
+        .name = "level2_stream_many_spectra_mmap",
+        .command = try std.fmt.allocPrint(
+            allocator,
+            "{s} check {s} -summary -mmap",
+            .{ mzvalidate_path, stream_fixture_path },
+        ),
+        .max_peak_rss_bytes = 64 * 1024 * 1024,
     });
     try scenarios.append(allocator, .{
         .name = "level2_large_array_workspace",

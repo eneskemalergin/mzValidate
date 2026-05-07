@@ -56,6 +56,7 @@ pub const IndexValidator = struct {
 
     // --- indexListOffset ---
     index_list_offset_depth: ?usize = null,
+    index_list_offset_byte_offset: ?u64 = null,
     index_list_offset_value: ?u64 = null,
 
     // --- fileChecksum ---
@@ -183,6 +184,7 @@ pub const IndexValidator = struct {
 
         // indexListOffset
         if (start.name.matches(mzml_namespace, "indexListOffset")) {
+            validator.index_list_offset_byte_offset = start.byte_offset;
             validator.index_list_offset_depth = element_depth;
             validator.text_buf.clearRetainingCapacity();
             return;
@@ -288,7 +290,7 @@ pub const IndexValidator = struct {
             if (validator.index_list_actual_offset) |actual| {
                 if (declared != actual) {
                     validator.appendDiagnostic(
-                        validator.file_checksum_byte_offset orelse 0,
+                        validator.index_list_offset_byte_offset orelse validator.index_list_actual_offset orelse 0,
                         RuleId.mzml_index_offset_list,
                         "declared indexListOffset does not match actual position of indexList",
                     ) catch {};

@@ -114,7 +114,6 @@ const BinaryArrayState = struct {
     array_kind: ArrayKind = .unknown,
     binary_depth: ?usize = null,
     binary_byte_offset: ?u64 = null,
-    payload: std.ArrayList(u8) = .empty,
     base64_stream: StreamingBase64Counter = .{},
     skipped: bool = false,
 
@@ -134,13 +133,6 @@ const BinaryArrayState = struct {
             .encoded_length = encoded_length,
         };
     }
-
-    fn deinit(state: *BinaryArrayState) void {
-        if (state.saw_zlib_compression) {
-            state.payload.deinit(state.allocator);
-        }
-        state.* = undefined;
-    }
 };
 
 pub const BinaryValidator = struct {
@@ -159,6 +151,10 @@ pub const BinaryValidator = struct {
     chromatogram: ?OwnerState = null,
     binary_array: ?BinaryArrayState = null,
 
+    /// Scratch buffer reused across binary arrays to reduce allocator churn.
+    /// Cleared with `clearRetainingCapacity` at the start of each binary element.
+    scratch_payload: std.ArrayList(u8) = .empty,
+
     /// Creates a validator that appends diagnostics to the shared result list.
     pub fn init(
         allocator: std.mem.Allocator,
@@ -174,7 +170,25 @@ pub const BinaryValidator = struct {
 
     /// Releases any active binary array workspace owned by the validator.
     pub fn deinit(validator: *BinaryValidator) void {
-        if (validator.binary_array) |*state| state.deinit();
+        validator.scratch_payload.deinit(validator.allocator);
+        validator.* = undefined;
+    }
+
+    /// After a binaryDataArray completes, optionally shrink the scratch buffer
+    /// to free capacity that would otherwise persist from occasional large arrays.
+    /// Only triggers when capacity exceeds a minimum threshold AND is significantly
+    /// larger than the actual data size, so typical files with uniform arrays see
+    /// no allocator churn.
+    fn maybeShrinkScratch(validator: *BinaryValidator) void {
+        const used: usize = validator.scratch_payload.items.len;
+        if (used == 0) return;
+        const min_threshold: usize = 1024 * 1024; // 1 MiB
+        const max_headroom: usize = 4;
+        if (validator.scratch_payload.capacity > min_threshold and
+            validator.scratch_payload.capacity > used * max_headroom)
+        {
+            validator.scratch_payload.shrinkAndFree(validator.allocator, used);
+        }
     }
 
     /// Runs the standalone binary validator over a reader-backed XML stream.
@@ -352,6 +366,7 @@ pub const BinaryValidator = struct {
                 if (element_depth == state.depth + 1) {
                     state.binary_depth = element_depth;
                     state.binary_byte_offset = start.byte_offset;
+                    validator.scratch_payload.clearRetainingCapacity();
                     if (state.encoded_length) |encoded_length| {
                         if (validator.max_binary_size) |max_size| {
                             if (encoded_length > max_size) {
@@ -368,7 +383,7 @@ pub const BinaryValidator = struct {
                             }
                         }
                         if (state.saw_zlib_compression) {
-                            try state.payload.ensureTotalCapacity(validator.allocator, encoded_length);
+                            try validator.scratch_payload.ensureTotalCapacity(validator.allocator, encoded_length);
                             state.encoded_length = null;
                         }
                     }
@@ -394,7 +409,7 @@ pub const BinaryValidator = struct {
             if (validator.binary_array) |*state| {
                 if (state.depth == element_depth) {
                     try validator.validateBinaryArray(state);
-                    state.deinit();
+                    validator.maybeShrinkScratch();
                     validator.binary_array = null;
                 }
             }
@@ -424,7 +439,7 @@ pub const BinaryValidator = struct {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
                 if (state.saw_zlib_compression) {
-                    try state.payload.appendSlice(validator.allocator, value);
+                    try validator.scratch_payload.appendSlice(validator.allocator, value);
                 } else {
                     state.base64_stream.feed(value);
                 }
@@ -491,7 +506,7 @@ pub const BinaryValidator = struct {
 
         const decoded_bytes = blk: {
             if (state.saw_zlib_compression) {
-                const encoded = state.payload.items;
+                const encoded = validator.scratch_payload.items;
                 const decoded_upper_bound = base64_decoder.calcSizeUpperBound(encoded.len);
                 const decoded_buffer = try validator.allocator.alloc(u8, decoded_upper_bound);
                 defer validator.allocator.free(decoded_buffer);
@@ -1098,6 +1113,19 @@ test "binary validator unlimited default does not reject large payloads" {
 
     // Default max_binary_size=null → no limit.
     var diagnostics = try runBinaryValidation(allocator, io, minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576"));
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "binary validator scratch buffer shrink survives multi-array file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Two uncompressed arrays in a chromatogram. Each array uses a small
+    // base64 payload. The scratch buffer is not used for uncompressed
+    // arrays, so the shrink path is exercised as a no-op.
+    var diagnostics = try runBinaryValidation(allocator, io, minimalChromatogramMzml("AAAAAA==", "AAAAAA=="));
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);

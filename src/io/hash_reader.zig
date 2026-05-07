@@ -8,15 +8,28 @@
 //! decoupling the inner reader's output from the parser's view of
 //! `r.buffer`, preventing `@memcpy` alias panics that occur when
 //! `defaultReadVec` backs the stream writer with `r.buffer`.
+//!
+//! The staging buffer size (`staging_size`) controls how many bytes
+//! are read from the inner reader per `stream` call.  The default
+//! value (8 KiB) is well above typical XML token sizes and provides
+//! ample throughput for streaming validation.  Increasing it uses
+//! more stack space without meaningful benefit since the parser
+//! already limits per-call reads via its own buffering.
 
 const std = @import("std");
 
 pub const HashingReader = struct {
+    /// Size of the internal staging buffer, in bytes.  This is the
+    /// maximum amount of data read from the inner reader per single
+    /// `stream` invocation.  Bumped only if profiling shows the
+    /// default value to be a bottleneck in a specific deployment.
+    pub const staging_size: usize = 8192;
+
     reader: std.Io.Reader,
     inner: *std.Io.Reader,
     sha_ctx: std.crypto.hash.Sha1,
     paused: bool,
-    staging: [8192]u8,
+    staging: [staging_size]u8,
 
     pub fn init(inner: *std.Io.Reader, read_buf: []u8) HashingReader {
         return .{
@@ -54,7 +67,7 @@ pub const HashingReader = struct {
         var temp_w = std.Io.Writer.fixed(&hr.staging);
         const max_to_read = if (limit == .unlimited) hr.staging.len else @min(@intFromEnum(limit), hr.staging.len);
         const n = hr.inner.stream(&temp_w, std.Io.Limit.limited(max_to_read)) catch |err| switch (err) {
-            error.EndOfStream => 0,
+            error.EndOfStream => return error.EndOfStream,
             else => |e| return e,
         };
 

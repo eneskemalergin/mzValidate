@@ -146,6 +146,9 @@ pub const StructuralValidator = struct {
     instrument_configuration_list_seen: bool = false,
     data_processing_list_seen: bool = false,
     last_top_level_slot: u8 = 0,
+    /// Bitmask of TopLevelSlot values whose duplicate diagnostic has already
+    /// been emitted.  Prevents N duplicates from producing N-1 error messages.
+    dup_reported_mask: u32 = 0,
 
     run_seen: bool = false,
     run_depth: ?usize = null,
@@ -1141,7 +1144,11 @@ pub const StructuralValidator = struct {
         }
 
         if (seen.*) {
-            try validator.nestingError(byte_offset, duplicateTopLevelMessage(element_name));
+            const slot_bit = @as(u32, 1) << @as(u5, @truncate(@intFromEnum(slot)));
+            if (validator.dup_reported_mask & slot_bit == 0) {
+                try validator.nestingError(byte_offset, duplicateTopLevelMessage(element_name));
+                validator.dup_reported_mask |= slot_bit;
+            }
             return;
         }
 

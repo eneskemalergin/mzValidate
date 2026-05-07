@@ -76,6 +76,8 @@ fn buildScenarios(allocator: std.mem.Allocator, repo_root: []const u8, mzvalidat
     defer allocator.free(small_uncompressed);
     const small_zlib = try std.fs.path.join(allocator, &.{ repo_root, "fixtures", "mzml", "valid", "small_zlib.pwiz.1.1.mzML" });
     defer allocator.free(small_zlib);
+    const tiny_indexed = try std.fs.path.join(allocator, &.{ repo_root, "fixtures", "mzml", "valid", "tiny.pwiz.1.1.mzML" });
+    defer allocator.free(tiny_indexed);
 
     var scenarios: std.ArrayList(Scenario) = .empty;
     errdefer {
@@ -90,9 +92,21 @@ fn buildScenarios(allocator: std.mem.Allocator, repo_root: []const u8, mzvalidat
         .min_throughput_mib_s = 100.0,
     });
     try scenarios.append(allocator, .{
+        .name = "level1_small_uncompressed_mmap",
+        .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary -mmap", .{ mzvalidate_path, small_uncompressed }),
+        .min_throughput_mib_s = 100.0,
+    });
+    try scenarios.append(allocator, .{
         .name = "level2_small_uncompressed",
         .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary", .{ mzvalidate_path, small_uncompressed }),
+        .min_throughput_mib_s = 50.0,
+    });
+    try scenarios.append(allocator, .{
+        .name = "level2_small_uncompressed_mmap",
+        .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -mmap", .{ mzvalidate_path, small_uncompressed }),
         .min_throughput_mib_s = 50.0,
     });
     try scenarios.append(allocator, .{
@@ -100,6 +114,25 @@ fn buildScenarios(allocator: std.mem.Allocator, repo_root: []const u8, mzvalidat
         .input_path = "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary", .{ mzvalidate_path, small_zlib }),
         .min_throughput_mib_s = 25.0,
+    });
+    try scenarios.append(allocator, .{
+        .name = "level2_small_zlib_mmap",
+        .input_path = "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -mmap", .{ mzvalidate_path, small_zlib }),
+        .min_throughput_mib_s = 25.0,
+    });
+    // Level 3: index validation on an indexed file.
+    try scenarios.append(allocator, .{
+        .name = "level3_tiny_indexed",
+        .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary", .{ mzvalidate_path, tiny_indexed }),
+        .min_throughput_mib_s = 100.0,
+    });
+    try scenarios.append(allocator, .{
+        .name = "level3_tiny_indexed_mmap",
+        .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary -mmap", .{ mzvalidate_path, tiny_indexed }),
+        .min_throughput_mib_s = 100.0,
     });
 
     return try scenarios.toOwnedSlice(allocator);
