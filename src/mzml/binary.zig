@@ -105,6 +105,7 @@ const BinaryArrayState = struct {
     owner_spectrum_index: ?usize,
     default_array_length: ?usize,
     encoded_length: ?usize = null,
+    encoded_length_declared: ?usize = null,
     precision: ?Precision = null,
     saw_precision_32: bool = false,
     saw_precision_64: bool = false,
@@ -131,6 +132,7 @@ const BinaryArrayState = struct {
             .owner_spectrum_index = owner.index,
             .default_array_length = owner.default_array_length,
             .encoded_length = encoded_length,
+            .encoded_length_declared = encoded_length,
         };
     }
 };
@@ -368,6 +370,10 @@ pub const BinaryValidator = struct {
                     state.binary_byte_offset = start.byte_offset;
                     validator.scratch_payload.clearRetainingCapacity();
                     if (state.encoded_length) |encoded_length| {
+                        if (encoded_length == 0) {
+                            // encodedLength=0 is suspicious; allow it but flag
+                            // if the actual payload is non-empty (caught below).
+                        }
                         if (validator.max_binary_size) |max_size| {
                             if (encoded_length > max_size) {
                                 try validator.appendDiagnostic(.{
@@ -449,6 +455,25 @@ pub const BinaryValidator = struct {
 
     fn validateBinaryArray(validator: *BinaryValidator, state: *const BinaryArrayState) !void {
         if (state.skipped) return;
+
+        // Check encodedLength sanity: if declared as 0 but we have content.
+        if (state.encoded_length_declared) |declared| {
+            const has_content = if (state.saw_zlib_compression)
+                validator.scratch_payload.items.len > 0
+            else
+                state.base64_stream.sig_len > 0;
+            if (declared == 0 and has_content) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_length_mismatch,
+                    .location = .{ .byte_offset = state.binary_byte_offset orelse state.byte_offset },
+                    .path = validator.path,
+                    .message = "binaryDataArray declares encodedLength=0 but contains data",
+                });
+                return;
+            }
+        }
+
         const location: diagnostic.Location = .{
             .byte_offset = state.binary_byte_offset orelse state.byte_offset,
             .spectrum_index = state.owner_spectrum_index,

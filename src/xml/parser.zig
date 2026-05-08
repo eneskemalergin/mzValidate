@@ -102,6 +102,8 @@ pub const Parser = struct {
     absolute_offset: u64 = 0,
     last_byte_offset: u64 = 0,
     pending_self_closing_end: bool = false,
+    /// True once the UTF-8 BOM (if any) has been checked and skipped.
+    bom_checked: bool = false,
 
     /// Constructs a parser from a reader and caller-supplied buffers.
     ///
@@ -123,6 +125,11 @@ pub const Parser = struct {
     pub fn next(parser: *Parser) ParseError!?Event {
         if (parser.pending_self_closing_end) {
             return try parser.emitSyntheticEnd();
+        }
+
+        if (!parser.bom_checked) {
+            parser.bom_checked = true;
+            try parser.skipBom();
         }
 
         while (true) {
@@ -664,6 +671,20 @@ pub const Parser = struct {
 
     fn peekRequiredByte(parser: *Parser) ParseError!u8 {
         return (try parser.peekOptionalByte()) orelse error.UnexpectedEof;
+    }
+
+    /// If the stream starts with a UTF-8 BOM (EF BB BF), consume it.
+    fn skipBom(parser: *Parser) ParseError!void {
+        const b0 = try parser.peekOptionalByte() orelse return;
+        if (b0 != 0xEF) return;
+        _ = try parser.takeRequiredByte();
+        const b1 = try parser.peekOptionalByte() orelse return;
+        if (b1 != 0xBB) return;
+        _ = try parser.takeRequiredByte();
+        const b2 = try parser.peekOptionalByte() orelse return;
+        if (b2 != 0xBF) return;
+        _ = try parser.takeRequiredByte();
+        // Successfully skipped EF BB BF
     }
 
     fn takeRequiredByte(parser: *Parser) ParseError!u8 {

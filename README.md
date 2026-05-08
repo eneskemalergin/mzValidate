@@ -64,7 +64,7 @@ The binary is placed at `zig-out/bin/mzValidate`.
 ### Download a release
 
 ```sh
-curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.0/mzValidate-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.1/mzValidate-x86_64-linux.tar.gz | tar xz
 ./mzValidate check myfile.mzML
 ```
 
@@ -182,9 +182,9 @@ zig build ci                 # All of the above
 
 | Version | Feature | Status |
 | ------- | ------- | ------ |
-| **v0.1.0** | mzML structural + binary validation, streaming parser, three output modes, fuzz testing, CI gates | ✅ Released |
-| **v0.2.0** | Index offset verification, SHA-1 checksum, truncation detection | 🔲 Planned |
-| **v0.3.0** | Semantic validation: OBO parser, CV accession checks, ID resolution, contradiction detection | 🔲 Planned |
+| **v0.1.1** | mzML structural + binary + index validation, SHA-1 checksums, mmap I/O, max-binary-size guard | ✅ Released |
+| **v0.2.0** | Semantic validation: OBO parser, CV accession checks, ID resolution, contradiction detection | 🔲 Planned |
+| **v0.3.0** | Performance & resource optimization: SIMD base64, parser profiling, large-file throughput | 🔲 Planned |
 | **v0.4.0** | CI integration, static binary releases, mzBridge/mzarc CI gates | 🔲 Planned |
 | **v0.5.0** | SDRF-Proteomics validation | 🔲 Planned |
 | **v0.6.0** | imzML cross-file validation | 🔲 Planned |

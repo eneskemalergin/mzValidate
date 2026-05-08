@@ -287,6 +287,37 @@ pub const StructuralValidator = struct {
         }
 
         try validator.reportMissingTopLevelChildren();
+
+        // indexedmzML wrapper requires indexList, indexListOffset, and fileChecksum.
+        if (validator.indexed_mzml_depth != null) {
+            if (!validator.index_list_seen) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_missing_child,
+                    .location = .{ .byte_offset = validator.root_byte_offset },
+                    .path = validator.path,
+                    .message = "indexedmzML is missing required child indexList",
+                });
+            }
+            if (!validator.index_list_offset_seen) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_missing_child,
+                    .location = .{ .byte_offset = validator.root_byte_offset },
+                    .path = validator.path,
+                    .message = "indexedmzML is missing required child indexListOffset",
+                });
+            }
+            if (!validator.file_checksum_seen) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_missing_child,
+                    .location = .{ .byte_offset = validator.root_byte_offset },
+                    .path = validator.path,
+                    .message = "indexedmzML is missing required child fileChecksum",
+                });
+            }
+        }
     }
 
     fn run(validator: *StructuralValidator, io: std.Io, parser: *xml_parser.Parser) !void {
@@ -348,6 +379,39 @@ pub const StructuralValidator = struct {
             validator.root_byte_offset = start.byte_offset;
             validator.mzml_depth = element_depth;
             try validator.requireAttribute(start, "version", "mzML is missing required attribute version");
+            return;
+        }
+
+        // Handle elements that appear as direct children of <indexedmzML>
+        // but OUTSIDE <mzML> — i.e. indexList, indexListOffset, fileChecksum.
+        // These run after </mzML> closes (mzml_depth = null) so the normal
+        // isWithinMzmlStartScope check on line 369 would skip them.
+        if (validator.indexed_mzml_depth != null and
+            element_depth == validator.indexed_mzml_depth.? + 1 and
+            (start.name.matches(mzml_namespace, "indexList") or
+             start.name.matches(mzml_namespace, "indexListOffset") or
+             start.name.matches(mzml_namespace, "fileChecksum")))
+        {
+            if (start.name.matches(mzml_namespace, "indexList")) {
+                if (validator.index_list_seen) {
+                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
+                } else {
+                    validator.index_list_seen = true;
+                }
+                try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
+            } else if (start.name.matches(mzml_namespace, "indexListOffset")) {
+                if (validator.index_list_offset_seen) {
+                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
+                } else {
+                    validator.index_list_offset_seen = true;
+                }
+            } else if (start.name.matches(mzml_namespace, "fileChecksum")) {
+                if (validator.file_checksum_seen) {
+                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
+                } else {
+                    validator.file_checksum_seen = true;
+                }
+            }
             return;
         }
 
@@ -1224,6 +1288,18 @@ pub const StructuralValidator = struct {
     fn requireAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, message: []const u8) !void {
         if (hasAttribute(start.attributes, attribute_name)) return;
         try validator.attributeError(start.byte_offset, message);
+    }
+
+    /// Checks that an attribute value is a non-negative integer. Emits a
+    /// diagnostic if the value is missing, non-numeric, or negative.
+    fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
+        const value = attributeValue(start.attributes, attribute_name) orelse {
+            validator.attributeError(start.byte_offset, element_label ++ " is missing required attribute " ++ attribute_name) catch {};
+            return;
+        };
+        if (value.len > 0 and value[0] == '-') {
+            validator.attributeError(start.byte_offset, element_label ++ " attribute " ++ attribute_name ++ " must not be negative") catch {};
+        }
     }
 
     fn attributeError(validator: *StructuralValidator, byte_offset: u64, message: []const u8) !void {

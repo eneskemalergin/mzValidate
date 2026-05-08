@@ -47,6 +47,8 @@ pub const IndexValidator = struct {
     // --- Index list parsing state ---
     index_list_depth: ?usize = null,
     index_list_actual_offset: ?u64 = null,
+    index_list_declared_count: ?u64 = null,
+    index_list_actual_count: u64 = 0,
 
     current_index_kind: ?IndexKind = null,
     offset_id_ref_owned: ?[]const u8 = null,
@@ -149,6 +151,12 @@ pub const IndexValidator = struct {
             validator.index_list_depth = element_depth;
             validator.index_list_actual_offset = start.byte_offset;
             validator.saw_index_elements = true;
+            // Capture declared count from attribute.
+            const count_attr = attributeValue(start.attributes, "count");
+            validator.index_list_declared_count = if (count_attr) |c|
+                std.fmt.parseUnsigned(u64, c, 10) catch null
+            else
+                null;
             return;
         }
 
@@ -156,6 +164,7 @@ pub const IndexValidator = struct {
         if (start.name.matches(mzml_namespace, "index")) {
             if (validator.index_list_depth == null) return;
             if (element_depth != validator.index_list_depth.? + 1) return;
+            validator.index_list_actual_count += 1;
             const name = attributeValue(start.attributes, "name") orelse {
                 try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
                 return;
@@ -164,8 +173,10 @@ pub const IndexValidator = struct {
                 IndexKind.spectrum
             else if (std.mem.eql(u8, name, "chromatogram"))
                 IndexKind.chromatogram
-            else
-                null;
+            else blk: {
+                try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index name must be \"spectrum\" or \"chromatogram\"");
+                break :blk null;
+            };
             return;
         }
 
@@ -245,15 +256,34 @@ pub const IndexValidator = struct {
 
         // Close indexListOffset.
         if (end.name.matches(mzml_namespace, "indexListOffset")) {
-            validator.index_list_offset_value = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch null;
+            const parsed = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10);
+            validator.index_list_offset_value = parsed catch |err| blk: {
+                if (err == error.InvalidCharacter) {
+                    validator.appendDiagnostic(
+                        validator.index_list_offset_byte_offset orelse 0,
+                        RuleId.mzml_index_offset_list,
+                        "indexListOffset value is not a valid integer",
+                    ) catch {};
+                }
+                break :blk null;
+            };
             validator.index_list_offset_depth = null;
             return;
         }
 
         // Close fileChecksum.
         if (end.name.matches(mzml_namespace, "fileChecksum")) {
-            decodeHex(validator.text_buf.items, &validator.file_checksum_raw);
-            validator.file_checksum_ok = true;
+            const hex = validator.text_buf.items;
+            if (hex.len != 40 or !isHexString(hex)) {
+                validator.appendDiagnostic(
+                    validator.file_checksum_byte_offset orelse 0,
+                    RuleId.mzml_index_checksum,
+                    "fileChecksum must be a 40-character hexadecimal string",
+                ) catch {};
+            } else {
+                decodeHex(hex, &validator.file_checksum_raw);
+                validator.file_checksum_ok = true;
+            }
             validator.file_checksum_depth = null;
             return;
         }
@@ -284,6 +314,17 @@ pub const IndexValidator = struct {
         file_bytes: ?[]const u8,
     ) void {
         if (!validator.saw_index_elements) return;
+
+        // Verify indexList declared count matches actual children.
+        if (validator.index_list_declared_count) |declared| {
+            if (declared != validator.index_list_actual_count) {
+                validator.appendDiagnostic(
+                    validator.index_list_actual_offset orelse 0,
+                    RuleId.mzml_index_offset_list,
+                    "indexList count does not match actual index elements",
+                ) catch {};
+            }
+        }
 
         // --- indexListOffset verification ---
         if (validator.index_list_offset_value) |declared| {
@@ -422,6 +463,13 @@ fn charToNibble(c: u8) ?u4 {
         'A'...'F' => @as(u4, @intCast(c - 'A' + 10)),
         else => null,
     };
+}
+
+fn isHexString(s: []const u8) bool {
+    for (s) |c| {
+        if (charToNibble(c) == null) return false;
+    }
+    return true;
 }
 
 fn freeHashMap(allocator: std.mem.Allocator, map: *std.StringHashMap(u64)) void {

@@ -82,6 +82,11 @@ pub fn runArgs(
         return 0;
     }
 
+    if (wantsVersion(args)) {
+        try stdout.print("mzValidate v{s}\n", .{@import("version.zig").semantic});
+        return 0;
+    }
+
     var command = parseArgs(allocator, args) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.MissingCommand,
@@ -173,8 +178,18 @@ fn wantsHelp(args: []const []const u8) bool {
     return false;
 }
 
+fn wantsVersion(args: []const []const u8) bool {
+    if (args.len == 2 and isVersionFlag(args[1])) return true;
+    if (args.len == 3 and std.mem.eql(u8, args[1], "check") and isVersionFlag(args[2])) return true;
+    return false;
+}
+
 fn isHelpFlag(arg: []const u8) bool {
     return std.mem.eql(u8, arg, "-h") or std.mem.eql(u8, arg, "--help");
+}
+
+fn isVersionFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "-version") or std.mem.eql(u8, arg, "--version");
 }
 
 fn runCheck(
@@ -221,6 +236,8 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
+            "  -version, --version\n" ++
+            "               Print the mzValidate version number and exit.\n" ++
             "  -h, --help   Show this help text.\n\n" ++
             "Behavior\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
@@ -271,6 +288,8 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
             !std.mem.eql(u8, arg, "-max-binary-size") and
             !std.mem.eql(u8, arg, "-json") and
             !std.mem.eql(u8, arg, "-summary") and
+            !std.mem.eql(u8, arg, "-version") and
+            !std.mem.eql(u8, arg, "--version") and
             !isHelpFlag(arg))
         {
             return arg;
