@@ -38,6 +38,7 @@ pub const mzml = struct {
 /// OBO parser for controlled vocabulary (PSI-MS, Unit Ontology).
 pub const obo = struct {
     pub const parser = @import("obo/parser.zig");
+    pub const rule_engine = @import("obo/rule_engine.zig");
 };
 
 // --- Re-exports for convenience ---
@@ -66,5 +67,6 @@ test {
     _ = @import("mzml/index.zig");
     _ = @import("mzml/semantic.zig");
     _ = @import("obo/parser.zig");
+    _ = @import("obo/rule_engine.zig");
     _ = @import("validate.zig");
 }

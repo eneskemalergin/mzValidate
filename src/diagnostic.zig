@@ -51,6 +51,10 @@ pub const RuleId = struct {
     pub const mzml_cv_namespace = "mzml.cv.namespace";
     /// Unit term accession is not recognised.
     pub const mzml_cv_unit = "mzml.cv.unit";
+    /// A required CV term is missing from an element.
+    pub const mzml_cv_required = "mzml.cv.required";
+    /// A recommended CV term is missing from an element.
+    pub const mzml_cv_recommended = "mzml.cv.recommended";
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.
