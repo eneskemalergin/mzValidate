@@ -41,6 +41,16 @@ pub const RuleId = struct {
     pub const mzml_index_truncated = "mzml.index.truncated";
     /// fileChecksum SHA-1 digest does not match the recomputed value.
     pub const mzml_index_checksum = "mzml.index.checksum";
+
+    // CV and semantic rules (Phase 3).
+    /// CV accession does not exist in the controlled vocabulary.
+    pub const mzml_cv_accession = "mzml.cv.accession";
+    /// CV term is obsolete and has been replaced.
+    pub const mzml_cv_obsolete = "mzml.cv.obsolete";
+    /// cvRef does not match the term's declared namespace.
+    pub const mzml_cv_namespace = "mzml.cv.namespace";
+    /// Unit term accession is not recognised.
+    pub const mzml_cv_unit = "mzml.cv.unit";
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.

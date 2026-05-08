@@ -32,6 +32,7 @@ pub const mzml = struct {
     pub const structural = @import("mzml/structural.zig");
     pub const binary = @import("mzml/binary.zig");
     pub const index = @import("mzml/index.zig");
+    pub const semantic = @import("mzml/semantic.zig");
 };
 
 /// OBO parser for controlled vocabulary (PSI-MS, Unit Ontology).
@@ -63,6 +64,7 @@ test {
     _ = @import("mzml/structural.zig");
     _ = @import("mzml/binary.zig");
     _ = @import("mzml/index.zig");
+    _ = @import("mzml/semantic.zig");
     _ = @import("obo/parser.zig");
     _ = @import("validate.zig");
 }

@@ -72,6 +72,18 @@ pub const CvTable = struct {
         return table.map.get(accession);
     }
 
+    /// Validates that `accession` exists in the table and belongs to namespace
+    /// `cv_ref`. Returns null on success, or an error message on failure.
+    pub fn validate(table: *const CvTable, cv_ref: []const u8, accession: []const u8) ?[]const u8 {
+        const term = table.lookup(accession) orelse
+            return "unrecognized CV accession";
+        if (term.is_obsolete)
+            return "CV term is obsolete";
+        if (!std.mem.eql(u8, term.namespace, cv_ref))
+            return "cvRef does not match term namespace";
+        return null;
+    }
+
     fn parse(table: *CvTable, text: []const u8) !void {
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         var in_term = false;
@@ -269,6 +281,32 @@ test "CvTable parses real psi-ms.obo" {
     // Verify namespace prefixes were extracted
     try std.testing.expect(table.ns_prefix.contains("MS"));
     try std.testing.expect(table.ns_prefix.contains("UO"));
+}
+
+test "CvTable.validate catches errors" {
+    const allocator = std.testing.allocator;
+    const obo =
+        "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: test term\n" ++
+        "namespace: MS\n" ++
+        "\n" ++
+        "[Term]\n" ++
+        "id: MS:1000002\n" ++
+        "name: obsolete\n" ++
+        "is_obsolete: true\n";
+
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+
+    // Valid
+    try std.testing.expect(table.validate("MS", "MS:1000001") == null);
+    // Wrong namespace
+    try std.testing.expect(table.validate("UO", "MS:1000001") != null);
+    // Obsolete
+    try std.testing.expect(table.validate("MS", "MS:1000002") != null);
+    // Non-existent
+    try std.testing.expect(table.validate("MS", "MS:9999999") != null);
 }
 
 test "CvTable parses is_a and relationship" {
