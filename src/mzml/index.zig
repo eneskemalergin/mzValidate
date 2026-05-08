@@ -340,7 +340,20 @@ pub const IndexValidator = struct {
         }
 
         // --- Cross-check each index entry ---
+        var prev_offset: ?u64 = null;
         for (validator.index_entries.items) |entry| {
+            // Check monotonic ordering.
+            if (prev_offset) |prev| {
+                if (entry.offset < prev) {
+                    validator.appendDiagnostic(
+                        entry.offset,
+                        RuleId.mzml_index_offset,
+                        "index offsets are not monotonically increasing",
+                    ) catch {};
+                }
+            }
+            prev_offset = entry.offset;
+
             // Check truncation (offset past EOF).
             if (file_bytes) |bytes| {
                 if (entry.offset >= bytes.len) {

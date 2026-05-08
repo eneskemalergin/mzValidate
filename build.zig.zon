@@ -7,6 +7,7 @@
     .paths = .{
         "build.zig",
         "build.zig.zon",
+        "data",
         "fixtures",
         "src",
         "tools/bump_version.zig",

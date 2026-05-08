@@ -34,6 +34,11 @@ pub const mzml = struct {
     pub const index = @import("mzml/index.zig");
 };
 
+/// OBO parser for controlled vocabulary (PSI-MS, Unit Ontology).
+pub const obo = struct {
+    pub const parser = @import("obo/parser.zig");
+};
+
 // --- Re-exports for convenience ---
 
 /// Shared diagnostic record. Avoid reaching through `diagnostic.Diagnostic`.
@@ -58,5 +63,6 @@ test {
     _ = @import("mzml/structural.zig");
     _ = @import("mzml/binary.zig");
     _ = @import("mzml/index.zig");
+    _ = @import("obo/parser.zig");
     _ = @import("validate.zig");
 }
