@@ -118,13 +118,19 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         var inner_pos = inner_start;
         while (inner_pos < inner_end) {
             const term_start = std.mem.indexOfPos(u8, xml, inner_pos, "<CvTerm") orelse break;
-            const term_end = std.mem.indexOfPos(u8, xml, term_start, "/>") orelse break;
-            const term_tag = xml[term_start..term_end];
+            const term_close = std.mem.indexOfPos(u8, xml, term_start, ">") orelse break;
+            const is_self_closing = term_close > 0 and xml[term_close - 1] == '/';
+            const term_tag = xml[term_start..term_close];
+            if (is_self_closing) {
+                inner_pos = term_close + 1;
+            } else {
+                const close_tag = std.mem.indexOfPos(u8, xml, term_close, "</CvTerm>") orelse break;
+                inner_pos = close_tag + "</CvTerm>".len;
+            }
             if (extractAttr(term_tag, "termAccession=\"")) |acc| {
                 const owned = try allocator.dupe(u8, acc);
                 try terms.append(allocator, owned);
             }
-            inner_pos = term_end + 2;
         }
 
         rules.append(allocator, .{
@@ -162,12 +168,7 @@ test "RuleEngine parses ms-mapping.xml" {
 
     // Verify known rules exist.
     const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
-    std.debug.print("spec rules={d}\n", .{rules.len});
-    for (rules, 0..) |r, i| {
-        std.debug.print("  rule {d}: id={s} terms={d}\n", .{ i, r.id, r.terms.len });
-    }
     try std.testing.expect(rules.len > 0);
-    // Each rule should have at least one term.
     for (rules) |r| {
         try std.testing.expect(r.terms.len > 0);
     }

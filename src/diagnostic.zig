@@ -55,6 +55,14 @@ pub const RuleId = struct {
     pub const mzml_cv_required = "mzml.cv.required";
     /// A recommended CV term is missing from an element.
     pub const mzml_cv_recommended = "mzml.cv.recommended";
+    /// Mutually exclusive CV terms appear on the same element.
+    pub const mzml_cv_contradiction = "mzml.cv.contradiction";
+    /// A *Ref attribute does not resolve to any declared id.
+    pub const mzml_ref_unresolved = "mzml.ref.unresolved";
+    /// Two or more elements share the same id.
+    pub const mzml_ref_duplicate_id = "mzml.ref.duplicate-id";
+    /// A required *Ref attribute is missing on an element.
+    pub const mzml_ref_missing = "mzml.ref.missing";
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.

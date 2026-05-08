@@ -798,6 +798,16 @@ pub const StructuralValidator = struct {
             return;
         }
 
+        if (start.name.matches(mzml_namespace, "scanWindowList")) {
+            try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
+            return;
+        }
+
+        if (start.name.matches(mzml_namespace, "selectedIonList")) {
+            try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
+            return;
+        }
+
         if (start.name.matches(mzml_namespace, "binaryDataArrayList")) {
             try validator.noteBinaryDataArrayListChild(start.byte_offset);
             try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
