@@ -11,8 +11,11 @@ const Diagnostic = diagnostic.Diagnostic;
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
+    skip_index: bool = false,
+    skip_semantic: bool = false,
     mmap: bool = false,
     max_binary_size: ?usize = null,
+    obo_path: ?[]const u8 = null,
     inputs: []const []const u8,
 
     /// Frees command-owned allocations after dispatch.
@@ -123,8 +126,11 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var output_mode: output.OutputMode = .text;
     var output_mode_set = false;
     var skip_binary = false;
+    var skip_index = false;
+    var skip_semantic = false;
     var mmap = false;
     var max_binary_size: ?usize = null;
+    var obo_path: ?[]const u8 = null;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -139,8 +145,22 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
             skip_binary = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "-skip-index")) {
+            skip_index = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-skip-semantic")) {
+            skip_semantic = true;
+            continue;
+        }
         if (std.mem.eql(u8, arg, "-mmap")) {
             mmap = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "-obo")) {
+            i += 1;
+            if (i >= args.len) return error.MissingValue;
+            obo_path = args[i];
             continue;
         }
         if (std.mem.eql(u8, arg, "-json")) {
@@ -165,8 +185,11 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     return .{ .check = .{
         .output_mode = output_mode,
         .skip_binary = skip_binary,
+        .skip_index = skip_index,
+        .skip_semantic = skip_semantic,
         .mmap = mmap,
         .max_binary_size = max_binary_size,
+        .obo_path = obo_path,
         .inputs = try input_paths.toOwnedSlice(allocator),
     } };
 }
@@ -204,8 +227,11 @@ fn runCheck(
     for (check.inputs) |path| {
         try validate.checkPath(allocator, io, &diagnostics, path, .{
             .skip_binary = check.skip_binary,
+            .skip_index = check.skip_index,
+            .skip_semantic = check.skip_semantic,
             .mmap = check.mmap,
             .max_binary_size = check.max_binary_size,
+            .obo_path = check.obo_path,
         });
     }
 
@@ -231,11 +257,15 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Options\n" ++
             "  -json        Emit stable JSON diagnostics for CI and pipelines.\n" ++
             "  -summary     Emit only aggregate status and severity counts.\n" ++
-            "  -skip-binary Skip binary payload checks. Structural work still runs when implemented.\n" ++
+            "  -skip-binary Skip binary payload checks.\n" ++
+            "  -skip-index  Skip index offset and checksum checks.\n" ++
+            "  -skip-semantic\n" ++
+            "               Skip CV term and semantic validation.\n" ++
             "  -mmap        Memory-map the input for random-access SHA-1 verification.\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
+            "  -obo <path>  Override the embedded psi-ms.obo with a custom file.\n" ++
             "  -version, --version\n" ++
             "               Print the mzValidate version number and exit.\n" ++
             "  -h, --help   Show this help text.\n\n" ++
@@ -284,8 +314,11 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
     for (args) |arg| {
         if (std.mem.startsWith(u8, arg, "-") and
             !std.mem.eql(u8, arg, "-skip-binary") and
+            !std.mem.eql(u8, arg, "-skip-index") and
+            !std.mem.eql(u8, arg, "-skip-semantic") and
             !std.mem.eql(u8, arg, "-mmap") and
             !std.mem.eql(u8, arg, "-max-binary-size") and
+            !std.mem.eql(u8, arg, "-obo") and
             !std.mem.eql(u8, arg, "-json") and
             !std.mem.eql(u8, arg, "-summary") and
             !std.mem.eql(u8, arg, "-version") and

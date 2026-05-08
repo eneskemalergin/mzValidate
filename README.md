@@ -11,7 +11,7 @@
   <a href="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/mzML-ready-4B9D6E?style=flat-square" alt="mzML ready">
+  <img src="https://img.shields.io/badge/mzML-L1_structural_✓_L2_binary_✓_L3_index_✓_L4_semantic_✓-4B9D6E?style=flat-square" alt="mzML L1-L4 ready">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-early_research-yellow?style=flat-square" alt="status: early research">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
@@ -25,7 +25,7 @@ What works today and what is coming. Each format is validated against its publis
 
 | Format | Status | Structural | Binary | Index | Semantic |
 | ------ | ------ | :--------: | :----: | :---: | :------: |
-| **mzML** 1.1.0 | ✅ | ✅ ready | ✅ ready | 🔲 planned | 🔲 planned |
+| **mzML** 1.1.0 | ✅ ready | ✅ ready | ✅ ready | ✅ ready | ✅ ready |
 | **imzML** 1.0 | 🔲 planned | 🔲 | 🔲 | - | 🔲 |
 | **SDRF-Proteomics** 1.1.0 | 🔲 planned | 🔲 | - | - | 🔲 |
 | **mzIdentML** 1.2 | 🔲 planned | 🔲 | - | 🔲 | 🔲 |
@@ -64,7 +64,7 @@ The binary is placed at `zig-out/bin/mzValidate`.
 ### Download a release
 
 ```sh
-curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.1/mzValidate-x86_64-linux.tar.gz | tar xz
+curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.2/mzValidate-x86_64-linux.tar.gz | tar xz
 ./mzValidate check myfile.mzML
 ```
 
@@ -95,6 +95,12 @@ mzValidate check -summary file1.mzML file2.mzML
 | `-summary` | Single-line status |
 | `-json` | Stable JSON array of all diagnostics |
 | `-skip-binary` | Skip binary payload validation |
+| `-skip-index` | Skip index validation |
+| `-skip-semantic` | Skip CV term and semantic validation |
+| `-mmap` | Memory-map input for random-access SHA-1 |
+| `-max-binary-size N` | Reject binary arrays with encodedLength > N (suffix: K/M/G/T) |
+| `-obo <path>` | Override embedded psi-ms.obo with a custom file |
+| `-version` | Print version number and exit |
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
 
@@ -114,15 +120,22 @@ mzML stores spectral data as base64-encoded, optionally compressed arrays inside
 
 **Recognized but not yet implemented:** All remaining `is_a: MS:1000572` (binary data compression type) terms (MS-Numpress variants `MS:1002312`–`MS:1002314`, `MS:1002746`–`MS:1002748`, truncation-based schemes `MS:1003089`, `MS:1003090`) produce a diagnostic (`mzml.binary.compression`) signaling unsupported compression rather than being silently misvalidated.
 
-### Level 3: Index & Checksum <img src="https://img.shields.io/badge/planned-8B8B8B?style=flat-square" alt="planned">
+### Level 3: Index & Checksum <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
 
-Index offset verification, SHA-1 checksum recomputation, truncation detection for indexed mzML.
+Index offset verification, SHA-1 checksum recomputation, truncation detection for indexed mzML. Supports both streaming and mmap I/O (`-mmap` flag).
 
-### Level 4: Semantic <img src="https://img.shields.io/badge/planned-8B8B8B?style=flat-square" alt="planned">
+### Level 4: Semantic <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
 
-CV accession validation against the PSI-MS controlled vocabulary, `*Ref` attribute resolution, unit term validation, contradictory term detection.
+CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo v4.1.248), `*Ref` attribute resolution, unit term validation, contradictory term detection, and required-term checks from the official `ms-mapping.xml` rule set. Uses a `CvTable` for O(1) accession lookup. Disable with `-skip-semantic`.
 
-## Rule reference
+- **CV checks:** every `<cvParam>` accession is resolved against the embedded OBO. Obsolete terms are flagged with their replacement.
+- **Unit checks:** `unitAccession` is validated against the Unit Ontology (UO). `unitName` is checked against the canonical term name.
+- **Contradiction detection:** mutual exclusive OR terms on the same element (centroid + profile, positive + negative polarity).
+- **Required-term checks:** MUST/SHOULD rules from `ms-mapping.xml` are enforced on every element.
+- **Reference resolution:** all `*Ref` attributes are resolved against declared `id` values. Duplicate IDs are flagged.
+- **IM-MS / DIA:** CV terms for ion mobility and data-independent acquisition are recognised without false positives.
+
+### Rule reference
 
 | Rule ID | Description |
 | ------- | ----------- |
@@ -134,9 +147,24 @@ CV accession validation against the PSI-MS controlled vocabulary, `*Ref` attribu
 | `mzml.structure.missing-child` | Required child element absent |
 | `mzml.binary.base64` | Invalid base64 encoding |
 | `mzml.binary.decompress` | Invalid zlib compressed data |
-| `mzml.binary.compression` | Conflicting, missing, or unsupported compression terms (all 10 PSI-MS `is_a: MS:1000572` types are recognized; MS-Numpress and truncation schemes are diagnosed as unsupported) |
+| `mzml.binary.compression` | Conflicting, missing, or unsupported compression terms |
 | `mzml.binary.precision-mismatch` | Declared precision does not match payload |
 | `mzml.binary.length-mismatch` | Decoded array length does not match `defaultArrayLength` |
+| `mzml.binary.oversized` | Binary payload exceeds `-max-binary-size` limit |
+| `mzml.index.offset-list` | IndexListOffset mismatch or count mismatch |
+| `mzml.index.offset` | Index offset does not match actual position or references non-existent element |
+| `mzml.index.truncated` | Index offset points past end of file |
+| `mzml.index.checksum` | FileChecksum SHA-1 mismatch or invalid hex format |
+| `mzml.cv.accession` | Unrecognized CV accession |
+| `mzml.cv.obsolete` | CV term is obsolete |
+| `mzml.cv.namespace` | cvRef does not match term namespace or cvList |
+| `mzml.cv.unit` | Invalid unit accession or unitName mismatch |
+| `mzml.cv.required` | Missing required CV term on element |
+| `mzml.cv.recommended` | Missing recommended CV term (warning) |
+| `mzml.cv.contradiction` | Mutually exclusive CV terms on same element |
+| `mzml.ref.unresolved` | *Ref attribute does not resolve to any declared id |
+| `mzml.ref.duplicate-id` | Two or more elements share the same id |
+| `mzml.ref.missing` | Required *Ref attribute is missing |
 
 ## Architecture
 
@@ -182,15 +210,14 @@ zig build ci                 # All of the above
 
 | Version | Feature | Status |
 | ------- | ------- | ------ |
-| **v0.1.1** | mzML structural + binary + index validation, SHA-1 checksums, mmap I/O, max-binary-size guard | ✅ Released |
-| **v0.2.0** | Semantic validation: OBO parser, CV accession checks, ID resolution, contradiction detection | 🔲 Planned |
-| **v0.3.0** | Performance & resource optimization: SIMD base64, parser profiling, large-file throughput | 🔲 Planned |
-| **v0.4.0** | CI integration, static binary releases, mzBridge/mzarc CI gates | 🔲 Planned |
-| **v0.5.0** | SDRF-Proteomics validation | 🔲 Planned |
-| **v0.6.0** | imzML cross-file validation | 🔲 Planned |
-| **v0.7.0** | mzIdentML validation | 🔲 Planned |
-| **v0.8.0** | mzTab validation | 🔲 Planned |
-| **v1.0.0** | Stable release, public API, documentation | 🔲 Planned |
+| **v0.1.2** | mzML structural + binary + index + semantic validation, OBO parser, RuleEngine, contradiction detection, reference resolution, mmap I/O, max-binary-size guard | ✅ Released |
+| **v0.2.0** | Performance & resource optimization: SIMD base64, parser profiling, large-file throughput | 🔲 Planned |
+| **v0.3.0** | CI integration, static binary releases, mzBridge/mzarc CI gates | 🔲 Planned |
+| **v0.4.0** | SDRF-Proteomics validation | 🔲 Planned |
+| **v0.5.0** | imzML cross-file validation | 🔲 Planned |
+| **v0.6.0** | mzIdentML validation | 🔲 Planned |
+| **v0.7.0** | mzTab validation | 🔲 Planned |
+| **v0.8.0** | Stable release, public API, documentation | 🔲 Planned |
 
 ## Ecosystem
 

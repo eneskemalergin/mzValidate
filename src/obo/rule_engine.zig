@@ -89,8 +89,8 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
 
     var pos: usize = 0;
     while (pos < xml.len) {
-        // Find the next <CvMappingRule> tag
-        const rule_start = std.mem.indexOfPos(u8, xml, pos, "<CvMappingRule") orelse break;
+        // Find the next <CvMappingRule> tag (note: trailing space avoids matching <CvMappingRuleList>)
+        const rule_start = std.mem.indexOfPos(u8, xml, pos, "<CvMappingRule ") orelse break;
         const rule_end = std.mem.indexOfPos(u8, xml, rule_start, ">") orelse break;
         const rule_tag = xml[rule_start..rule_end];
 

@@ -134,6 +134,13 @@ fn buildScenarios(allocator: std.mem.Allocator, repo_root: []const u8, mzvalidat
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary -mmap", .{ mzvalidate_path, tiny_indexed }),
         .min_throughput_mib_s = 100.0,
     });
+    // Level 3: semantic validation (CV + reference resolution).
+    try scenarios.append(allocator, .{
+        .name = "level3_semantic_tiny",
+        .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary", .{ mzvalidate_path, tiny_indexed }),
+        .min_throughput_mib_s = 50.0,
+    });
 
     return try scenarios.toOwnedSlice(allocator);
 }

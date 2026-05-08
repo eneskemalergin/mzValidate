@@ -179,6 +179,24 @@ fn buildScenarios(
         ),
         .max_peak_rss_bytes = 16 * 1024 * 1024,
     });
+    try scenarios.append(allocator, .{
+        .name = "level3_semantic_50k_spectra",
+        .command = try std.fmt.allocPrint(
+            allocator,
+            "{s} check {s} -summary",
+            .{ mzvalidate_path, stream_fixture_path },
+        ),
+        .max_peak_rss_bytes = 32 * 1024 * 1024,
+    });
+    try scenarios.append(allocator, .{
+        .name = "level3_reftable_50k",
+        .command = try std.fmt.allocPrint(
+            allocator,
+            "{s} check {s} -summary -skip-binary -skip-index",
+            .{ mzvalidate_path, stream_fixture_path },
+        ),
+        .max_peak_rss_bytes = 16 * 1024 * 1024,
+    });
 
     return try scenarios.toOwnedSlice(allocator);
 }

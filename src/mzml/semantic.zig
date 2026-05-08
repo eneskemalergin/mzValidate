@@ -1,7 +1,7 @@
 //! CV validation, scope tracking, contradiction detection, and reference resolution.
 //!
 //! Validates every `<cvParam>` and `<userParam>` against the CvTable built
-//! from psi-ms.obo. Checks:
+//! from psi-ms.obo.  Checks:
 //!   - cvRef resolves to a declared `<cv>` entry in `<cvList>`
 //!   - Accession exists in the CV
 //!   - Term is not obsolete
@@ -10,7 +10,8 @@
 //!   - Contradictory OR terms on the same element (Slice E)
 //!   - All *Ref attributes resolve to declared id values (Slice F)
 //!
-//! Slices B through F of Phase 3.
+//! Slices B through F of Phase 3.  Wired into `checkReader` alongside the
+//! structural, binary, and index validators.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");

@@ -398,6 +398,31 @@ test "checkPath_indexedMzMLFixture_runsCleanWithIndexValidationEnabled" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "checkPath_semantic_end_to_end" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Run full validation including semantic on a real indexed fixture.
+    // This tests that the CvTable, RuleEngine, and SemanticValidator
+    // initialise correctly and process events without crashing.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true });
+
+    // The fixture has known CV issues. We expect CV diagnostics but no crashes.
+    try std.testing.expect(diagnostics.items.len > 0);
+    // Verify at least one CV-related diagnostic was produced.
+    var has_cv_diag = false;
+    for (diagnostics.items) |d| {
+        if (std.mem.startsWith(u8, d.rule, "mzml.cv.") or std.mem.startsWith(u8, d.rule, "mzml.ref.")) {
+            has_cv_diag = true;
+            break;
+        }
+    }
+    try std.testing.expect(has_cv_diag);
+}
+
 test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
