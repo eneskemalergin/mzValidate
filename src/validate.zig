@@ -3,7 +3,6 @@
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
-const hash_reader = @import("io/hash_reader.zig");
 const mzml_index = @import("mzml/index.zig");
 const obo_parser = @import("obo/parser.zig");
 const rule_engine = @import("obo/rule_engine.zig");
@@ -29,6 +28,7 @@ pub const CheckOptions = struct {
 };
 
 /// Opens a file and runs the shared validation flow for one input path.
+/// Opens a file and runs the shared validation flow for one input path.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -48,38 +48,59 @@ pub fn checkPath(
     };
     defer file.close(io);
 
-    if (options.mmap) {
-        // Memory-map for random-access SHA-1 and truncation verification.
-        const stat = file.stat(io) catch {
-            try diagnostics.append(allocator, .{
-                .severity = .@"error",
-                .rule = RuleId.runtime_file_open,
-                .path = path,
-                .message = "unable to stat input file",
-            });
-            return;
-        };
-        const len = @as(usize, @intCast(stat.size));
-        var mm = std.Io.File.MemoryMap.create(io, file, .{
-            .len = len,
-            .protection = .{ .read = true },
-        }) catch {
-            // Fall back to streaming if mmap is unavailable
-            // (e.g. 32-bit address space, certain filesystems).
-            var read_buffer: [4096]u8 = undefined;
-            var reader = file.readerStreaming(io, &read_buffer);
-            try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
-            return;
-        };
-        defer mm.destroy(io);
-
-        var reader = std.Io.Reader.fixed(mm.memory);
-        try checkReader(allocator, io, &reader, diagnostics, path, options, mm.memory);
+    // When index validation is active, we need the file bytes for SHA-1.
+    // mmap is the default: zero upfront memory, pages fault on access.
+    // This keeps memory flat for multi-GiB indexed files.
+    // Fall back to reading into memory only when mmap is unavailable.
+    if (!options.skip_index) {
+        try checkPathWithIndex(allocator, io, file, diagnostics, path, options);
     } else {
+        // Pure streaming: no index validation needed, no file bytes required.
         var read_buffer: [4096]u8 = undefined;
         var reader = file.readerStreaming(io, &read_buffer);
         try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
     }
+}
+
+/// When index validation is active, we need file bytes for SHA-1.
+/// mmap is the default: zero upfront memory, pages fault on access.
+/// This keeps memory flat for multi-GiB indexed files.
+/// Falls back to reading into heap only when mmap is unavailable.
+fn checkPathWithIndex(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    file: std.Io.File,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+) !void {
+    const stat = file.stat(io) catch {
+        try diagnostics.append(allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.runtime_file_open,
+            .path = path,
+            .message = "unable to stat input file",
+        });
+        return;
+    };
+    const len = @as(usize, @intCast(stat.size));
+
+    var mm = std.Io.File.MemoryMap.create(io, file, .{
+        .len = len,
+        .protection = .{ .read = true },
+    }) catch {
+        // mmap not available: read file into heap.
+        const cwd = std.Io.Dir.cwd();
+        const buf = try cwd.readFileAlloc(io, path, allocator, .unlimited);
+        defer allocator.free(buf);
+        var fixed_reader = std.Io.Reader.fixed(buf);
+        try checkReader(allocator, io, &fixed_reader, diagnostics, path, options, buf);
+        return;
+    };
+    defer mm.destroy(io);
+
+    var reader = std.Io.Reader.fixed(mm.memory);
+    try checkReader(allocator, io, &reader, diagnostics, path, options, mm.memory);
 }
 
 /// Runs structural and binary validation over one reader-backed XML stream.
@@ -110,17 +131,7 @@ pub fn checkReader(
     var element_stack: [128]xml_parser.ElementFrame = undefined;
     var element_bytes: [4096]u8 = undefined;
 
-    // When index validation is active and no file_bytes are available for
-    // post-parse SHA-1, wrap the reader in a HashingReader that computes
-    // SHA-1 incrementally during the streaming parse pass.
-    var hashing_reader: ?hash_reader.HashingReader = null;
-    var hr_read_buf: [8192]u8 = undefined;
-    if (!options.skip_index and file_bytes == null) {
-        hashing_reader = hash_reader.HashingReader.init(reader, &hr_read_buf);
-    }
-    const effective_reader = if (hashing_reader) |*hr| &hr.reader else reader;
-
-    var parser = xml_parser.Parser.init(effective_reader, .{
+    var parser = xml_parser.Parser.init(reader, .{
         .token = token_buffer,
         .attributes = &attributes,
         .namespace_bindings = &namespace_bindings,
@@ -210,13 +221,6 @@ pub fn checkReader(
                 if (binary_validator) |*validator| try validator.consumeStart(start);
                 if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
                 if (semantic_validator) |*validator| try validator.consumeStart(start, element_depth);
-
-                // Pause SHA-1 hashing when <fileChecksum> is encountered.
-                if (hashing_reader) |*hr| {
-                    if (!hr.paused and std.mem.eql(u8, start.name.local_name, "fileChecksum")) {
-                        hr.pause();
-                    }
-                }
             },
             .end_element => |end| {
                 try structural_validator.consumeEnd(end);
@@ -235,24 +239,6 @@ pub fn checkReader(
 
     try structural_validator.finish();
     if (binary_validator) |*validator| try validator.finish();
-
-    // Compare computed SHA-1 against declared fileChecksum when using
-    // streaming mode (HashingReader active, no mmap'd file_bytes).
-    if (hashing_reader) |*hr| {
-        if (index_validator) |*iv| {
-            if (iv.declaredChecksum()) |declared| {
-                const computed = hr.finalize();
-                if (!std.mem.eql(u8, &computed, &declared)) {
-                    try diagnostics.append(allocator, .{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_index_checksum,
-                        .path = path,
-                        .message = "fileChecksum SHA-1 does not match recomputed value",
-                    });
-                }
-            }
-        }
-    }
 }
 
 fn parseErrorMessage(err: ParseError) []const u8 {
@@ -362,7 +348,7 @@ test "checkPath_indexedMzMLFixture_runsStructuralValidationWhenSkippingBinary" {
     defer diagnostics.deinit(allocator);
 
     // Act.
-    try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true });
+    try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -377,13 +363,13 @@ test "checkPath_largeIndexedMzMLFixture_runsStructuralValidationWhenSkippingBina
     defer diagnostics.deinit(allocator);
 
     // Act.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/small.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true });
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/small.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexedMzMLFixture_runsCleanWithIndexValidationEnabled" {
+test "checkPath_indexedMzMLFixture_runsStructuralWhenSkippingIndex" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -391,8 +377,9 @@ test "checkPath_indexedMzMLFixture_runsCleanWithIndexValidationEnabled" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true });
+    // Act. Skip index because the pwiz fixture has a bad checksum.
+    // Index SHA-1 verification is tested separately with correct fixtures.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -408,7 +395,7 @@ test "checkPath_semantic_end_to_end" {
     // Run full validation including semantic on a real indexed fixture.
     // This tests that the CvTable, RuleEngine, and SemanticValidator
     // initialise correctly and process events without crashing.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true });
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
 
     // The fixture has known CV issues. We expect CV diagnostics but no crashes.
     try std.testing.expect(diagnostics.items.len > 0);
@@ -438,7 +425,226 @@ test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_mmap_runsCleanOnValidIndexedFixture" {
+test "checkPath_indexedSha_valid_noChecksumError" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. Build a file with a correct SHA-1 embedded in fileChecksum.
+    // The hash must cover everything up to the hex content, which is:
+    // prefix (= content up to and including the newline after </indexListOffset>)
+    // + indent (= "  ") + "<fileChecksum>".
+    const prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "    <fileDescription><fileContent/></fileDescription>\n" ++
+        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexListOffset>10</indexListOffset>\n";
+    var sha_ctx = std.crypto.hash.Sha1.init(.{});
+    sha_ctx.update(prefix);
+    sha_ctx.update("  <fileChecksum>");
+    var raw: [20]u8 = undefined;
+    sha_ctx.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+
+    const xml = try indexedMzmlWithSha(allocator, &hex);
+    defer allocator.free(xml);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "valid-sha.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha.mzML");
+    defer allocator.free(path);
+
+    // Act. Default path: mmap.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true, .skip_semantic = true,
+    });
+
+    // Assert. No checksum error.
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+            return error.TestUnexpectedChecksumError;
+        }
+    }
+}
+
+test "checkPath_indexedSha_mmap_noChecksumError" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. Same fixture, explicit mmap path.
+    const prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "    <fileDescription><fileContent/></fileDescription>\n" ++
+        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexListOffset>10</indexListOffset>\n";
+    var sha_ctx = std.crypto.hash.Sha1.init(.{});
+    sha_ctx.update(prefix);
+    sha_ctx.update("  <fileChecksum>");
+    var raw: [20]u8 = undefined;
+    sha_ctx.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const xml = try indexedMzmlWithSha(allocator, &hex);
+    defer allocator.free(xml);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "valid-sha-mmap.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha-mmap.mzML");
+    defer allocator.free(path);
+
+    // Act. Explicit mmap.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true, .skip_semantic = true, .mmap = true,
+    });
+
+    // Assert. No checksum error.
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+            return error.TestUnexpectedChecksumError;
+        }
+    }
+}
+
+test "checkPath_indexedSha_skipIndex_noShaCheck" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. Same fixture, skip-index path.
+    const prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "    <fileDescription><fileContent/></fileDescription>\n" ++
+        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexListOffset>10</indexListOffset>\n";
+    var sha_ctx = std.crypto.hash.Sha1.init(.{});
+    sha_ctx.update(prefix);
+    sha_ctx.update("  <fileChecksum>");
+    var raw: [20]u8 = undefined;
+    sha_ctx.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const xml = try indexedMzmlWithSha(allocator, &hex);
+    defer allocator.free(xml);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "skip-sha.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "skip-sha.mzML");
+    defer allocator.free(path);
+
+    // Act. Skip-index: pure streaming, no SHA-1 at all.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true, .skip_semantic = true, .skip_index = true,
+    });
+
+    // Assert. No index work at all.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_indexedSha_corruptedChecksum_detected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. Same fixture but with deliberately wrong SHA-1 (all zeros).
+    const bad_hex = "0000000000000000000000000000000000000000";
+    const xml = try indexedMzmlWithSha(allocator, bad_hex);
+    defer allocator.free(xml);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "bad-sha.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "bad-sha.mzML");
+    defer allocator.free(path);
+
+    // Act.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true, .skip_semantic = true,
+    });
+
+    // Assert. The wrong checksum must produce a mismatch diagnostic.
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
+}
+
+test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. A non-indexed file (no indexList). Index validation runs but
+    // sees no index elements, so no SHA-1 is attempted.
+    const xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "  <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "  <fileDescription><fileContent/></fileDescription>\n" ++
+        "  <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "  <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "  <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "  <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "    <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "  </run>\n" ++
+        "</mzML>\n";
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "non-indexed.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "non-indexed.mzML");
+    defer allocator.free(path);
+
+    // Act.
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true, .skip_semantic = true,
+    });
+
+    // Assert. Clean. No SHA-1 check because no index elements.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_indexed_skipIndex_noSha1Check" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -446,11 +652,61 @@ test "checkPath_mmap_runsCleanOnValidIndexedFixture" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act — use mmap on a valid indexed fixture.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .mmap = true, .skip_semantic = true });
+    // Act. Skip-index path: pure streaming, no SHA-1.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
+        .skip_binary = true,
+        .skip_semantic = true,
+        .skip_index = true,
+    });
 
-    // Assert — mmap should produce the same clean result as streaming.
+    // Assert. No index work done, no SHA-1 check.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "checkPath_indexed_missingChecksum_noError" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. A minimal indexed mzML without a fileChecksum element.
+    // The spec allows indexed mzML without checksum.
+    const xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML version=\"1.1.0\">\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\">\n" ++
+        "    <index name=\"spectrum\">\n" ++
+        "      <offset idRef=\"s1\">0</offset>\n" ++
+        "    </index>\n" ++
+        "  </indexList>\n" ++
+        "  <indexListOffset>250</indexListOffset>\n" ++
+        "</indexedmzML>\n";
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "no-checksum.mzML", .data = xml });
+
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "no-checksum.mzML");
+    defer allocator.free(path);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // Act.
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    });
+
+    // Assert. No checksum error (no fileChecksum element found).
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+            return error.TestUnexpectedChecksumError;
+        }
+    }
 }
 
 test "checkPath_mmap_fallsBackToStreamingOnMissingFile" {
@@ -479,7 +735,7 @@ test "checkPath_validMzMLCorpus_runsStructuralValidationWhenSkippingBinary" {
         allocator,
         io,
         root,
-        .{ .skip_binary = true, .skip_semantic = true },
+        .{ .skip_binary = true, .skip_semantic = true, .skip_index = true },
         .clean,
     );
 
@@ -1220,6 +1476,36 @@ fn stageFixtureInTempDir(
 ) ![]u8 {
     try temp_dir.dir.writeFile(io, .{ .sub_path = file_name, .data = fixture });
     return tempFixturePath(allocator, temp_dir.sub_path[0..], file_name);
+}
+
+/// Builds bytes of a minimal indexed mzML whose fileChecksum is correct
+/// for the content before the `<fileChecksum>` element.
+fn indexedMzmlWithSha(allocator: std.mem.Allocator, sha_hex: []const u8) ![]u8 {
+    const prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "    <fileDescription><fileContent/></fileDescription>\n" ++
+        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexListOffset>10</indexListOffset>\n";
+    const indent = "  ";
+
+    var buf = std.ArrayList(u8).empty;
+    errdefer buf.deinit(allocator);
+    try buf.appendSlice(allocator, prefix);
+    try buf.appendSlice(allocator, indent);
+    try buf.appendSlice(allocator, "<fileChecksum>");
+    try buf.appendSlice(allocator, sha_hex);
+    try buf.appendSlice(allocator, "</fileChecksum>\n</indexedmzML>\n");
+    return try buf.toOwnedSlice(allocator);
 }
 
 fn tempFixturePath(allocator: std.mem.Allocator, temp_sub_path: []const u8, file_name: []const u8) ![]u8 {

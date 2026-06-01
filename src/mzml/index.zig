@@ -134,7 +134,7 @@ pub const IndexValidator = struct {
         }
 
         if (validator.mzml_depth == null) return;
-        if (element_depth <= validator.mzml_depth.?) return;
+        if (element_depth < validator.mzml_depth.?) return;
 
         // Track spectrum and chromatogram start offsets.
         if (start.name.matches(mzml_namespace, "spectrum")) {
@@ -204,7 +204,7 @@ pub const IndexValidator = struct {
         // fileChecksum
         if (start.name.matches(mzml_namespace, "fileChecksum")) {
             validator.file_checksum_depth = element_depth;
-            validator.file_checksum_byte_offset = start.byte_offset;
+            validator.file_checksum_byte_offset = start.byte_offset + "<fileChecksum>".len;
             validator.text_buf.clearRetainingCapacity();
             return;
         }
@@ -216,10 +216,7 @@ pub const IndexValidator = struct {
         element_depth: usize,
     ) void {
         if (validator.mzml_depth == null) return;
-        if (element_depth <= validator.mzml_depth.?) {
-            if (end.name.matches(mzml_namespace, "mzML") and validator.mzml_depth == element_depth) {
-                validator.mzml_depth = null;
-            }
+        if (element_depth < validator.mzml_depth.?) {
             return;
         }
 
@@ -391,6 +388,14 @@ pub const IndexValidator = struct {
         if (file_bytes) |bytes| {
             if (validator.file_checksum_ok) {
                 if (validator.file_checksum_byte_offset) |checksum_offset| {
+                    if (checksum_offset > bytes.len) {
+                        validator.appendDiagnostic(
+                            checksum_offset,
+                            RuleId.mzml_index_checksum,
+                            "fileChecksum offset exceeds file size",
+                        ) catch {};
+                        return;
+                    }
                     var computed: [20]u8 = undefined;
                     var ctx = std.crypto.hash.Sha1.init(.{});
                     ctx.update(bytes[0..checksum_offset]);

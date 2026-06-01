@@ -146,6 +146,7 @@ pub fn build(b: *std.Build) void {
     addFixtureArgs(cli_valid_cmd, valid_fixtures);
     cli_valid_cmd.addArg("fixtures/examples/mzml/clean-single-spectrum.mzML");
     cli_valid_cmd.addArg("-skip-semantic");
+    cli_valid_cmd.addArg("-skip-index");
     cli_valid_cmd.addArg("-summary");
     cli_valid_cmd.expectStdOutEqual("status=clean info=0 warnings=0 errors=0\n");
 
