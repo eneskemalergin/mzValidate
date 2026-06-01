@@ -702,18 +702,21 @@ pub const StructuralValidator = struct {
         if (start.name.matches(mzml_namespace, "source")) {
             try validator.noteComponentChild(start.byte_offset, .source);
             try validator.requireAttribute(start, "order", "source is missing required attribute order");
+            validator.requireNonNegativeAttribute(start, "order", "source");
             return;
         }
 
         if (start.name.matches(mzml_namespace, "analyzer")) {
             try validator.noteComponentChild(start.byte_offset, .analyzer);
             try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
+            validator.requireNonNegativeAttribute(start, "order", "analyzer");
             return;
         }
 
         if (start.name.matches(mzml_namespace, "detector")) {
             try validator.noteComponentChild(start.byte_offset, .detector);
             try validator.requireAttribute(start, "order", "detector is missing required attribute order");
+            validator.requireNonNegativeAttribute(start, "order", "detector");
             return;
         }
 
@@ -733,6 +736,7 @@ pub const StructuralValidator = struct {
                 }
             }
             try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
+            validator.requireNonNegativeAttribute(start, "order", "processingMethod");
             try validator.requireAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
             return;
         }
@@ -850,6 +854,12 @@ pub const StructuralValidator = struct {
             validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
             return;
         }
+
+        // cvParam and userParam are validated by the semantic validator,
+        // not the structural validator. Return early to avoid hitting the
+        // unknown-element catch-all below.
+        if (start.name.matches(mzml_namespace, "cvParam")) return;
+        if (start.name.matches(mzml_namespace, "userParam")) return;
 
         // Unrecognized element inside mzML scope.
         if (validator.isWithinMzmlStartScope()) {
@@ -1408,12 +1418,18 @@ pub const StructuralValidator = struct {
                 "spectrum is missing required attribute index"
             else
                 "chromatogram is missing required attribute index");
+        } else {
+            const label = if (kind == .spectrum) "spectrum" else "chromatogram";
+            validator.requireNonNegativeAttribute(start, "index", label);
         }
         if (!hasAttribute(start.attributes, "defaultArrayLength")) {
             try validator.attributeError(start.byte_offset, if (kind == .spectrum)
                 "spectrum is missing required attribute defaultArrayLength"
             else
                 "chromatogram is missing required attribute defaultArrayLength");
+        } else {
+            const label = if (kind == .spectrum) "spectrum" else "chromatogram";
+            validator.requireNonNegativeAttribute(start, "defaultArrayLength", label);
         }
     }
 
@@ -1425,12 +1441,10 @@ pub const StructuralValidator = struct {
     /// Checks that an attribute value is a non-negative integer. Emits a
     /// diagnostic if the value is missing, non-numeric, or negative.
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
-        const value = attributeValue(start.attributes, attribute_name) orelse {
-            validator.attributeError(start.byte_offset, element_label ++ " is missing required attribute " ++ attribute_name) catch {};
-            return;
-        };
+        _ = element_label;
+        const value = attributeValue(start.attributes, attribute_name) orelse return;
         if (value.len > 0 and value[0] == '-') {
-            validator.attributeError(start.byte_offset, element_label ++ " attribute " ++ attribute_name ++ " must not be negative") catch {};
+            validator.attributeError(start.byte_offset, "attribute must not be negative") catch {};
         }
     }
 

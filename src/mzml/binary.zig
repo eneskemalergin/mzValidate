@@ -583,6 +583,23 @@ pub const BinaryValidator = struct {
             return;
         }
 
+        // Empty payload with a non-zero encodedLength is always a mismatch:
+        // something declared data that never arrived.
+        if (decoded_bytes == 0) {
+            if (state.encoded_length_declared) |declared| {
+                if (declared > 0) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_length_mismatch,
+                        .location = location,
+                        .path = validator.path,
+                        .message = "binary payload is empty but encodedLength declares data",
+                    });
+                    return;
+                }
+            }
+        }
+
         const element_count = decoded_bytes / width;
         const declared_count = state.default_array_length orelse return;
         if (element_count == declared_count) return;
@@ -864,6 +881,67 @@ test "binary validator reports empty binary payload when declared length is nonz
         RuleId.mzml_binary_length_mismatch,
         "decoded array length does not match defaultArrayLength",
     );
+}
+
+test "binary validator reports empty payload with non-zero encodedLength and no defaultArrayLength" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. A fixture with encodedLength=8, empty payload, zlib, and
+    // NO defaultArrayLength attribute on the spectrum. The validator
+    // previously exited via orelse return without producing any error.
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000574\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "binary payload is empty but encodedLength declares data",
+    );
+}
+
+test "binary validator does not report error for encodedLength=0 with no payload and no defaultArrayLength" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    // Arrange. encodedLength=0, empty payload, no defaultArrayLength.
+    // This is a valid empty array.
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"0\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000574\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+
+    // Act.
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    // Assert.
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "binary validator reports decoded length mismatch after valid zlib decompression" {
