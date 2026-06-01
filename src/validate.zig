@@ -1786,10 +1786,10 @@ fn tooDeepXml(allocator: std.mem.Allocator, depth: usize) ![]u8 {
 
     try xml.appendSlice(allocator, "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">");
     for (0..depth) |_| {
-        try xml.appendSlice(allocator, "<n>");
+        try xml.appendSlice(allocator, "<cvParam/>");
     }
     for (0..depth) |_| {
-        try xml.appendSlice(allocator, "</n>");
+        try xml.appendSlice(allocator, "</cvParam>");
     }
     try xml.appendSlice(allocator, "</run></mzML>");
     return try xml.toOwnedSlice(allocator);

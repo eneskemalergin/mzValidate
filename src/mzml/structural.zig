@@ -848,7 +848,89 @@ pub const StructuralValidator = struct {
 
         if (start.name.matches(mzml_namespace, "binaryDataArray")) {
             validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
+            return;
         }
+
+        // Unrecognized element inside mzML scope.
+        if (validator.isWithinMzmlStartScope()) {
+            const in_mzml_ns = if (start.name.namespace_uri) |ns|
+                std.mem.eql(u8, ns, mzml_namespace)
+            else
+                true;
+            if (in_mzml_ns and !isKnownMzmlElement(start.name.local_name)) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_nesting,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "unrecognized element in mzML scope",
+                });
+            }
+        }
+    }
+
+    /// Returns true for every element name defined in the mzML 1.1.0 schema.
+    fn isKnownMzmlElement(name: []const u8) bool {
+        return std.mem.eql(u8, name, "activation") or
+            std.mem.eql(u8, name, "analyzer") or
+            std.mem.eql(u8, name, "binary") or
+            std.mem.eql(u8, name, "binaryDataArray") or
+            std.mem.eql(u8, name, "binaryDataArrayList") or
+            std.mem.eql(u8, name, "chromatogram") or
+            std.mem.eql(u8, name, "chromatogramList") or
+            std.mem.eql(u8, name, "componentList") or
+            std.mem.eql(u8, name, "contact") or
+            std.mem.eql(u8, name, "cv") or
+            std.mem.eql(u8, name, "cvList") or
+            std.mem.eql(u8, name, "cvParam") or
+            std.mem.eql(u8, name, "dataProcessing") or
+            std.mem.eql(u8, name, "dataProcessingList") or
+            std.mem.eql(u8, name, "detector") or
+            std.mem.eql(u8, name, "fileChecksum") or
+            std.mem.eql(u8, name, "fileContent") or
+            std.mem.eql(u8, name, "fileDescription") or
+            std.mem.eql(u8, name, "index") or
+            std.mem.eql(u8, name, "indexList") or
+            std.mem.eql(u8, name, "indexListOffset") or
+            std.mem.eql(u8, name, "indexedmzML") or
+            std.mem.eql(u8, name, "instrumentConfiguration") or
+            std.mem.eql(u8, name, "instrumentConfigurationList") or
+            std.mem.eql(u8, name, "isolationWindow") or
+            std.mem.eql(u8, name, "mzML") or
+            std.mem.eql(u8, name, "offset") or
+            std.mem.eql(u8, name, "paramGroupRef") or
+            std.mem.eql(u8, name, "precursor") or
+            std.mem.eql(u8, name, "precursorList") or
+            std.mem.eql(u8, name, "processingMethod") or
+            std.mem.eql(u8, name, "product") or
+            std.mem.eql(u8, name, "productList") or
+            std.mem.eql(u8, name, "referenceableParamGroup") or
+            std.mem.eql(u8, name, "referenceableParamGroupList") or
+            std.mem.eql(u8, name, "referenceableParamGroupRef") or
+            std.mem.eql(u8, name, "run") or
+            std.mem.eql(u8, name, "sample") or
+            std.mem.eql(u8, name, "sampleList") or
+            std.mem.eql(u8, name, "scan") or
+            std.mem.eql(u8, name, "scanList") or
+            std.mem.eql(u8, name, "scanSettings") or
+            std.mem.eql(u8, name, "scanSettingsList") or
+            std.mem.eql(u8, name, "scanWindow") or
+            std.mem.eql(u8, name, "scanWindowList") or
+            std.mem.eql(u8, name, "selectedIon") or
+            std.mem.eql(u8, name, "selectedIonList") or
+            std.mem.eql(u8, name, "software") or
+            std.mem.eql(u8, name, "softwareList") or
+            std.mem.eql(u8, name, "softwareRef") or
+            std.mem.eql(u8, name, "source") or
+            std.mem.eql(u8, name, "sourceFile") or
+            std.mem.eql(u8, name, "sourceFileList") or
+            std.mem.eql(u8, name, "sourceFileRef") or
+            std.mem.eql(u8, name, "sourceFileRefList") or
+            std.mem.eql(u8, name, "spectrum") or
+            std.mem.eql(u8, name, "spectrumList") or
+            std.mem.eql(u8, name, "target") or
+            std.mem.eql(u8, name, "targetList") or
+            std.mem.eql(u8, name, "userParam");
     }
 
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
