@@ -292,26 +292,69 @@ pub const BinaryValidator = struct {
         if (!validator.isWithinMzmlScope(element_depth)) return;
 
         if (start.name.matches(mzml_namespace, "spectrum")) {
+            const index_attr = attributeValue(start.attributes, "index");
+            const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
+            const index = parseOptionalUnsigned(index_attr);
+            const dal = parseOptionalUnsigned(dal_attr);
+            if (index_attr != null and index == null) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_base64,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "spectrum index must be a non-negative integer",
+                });
+            }
+            if (dal_attr != null and dal == null) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_base64,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "spectrum defaultArrayLength must be a non-negative integer",
+                });
+            }
             validator.spectrum = .{
                 .depth = element_depth,
-                .index = parseOptionalUnsigned(attributeValue(start.attributes, "index")),
-                .default_array_length = parseOptionalUnsigned(attributeValue(start.attributes, "defaultArrayLength")),
+                .index = index,
+                .default_array_length = dal,
             };
             return;
         }
 
         if (start.name.matches(mzml_namespace, "chromatogram")) {
+            const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
+            const dal = parseOptionalUnsigned(dal_attr);
+            if (dal_attr != null and dal == null) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_base64,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "chromatogram defaultArrayLength must be a non-negative integer",
+                });
+            }
             validator.chromatogram = .{
                 .depth = element_depth,
                 .index = null,
-                .default_array_length = parseOptionalUnsigned(attributeValue(start.attributes, "defaultArrayLength")),
+                .default_array_length = dal,
             };
             return;
         }
 
         if (start.name.matches(mzml_namespace, "binaryDataArray")) {
             if (validator.binary_array != null) return;
-            const encoded_length = parseOptionalUnsigned(attributeValue(start.attributes, "encodedLength"));
+            const enc_attr = attributeValue(start.attributes, "encodedLength");
+            const encoded_length = parseOptionalUnsigned(enc_attr);
+            if (enc_attr != null and encoded_length == null) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_base64,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "binaryDataArray encodedLength must be a non-negative integer",
+                });
+            }
             if (validator.spectrum) |owner| {
                 validator.binary_array = BinaryArrayState.init(validator.allocator, start.byte_offset, element_depth, owner, encoded_length);
                 return;
@@ -502,6 +545,36 @@ pub const BinaryValidator = struct {
                 .message = "binaryDataArray declares unsupported compression terms",
             });
             return;
+        }
+        if (compression_terms == 0) {
+            try validator.appendDiagnostic(.{
+                .severity = .info,
+                .rule = RuleId.mzml_binary_compression,
+                .location = location,
+                .path = validator.path,
+                .message = "binaryDataArray is missing a compression type declaration",
+            });
+        }
+
+        // If encodedLength was omitted, the early oversized check in
+        // handleStart was skipped. Check actual payload size here.
+        if (state.encoded_length_declared == null) {
+            if (validator.max_binary_size) |max_size| {
+                const actual = if (state.saw_zlib_compression)
+                    validator.scratch_payload.items.len
+                else
+                    state.base64_stream.sig_len;
+                if (actual > max_size) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_oversized,
+                        .location = location,
+                        .path = validator.path,
+                        .message = "binary payload exceeds -max-binary-size limit",
+                    });
+                    return;
+                }
+            }
         }
 
         const precision = blk: {
