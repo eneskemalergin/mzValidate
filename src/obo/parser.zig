@@ -183,7 +183,8 @@ pub const CvTable = struct {
         const nm = name orelse "__unnamed__";
 
         const ns_end = std.mem.indexOfScalar(u8, acc, ':') orelse return;
-        const ns = if (namespace) |n| n else acc[0..ns_end];
+        const raw_ns = if (namespace) |n| n else acc[0..ns_end];
+        const ns = if (std.mem.eql(u8, raw_ns, "unit.ontology")) "UO" else raw_ns;
 
         const term = CvTerm{
             .accession = try table.allocator.dupe(u8, acc),

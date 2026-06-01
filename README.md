@@ -208,8 +208,6 @@ zig build ci                 # All of the above
 
 ## Roadmap
 
-- Fix build failure on fresh clone: `@embedFile` cannot find OBO files (gitignored `data/`)
-- Fix false positive `mzml.binary.decompress` on empty binary arrays
 - Performance: SIMD base64, parser profiling, large-file throughput
 - Conformance score for CI integration (`mzValidate score`)
 - Quick summary statistics (`mzValidate stats`)

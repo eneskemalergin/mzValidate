@@ -532,6 +532,7 @@ pub const BinaryValidator = struct {
         const decoded_bytes = blk: {
             if (state.saw_zlib_compression) {
                 const encoded = validator.scratch_payload.items;
+                if (encoded.len == 0) break :blk @as(usize, 0);
                 const decoded_upper_bound = base64_decoder.calcSizeUpperBound(encoded.len);
                 const decoded_buffer = try validator.allocator.alloc(u8, decoded_upper_bound);
                 defer validator.allocator.free(decoded_buffer);
