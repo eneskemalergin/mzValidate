@@ -175,6 +175,12 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
             output_mode_set = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "-brief")) {
+            if (output_mode_set and output_mode != .brief) return error.ConflictingOutputMode;
+            output_mode = .brief;
+            output_mode_set = true;
+            continue;
+        }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnexpectedFlag;
 
         try input_paths.append(allocator, arg);
@@ -239,6 +245,7 @@ fn runCheck(
         .text => try output.renderText(writer, diagnostics.items),
         .json => try output.renderJson(writer, diagnostics.items),
         .summary => try output.renderSummary(writer, diagnostics.items),
+        .brief => try output.renderBrief(writer, diagnostics.items),
     }
 
     return diagnostic.exitCode(diagnostics.items);
@@ -257,6 +264,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Options\n" ++
             "  -json        Emit stable JSON diagnostics for CI and pipelines.\n" ++
             "  -summary     Emit only aggregate status and severity counts.\n" ++
+            "  -brief       Group diagnostics by rule with occurrence counts.\n" ++
             "  -skip-binary Skip binary payload checks.\n" ++
             "  -skip-index  Skip index offset and checksum checks.\n" ++
             "  -skip-semantic\n" ++
@@ -273,7 +281,9 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
             "  Text mode groups diagnostics by input path and ends with one aggregate summary.\n" ++
             "  JSON mode emits one diagnostic object per finding and keeps keys stable.\n" ++
-            "  Summary mode reports the aggregate result for the whole invocation.\n\n" ++
+            "  Summary mode reports the aggregate result for the whole invocation.\n" ++
+            "  Brief mode groups identical diagnostics by severity, rule, and message\n" ++
+            "  with occurrence counts. Ideal for spotting patterns in large files.\n\n" ++
             "Exit Codes\n" ++
             "  0  clean\n" ++
             "  1  warnings only\n" ++
@@ -303,7 +313,7 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
                 try writer.writeAll("error: unexpected flag");
             }
         },
-        error.ConflictingOutputMode => try writer.writeAll("error: choose either -json or -summary, not both"),
+        error.ConflictingOutputMode => try writer.writeAll("error: choose one of -json, -summary, or -brief"),
         error.MissingValue => try writer.writeAll("error: -max-binary-size requires a value"),
         error.InvalidValue => try writer.writeAll("error: invalid -max-binary-size value"),
         error.Overflow => try writer.writeAll("error: -max-binary-size value overflow (too large)"),
@@ -321,6 +331,7 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
             !std.mem.eql(u8, arg, "-obo") and
             !std.mem.eql(u8, arg, "-json") and
             !std.mem.eql(u8, arg, "-summary") and
+            !std.mem.eql(u8, arg, "-brief") and
             !std.mem.eql(u8, arg, "-version") and
             !std.mem.eql(u8, arg, "--version") and
             !isHelpFlag(arg))
@@ -333,7 +344,7 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
 
 /// Parses a byte-size string with optional binary suffix (K, M, G, T).
 /// Examples: "1024", "1K" (1024), "2M" (2 MiB), "1G" (1 GiB).
-fn parseSize(s: []const u8) error{Overflow, InvalidValue}!usize {
+fn parseSize(s: []const u8) error{ Overflow, InvalidValue }!usize {
     if (s.len == 0) return error.InvalidValue;
 
     var i: usize = 0;
@@ -688,7 +699,7 @@ test "runArgs_conflicting_output_modes_returns_usage_failure_on_stderr" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose either -json or -summary") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of -json, -summary, or -brief") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "Usage") != null);
 }
 

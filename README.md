@@ -73,6 +73,7 @@ curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.2/mz
 ```sh
 mzValidate check sample.mzML
 mzValidate check sample.mzML -summary
+mzValidate check sample.mzML -brief
 mzValidate check sample.mzML -json > report.json
 mzValidate check sample.mzML -skip-binary
 mzValidate check -summary file1.mzML file2.mzML
@@ -93,6 +94,7 @@ mzValidate check -summary file1.mzML file2.mzML
 | -------------------- | ------------------------------------------------------------- |
 | *(default)*          | Human-readable text, one line per diagnostic                  |
 | `-summary`           | Single-line status                                            |
+| `-brief`             | Grouped by rule with occurrence counts                        |
 | `-json`              | Stable JSON array of all diagnostics                          |
 | `-skip-binary`       | Skip binary payload validation                                |
 | `-skip-index`        | Skip index validation                                         |
@@ -180,7 +182,7 @@ Checks register as independent rules. Each rule receives the XML event stream an
 
 ### Output modes
 
-Three renderers from the same diagnostic model. Text for interactive use. JSON for pipeline consumption. Summary mode for quick pass/fail in scripts.
+Four renderers from the same diagnostic model. Text for interactive use. JSON for pipeline consumption. Summary mode for quick pass/fail in scripts. Brief mode groups identical diagnostics by rule and shows occurrence counts; useful for spotting patterns in files with thousands of findings.
 
 ## Testing
 

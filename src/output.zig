@@ -1,6 +1,6 @@
-//! Diagnostic renderers for text, JSON, and summary output modes.
+//! Diagnostic renderers for text, JSON, summary, and brief output modes.
 //!
-//! Three public render functions cover the three modes. Each writes directly
+//! Four public render functions cover four modes. Each writes directly
 //! to a `std.Io.Writer`, so callers can redirect to stdout, a buffer, or a
 //! file without extra allocation.
 
@@ -8,6 +8,7 @@ const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
+const Severity = diagnostic.Severity;
 
 // --- Types ---
 /// Selects how diagnostics are rendered for humans or CI.
@@ -15,6 +16,7 @@ pub const OutputMode = enum {
     text,
     json,
     summary,
+    brief,
 };
 
 /// Renders diagnostics in the default human-readable format.
@@ -68,6 +70,108 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
             summary.totals.errors,
         },
     );
+}
+
+/// Groups diagnostics by severity+rule+message and prints compact counts.
+/// Columns auto-adjust to content width. Zero heap allocation.
+/// Groups are sorted: errors first (by count desc), then warnings, then info.
+pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
+    const summary = diagnostic.summarize(diagnostics);
+    try writer.print("status={s} info={d} warnings={d} errors={d}\n", .{
+        summary.status().label(),
+        summary.totals.info,
+        summary.totals.warnings,
+        summary.totals.errors,
+    });
+    if (diagnostics.len == 0) return;
+
+    const max_groups = 64;
+    var sev: [max_groups]Severity = undefined;
+    var rule: [max_groups][]const u8 = undefined;
+    var msg: [max_groups][]const u8 = undefined;
+    var cnt: [max_groups]usize = undefined;
+    var gcnt: usize = 0;
+
+    // Phase 1: group all diagnostics by (severity, rule, message).
+    for (diagnostics) |d| {
+        var found = false;
+        for (0..gcnt) |i| {
+            if (sev[i] == d.severity and
+                std.mem.eql(u8, rule[i], d.rule) and
+                std.mem.eql(u8, msg[i], d.message))
+            {
+                cnt[i] += 1;
+                found = true;
+                break;
+            }
+        }
+        if (!found and gcnt < max_groups) {
+            sev[gcnt] = d.severity;
+            rule[gcnt] = d.rule;
+            msg[gcnt] = d.message;
+            cnt[gcnt] = 1;
+            gcnt += 1;
+        }
+    }
+
+    // Phase 2: sort by severity desc (error=2, warning=1, info=0),
+    // then by count desc within the same severity.
+    for (1..gcnt) |i| {
+        var j = i;
+        while (j > 0) : (j -= 1) {
+            const a = @intFromEnum(sev[j]);
+            const b = @intFromEnum(sev[j - 1]);
+            const swap = if (a != b) a > b else cnt[j] > cnt[j - 1];
+            if (!swap) break;
+            std.mem.swap(Severity, &sev[j], &sev[j - 1]);
+            std.mem.swap([]const u8, &rule[j], &rule[j - 1]);
+            std.mem.swap([]const u8, &msg[j], &msg[j - 1]);
+            std.mem.swap(usize, &cnt[j], &cnt[j - 1]);
+        }
+    }
+
+    // Phase 3: measure column widths for aligned output.
+    var count_w: usize = 1;
+    var sev_w: usize = 0;
+    var rule_w: usize = 0;
+    for (0..gcnt) |i| {
+        var n = cnt[i];
+        var cw: usize = 1;
+        while (n >= 10) : (n /= 10) cw += 1;
+        if (cw > count_w) count_w = cw;
+
+        const sl = sev[i].label().len;
+        if (sl > sev_w) sev_w = sl;
+
+        const rl = rule[i].len;
+        if (rl > rule_w) rule_w = rl;
+    }
+
+    // Phase 4: render aligned table.
+    // Layout: <count:count_w>  <severity:sev_w>  <rule:rule_w>  <message>
+    try writer.writeByte('\n');
+    for (0..gcnt) |i| {
+        // Right-align count.
+        var n = cnt[i];
+        var cw: usize = 1;
+        while (n >= 10) : (n /= 10) cw += 1;
+        for (0..count_w - cw) |_| try writer.writeByte(' ');
+        try writer.print("{d}  ", .{cnt[i]});
+
+        // Left-align severity within sev_w.
+        try writer.writeAll(sev[i].label());
+        for (0..sev_w - sev[i].label().len) |_| try writer.writeByte(' ');
+        try writer.writeAll("  ");
+
+        // Left-align rule within rule_w.
+        try writer.writeAll(rule[i]);
+        for (0..rule_w - rule[i].len) |_| try writer.writeByte(' ');
+        try writer.writeAll("  ");
+
+        // Message is last column, no padding needed.
+        try writer.writeAll(msg[i]);
+        try writer.writeByte('\n');
+    }
 }
 
 /// Renders diagnostics in a stable JSON shape for automation.
