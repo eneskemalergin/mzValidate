@@ -154,6 +154,7 @@ pub const SemanticValidator = struct {
         var it = validator.cv_refs.iterator();
         while (it.next()) |entry| validator.allocator.free(entry.key_ptr.*);
         validator.cv_refs.deinit();
+        for (validator.element_names.items) |name| validator.allocator.free(name);
         validator.element_names.deinit(validator.allocator);
         for (validator.scope_terms.items) |*list| {
             for (list.items) |item| validator.allocator.free(item);
@@ -218,11 +219,10 @@ pub const SemanticValidator = struct {
                 }
             }
         } else {
-            try validator.element_names.append(validator.allocator, start.name.local_name);
+            const owned = try validator.allocator.dupe(u8, start.name.local_name);
+            try validator.element_names.append(validator.allocator, owned);
             try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
         }
-
-        if (!start.name.matches(mzml_namespace, "cvParam")) return;
 
         const accession = attributeValue(start.attributes, "accession") orelse return;
         const cv_ref = attributeValue(start.attributes, "cvRef") orelse return;
@@ -311,6 +311,9 @@ pub const SemanticValidator = struct {
 
     pub fn consumeEnd(validator: *SemanticValidator, end: EndElement, _: usize) void {
         if (end.name.matches(mzml_namespace, "cvParam") or end.name.matches(mzml_namespace, "userParam")) return;
+        // <cv> elements are handled in consumeStart with an early return and
+        // are not pushed to element_names. Skip them here to avoid desync.
+        if (end.name.matches(mzml_namespace, "cv")) return;
 
         // Build element path from the name stack BEFORE popping.
         var path_buf: [256]u8 = undefined;
@@ -325,6 +328,8 @@ pub const SemanticValidator = struct {
 
         // Pop scope and element name.
         if (validator.element_names.items.len == 0) return;
+        const name = validator.element_names.items[validator.element_names.items.len - 1];
+        validator.allocator.free(name);
         validator.element_names.items.len -= 1;
         if (validator.scope_terms.items.len == 0) return;
         const scope = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
@@ -334,23 +339,60 @@ pub const SemanticValidator = struct {
             scope.deinit(validator.allocator);
         }
 
-        // Check OR rules for contradictions.
+        // Check rules for required terms and contradictions.
         const rules = validator.rule_engine.rulesFor(path);
         for (rules) |rule| {
-            if (rule.logic != .@"or") continue;
-            // Count how many terms from this OR rule appear in the scope.
             var matched: usize = 0;
-            var last_match: []const u8 = "";
             for (rule.terms) |rt| {
                 for (scope.items) |st| {
-                    if (std.mem.eql(u8, rt, st)) {
+                    const is_match = if (rt.allow_children)
+                        validator.cv_table.isDescendantOf(st, rt.accession)
+                    else
+                        std.mem.eql(u8, st, rt.accession);
+                    if (is_match) {
                         matched += 1;
-                        last_match = rt;
                         break;
                     }
                 }
             }
-            if (matched > 1) {
+
+            switch (rule.requirement) {
+                .must => {
+                    const ok = switch (rule.logic) {
+                        .@"and" => matched == rule.terms.len,
+                        .@"or" => matched > 0,
+                    };
+                    if (!ok) {
+                        validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_cv_required,
+                            .location = .{ .byte_offset = end.byte_offset },
+                            .path = validator.path,
+                            .message = "missing required CV term for element",
+                        }) catch {};
+                        return;
+                    }
+                },
+                .should => {
+                    const ok = switch (rule.logic) {
+                        .@"and" => matched == rule.terms.len,
+                        .@"or" => matched > 0,
+                    };
+                    if (!ok) {
+                        validator.diagnostics.append(validator.allocator, .{
+                            .severity = .warning,
+                            .rule = RuleId.mzml_cv_recommended,
+                            .location = .{ .byte_offset = end.byte_offset },
+                            .path = validator.path,
+                            .message = "missing recommended CV term for element",
+                        }) catch {};
+                    }
+                },
+                .may => {},
+            }
+
+            // Contradiction detection for OR rules.
+            if (rule.logic == .@"or" and matched > 1) {
                 validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_contradiction,
@@ -738,6 +780,156 @@ test "SemanticValidator: no contradiction with single term" {
 
     // Close spectrum — no contradiction
     sv.consumeEnd(.{ .byte_offset = 30, .name = .{ .local_name = "spectrum", .namespace_uri = mzml_namespace } }, 2);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "SemanticValidator: must rule fires when term missing" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000008\n" ++ "name: ionization type\n" ++ "namespace: MS\n" ++
+        "[Term]\n" ++ "id: MS:1000482\n" ++ "name: source attribute\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // MUST/AND rule: source must have MS:1000008
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "</CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try sv.consumeStart(makeCv("MS"), 1);
+
+    // Open source element
+    try sv.consumeStart(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
+        .attributes = &.{},
+        .self_closing = false,
+    }, 2);
+
+    // Add a wrong cvParam that IS in the CV but does NOT match the MUST rule
+    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
+
+    // Close source — MUST rule should fire (MS:1000482 != MS:1000008)
+    sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: must rule passes when term present" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000008\n" ++ "name: ionization type\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "</CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try sv.consumeStart(makeCv("MS"), 1);
+
+    // Open source element
+    try sv.consumeStart(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
+        .attributes = &.{},
+        .self_closing = false,
+    }, 2);
+
+    // Add the required term
+    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
+
+    // Close source — MUST rule satisfied
+    sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "SemanticValidator: must or rule fires when no term matches" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000008\n" ++ "name: ionization type\n" ++ "namespace: MS\n" ++
+        "[Term]\n" ++ "id: MS:1000443\n" ++ "name: mass analyzer\n" ++ "namespace: MS\n" ++
+        "[Term]\n" ++ "id: MS:1000482\n" ++ "name: source attribute\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    // MUST/OR rule: source must have MS:1000008 or MS:1000443
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000443\"></CvTerm>" ++
+        "</CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try sv.consumeStart(makeCv("MS"), 1);
+
+    try sv.consumeStart(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
+        .attributes = &.{},
+        .self_closing = false,
+    }, 2);
+
+    // Add wrong term — MS:1000482 is neither MS:1000008 nor MS:1000443
+    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
+
+    sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: must or rule passes when one term present" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000008\n" ++ "name: ionization type\n" ++ "namespace: MS\n" ++
+        "[Term]\n" ++ "id: MS:1000443\n" ++ "name: mass analyzer\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000443\"></CvTerm>" ++
+        "</CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try sv.consumeStart(makeCv("MS"), 1);
+
+    try sv.consumeStart(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
+        .attributes = &.{},
+        .self_closing = false,
+    }, 2);
+
+    // Add one matching term — OR rule satisfied
+    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
+
+    sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 

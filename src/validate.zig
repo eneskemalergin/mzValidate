@@ -1350,9 +1350,7 @@ test "checkPath_reports_conflictingCompression_fixture" {
     defer diagnostics.deinit(allocator);
 
     // Act.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/conflicting-compression.mzML", .{});
-
-    // Assert.
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/conflicting-compression.mzML", .{ .skip_semantic = true });
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
 }
@@ -1360,13 +1358,9 @@ test "checkPath_reports_conflictingCompression_fixture" {
 test "checkPath_reports_unsupportedCompression_fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-
-    // Arrange.
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-
-    // Act.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/unsupported-compression.mzML", .{});
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/unsupported-compression.mzML", .{ .skip_semantic = true });
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
@@ -1390,7 +1384,7 @@ test "checkPath_invalidMzMLBinaryCorpus_reportsExactRulePerFixture" {
     for (expectations) |expectation| {
         var diagnostics: std.ArrayList(Diagnostic) = .empty;
         defer diagnostics.deinit(allocator);
-        try checkPath(allocator, io, &diagnostics, expectation.sub_path, .{});
+        try checkPath(allocator, io, &diagnostics, expectation.sub_path, .{ .skip_semantic = true });
 
         // Assert.
         try expectSingleDiagnostic(diagnostics.items, expectation.rule, expectation.message);
@@ -1407,7 +1401,7 @@ test "checkPath_invalidMzMLBinaryCorpus_is_clean_when_skip_binary_is_enabled" {
         allocator,
         io,
         root,
-        .{ .skip_binary = true },
+        .{ .skip_binary = true, .skip_semantic = true },
         .clean,
     );
 

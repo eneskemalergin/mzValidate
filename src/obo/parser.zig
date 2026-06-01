@@ -84,6 +84,36 @@ pub const CvTable = struct {
         return null;
     }
 
+    /// Returns true if `term_acc` equals `ancestor_acc` or any of its
+    /// `is_a` ancestors in the CV hierarchy (up to 64 steps total).
+    pub fn isDescendantOf(table: *const CvTable, term_acc: []const u8, ancestor_acc: []const u8) bool {
+        if (std.mem.eql(u8, term_acc, ancestor_acc)) return true;
+        var stack: [64][]const u8 = undefined;
+        var count: usize = 0;
+        if (table.lookup(term_acc)) |t| {
+            for (t.is_a) |parent| {
+                if (count < stack.len) {
+                    stack[count] = parent;
+                    count += 1;
+                }
+            }
+        }
+        var visited: usize = 0;
+        while (visited < count and visited < 64) : (visited += 1) {
+            const current = stack[visited];
+            if (std.mem.eql(u8, current, ancestor_acc)) return true;
+            if (table.lookup(current)) |t| {
+                for (t.is_a) |parent| {
+                    if (count < stack.len) {
+                        stack[count] = parent;
+                        count += 1;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
     fn parse(table: *CvTable, text: []const u8) !void {
         var lines = std.mem.tokenizeScalar(u8, text, '\n');
         var in_term = false;

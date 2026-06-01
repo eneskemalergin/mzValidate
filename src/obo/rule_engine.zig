@@ -22,12 +22,17 @@ pub const CombinationLogic = enum(u8) {
     @"or",
 };
 
+pub const MappingTerm = struct {
+    accession: []const u8,
+    allow_children: bool,
+};
+
 pub const MappingRule = struct {
     id: []const u8,
     element_path: []const u8,
     requirement: RequirementLevel,
     logic: CombinationLogic,
-    terms: []const []const u8,
+    terms: []const MappingTerm,
 };
 
 pub const RuleEngine = struct {
@@ -45,7 +50,7 @@ pub const RuleEngine = struct {
         for (engine.rules) |rule| {
             engine.allocator.free(rule.id);
             engine.allocator.free(rule.element_path);
-            for (rule.terms) |term| engine.allocator.free(term);
+            for (rule.terms) |term| engine.allocator.free(term.accession);
             engine.allocator.free(rule.terms);
         }
         engine.allocator.free(engine.rules);
@@ -81,7 +86,7 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         for (rules.items) |r| {
             allocator.free(r.id);
             allocator.free(r.element_path);
-            for (r.terms) |t| allocator.free(t);
+            for (r.terms) |t| allocator.free(t.accession);
             allocator.free(r.terms);
         }
         rules.deinit(allocator);
@@ -89,6 +94,14 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
 
     var pos: usize = 0;
     while (pos < xml.len) {
+        // Skip XML comments, the mapping file has commented-out rules
+        // that must not be parsed (e.g. sourcefile_must).
+        if (std.mem.startsWith(u8, xml[pos..], "<!--")) {
+            const comment_end = std.mem.indexOfPos(u8, xml, pos, "-->") orelse break;
+            pos = comment_end + 3;
+            continue;
+        }
+
         // Find the next <CvMappingRule> tag (note: trailing space avoids matching <CvMappingRuleList>)
         const rule_start = std.mem.indexOfPos(u8, xml, pos, "<CvMappingRule ") orelse break;
         const rule_end = std.mem.indexOfPos(u8, xml, rule_start, ">") orelse break;
@@ -109,9 +122,9 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         const logic: CombinationLogic = if (std.mem.eql(u8, logic_str, "AND")) .@"and" else .@"or";
 
         // Parse <CvTerm> children
-        var terms: std.ArrayList([]const u8) = .empty;
+        var terms: std.ArrayList(MappingTerm) = .empty;
         errdefer {
-            for (terms.items) |t| allocator.free(t);
+            for (terms.items) |t| allocator.free(t.accession);
             terms.deinit(allocator);
         }
 
@@ -129,19 +142,25 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
             }
             if (extractAttr(term_tag, "termAccession=\"")) |acc| {
                 const owned = try allocator.dupe(u8, acc);
-                try terms.append(allocator, owned);
+                const allow_children_str = extractAttr(term_tag, "allowChildren=\"");
+                const allow_children = if (allow_children_str) |s| std.mem.eql(u8, s, "true") else false;
+                try terms.append(allocator, .{
+                    .accession = owned,
+                    .allow_children = allow_children,
+                });
             }
         }
 
+        const owned_terms = try terms.toOwnedSlice(allocator);
         rules.append(allocator, .{
             .id = try allocator.dupe(u8, id),
             .element_path = try allocator.dupe(u8, element_path),
             .requirement = requirement,
             .logic = logic,
-            .terms = try terms.toOwnedSlice(allocator),
+            .terms = owned_terms,
         }) catch |err| {
-            for (terms.items) |t| allocator.free(t);
-            terms.deinit(allocator);
+            for (owned_terms) |t| allocator.free(t.accession);
+            allocator.free(owned_terms);
             return err;
         };
 
@@ -182,6 +201,12 @@ test "RuleEngine parses ms-mapping.xml" {
     // Verify instrument configuration rules.
     const ic_rules = engine.rulesFor("/mzML/instrumentConfigurationList/instrumentConfiguration");
     try std.testing.expect(ic_rules.len > 0);
+
+    // Verify source rules.
+    const source_rules = engine.rulesFor("/mzML/instrumentConfigurationList/instrumentConfiguration/componentList/source");
+    try std.testing.expect(source_rules.len > 0);
+    // source_must + source_may should be returned.
+    try std.testing.expect(source_rules.len >= 2);
 }
 
 test "RuleEngine.rulesFor returns empty for unknown path" {

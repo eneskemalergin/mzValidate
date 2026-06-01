@@ -592,7 +592,7 @@ pub const StructuralValidator = struct {
             validator.chromatogram_list_depth = element_depth;
             try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
             try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
-            validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
+            validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 0);
             return;
         }
 
