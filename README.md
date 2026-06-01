@@ -3,18 +3,18 @@
 <h1 align="center">mzValidate</h1>
 
 <p align="center">
-  A fast, zero-dependency validator for open proteomics data formats.
-  Written in Zig. Single static binary. Streaming single-pass validation.
+  A fast, zero-dependency validator for open proteomics data formats. Written in Zig. Single static binary. Streaming single-pass validation.
 </p>
 
 <p align="center">
   <a href="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml">
     <img src="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
-  <img src="https://img.shields.io/badge/mzML-L1_structural_✓_L2_binary_✓_L3_index_✓_L4_semantic_✓-4B9D6E?style=flat-square" alt="mzML L1-L4 ready">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-early_research-yellow?style=flat-square" alt="status: early research">
   <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
+  <br/>
+  <img src="https://img.shields.io/badge/mzML-L1_structural_✓_L2_binary_✓_L3_index_✓_L4_semantic_✓-4B9D6E?style=flat-square" alt="mzML L1-L4 ready">
 </p>
 
 ---
@@ -23,13 +23,13 @@
 
 What works today and what is coming. Each format is validated against its published specification.
 
-| Format | Status | Structural | Binary | Index | Semantic |
-| ------ | ------ | :--------: | :----: | :---: | :------: |
-| **mzML** 1.1.0 | ✅ ready | ✅ ready | ✅ ready | ✅ ready | ✅ ready |
-| **imzML** 1.0 | 🔲 planned | 🔲 | 🔲 | - | 🔲 |
-| **SDRF-Proteomics** 1.1.0 | 🔲 planned | 🔲 | - | - | 🔲 |
-| **mzIdentML** 1.2 | 🔲 planned | 🔲 | - | 🔲 | 🔲 |
-| **mzTab** 1.0 | 🔲 planned | 🔲 | - | - | 🔲 |
+| Format                    | Status    | Structural | Binary  |  Index  | Semantic |
+| ------------------------- | --------- | :--------: | :-----: | :-----: | :------: |
+| **mzML** 1.1.0            | ready     |   ready    |  ready  |  ready  |  ready   |
+| **imzML** 1.0             | planned   |  planned   | planned |    -    | planned  |
+| **SDRF-Proteomics** 1.1.0 | planned   |  planned   |    -    |    -    | planned  |
+| **mzIdentML** 1.2         | planned   |  planned   |    -    | planned | planned  |
+| **mzTab** 1.0             | planned   |  planned   |    -    |    -    | planned  |
 
 No XML schema is embedded or required. All validation is driven by format-aware rules compiled into the binary.
 
@@ -85,22 +85,22 @@ mzValidate check -summary file1.mzML file2.mzML
 
 ## CLI reference
 
-| Argument | Description |
-| -------- | ----------- |
+| Argument           | Description                     |
+| ------------------ | ------------------------------- |
 | `check <paths...>` | Validate one or more mzML files |
 
-| Flag | Description |
-| ---- | ----------- |
-| *(default)* | Human-readable text, one line per diagnostic |
-| `-summary` | Single-line status |
-| `-json` | Stable JSON array of all diagnostics |
-| `-skip-binary` | Skip binary payload validation |
-| `-skip-index` | Skip index validation |
-| `-skip-semantic` | Skip CV term and semantic validation |
-| `-mmap` | Memory-map input for random-access SHA-1 |
+| Flag                 | Description                                                   |
+| -------------------- | ------------------------------------------------------------- |
+| *(default)*          | Human-readable text, one line per diagnostic                  |
+| `-summary`           | Single-line status                                            |
+| `-json`              | Stable JSON array of all diagnostics                          |
+| `-skip-binary`       | Skip binary payload validation                                |
+| `-skip-index`        | Skip index validation                                         |
+| `-skip-semantic`     | Skip CV term and semantic validation                          |
+| `-mmap`              | Memory-map input for random-access SHA-1                      |
 | `-max-binary-size N` | Reject binary arrays with encodedLength > N (suffix: K/M/G/T) |
-| `-obo <path>` | Override embedded psi-ms.obo with a custom file |
-| `-version` | Print version number and exit |
+| `-obo <path>`        | Override embedded psi-ms.obo with a custom file               |
+| `-version`           | Print version number and exit                                 |
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
 
@@ -137,34 +137,34 @@ CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo v4.
 
 ### Rule reference
 
-| Rule ID | Description |
-| ------- | ----------- |
-| `mzml.structure.xml` | Malformed XML or parser error |
-| `mzml.structure.root` | Missing or wrong root element |
-| `mzml.structure.nesting` | Invalid element nesting |
-| `mzml.structure.attribute` | Missing or invalid attribute |
-| `mzml.structure.count` | List count mismatch |
-| `mzml.structure.missing-child` | Required child element absent |
-| `mzml.binary.base64` | Invalid base64 encoding |
-| `mzml.binary.decompress` | Invalid zlib compressed data |
-| `mzml.binary.compression` | Conflicting, missing, or unsupported compression terms |
-| `mzml.binary.precision-mismatch` | Declared precision does not match payload |
-| `mzml.binary.length-mismatch` | Decoded array length does not match `defaultArrayLength` |
-| `mzml.binary.oversized` | Binary payload exceeds `-max-binary-size` limit |
-| `mzml.index.offset-list` | IndexListOffset mismatch or count mismatch |
-| `mzml.index.offset` | Index offset does not match actual position or references non-existent element |
-| `mzml.index.truncated` | Index offset points past end of file |
-| `mzml.index.checksum` | FileChecksum SHA-1 mismatch or invalid hex format |
-| `mzml.cv.accession` | Unrecognized CV accession |
-| `mzml.cv.obsolete` | CV term is obsolete |
-| `mzml.cv.namespace` | cvRef does not match term namespace or cvList |
-| `mzml.cv.unit` | Invalid unit accession or unitName mismatch |
-| `mzml.cv.required` | Missing required CV term on element |
-| `mzml.cv.recommended` | Missing recommended CV term (warning) |
-| `mzml.cv.contradiction` | Mutually exclusive CV terms on same element |
-| `mzml.ref.unresolved` | *Ref attribute does not resolve to any declared id |
-| `mzml.ref.duplicate-id` | Two or more elements share the same id |
-| `mzml.ref.missing` | Required *Ref attribute is missing |
+| Rule ID                          | Description                                                                    |
+| -------------------------------- | ------------------------------------------------------------------------------ |
+| `mzml.structure.xml`             | Malformed XML or parser error                                                  |
+| `mzml.structure.root`            | Missing or wrong root element                                                  |
+| `mzml.structure.nesting`         | Invalid element nesting                                                        |
+| `mzml.structure.attribute`       | Missing or invalid attribute                                                   |
+| `mzml.structure.count`           | List count mismatch                                                            |
+| `mzml.structure.missing-child`   | Required child element absent                                                  |
+| `mzml.binary.base64`             | Invalid base64 encoding                                                        |
+| `mzml.binary.decompress`         | Invalid zlib compressed data                                                   |
+| `mzml.binary.compression`        | Conflicting, missing, or unsupported compression terms                         |
+| `mzml.binary.precision-mismatch` | Declared precision does not match payload                                      |
+| `mzml.binary.length-mismatch`    | Decoded array length does not match `defaultArrayLength`                       |
+| `mzml.binary.oversized`          | Binary payload exceeds `-max-binary-size` limit                                |
+| `mzml.index.offset-list`         | IndexListOffset mismatch or count mismatch                                     |
+| `mzml.index.offset`              | Index offset does not match actual position or references non-existent element |
+| `mzml.index.truncated`           | Index offset points past end of file                                           |
+| `mzml.index.checksum`            | FileChecksum SHA-1 mismatch or invalid hex format                              |
+| `mzml.cv.accession`              | Unrecognized CV accession                                                      |
+| `mzml.cv.obsolete`               | CV term is obsolete                                                            |
+| `mzml.cv.namespace`              | cvRef does not match term namespace or cvList                                  |
+| `mzml.cv.unit`                   | Invalid unit accession or unitName mismatch                                    |
+| `mzml.cv.required`               | Missing required CV term on element                                            |
+| `mzml.cv.recommended`            | Missing recommended CV term (warning)                                          |
+| `mzml.cv.contradiction`          | Mutually exclusive CV terms on same element                                    |
+| `mzml.ref.unresolved`            | *Ref attribute does not resolve to any declared id                             |
+| `mzml.ref.duplicate-id`          | Two or more elements share the same id                                         |
+| `mzml.ref.missing`               | Required *Ref attribute is missing                                             |
 
 ## Architecture
 
@@ -195,29 +195,33 @@ zig build ci                 # All of the above
 
 ## Build steps
 
-| Command | What it does |
-| ------- | ------------ |
-| `zig build` | Build debug binary |
-| `zig build -Doptimize=ReleaseFast` | Build release binary |
-| `zig build test` | Run all unit tests |
-| `zig build cli-contract` | Run CLI contract tests |
-| `zig build fuzz-smoke` | Run fuzz targets |
-| `zig build resource-check` | Profile peak RSS |
-| `zig build throughput-baseline` | Benchmark throughput |
-| `zig build run -- check file.mzML` | Build and run |
+| Command                            | What it does           |
+| ---------------------------------- | ---------------------- |
+| `zig build`                        | Build debug binary     |
+| `zig build -Doptimize=ReleaseFast` | Build release binary   |
+| `zig build test`                   | Run all unit tests     |
+| `zig build cli-contract`           | Run CLI contract tests |
+| `zig build fuzz-smoke`             | Run fuzz targets       |
+| `zig build resource-check`         | Profile peak RSS       |
+| `zig build throughput-baseline`    | Benchmark throughput   |
+| `zig build run -- check file.mzML` | Build and run          |
 
 ## Roadmap
 
-| Version | Feature | Status |
-| ------- | ------- | ------ |
-| **v0.1.2** | mzML structural + binary + index + semantic validation, OBO parser, RuleEngine, contradiction detection, reference resolution, mmap I/O, max-binary-size guard | ✅ Released |
-| **v0.2.0** | Performance & resource optimization: SIMD base64, parser profiling, large-file throughput | 🔲 Planned |
-| **v0.3.0** | CI integration, static binary releases, mzBridge/mzarc CI gates | 🔲 Planned |
-| **v0.4.0** | SDRF-Proteomics validation | 🔲 Planned |
-| **v0.5.0** | imzML cross-file validation | 🔲 Planned |
-| **v0.6.0** | mzIdentML validation | 🔲 Planned |
-| **v0.7.0** | mzTab validation | 🔲 Planned |
-| **v0.8.0** | Stable release, public API, documentation | 🔲 Planned |
+- Fix build failure on fresh clone: `@embedFile` cannot find OBO files (gitignored `data/`)
+- Fix false positive `mzml.binary.decompress` on empty binary arrays
+- Performance: SIMD base64, parser profiling, large-file throughput
+- Conformance score for CI integration (`mzValidate score`)
+- Quick summary statistics (`mzValidate stats`)
+- Auto-repair common mzML issues (`mzValidate check --fix`)
+- Detect profile spectra and warn before search
+- Compare two mzML files (`mzValidate diff`)
+- CI integration, static binary releases, mzBridge/mzarc CI gates
+- SDRF-Proteomics validation
+- imzML cross-file validation
+- mzIdentML validation
+- mzTab validation
+- Stable release, public API, documentation
 
 ## Ecosystem
 
