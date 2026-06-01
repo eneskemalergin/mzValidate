@@ -182,6 +182,10 @@ pub const StructuralValidator = struct {
     spectrum_list: ?ListCountState = null,
     chromatogram_list: ?ListCountState = null,
     scan_list: ?ListCountState = null,
+    precursor_list: ?ListCountState = null,
+    product_list: ?ListCountState = null,
+    scan_window_list: ?ListCountState = null,
+    selected_ion_list: ?ListCountState = null,
     binary_data_array_list: ?ListCountState = null,
 
     spectrum: ?ContainerState = null,
@@ -749,6 +753,7 @@ pub const StructuralValidator = struct {
             }
             try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
             try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
+            validator.precursor_list = validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
             return;
         }
 
@@ -758,6 +763,7 @@ pub const StructuralValidator = struct {
             }
             try validator.noteSpectrumChild(start.byte_offset, .product_list);
             try validator.requireAttribute(start, "count", "productList is missing required attribute count");
+            validator.product_list = validator.initListCountState(start, element_depth, "productList", "product", 0);
             return;
         }
 
@@ -769,6 +775,7 @@ pub const StructuralValidator = struct {
                 return;
             }
             if (validator.spectrum != null) {
+                validator.bumpListItemCount(&validator.precursor_list, element_depth);
                 return;
             }
             {
@@ -785,6 +792,7 @@ pub const StructuralValidator = struct {
                 return;
             }
             if (validator.spectrum != null) {
+                validator.bumpListItemCount(&validator.product_list, element_depth);
                 return;
             }
             {
@@ -800,11 +808,23 @@ pub const StructuralValidator = struct {
 
         if (start.name.matches(mzml_namespace, "scanWindowList")) {
             try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
+            validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
+            return;
+        }
+
+        if (start.name.matches(mzml_namespace, "scanWindow")) {
+            validator.bumpListItemCount(&validator.scan_window_list, element_depth);
             return;
         }
 
         if (start.name.matches(mzml_namespace, "selectedIonList")) {
             try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
+            validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
+            return;
+        }
+
+        if (start.name.matches(mzml_namespace, "selectedIon")) {
+            validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
@@ -955,6 +975,26 @@ pub const StructuralValidator = struct {
 
         if (end.name.matches(mzml_namespace, "binaryDataArrayList")) {
             try validator.finishListCount(&validator.binary_data_array_list, element_depth);
+            return;
+        }
+
+        if (end.name.matches(mzml_namespace, "precursorList")) {
+            try validator.finishListCount(&validator.precursor_list, element_depth);
+            return;
+        }
+
+        if (end.name.matches(mzml_namespace, "productList")) {
+            try validator.finishListCount(&validator.product_list, element_depth);
+            return;
+        }
+
+        if (end.name.matches(mzml_namespace, "scanWindowList")) {
+            try validator.finishListCount(&validator.scan_window_list, element_depth);
+            return;
+        }
+
+        if (end.name.matches(mzml_namespace, "selectedIonList")) {
+            try validator.finishListCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
@@ -1414,6 +1454,8 @@ fn invalidCountMessage(label: []const u8) []const u8 {
     if (std.mem.eql(u8, label, "spectrumList")) return "spectrumList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "chromatogramList")) return "chromatogramList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "scanList")) return "scanList count attribute must be a non-negative integer";
+    if (std.mem.eql(u8, label, "scanWindowList")) return "scanWindowList count attribute must be a non-negative integer";
+    if (std.mem.eql(u8, label, "selectedIonList")) return "selectedIonList count attribute must be a non-negative integer";
     return "binaryDataArrayList count attribute must be a non-negative integer";
 }
 
@@ -1429,6 +1471,10 @@ fn countMismatchMessage(active: ListCountState) []const u8 {
     if (std.mem.eql(u8, active.label, "spectrumList")) return "spectrumList count does not match actual spectrum elements";
     if (std.mem.eql(u8, active.label, "chromatogramList")) return "chromatogramList count does not match actual chromatogram elements";
     if (std.mem.eql(u8, active.label, "scanList")) return "scanList count does not match actual scan elements";
+    if (std.mem.eql(u8, active.label, "precursorList")) return "precursorList count does not match actual precursor elements";
+    if (std.mem.eql(u8, active.label, "productList")) return "productList count does not match actual product elements";
+    if (std.mem.eql(u8, active.label, "scanWindowList")) return "scanWindowList count does not match actual scanWindow elements";
+    if (std.mem.eql(u8, active.label, "selectedIonList")) return "selectedIonList count does not match actual selectedIon elements";
     return "binaryDataArrayList count does not match actual binaryDataArray elements";
 }
 
