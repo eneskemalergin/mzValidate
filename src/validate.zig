@@ -1,4 +1,14 @@
-//! Public validation entry points for Phase 1 mzML checks.
+//! Entry points for running validation against files or streams.
+//!
+//! Three I/O paths:
+//!   checkPath + skip_index  -> pure streaming from a file reader.
+//!   checkPath + index active -> mmap (preferred) or read-into-heap fallback.
+//!   checkReader              -> caller provides the reader and file_bytes.
+//!
+//! All validators (structural, binary, index, semantic) run in one
+//! forward pass over the event stream. State is bounded per phase:
+//! parser buffers, one active binary workspace, index tables, and
+//! the semantic CV/ref tracker. Nothing accumulates across spectra.
 
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
@@ -17,7 +27,6 @@ const ParseError = xml_parser.ParseError;
 const RuleId = diagnostic.RuleId;
 const max_validation_token_bytes = 1024 * 1024;
 
-/// Controls which validation layers run for a check command.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
@@ -27,8 +36,6 @@ pub const CheckOptions = struct {
     obo_path: ?[]const u8 = null,
 };
 
-/// Opens a file and runs the shared validation flow for one input path.
-/// Opens a file and runs the shared validation flow for one input path.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -48,10 +55,7 @@ pub fn checkPath(
     };
     defer file.close(io);
 
-    // When index validation is active, we need the file bytes for SHA-1.
-    // mmap is the default: zero upfront memory, pages fault on access.
-    // This keeps memory flat for multi-GiB indexed files.
-    // Fall back to reading into memory only when mmap is unavailable.
+    // Need raw file bytes for SHA-1. mmap preferred, heap fallback.
     if (!options.skip_index) {
         try checkPathWithIndex(allocator, io, file, diagnostics, path, options);
     } else {
@@ -62,10 +66,7 @@ pub fn checkPath(
     }
 }
 
-/// When index validation is active, we need file bytes for SHA-1.
-/// mmap is the default: zero upfront memory, pages fault on access.
-/// This keeps memory flat for multi-GiB indexed files.
-/// Falls back to reading into heap only when mmap is unavailable.
+// mmap for random-access SHA-1, fall back to read-into-heap.
 fn checkPathWithIndex(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -103,10 +104,8 @@ fn checkPathWithIndex(
     try checkReader(allocator, io, &reader, diagnostics, path, options, mm.memory);
 }
 
-/// Runs structural and binary validation over one reader-backed XML stream.
-///
-/// This is the public one-pass seam for library callers. It keeps parser state,
-/// structural state, and at most one active binary workspace alive at a time.
+/// Public one-pass seam for library callers. Keeps parser state,
+/// structural state, and at most one active binary workspace alive.
 pub fn checkReader(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -117,11 +116,8 @@ pub fn checkReader(
     file_bytes: ?[]const u8,
 ) !void {
 
-    // Phase 1 keeps traversal state bounded: one shared token buffer, parser namespace
-    // and element stacks, one structural validator for local container bookkeeping,
-    // and at most one active binary array workspace for the current spectrum or
-    // chromatogram. Memory therefore scales with parser limits and one in-flight array,
-    // not with full document size or prior spectra.
+    // Bounded traversal: parser stacks, structural state, one binary workspace.
+    // No accumulation across spectra; memory flat regardless of file size.
     const token_buffer = try allocator.alloc(u8, max_validation_token_bytes);
     defer allocator.free(token_buffer);
 
@@ -154,14 +150,18 @@ pub fn checkReader(
     var index_validator = if (options.skip_index) null else mzml_index.IndexValidator.init(allocator, diagnostics, path);
     defer if (index_validator) |*validator| validator.deinit();
 
-    // Semantic validation (Phase 3): CvTable + RuleEngine + SemanticValidator.
+    // Load OBO and mapping rules. Embedded at build time, overridable at
+    // runtime via -obo. If either fails we log an error and skip semantic
+    // checks instead of crashing.
     var cv_table: ?obo_parser.CvTable = null;
     var rule_eng: ?rule_engine.RuleEngine = null;
     var semantic_validator: ?semantic.SemanticValidator = null;
     if (!options.skip_semantic) {
         const obo_text = if (options.obo_path) |obo_path| blk: {
             const cwd = std.Io.Dir.cwd();
-            break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(std.math.maxInt(usize))) catch {
+            // 50 MB limit: the embedded psi-ms.obo is 1.2 MB; the largest
+            // OBO in common use (GO) fits well under this ceiling.
+            break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(50 * 1024 * 1024)) catch {
                 try diagnostics.append(allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.runtime_file_open,
@@ -226,7 +226,7 @@ pub fn checkReader(
                 try structural_validator.consumeEnd(end);
                 if (binary_validator) |*validator| try validator.consumeEnd(end);
                 if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
-                if (semantic_validator) |*validator| validator.consumeEnd(end, element_depth);
+                if (semantic_validator) |*validator| try validator.consumeEnd(end, element_depth);
                 element_depth -= 1;
             },
             .text => |text| {
@@ -247,15 +247,15 @@ fn parseErrorMessage(err: ParseError) []const u8 {
         error.InvalidUtf8 => "invalid UTF-8 in XML input",
         error.TokenTooLong => "XML token exceeds the configured parser buffer",
         error.TooManyAttributes => "XML element has more attributes than the configured parser limit",
+        error.MismatchedEndTag => "closing tag does not match the most recent opening tag",
+        error.UnknownEntity => "unknown XML entity reference",
+        error.UnsupportedMarkup => "DTD or unsupported XML construct",
         error.TooManyNamespaces,
         error.NamespaceStorageExceeded,
         error.ElementNestingTooDeep,
         error.ElementStorageExceeded,
         error.MalformedXml,
-        error.UnknownEntity,
         error.InvalidCharacterReference,
-        error.UnsupportedMarkup,
-        error.MismatchedEndTag,
         error.ReadFailed,
         => "malformed XML input",
     };
@@ -392,9 +392,7 @@ test "checkPath_semantic_end_to_end" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Run full validation including semantic on a real indexed fixture.
-    // This tests that the CvTable, RuleEngine, and SemanticValidator
-    // initialise correctly and process events without crashing.
+    // Smoke test: semantic validators initialise and process without crashing.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
 
     // The fixture has known CV issues. We expect CV diagnostics but no crashes.
@@ -873,7 +871,7 @@ test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "malformed XML input",
+        "closing tag does not match the most recent opening tag",
     );
 }
 
@@ -1185,25 +1183,20 @@ test "checkReader_excessive_nesting_maps_parser_limit_to_structure_xml_diagnosti
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const xml = try tooDeepXml(allocator, 129);
     defer allocator.free(xml);
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-too-deep.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
         "malformed XML input",
     );
 }
-
-// Tests: structural failure handling.
 
 test "checkPath_existingFile_reportsStructuralErrorWithoutBinaryNoise" {
     const allocator = std.testing.allocator;
@@ -1479,8 +1472,8 @@ fn stageFixtureInTempDir(
     return tempFixturePath(allocator, temp_dir.sub_path[0..], file_name);
 }
 
-/// Builds bytes of a minimal indexed mzML whose fileChecksum is correct
-/// for the content before the `<fileChecksum>` element.
+// Builds bytes of a minimal indexed mzML whose fileChecksum is correct
+// for the content before the `<fileChecksum>` element.
 fn indexedMzmlWithSha(allocator: std.mem.Allocator, sha_hex: []const u8) ![]u8 {
     const prefix =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
@@ -1792,8 +1785,9 @@ fn tooDeepXml(allocator: std.mem.Allocator, depth: usize) ![]u8 {
     errdefer xml.deinit(allocator);
 
     try xml.appendSlice(allocator, "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">");
+    // Non-self-closing elements to actually exceed the nesting limit.
     for (0..depth) |_| {
-        try xml.appendSlice(allocator, "<cvParam/>");
+        try xml.appendSlice(allocator, "<cvParam>");
     }
     for (0..depth) |_| {
         try xml.appendSlice(allocator, "</cvParam>");

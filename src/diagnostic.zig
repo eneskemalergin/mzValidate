@@ -1,7 +1,20 @@
-//! Diagnostic types, stable rule IDs, severity levels, and exit-code mapping.
+//! Diagnostic types and helpers for the shared reporting model.
 //!
-//! Every public symbol here is part of the external contract between the validator
-//! and consumers (CLI, tests, JSON output). Change them carefully.
+//! Every public symbol here is part of the external contract between
+//! the validator and its consumers (CLI, JSON output, CI pipelines).
+//! Change them carefully.
+//!
+//! Types:
+//!   Severity:     info / warning / error
+//!   Location:     optional byte offset and spectrum index
+//!   Diagnostic:   one validation result (severity, rule, location, message, path)
+//!   Totals:       counts by severity
+//!   Summary:      totals + derived status (clean / warnings-only / errors-present)
+//!   ResultStatus: the three states the CLI exit code maps to
+//!   RuleId:       stable string constants in `domain.category.slug` form
+
+/// mzML namespace URI, shared across all mzML validators.
+pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
 
 const std = @import("std");
 
@@ -12,9 +25,7 @@ const std = @import("std");
 /// Naming convention: `domain.category.slug`. The slug appears verbatim in JSON
 /// so it is a breaking change to rename or remove an existing entry.
 pub const RuleId = struct {
-    /// File could not be opened. Carries the OS error in the message.
     pub const runtime_file_open = "runtime.file-open";
-    /// Reserved placeholder. Used in tests and output contract assertions.
     pub const runtime_stub = "runtime.stub";
 
     pub const mzml_structure_root = "mzml.structure.root";
@@ -28,12 +39,10 @@ pub const RuleId = struct {
     pub const mzml_binary_decompress = "mzml.binary.decompress";
     pub const mzml_binary_length_mismatch = "mzml.binary.length-mismatch";
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
-    /// Binary payload encodedLength exceeds the -max-binary-size limit.
     pub const mzml_binary_oversized = "mzml.binary.oversized";
-    /// Binary data array type is incompatible with the declared data type.
+    // TODO: Need to either wire this into a validator or remove it.
     pub const mzml_binary_type_mismatch = "mzml.binary.type-mismatch";
 
-    // Index and checksum rules (Phase 2).
     /// Declared indexListOffset does not match the actual byte offset of indexList.
     pub const mzml_index_offset_list = "mzml.index.offset-list";
     /// Index offset does not match the recorded spectrum/chromatogram position,
@@ -44,7 +53,6 @@ pub const RuleId = struct {
     /// fileChecksum SHA-1 digest does not match the recomputed value.
     pub const mzml_index_checksum = "mzml.index.checksum";
 
-    // CV and semantic rules (Phase 3).
     /// CV accession does not exist in the controlled vocabulary.
     pub const mzml_cv_accession = "mzml.cv.accession";
     /// CV term is obsolete and has been replaced.
@@ -59,6 +67,7 @@ pub const RuleId = struct {
     pub const mzml_cv_recommended = "mzml.cv.recommended";
     /// Mutually exclusive CV terms appear on the same element.
     pub const mzml_cv_contradiction = "mzml.cv.contradiction";
+    // TODO: Need to either wire this into a validator or remove it.
     /// Non-repeatable CV term appears more than once on the same element.
     pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";
     /// A *Ref attribute does not resolve to any declared id.
@@ -75,7 +84,6 @@ pub const Severity = enum {
     warning,
     @"error",
 
-    /// Returns the stable text label used in text and JSON output.
     pub fn label(severity: Severity) []const u8 {
         return switch (severity) {
             .info => "info",
@@ -113,7 +121,6 @@ pub const ResultStatus = enum {
     warnings_only,
     errors_present,
 
-    /// Returns the stable label used in human summaries.
     pub fn label(status: ResultStatus) []const u8 {
         return switch (status) {
             .clean => "clean",
@@ -127,7 +134,6 @@ pub const ResultStatus = enum {
 pub const Summary = struct {
     totals: Totals,
 
-    /// Reports the overall result without forcing callers to inspect counters.
     pub fn status(summary: Summary) ResultStatus {
         if (summary.totals.errors > 0) return .errors_present;
         if (summary.totals.warnings > 0) return .warnings_only;
@@ -135,7 +141,6 @@ pub const Summary = struct {
     }
 };
 
-/// Counts severities across all diagnostics.
 pub fn count(diagnostics: []const Diagnostic) Totals {
     var totals: Totals = .{};
     for (diagnostics) |diagnostic| {
@@ -148,7 +153,6 @@ pub fn count(diagnostics: []const Diagnostic) Totals {
     return totals;
 }
 
-/// Aggregates diagnostics into totals plus a derived result state.
 pub fn summarize(diagnostics: []const Diagnostic) Summary {
     return .{ .totals = count(diagnostics) };
 }

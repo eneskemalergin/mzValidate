@@ -1,14 +1,22 @@
-//! XML event types produced by the streaming parser.
+//! Event types the streaming parser emits.
 //!
-//! All slice fields borrow from the parser's caller-supplied buffers and
-//! are only valid until the next `Parser.next()` call. Consumers that need
-//! to retain a value across calls must copy it.
+//! Every slice field borrows from the parser's caller-supplied buffers.
+//! They are only valid until the next `Parser.next()` call. Copy anything
+//! you need to keep.
+//!
+//! Types:
+//!   StartElement: opening tag with name, attributes, self-closing flag
+//!   EndElement:   closing tag
+//!   Text:         character data or CDATA (distinguished by `from_cdata`)
+//!   Attribute:    one attribute within a start event
+//!   QName:        namespace-expanded element or attribute name
+//!   Event:        union of the three event kinds
+//!   EventKind:    enum discriminators for the union
 
 const std = @import("std");
 
 // --- Types ---
 
-/// Namespace-expanded element or attribute name.
 pub const QName = struct {
     prefix: ?[]const u8 = null,
     local_name: []const u8,
@@ -27,7 +35,6 @@ pub const QName = struct {
     }
 };
 
-/// View of one attribute within a start-element event.
 pub const Attribute = struct {
     byte_offset: u64,
     name: QName,
@@ -35,7 +42,7 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
-/// Start tag with borrowed attribute views. Valid until the next `Parser.next()` call.
+/// Borrowed attribute views. Valid until the next `Parser.next()` call.
 pub const StartElement = struct {
     byte_offset: u64,
     name: QName,
@@ -43,28 +50,26 @@ pub const StartElement = struct {
     self_closing: bool,
 };
 
-/// End tag after namespace expansion.
 pub const EndElement = struct {
     byte_offset: u64,
     name: QName,
 };
 
-/// Text node or decoded CDATA section. Both surfaces as the same event kind.
-/// `from_cdata` lets validators warn about CDATA if the schema prohibits it.
+/// `from_cdata` distinguishes CDATA from normal text, so validators can
+/// warn about CDATA usage if the schema prohibits it.
 pub const Text = struct {
     byte_offset: u64,
     value: []const u8,
     from_cdata: bool = false,
 };
 
-/// Kinds emitted by the streaming parser.
 pub const EventKind = enum {
     start_element,
     end_element,
     text,
 };
 
-/// One parser event. All slices remain valid until the next `Parser.next` call.
+/// All slices remain valid until the next `Parser.next()` call.
 pub const Event = union(EventKind) {
     start_element: StartElement,
     end_element: EndElement,

@@ -1,14 +1,24 @@
-//! Public API surface for the mzValidate library.
+//! Public face of the mzValidate library.
 //!
-//! Import this module as `mzvalidate` from executables or integration tests.
-//! Submodule namespaces (`cli`, `diagnostic`, `output`) are re-exported so
-//! callers can reach individual helpers without knowing the internal layout.
+//! Re-exports every submodule and the most common types (Diagnostic,
+//! Severity, OutputMode, CheckOptions) so callers do not dig through
+//! internal paths.  Import as `mzvalidate` from executables, tests,
+//! or downstream tools that want to reuse the validation engine.
+//!
+//! Namespace layout:
+//!   mzvalidate.cli           CLI parsing and dispatch
+//!   mzvalidate.diagnostic    Diagnostic model and rule IDs
+//!   mzvalidate.output        Text, JSON, summary renderers
+//!   mzvalidate.validate      I/O dispatch and orchestration
+//!   mzvalidate.xml           Streaming XML parser + events
+//!   mzvalidate.mzml          Structural, binary, index, semantic
+//!   mzvalidate.obo           OBO/psi-ms parser + rule engine
 
 const std = @import("std");
 
 // --- Submodule exports ---
 
-/// CLI parsing and dispatch.
+/// CLI argument parsing, dispatch, and output modes.
 pub const cli = @import("cli.zig");
 /// Shared diagnostic types and helpers.
 pub const diagnostic = @import("diagnostic.zig");
@@ -16,14 +26,14 @@ pub const diagnostic = @import("diagnostic.zig");
 pub const output = @import("output.zig");
 /// Project version constants.
 pub const version = @import("version.zig");
-/// Validation entry points.
+/// I/O dispatch and validation orchestration.
 pub const validate = @import("validate.zig");
 /// XML parser surface for focused tooling.
 pub const xml = struct {
     pub const events = @import("xml/events.zig");
     pub const parser = @import("xml/parser.zig");
 };
-/// I/O utilities.
+// I/O helpers live here when extracted from validate.zig.
 pub const io = struct {};
 /// mzML validators for focused tooling.
 pub const mzml = struct {
@@ -50,7 +60,6 @@ pub const OutputMode = output.OutputMode;
 /// Check options. Avoid reaching through `validate.CheckOptions`.
 pub const CheckOptions = validate.CheckOptions;
 
-/// Runs the top-level CLI through the library entry point.
 pub fn run(init: std.process.Init) !u8 {
     return cli.run(init);
 }

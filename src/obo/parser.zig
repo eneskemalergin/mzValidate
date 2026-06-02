@@ -1,10 +1,14 @@
 //! OBO format 1.4 parser for psi-ms.obo controlled vocabularies.
 //!
-//! Parses stanzas (`[Term]`, `[Typedef]`), tag-value pairs, line continuations,
-//! escape sequences, and builds a `CvTable` for fast accession lookup.
+//! Parses stanzas (`[Term]`, `[Typedef]`), tag-value pairs, line
+//! continuations, and escape sequences.  Builds a `CvTable` keyed by
+//! accession for fast lookup of CV terms, relationships, synonyms,
+//! and metadata (obsoletion, unit constraints, xsd types).
 //!
-//! Usage:
-//!   var table = try CvTable.init(allocator, embedded_obo);
+//! The table is embedded at compile time via `@embedFile("data/psi-ms.obo")`
+//! and overridable at runtime with `-obo`.  Callers get a read-only view:
+//!
+//!   var table = try CvTable.init(allocator, obo_text);
 //!   defer table.deinit();
 //!   const term = table.lookup("MS:1000001");
 
@@ -25,11 +29,11 @@ pub const CvTerm = struct {
     is_a: [][]const u8,
     relationships: []Relationship,
     synonyms: [][]const u8,
-    /// XSD type for cvParam value validation (F1). Parsed from `relationship: has_value_type xsd:TYPE`.
+    /// cvParam value type constraint from `relationship: has_value_type xsd:TYPE`.
     xsd_type: ?[]const u8 = null,
-    /// Allowed unit accessions for this term (F4). Parsed from `relationship: has_units ACC`.
+    /// Allowed unit accessions from `relationship: has_units ACC`.
     allowed_units: [][]const u8 = &.{},
-    /// Allowed binary data type accessions (F3). Parsed from `xref: binary-data-type:ACC`.
+    /// Allowed binary data type accessions from `xref: binary-data-type:ACC`.
     binary_data_types: [][]const u8 = &.{},
 };
 
@@ -94,10 +98,10 @@ pub const CvTable = struct {
     }
 
     /// Returns true if `term_acc` equals `ancestor_acc` or any of its
-    /// `is_a` ancestors in the CV hierarchy (up to 64 steps total).
+    /// `is_a` ancestors in the CV hierarchy.
     pub fn isDescendantOf(table: *const CvTable, term_acc: []const u8, ancestor_acc: []const u8) bool {
         if (std.mem.eql(u8, term_acc, ancestor_acc)) return true;
-        var stack: [64][]const u8 = undefined;
+        var stack: [256][]const u8 = undefined;
         var count: usize = 0;
         if (table.lookup(term_acc)) |t| {
             for (t.is_a) |parent| {
@@ -108,7 +112,7 @@ pub const CvTable = struct {
             }
         }
         var visited: usize = 0;
-        while (visited < count and visited < 64) : (visited += 1) {
+        while (visited < count) : (visited += 1) {
             const current = stack[visited];
             if (std.mem.eql(u8, current, ancestor_acc)) return true;
             if (table.lookup(current)) |t| {
@@ -198,7 +202,7 @@ pub const CvTable = struct {
                     var acc_len: usize = 0;
                     var i: usize = 0;
                     while (i < space_pos) : (i += 1) {
-                        if (rest[i] == '\\' and i + 1 < colon) {
+                        if (rest[i] == '\\' and i + 1 < space_pos) {
                             i += 1;
                         }
                         acc_buf[acc_len] = rest[i];
@@ -219,13 +223,13 @@ pub const CvTable = struct {
                     .name = try table.allocator.dupe(u8, rname),
                     .target = try table.allocator.dupe(u8, rtarget),
                 });
-                // Extract xsd type for F1 cv value validation.
+                // Extract xsd type for cv value validation.
                 if (std.mem.eql(u8, rname, "has_value_type")) {
                     if (std.mem.startsWith(u8, rtarget, "xsd:")) {
                         xsd_type = rtarget;
                     }
                 }
-                // Extract allowed units for F4.
+                // Extract allowed units.
                 if (std.mem.eql(u8, rname, "has_units")) {
                     const space = std.mem.indexOfScalar(u8, rtarget, ' ') orelse rtarget.len;
                     const owned = try table.allocator.dupe(u8, rtarget[0..space]);
@@ -308,8 +312,7 @@ pub const CvTable = struct {
     }
 };
 
-/// Extracts text between the first pair of double-quotes in `value`.
-/// Returns the original slice if no quotes are found.
+// Extracts text between the first pair of double-quotes in `value`.
 fn extractQuotedString(value: []const u8) []const u8 {
     const start = std.mem.indexOfScalar(u8, value, '"') orelse return value;
     const remaining = value[start + 1 ..];

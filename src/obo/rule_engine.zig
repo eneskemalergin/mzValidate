@@ -1,11 +1,11 @@
-//! Rule engine for CV term mapping rules from ms-mapping.xml.
+//! Rule engine for PSI-MS CV mapping rules (ms-mapping.xml).
 //!
-//! The rule engine parses the PSI's official CV mapping rules and provides
-//! lookup by element path. Each rule defines which CV terms MUST, SHOULD,
-//! or MAY appear on a given XML element.
+//! Parses the PSI's official mapping rules and provides path-based lookup.
+//! Each rule defines which CV terms MUST, SHOULD, or MAY appear on a given
+//! XML element path, and whether they combine via AND or OR logic.
 //!
 //! Usage:
-//!   var engine = try RuleEngine.init(allocator, embedded_xml);
+//!   var engine = try RuleEngine.init(allocator, mapping_xml);
 //!   defer engine.deinit();
 //!   const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
 
@@ -58,8 +58,8 @@ pub const RuleEngine = struct {
     }
 
     /// Linear scan to find rules for a given element path.
-    /// Only 34 rules in practice. Returns a slice of the internal rules array.
-    /// The caller must not rely on this slice being valid after the engine is mutated.
+    /// Returns a slice of the internal rules array that is invalidated
+    /// if the engine is mutated.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
         var start: ?usize = null;
         var end: usize = 0;
@@ -78,8 +78,8 @@ pub const RuleEngine = struct {
     }
 };
 
-/// Minimal XML parser for ms-mapping.xml. Handles only the subset needed:
-/// <CvMappingRule>, <CvTerm>, and their attributes.
+// Minimal XML parser for ms-mapping.xml. Handles only the subset needed:
+// <CvMappingRule>, <CvTerm>, and their attributes.
 fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
     var rules: std.ArrayList(MappingRule) = .empty;
     errdefer {
@@ -150,6 +150,8 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                 const close_tag = std.mem.indexOfPos(u8, xml, term_close, "</CvTerm>") orelse break;
                 inner_pos = close_tag + "</CvTerm>".len;
             }
+            // TODO: also parse useTerm, useTermName, cvIdentifierRef from CvTerm.
+            // Needed for value validation and multi-CV mapping.
             if (extractAttr(term_tag, "termAccession=\"")) |acc| {
                 const owned = try allocator.dupe(u8, acc);
                 const allow_children_str = extractAttr(term_tag, "allowChildren=\"");
@@ -183,8 +185,8 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
     return try rules.toOwnedSlice(allocator);
 }
 
-/// Extracts a quoted attribute value from an XML tag.
-/// e.g. extractAttr(`id="foo"`, `id="`) returns "foo".
+// Extracts a quoted attribute value from an XML tag.
+// e.g. extractAttr(`id="foo"`, `id="`) returns "foo".
 fn extractAttr(tag: []const u8, prefix: []const u8) ?[]const u8 {
     const start = std.mem.indexOfPos(u8, tag, 0, prefix) orelse return null;
     const value_start = start + prefix.len;

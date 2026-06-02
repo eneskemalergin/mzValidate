@@ -1,4 +1,13 @@
-//! Command-line parsing and top-level dispatch for mzValidate.
+//! CLI argument parsing, dispatch, and output.
+//!
+//! Three layers:
+//!   `run`:      Juicy Main entry point, wires stdout/stderr writers.
+//!   `runArgs`:  Public test seam that accepts caller-provided writers.
+//!   `runCheck`: Iterates inputs, collects diagnostics, picks the renderer.
+//!
+//! The rest is helpers: `parseArgs` converts argv into a `CheckCommand`,
+//! `writeUsage` and `writeParseError` format output, `findUnexpectedFlag`
+//! keeps the parsing loop clean.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -7,7 +16,6 @@ const validate = @import("validate.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
-/// Stores the parsed state for the `check` command.
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
@@ -18,18 +26,15 @@ pub const CheckCommand = struct {
     obo_path: ?[]const u8 = null,
     inputs: []const []const u8,
 
-    /// Frees command-owned allocations after dispatch.
     pub fn deinit(command: *CheckCommand, allocator: std.mem.Allocator) void {
         allocator.free(command.inputs);
         command.* = undefined;
     }
 };
 
-/// Represents the supported top-level CLI commands.
 pub const Command = union(enum) {
     check: CheckCommand,
 
-    /// Frees command-owned allocations regardless of the active variant.
     pub fn deinit(command: *Command, allocator: std.mem.Allocator) void {
         switch (command.*) {
             .check => |*check| check.deinit(allocator),
@@ -50,7 +55,6 @@ const ParseError = error{
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
-/// Parses arguments, runs the selected command, and returns the process exit code.
 pub fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(gpa);
@@ -69,9 +73,7 @@ pub fn run(init: std.process.Init) !u8 {
     return runArgs(gpa, init.io, stdout, stderr, args);
 }
 
-/// Runs the CLI against a caller-provided argument slice and writers.
-///
-/// This keeps the process-based `run` entry point thin and gives tests a stable
+/// Keeps the process-based `run` entry point thin and gives tests a stable
 /// public seam that does not depend on `std.process.Init` construction.
 pub fn runArgs(
     allocator: std.mem.Allocator,
@@ -115,7 +117,6 @@ pub fn runArgs(
     };
 }
 
-/// Parses CLI arguments into a command structure with owned inputs.
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseArgsError!Command {
     if (args.len < 2) return error.MissingCommand;
     if (!std.mem.eql(u8, args[1], "check")) return error.UnsupportedCommand;
@@ -342,8 +343,8 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
     return null;
 }
 
-/// Parses a byte-size string with optional binary suffix (K, M, G, T).
-/// Examples: "1024", "1K" (1024), "2M" (2 MiB), "1G" (1 GiB).
+// Parses a byte-size string with optional binary suffix (K, M, G, T).
+// Examples: "1024", "1K" (1024), "2M" (2 MiB), "1G" (1 GiB).
 fn parseSize(s: []const u8) error{ Overflow, InvalidValue }!usize {
     if (s.len == 0) return error.InvalidValue;
 
@@ -390,13 +391,9 @@ test "parseArgs_check_parsesFlagsAndInputs" {
         "sample-b.mzML",
     };
 
-    // Arrange.
-
-    // Act.
     var command = try parseArgs(allocator, &argv);
     defer command.deinit(allocator);
 
-    // Assert.
     switch (command) {
         .check => |check| {
             try std.testing.expectEqual(output.OutputMode.json, check.output_mode);
@@ -418,10 +415,6 @@ test "parseArgs_rejects_conflicting_output_modes" {
         "-summary",
     };
 
-    // Arrange.
-
-    // Act.
-    // Assert.
     try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
 }
 
@@ -433,10 +426,6 @@ test "parseArgs_rejects_check_without_inputs_even_when_flags_are_present" {
         "-summary",
     };
 
-    // Arrange.
-
-    // Act.
-    // Assert.
     try std.testing.expectError(error.MissingInputPath, parseArgs(std.testing.allocator, &argv));
 }
 
@@ -448,10 +437,6 @@ test "parseArgs_rejects_unknown_flag_before_any_input" {
         "sample.mzML",
     };
 
-    // Arrange.
-
-    // Act.
-    // Assert.
     try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 

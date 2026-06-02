@@ -1,4 +1,8 @@
-//! Executable entry point. Delegates everything to the library.
+//! Executable entry point. Three lines, one job.
+//!
+//! Juicy Main (`std.process.Init`) provides the allocator, I/O, and args.
+//! Everything else lives in the library so tests and downstream tools
+//! import `mzvalidate` and call `run(init)` directly.
 
 const std = @import("std");
 const mzvalidate = @import("mzvalidate");

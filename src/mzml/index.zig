@@ -1,9 +1,12 @@
-//! Index and checksum validation for indexed mzML files.
+//! Index offset verification and SHA-1 checksum validation.
 //!
-//! During the forward pass the validator records byte offsets of every
-//! spectrum and chromatogram, parses `<indexList>` entries, and captures
-//! `<indexListOffset>` and `<fileChecksum>` values. Cross-checks and SHA-1
-//! verification run in `finish()` against random-access file bytes (mmap).
+//! Two-pass design: the forward pass records byte offsets of every spectrum
+//! and chromatogram, parses `<indexList>` entries, and captures the declared
+//! `<indexListOffset>` and `<fileChecksum>`.  Then `finish()` cross-checks
+//! everything against the raw file bytes via mmap.
+//!
+//! Tolerates both pwiz offsets (pointing at `<`) and ThermoRawFileParser
+//! offsets (pointing at the line start before whitespace).
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -17,8 +20,7 @@ const StartElement = xml_events.StartElement;
 const Text = xml_events.Text;
 const QName = xml_events.QName;
 
-/// Namespace matched by the streaming mzML validators.
-const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+const mzml_namespace = diagnostic.mzml_namespace;
 
 const IndexKind = enum { spectrum, chromatogram };
 
@@ -73,7 +75,7 @@ pub const IndexValidator = struct {
     // Set true when any index-related element is encountered.
     saw_index_elements: bool = false,
 
-    /// True if the file appears to have an index (we saw at least one index element).
+    /// True after we see any index-related elements.
     pub fn isIndexed(validator: *const IndexValidator) bool {
         return validator.saw_index_elements;
     }
@@ -313,6 +315,16 @@ pub const IndexValidator = struct {
     ) void {
         if (!validator.saw_index_elements) return;
 
+        if (file_bytes == null) {
+            validator.diagnostics.append(validator.allocator, .{
+                .severity = .info,
+                .rule = RuleId.mzml_index_checksum,
+                .location = .{ .byte_offset = 0 },
+                .path = validator.path,
+                .message = "file bytes unavailable; SHA-1 and truncation checks skipped",
+            }) catch {};
+        }
+
         // Verify indexList declared count matches actual children.
         if (validator.index_list_declared_count) |declared| {
             if (declared != validator.index_list_actual_count) {
@@ -526,13 +538,9 @@ fn freeIndexEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(IndexE
     }
 }
 
-/// Checks whether two byte offsets can be considered a match.
-/// Exact match is always accepted.  If `declared` is before `actual`
-/// and the bytes between them are only whitespace (spaces, tabs, newlines),
-/// the offset is also accepted.  This handles tools that write index offsets
-/// pointing to the start of the line rather than the start of the element tag
-/// (e.g. ThermoRawFileParser).  When `file_bytes` is null, falls back to
-/// exact match only.
+// ThermoRawFileParser writes line-start offsets instead of element-start
+// offsets. Accept `declared` before `actual` when the gap is all whitespace.
+// Falls back to exact match when file_bytes is unavailable.
 fn offsetsMatchWithWhitespace(file_bytes: ?[]const u8, declared: u64, actual: u64) bool {
     if (declared == actual) return true;
     if (declared > actual) return false;
@@ -643,7 +651,8 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
 
     v.finish(null);
 
-    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
 }
 
 test "IndexValidator: bad offset value produces diagnostic" {
@@ -671,8 +680,9 @@ test "IndexValidator: bad offset value produces diagnostic" {
 
     v.finish(null);
 
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: reference to non-existent element produces diagnostic" {
@@ -698,8 +708,9 @@ test "IndexValidator: reference to non-existent element produces diagnostic" {
 
     v.finish(null);
 
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: indexListOffset mismatch produces diagnostic" {
@@ -725,8 +736,9 @@ test "IndexValidator: indexListOffset mismatch produces diagnostic" {
 
     v.finish(null);
 
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: truncated offset produces diagnostic" {
@@ -904,8 +916,9 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
 
     v.finish(null);
 
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
 }
 
 fn hexChar(nibble: u4) u8 {

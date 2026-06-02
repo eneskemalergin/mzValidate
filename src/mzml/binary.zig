@@ -1,4 +1,10 @@
-//! One-pass Phase 1 binary integrity checks for mzML payloads.
+//! Binary integrity checks for mzML payloads.
+//!
+//! Decodes base64, decompresses zlib, and validates array lengths against
+//! `defaultArrayLength` and declared precision.  Skips materializing the
+//! decoded output for uncompressed arrays (streaming base64 counter).
+//! For zlib arrays, decompresses into a scratch buffer reused between
+//! arrays to keep allocator churn low.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -13,8 +19,7 @@ const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
 
-/// Namespace matched by the streaming mzML validators.
-pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 
@@ -49,8 +54,8 @@ const ArrayKind = enum {
     time,
 };
 
-/// Tracks the decoded byte count of a base64 payload across chunked text events.
-/// No decoded bytes are materialized. Whitespace is ignored per the mzML spec.
+// Tracks the decoded byte count of a base64 payload across chunked text events.
+// No decoded bytes are materialized. Whitespace is ignored per the mzML spec.
 const StreamingBase64Counter = struct {
     sig_len: usize = 0,
     padding: usize = 0,
@@ -143,9 +148,7 @@ pub const BinaryValidator = struct {
     path: ?[]const u8,
     max_binary_size: ?usize = null,
 
-    // Binary validation retains only the current owner metadata plus one active
-    // binaryDataArray payload and its declarations. This bounds retained state to the
-    // current spectrum or chromatogram and one decoded workspace rather than the full file.
+    // Only one active binary array at a time. No accumulation across spectra.
     depth: usize = 0,
     indexed_mzml_depth: ?usize = null,
     mzml_depth: ?usize = null,
@@ -157,7 +160,6 @@ pub const BinaryValidator = struct {
     /// Cleared with `clearRetainingCapacity` at the start of each binary element.
     scratch_payload: std.ArrayList(u8) = .empty,
 
-    /// Creates a validator that appends diagnostics to the shared result list.
     pub fn init(
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
@@ -170,17 +172,13 @@ pub const BinaryValidator = struct {
         };
     }
 
-    /// Releases any active binary array workspace owned by the validator.
     pub fn deinit(validator: *BinaryValidator) void {
         validator.scratch_payload.deinit(validator.allocator);
         validator.* = undefined;
     }
 
-    /// After a binaryDataArray completes, optionally shrink the scratch buffer
-    /// to free capacity that would otherwise persist from occasional large arrays.
-    /// Only triggers when capacity exceeds a minimum threshold AND is significantly
-    /// larger than the actual data size, so typical files with uniform arrays see
-    /// no allocator churn.
+    // Prevent a single oversized array from hogging scratch capacity.
+    // Only kicks in when capacity > 1 MiB AND 4x the actual data.
     fn maybeShrinkScratch(validator: *BinaryValidator) void {
         const used: usize = validator.scratch_payload.items.len;
         if (used == 0) return;
@@ -193,7 +191,6 @@ pub const BinaryValidator = struct {
         }
     }
 
-    /// Runs the standalone binary validator over a reader-backed XML stream.
     pub fn validateReader(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -224,26 +221,22 @@ pub const BinaryValidator = struct {
         try validator.run(io, &parser);
     }
 
-    /// Consumes one start-element event from the shared XML traversal.
     pub fn consumeStart(validator: *BinaryValidator, start: StartElement) !void {
         const element_depth = validator.depth + 1;
         try validator.handleStart(start, element_depth);
         validator.depth += 1;
     }
 
-    /// Consumes one end-element event from the shared XML traversal.
     pub fn consumeEnd(validator: *BinaryValidator, end: EndElement) !void {
         const element_depth = validator.depth;
         try validator.handleEnd(end, element_depth);
         validator.depth -= 1;
     }
 
-    /// Consumes one text event from the shared XML traversal.
     pub fn consumeText(validator: *BinaryValidator, text: xml_events.Text) !void {
         try validator.handleText(text.value);
     }
 
-    /// Finalizes one-pass binary validation after the last XML event.
     pub fn finish(validator: *BinaryValidator) !void {
         _ = validator;
     }
@@ -674,6 +667,8 @@ pub const BinaryValidator = struct {
         }
 
         const element_count = decoded_bytes / width;
+        // TODO: when defaultArrayLength is null and the payload has data,
+        // we skip the length check entirely.  That is a false negative.
         const declared_count = state.default_array_length orelse return;
         if (element_count == declared_count) return;
 
@@ -708,8 +703,8 @@ pub const BinaryValidator = struct {
     }
 };
 
-/// Streaming inflate: decompresses zlib data and returns the decoded byte count
-/// without materializing the decompressed output. Uses a small stack buffer.
+// Streaming inflate: decompresses zlib data and returns the decoded byte count
+// without materializing the decompressed output. Uses a small stack buffer.
 fn inflateCount(compressed: []const u8) error{InvalidBinaryPayload}!usize {
     var input = std.Io.Reader.fixed(compressed);
     var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
@@ -745,11 +740,8 @@ fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
     return std.fmt.parseUnsigned(usize, slice, 10) catch null;
 }
 
-/// All `is_a: MS:1000572` (binary data compression type) terms from the
-/// PSI-MS controlled vocabulary. Unsupported terms are accepted for
-/// recognition and diagnostic reporting; they produce a
-/// `mzml.binary.compression` diagnostic rather than being silently
-/// treated as "no compression".
+// Recognise unsupported compression types so we can report them instead
+// of silently treating them as "no compression".
 fn isCompressionAccession(accession: []const u8) bool {
     return std.mem.eql(u8, accession, "MS:1000574") or
         std.mem.eql(u8, accession, "MS:1000576") or
@@ -1299,9 +1291,7 @@ test "binary validator scratch buffer shrink survives multi-array file" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Two uncompressed arrays in a chromatogram. Each array uses a small
-    // base64 payload. The scratch buffer is not used for uncompressed
-    // arrays, so the shrink path is exercised as a no-op.
+    // Uncompressed arrays exercise the shrink path as a no-op.
     var diagnostics = try runBinaryValidation(allocator, io, minimalChromatogramMzml("AAAAAA==", "AAAAAA=="));
     defer diagnostics.deinit(allocator);
 

@@ -3,7 +3,7 @@
 <h1 align="center">mzValidate</h1>
 
 <p align="center">
-  A fast, zero-dependency validator for open proteomics data formats. Written in Zig. Single static binary. Streaming single-pass validation.
+  Validates mzML files. No runtime required. Single binary, no dependencies.
 </p>
 
 <p align="center">
@@ -11,10 +11,9 @@
     <img src="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
   </a>
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
-  <img src="https://img.shields.io/badge/status-early_research-yellow?style=flat-square" alt="status: early research">
-  <img src="https://img.shields.io/badge/license-MIT-4B9D6E?style=flat-square" alt="MIT">
+  <img src="https://img.shields.io/badge/status-development-green?style=flat-square" alt="status: development">
   <br/>
-  <img src="https://img.shields.io/badge/mzML-L1_structural_✓_L2_binary_✓_L3_index_✓_L4_semantic_✓-4B9D6E?style=flat-square" alt="mzML L1-L4 ready">
+  <img src="https://img.shields.io/badge/mzML-validated-4B9D6E?style=flat-square" alt="mzML validated">
 </p>
 
 ---
@@ -36,18 +35,16 @@ No XML schema is embedded or required. All validation is driven by format-aware 
 ---
 
 - No JVM, no Python, no .NET, no libxml2.
-- Streaming XML parser in a single forward pass, no DOM, constant memory.
+- Streaming XML parser in a single forward pass, no DOM, bounded memory.
 - Structural validation: element nesting, required attributes, list counts, child-element presence.
 - Binary integrity: base64 decoding, zlib decompression, `defaultArrayLength` cross-check, precision validation.
 - Uncompressed arrays validated by counting base64 characters incrementally, no materialization.
-- Zlib arrays counted through streaming inflate, no allocation of decompressed output.
-- Corpus-validated with known-good and known-bad fixtures, adversarial edge cases, and fuzz targets.
+- Zlib arrays validated through streaming inflate, no allocation of decompressed output.
+- Tested against known-good and known-bad fixtures, adversarial edge cases, and fuzz targets.
 
 ## Requirements
 
 Zig **0.16.0** or later to build from source.
-
-Pre-built static binaries for Linux x86_64, Linux aarch64, and macOS arm64. No runtime dependencies.
 
 ## Installation
 
@@ -60,13 +57,6 @@ zig build -Doptimize=ReleaseFast
 ```
 
 The binary is placed at `zig-out/bin/mzValidate`.
-
-### Download a release
-
-```sh
-curl -L https://github.com/eneskemalergin/mzValidate/releases/download/v0.1.2/mzValidate-x86_64-linux.tar.gz | tar xz
-./mzValidate check myfile.mzML
-```
 
 ## Quick start
 
@@ -106,36 +96,36 @@ mzValidate check -summary file1.mzML file2.mzML
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
 
-## Validation levels
+## Validation
 
-Validation runs in a single streaming pass over the file. All levels share the same parser and diagnostic list.
+Every file is checked in a single streaming pass. Same parser, same diagnostic list.
 
-### Level 1: Structural <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
+### Structural
 
-XML well-formedness and mzML schema conformance. Catches missing elements, wrong nesting, invalid attributes, list count mismatches. Namespace-aware. No XSD dependency.
+XML well-formedness and mzML schema conformance. Catches missing elements, wrong nesting, invalid attributes, list count mismatches. Namespace-aware. No XSD required.
 
-### Level 2: Binary Integrity <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
+### Binary integrity
 
-mzML stores spectral data as base64-encoded, optionally compressed arrays inside XML. Every array is validated: the byte count is checked against `defaultArrayLength`, and the encoded precision (32-bit or 64-bit float) is verified against the declared CV term.
+mzML stores spectral data as base64-encoded, optionally compressed arrays. Each array is checked: byte count against `defaultArrayLength`, precision (32 or 64 bit) against the declared CV term.
 
-**Supported compression:** `MS:1000576` (no compression) and `MS:1000574` (zlib). Uncompressed arrays are validated by counting base64 characters incrementally with no materialization. Zlib arrays are decoded and streamed through `std.compress.flate` with no allocation of the inflated buffer.
+Supported compression: `MS:1000576` (none) and `MS:1000574` (zlib). Uncompressed arrays are validated by counting base64 characters incrementally without decoding the payload. Zlib arrays stream through `std.compress.flate` with no inflated buffer allocation.
 
-**Recognized but not yet implemented:** All remaining `is_a: MS:1000572` (binary data compression type) terms (MS-Numpress variants `MS:1002312`–`MS:1002314`, `MS:1002746`–`MS:1002748`, truncation-based schemes `MS:1003089`, `MS:1003090`) produce a diagnostic (`mzml.binary.compression`) signaling unsupported compression rather than being silently misvalidated.
+Other compression schemes (MS-Numpress, truncation-based) are recognised and reported as unsupported (`mzml.binary.compression`) rather than passing silently.
 
-### Level 3: Index & Checksum <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
+### Index and checksum
 
-Index offset verification, SHA-1 checksum recomputation, truncation detection for indexed mzML. Supports both streaming and mmap I/O (`-mmap` flag).
+For indexed mzML files: validates every index offset against the actual byte position, recomputes the SHA-1 checksum, and detects truncated files. SHA-1 requires random access to the file (mmap or read into memory). When streaming without the file bytes available, index validation runs without checksum and truncation checks.
 
-### Level 4: Semantic <img src="https://img.shields.io/badge/ready-4B9D6E?style=flat-square" alt="ready">
+### Semantic
 
-CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo v4.1.248), `*Ref` attribute resolution, unit term validation, contradictory term detection, and required-term checks from the official `ms-mapping.xml` rule set. Uses a `CvTable` for O(1) accession lookup. Disable with `-skip-semantic`.
+CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo 4.1.248), `*Ref` attribute resolution, unit term validation, contradiction checks, and required-term enforcement from the official `ms-mapping.xml` rules. Can be disabled with `-skip-semantic`.
 
-- **CV checks:** every `<cvParam>` accession is resolved against the embedded OBO. Obsolete terms are flagged with their replacement.
-- **Unit checks:** `unitAccession` is validated against the Unit Ontology (UO). `unitName` is checked against the canonical term name.
-- **Contradiction detection:** mutual exclusive OR terms on the same element (centroid + profile, positive + negative polarity).
-- **Required-term checks:** MUST/SHOULD rules from `ms-mapping.xml` are enforced on every element.
-- **Reference resolution:** all `*Ref` attributes are resolved against declared `id` values. Duplicate IDs are flagged.
-- **IM-MS / DIA:** CV terms for ion mobility and data-independent acquisition are recognised without false positives.
+- Every `<cvParam>` accession is resolved against the embedded OBO. Obsolete terms are flagged.
+- Unit accessions are validated against the Unit Ontology. Unit names are checked against the canonical term.
+- Mutually exclusive OR terms on the same element (centroid + profile, positive + negative) are flagged.
+- MUST and SHOULD rules from `ms-mapping.xml` are enforced per element.
+- All `*Ref` attributes are resolved against declared `id` values. Duplicate IDs are flagged.
+- IM-MS and DIA CV terms are recognised without false positives.
 
 ### Rule reference
 
@@ -172,13 +162,13 @@ CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo v4.
 
 ### Streaming XML parser
 
-No DOM, no full-file buffer. Events are read in a single forward pass over a `std.Io.Reader`. Memory stays flat regardless of file size for Levels 1-3. A 50 GB mzML file validates in the same footprint as a 50 MB one.
+No DOM, no full-file buffer. Events are read in a single forward pass over a `std.Io.Reader`. Memory use stays flat for structural, binary, and index checks regardless of file size. (Semantic validation accumulates ID tables, so memory grows with spectrum count.)
 
 Hand-rolled in Zig. No libxml2, no expat, no dependency.
 
 ### Validation engine
 
-Checks register as independent rules. Each rule receives the XML event stream and emits zero or more diagnostics. The structural and binary validators share the same parser and diagnostic list, with events dispatched to both in parallel.
+Structural and binary validators share the same parser and diagnostic list. Events are dispatched to both in parallel during a single pass.
 
 ### Output modes
 
@@ -187,12 +177,12 @@ Four renderers from the same diagnostic model. Text for interactive use. JSON fo
 ## Testing
 
 ```sh
-zig build test               # 100+ unit tests, memory leak detection, fuzzing
-zig build cli-contract       # Known-good and known-bad fixture checks
-zig build fuzz-smoke         # Deterministic fuzz targets
-zig build resource-check     # Peak RSS gate
-zig build throughput-baseline # Release-mode throughput gate
-zig build ci                 # All of the above
+zig build test                # Unit tests with leak detection
+zig build cli-contract        # Valid and invalid fixture checks
+zig build fuzz-smoke          # Random and mutation-based fuzzing
+zig build resource-check      # Peak RSS profiling
+zig build throughput-baseline # Release-mode throughput metrics
+zig build ci                 # test + cli-contract + fuzz-smoke + throughput-baseline
 ```
 
 ## Build steps

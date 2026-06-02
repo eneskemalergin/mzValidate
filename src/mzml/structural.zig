@@ -1,4 +1,16 @@
-//! One-pass Phase 1 structural validation for mzML documents.
+//! Structural validation: element nesting, ordering, required attributes.
+//!
+//! Validates every element in the mzML 1.1 schema:
+//!   - Root element is `mzML` in the correct namespace
+//!   - Top-level children appear in schema order (cvList, fileDescription, ...)
+//!   - Required attributes are present on every element type
+//!   - List counts match actual children (`count` attribute vs children seen)
+//!   - Required children exist (e.g. fileContent in fileDescription)
+//!   - No duplicate top-level elements
+//!   - Spectrum/chromatogram/component child ordering
+//!
+//! Does not handle binary payloads, index offsets, or CV terms.
+//! Those are delegated to their own validators.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -15,8 +27,7 @@ const RuleId = diagnostic.RuleId;
 const Severity = diagnostic.Severity;
 const StartElement = xml_events.StartElement;
 
-/// Namespace matched by the streaming mzML validators.
-pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_structural_token_bytes = 1024 * 1024;
 
 const TopLevelSlot = enum(u8) {
@@ -128,9 +139,7 @@ pub const StructuralValidator = struct {
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
 
-    // Structural validation retains only the current nesting depth, top-level ordering,
-    // and active local container/list state needed to validate the current branch.
-    // Completed spectra and chromatograms are discarded as soon as their end element is seen.
+    // Bounded: spectra/chromatograms are discarded after their end element.
     depth: usize = 0,
     root_seen: bool = false,
     root_valid: bool = false,
@@ -146,8 +155,8 @@ pub const StructuralValidator = struct {
     instrument_configuration_list_seen: bool = false,
     data_processing_list_seen: bool = false,
     last_top_level_slot: u8 = 0,
-    /// Bitmask of TopLevelSlot values whose duplicate diagnostic has already
-    /// been emitted.  Prevents N duplicates from producing N-1 error messages.
+    // Bitmask of TopLevelSlot values whose duplicate diagnostic has already
+    // been emitted.  Prevents N duplicates from producing N-1 error messages.
     dup_reported_mask: u32 = 0,
 
     run_seen: bool = false,
@@ -191,7 +200,6 @@ pub const StructuralValidator = struct {
     spectrum: ?ContainerState = null,
     chromatogram: ?ContainerState = null,
 
-    /// Creates a validator that appends structural diagnostics to the shared list.
     pub fn init(
         allocator: std.mem.Allocator,
         diagnostics: *std.ArrayList(Diagnostic),
@@ -204,12 +212,10 @@ pub const StructuralValidator = struct {
         };
     }
 
-    /// Structural validation does not own long-lived allocations today.
     pub fn deinit(validator: *StructuralValidator) void {
         _ = validator;
     }
 
-    /// Runs the standalone structural validator over a reader-backed XML stream.
     pub fn validateReader(
         allocator: std.mem.Allocator,
         io: std.Io,
@@ -238,26 +244,22 @@ pub const StructuralValidator = struct {
         try validator.run(io, &parser);
     }
 
-    /// Consumes one start-element event from the shared XML traversal.
     pub fn consumeStart(validator: *StructuralValidator, start: StartElement) !void {
         const element_depth = validator.depth + 1;
         try validator.handleStart(start, element_depth);
         validator.depth += 1;
     }
 
-    /// Consumes one end-element event from the shared XML traversal.
     pub fn consumeEnd(validator: *StructuralValidator, end: EndElement) !void {
         const element_depth = validator.depth;
         try validator.handleEnd(end, element_depth);
         validator.depth -= 1;
     }
 
-    /// Consumes one text event from the shared XML traversal.
     pub fn consumeText(validator: *StructuralValidator, text: xml_events.Text) !void {
         try validator.handleText(text.value, text.byte_offset);
     }
 
-    /// Emits any root or container diagnostics that can only be decided at end of stream.
     pub fn finish(validator: *StructuralValidator) !void {
         if (!validator.root_seen) {
             try validator.appendDiagnostic(.{
@@ -386,10 +388,8 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        // Handle elements that appear as direct children of <indexedmzML>
-        // but OUTSIDE <mzML> i.e. indexList, indexListOffset, fileChecksum.
-        // These run after </mzML> closes (mzml_depth = null) so the normal
-        // isWithinMzmlStartScope check on line 369 would skip them.
+        // indexList, indexListOffset, fileChecksum sit outside <mzML> under
+        // <indexedmzML>. Need explicit handling since mzml_depth is null.
         if (validator.indexed_mzml_depth != null and
             element_depth == validator.indexed_mzml_depth.? + 1 and
             (start.name.matches(mzml_namespace, "indexList") or
@@ -493,10 +493,8 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        // Index and checksum elements. These are optional post-run top-level children.
-        // They must appear after <run> and follow their own ordering:
-        //   indexList → indexListOffset → fileChecksum
-        // Deep index content validation is done by IndexValidator (index.zig).
+        // Post-run: indexList > indexListOffset > fileChecksum.
+        // Content validation delegated to IndexValidator.
 
         if (start.name.matches(mzml_namespace, "indexList")) {
             if (!validator.run_seen) {
@@ -855,9 +853,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        // cvParam and userParam are validated by the semantic validator,
-        // not the structural validator. Return early to avoid hitting the
-        // unknown-element catch-all below.
+        // Handled by SemanticValidator. Return early to avoid the catch-all.
         if (start.name.matches(mzml_namespace, "cvParam")) return;
         if (start.name.matches(mzml_namespace, "userParam")) return;
 
@@ -879,7 +875,7 @@ pub const StructuralValidator = struct {
         }
     }
 
-    /// Returns true for every element name defined in the mzML 1.1.0 schema.
+    // Returns true for every element name defined in the mzML 1.1.0 schema.
     fn isKnownMzmlElement(name: []const u8) bool {
         return std.mem.eql(u8, name, "activation") or
             std.mem.eql(u8, name, "analyzer") or
@@ -1438,8 +1434,6 @@ pub const StructuralValidator = struct {
         try validator.attributeError(start.byte_offset, message);
     }
 
-    /// Checks that an attribute value is a non-negative integer. Emits a
-    /// diagnostic if the value is missing, non-numeric, or negative.
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
         _ = element_label;
         const value = attributeValue(start.attributes, attribute_name) orelse return;

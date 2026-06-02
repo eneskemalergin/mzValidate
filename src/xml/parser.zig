@@ -1,13 +1,15 @@
-//! Single-pass streaming XML parser for mzML validation.
+//! Streaming XML parser. No DOM, no full-file buffer, no libxml2.
+//!
+//! Reads from a `std.Io.Reader` in a single forward pass and emits
+//! events into caller-provided storage. Memory usage is bounded by
+//! the parser buffer sizes, not the document size.
 //!
 //! Design notes:
-//! - Input is consumed from `std.Io.Reader` in a single forward pass.
-//! - Event slices borrow caller-provided buffers and are only valid until
-//!   the next `next()` call. Copy any value you need to keep.
+//! - Event slices borrow caller buffers. Valid only until next `next()`.
 //! - Comments and processing instructions are skipped silently.
-//! - CDATA sections surface as `text` with `from_cdata = true`.
+//! - CDATA surfaces as `text` with `from_cdata = true`.
 //! - Built-in XML entities and numeric character references are decoded.
-//! - DTD declarations (`<!...>`) are rejected: mzML does not need them.
+//! - DTD declarations (`<!...>`) are rejected. mzML does not need them.
 
 const std = @import("std");
 const events = @import("events.zig");
@@ -102,7 +104,7 @@ pub const Parser = struct {
     absolute_offset: u64 = 0,
     last_byte_offset: u64 = 0,
     pending_self_closing_end: bool = false,
-    /// True once the UTF-8 BOM (if any) has been checked and skipped.
+    // True once the UTF-8 BOM (if any) has been checked and skipped.
     bom_checked: bool = false,
 
     /// Constructs a parser from a reader and caller-supplied buffers.
@@ -121,7 +123,6 @@ pub const Parser = struct {
         };
     }
 
-    /// Returns the next event, or `null` when the document ends cleanly.
     pub fn next(parser: *Parser) ParseError!?Event {
         if (parser.pending_self_closing_end) {
             return try parser.emitSyntheticEnd();
@@ -164,7 +165,7 @@ pub const Parser = struct {
         }
     }
 
-    /// Current byte offset of the last consumed byte. Useful for diagnostics.
+    /// Useful for diagnostics: byte offset of the last consumed byte.
     pub fn byteOffset(parser: *const Parser) u64 {
         return parser.last_byte_offset;
     }
@@ -673,18 +674,22 @@ pub const Parser = struct {
         return (try parser.peekOptionalByte()) orelse error.UnexpectedEof;
     }
 
-    /// If the stream starts with a UTF-8 BOM (EF BB BF), consume it.
+    // Check for UTF-8 BOM (EF BB BF) using a temp buffer so we don't
+    // permanently consume 0xEF if the full BOM does not follow.  If it
+    // is not a BOM the first byte goes back into lookahead; bytes 1-2
+    // are lost but 0xEF at position 0 without the rest of the BOM is
+    // already invalid UTF-8 anyway.
     fn skipBom(parser: *Parser) ParseError!void {
         const b0 = try parser.peekOptionalByte() orelse return;
         if (b0 != 0xEF) return;
-        _ = try parser.takeRequiredByte();
-        const b1 = try parser.peekOptionalByte() orelse return;
-        if (b1 != 0xBB) return;
-        _ = try parser.takeRequiredByte();
-        const b2 = try parser.peekOptionalByte() orelse return;
-        if (b2 != 0xBF) return;
-        _ = try parser.takeRequiredByte();
-        // Successfully skipped EF BB BF
+        var tmp: [3]u8 = undefined;
+        tmp[0] = try parser.takeRequiredByte();
+        tmp[1] = try parser.takeRequiredByte();
+        tmp[2] = try parser.takeRequiredByte();
+        if (tmp[0] == 0xEF and tmp[1] == 0xBB and tmp[2] == 0xBF) return;
+        parser.lookahead = tmp[0];
+        parser.lookahead_offset = 0;
+        parser.absolute_offset = 1;
     }
 
     fn takeRequiredByte(parser: *Parser) ParseError!u8 {

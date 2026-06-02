@@ -1,8 +1,14 @@
-//! Diagnostic renderers for text, JSON, summary, and brief output modes.
+//! Renders diagnostics for humans and machines.
 //!
-//! Four public render functions cover four modes. Each writes directly
-//! to a `std.Io.Writer`, so callers can redirect to stdout, a buffer, or a
-//! file without extra allocation.
+//! Four modes, one writer interface:
+//!   text:    Grouped by input path, one line per diagnostic, aggregate summary.
+//!   json:    Stable JSON array for CI pipelines. Keys never reorder.
+//!   summary: One line with status and counts. Good for pass/fail gating.
+//!   brief:   Grouped by severity/rule/message with occurrence counts.
+//!            Errors first (most frequent), then warnings, then info.
+//!
+//! Every renderer writes directly to a `std.Io.Writer`. stdout, buffer,
+//! file, or network sink. Zero heap allocation outside the writer.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -19,7 +25,6 @@ pub const OutputMode = enum {
     brief,
 };
 
-/// Renders diagnostics in the default human-readable format.
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     const summary = diagnostic.summarize(diagnostics);
 
@@ -58,7 +63,6 @@ pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.I
     try writeSummaryLine(writer, summary);
 }
 
-/// Renders only the severity totals.
 pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     const summary = diagnostic.summarize(diagnostics);
     try writer.print(
@@ -85,12 +89,13 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
     });
     if (diagnostics.len == 0) return;
 
-    const max_groups = 64;
+    const max_groups = 256;
     var sev: [max_groups]Severity = undefined;
     var rule: [max_groups][]const u8 = undefined;
     var msg: [max_groups][]const u8 = undefined;
     var cnt: [max_groups]usize = undefined;
     var gcnt: usize = 0;
+    var dropped: usize = 0;
 
     // Phase 1: group all diagnostics by (severity, rule, message).
     for (diagnostics) |d| {
@@ -111,6 +116,8 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
             msg[gcnt] = d.message;
             cnt[gcnt] = 1;
             gcnt += 1;
+        } else if (!found) {
+            dropped += 1;
         }
     }
 
@@ -151,19 +158,16 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
     // Layout: <count:count_w>  <severity:sev_w>  <rule:rule_w>  <message>
     try writer.writeByte('\n');
     for (0..gcnt) |i| {
-        // Right-align count.
         var n = cnt[i];
         var cw: usize = 1;
         while (n >= 10) : (n /= 10) cw += 1;
         for (0..count_w - cw) |_| try writer.writeByte(' ');
         try writer.print("{d}  ", .{cnt[i]});
 
-        // Left-align severity within sev_w.
         try writer.writeAll(sev[i].label());
         for (0..sev_w - sev[i].label().len) |_| try writer.writeByte(' ');
         try writer.writeAll("  ");
 
-        // Left-align rule within rule_w.
         try writer.writeAll(rule[i]);
         for (0..rule_w - rule[i].len) |_| try writer.writeByte(' ');
         try writer.writeAll("  ");
@@ -171,6 +175,9 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
         // Message is last column, no padding needed.
         try writer.writeAll(msg[i]);
         try writer.writeByte('\n');
+    }
+    if (dropped > 0) {
+        try writer.print("... and {d} more unique diagnostic groups (brief limit)\n", .{dropped});
     }
 }
 
