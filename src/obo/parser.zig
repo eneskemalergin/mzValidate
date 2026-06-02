@@ -25,6 +25,12 @@ pub const CvTerm = struct {
     is_a: [][]const u8,
     relationships: []Relationship,
     synonyms: [][]const u8,
+    /// XSD type for cvParam value validation (F1). Parsed from `relationship: has_value_type xsd:TYPE`.
+    xsd_type: ?[]const u8 = null,
+    /// Allowed unit accessions for this term (F4). Parsed from `relationship: has_units ACC`.
+    allowed_units: [][]const u8 = &.{},
+    /// Allowed binary data type accessions (F3). Parsed from `xref: binary-data-type:ACC`.
+    binary_data_types: [][]const u8 = &.{},
 };
 
 pub const CvTable = struct {
@@ -44,8 +50,6 @@ pub const CvTable = struct {
     }
 
     pub fn deinit(table: *CvTable) void {
-        // Free all CvTerm heap allocations before deinitting the map.
-        // map.deinit() frees buckets/metadata only (not key/value data).
         var it = table.map.iterator();
         while (it.next()) |entry| {
             const term = entry.value_ptr;
@@ -63,6 +67,11 @@ pub const CvTable = struct {
             if (term.relationships.len > 0) table.allocator.free(term.relationships);
             for (term.synonyms) |syn| table.allocator.free(syn);
             if (term.synonyms.len > 0) table.allocator.free(term.synonyms);
+            if (term.xsd_type) |v| table.allocator.free(v);
+            for (term.allowed_units) |u| table.allocator.free(u);
+            if (term.allowed_units.len > 0) table.allocator.free(term.allowed_units);
+            for (term.binary_data_types) |b| table.allocator.free(b);
+            if (term.binary_data_types.len > 0) table.allocator.free(term.binary_data_types);
         }
         table.map.deinit();
         table.ns_prefix.deinit();
@@ -123,13 +132,18 @@ pub const CvTable = struct {
         var namespace: ?[]const u8 = null;
         var is_obsolete: bool = false;
         var replaced_by: ?[]const u8 = null;
+        var xsd_type: ?[]const u8 = null;
         var is_a_list: std.ArrayList([]const u8) = .empty;
         var rel_list: std.ArrayList(Relationship) = .empty;
         var syn_list: std.ArrayList([]const u8) = .empty;
+        var unit_list: std.ArrayList([]const u8) = .empty;
+        var binary_type_list: std.ArrayList([]const u8) = .empty;
         defer {
             is_a_list.deinit(table.allocator);
             rel_list.deinit(table.allocator);
             syn_list.deinit(table.allocator);
+            unit_list.deinit(table.allocator);
+            binary_type_list.deinit(table.allocator);
         }
 
         while (lines.next()) |raw_line| {
@@ -139,11 +153,13 @@ pub const CvTable = struct {
 
             if (line[0] == '[') {
                 if (in_term) {
-                    try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, &is_a_list, &rel_list, &syn_list);
-                    id = null; name = null; def_val = null; namespace = null; is_obsolete = false; replaced_by = null;
+                    try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, xsd_type, &is_a_list, &rel_list, &syn_list, &unit_list, &binary_type_list);
+                    id = null; name = null; def_val = null; namespace = null; is_obsolete = false; replaced_by = null; xsd_type = null;
                     is_a_list.clearRetainingCapacity();
                     rel_list.clearRetainingCapacity();
                     syn_list.clearRetainingCapacity();
+                    unit_list.clearRetainingCapacity();
+                    binary_type_list.clearRetainingCapacity();
                 }
                 in_term = true;
                 continue;
@@ -171,6 +187,26 @@ pub const CvTable = struct {
                 replaced_by = value;
             } else if (std.mem.eql(u8, tag, "consider")) {
                 if (replaced_by == null) replaced_by = value;
+            } else if (std.mem.eql(u8, tag, "xref")) {
+                // Parse xref: binary-data-type:MS\:1000521 "32-bit float"
+                if (std.mem.startsWith(u8, value, "binary-data-type:")) {
+                    const acc_start = "binary-data-type:".len;
+                    const rest = value[acc_start..];
+                    // The accession may use backslash-escaped colons.
+                    const space_pos = std.mem.indexOfScalar(u8, rest, ' ') orelse continue;
+                    var acc_buf: [128]u8 = undefined;
+                    var acc_len: usize = 0;
+                    var i: usize = 0;
+                    while (i < space_pos) : (i += 1) {
+                        if (rest[i] == '\\' and i + 1 < colon) {
+                            i += 1;
+                        }
+                        acc_buf[acc_len] = rest[i];
+                        acc_len += 1;
+                    }
+                    const owned = try table.allocator.dupe(u8, acc_buf[0..acc_len]);
+                    try binary_type_list.append(table.allocator, owned);
+                }
             } else if (std.mem.eql(u8, tag, "is_a")) {
                 const space = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
                 const owned = try table.allocator.dupe(u8, value[0..space]);
@@ -183,6 +219,18 @@ pub const CvTable = struct {
                     .name = try table.allocator.dupe(u8, rname),
                     .target = try table.allocator.dupe(u8, rtarget),
                 });
+                // Extract xsd type for F1 cv value validation.
+                if (std.mem.eql(u8, rname, "has_value_type")) {
+                    if (std.mem.startsWith(u8, rtarget, "xsd:")) {
+                        xsd_type = rtarget;
+                    }
+                }
+                // Extract allowed units for F4.
+                if (std.mem.eql(u8, rname, "has_units")) {
+                    const space = std.mem.indexOfScalar(u8, rtarget, ' ') orelse rtarget.len;
+                    const owned = try table.allocator.dupe(u8, rtarget[0..space]);
+                    try unit_list.append(table.allocator, owned);
+                }
             } else if (std.mem.eql(u8, tag, "synonym")) {
                 if (value.len > 0 and value[0] == '"') {
                     const close = std.mem.indexOfScalar(u8, value[1..], '"') orelse continue;
@@ -193,7 +241,7 @@ pub const CvTable = struct {
         }
 
         if (in_term) {
-            try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, &is_a_list, &rel_list, &syn_list);
+            try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, xsd_type, &is_a_list, &rel_list, &syn_list, &unit_list, &binary_type_list);
         }
     }
 
@@ -205,9 +253,12 @@ pub const CvTable = struct {
         namespace: ?[]const u8,
         is_obsolete: bool,
         replaced_by: ?[]const u8,
+        xsd_type: ?[]const u8,
         is_a_list: *std.ArrayList([]const u8),
         rel_list: *std.ArrayList(Relationship),
         syn_list: *std.ArrayList([]const u8),
+        unit_list: *std.ArrayList([]const u8),
+        binary_type_list: *std.ArrayList([]const u8),
     ) !void {
         const acc = id orelse return;
         const nm = name orelse "__unnamed__";
@@ -226,6 +277,9 @@ pub const CvTable = struct {
             .is_a = try is_a_list.toOwnedSlice(table.allocator),
             .relationships = try rel_list.toOwnedSlice(table.allocator),
             .synonyms = try syn_list.toOwnedSlice(table.allocator),
+            .xsd_type = if (xsd_type) |v| try table.allocator.dupe(u8, v) else null,
+            .allowed_units = try unit_list.toOwnedSlice(table.allocator),
+            .binary_data_types = try binary_type_list.toOwnedSlice(table.allocator),
         };
 
         table.map.put(term.accession, term) catch |err| {
@@ -244,6 +298,11 @@ pub const CvTable = struct {
             if (term.relationships.len > 0) table.allocator.free(term.relationships);
             for (term.synonyms) |syn| table.allocator.free(syn);
             if (term.synonyms.len > 0) table.allocator.free(term.synonyms);
+            if (term.xsd_type) |v| table.allocator.free(v);
+            for (term.allowed_units) |u| table.allocator.free(u);
+            if (term.allowed_units.len > 0) table.allocator.free(term.allowed_units);
+            for (term.binary_data_types) |b| table.allocator.free(b);
+            if (term.binary_data_types.len > 0) table.allocator.free(term.binary_data_types);
             return err;
         };
     }

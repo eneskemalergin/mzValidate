@@ -133,8 +133,13 @@ pub const SemanticValidator = struct {
     /// Per-scope term accessions collected for contradiction detection.
     scope_terms: std.ArrayList(std.ArrayList([]const u8)),
 
-    /// Reference resolution table (Slice F).
+    /// Reference resolution table.
     ref_table: RefTable,
+
+    /// ReferenceableParamGroup id -> list of cvParam accessions.
+    param_groups: std.StringHashMap(std.ArrayList([]const u8)),
+    /// Set when inside a referenceableParamGroup to capture its id.
+    current_group_id: ?[]const u8 = null,
 
     pub fn init(allocator: std.mem.Allocator, cv_table: *const CvTable, engine: *const RuleEngine, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) SemanticValidator {
         return .{
@@ -147,6 +152,7 @@ pub const SemanticValidator = struct {
             .element_names = std.ArrayList([]const u8).empty,
             .scope_terms = std.ArrayList(std.ArrayList([]const u8)).empty,
             .ref_table = RefTable.init(allocator),
+            .param_groups = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
         };
     }
 
@@ -161,6 +167,16 @@ pub const SemanticValidator = struct {
             list.deinit(validator.allocator);
         }
         validator.scope_terms.deinit(validator.allocator);
+        // Free param_groups entries.
+        {
+            var pg_it = validator.param_groups.iterator();
+            while (pg_it.next()) |entry| {
+                validator.allocator.free(entry.key_ptr.*);
+                for (entry.value_ptr.items) |acc| validator.allocator.free(acc);
+                entry.value_ptr.deinit(validator.allocator);
+            }
+        }
+        validator.param_groups.deinit();
         validator.ref_table.deinit();
     }
 
@@ -222,6 +238,29 @@ pub const SemanticValidator = struct {
             const owned = try validator.allocator.dupe(u8, start.name.local_name);
             try validator.element_names.append(validator.allocator, owned);
             try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
+
+            // Track referenceableParamGroup id for later capture.
+            if (start.name.matches(mzml_namespace, "referenceableParamGroup")) {
+                validator.current_group_id = attributeValue(start.attributes, "id");
+            }
+
+            // Resolve referenceableParamGroupRef: add group's cvParams to parent scope.
+            if (start.name.matches(mzml_namespace, "referenceableParamGroupRef")) {
+                if (attributeValue(start.attributes, "ref")) |ref_id| {
+                    if (validator.param_groups.get(ref_id)) |group_terms| {
+                        if (validator.scope_terms.items.len >= 2) {
+                            const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
+                            for (group_terms.items) |acc| {
+                                const owned_acc = try validator.allocator.dupe(u8, acc);
+                                parent.append(validator.allocator, owned_acc) catch {
+                                    validator.allocator.free(owned_acc);
+                                    return;
+                                };
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         const accession = attributeValue(start.attributes, "accession") orelse return;
@@ -366,6 +405,42 @@ pub const SemanticValidator = struct {
             scope.deinit(validator.allocator);
         }
 
+        // Capture referenceableParamGroup cvParams for later ref resolution.
+        if (end.name.matches(mzml_namespace, "referenceableParamGroup")) {
+            if (validator.current_group_id) |group_id| {
+                if (validator.param_groups.get(group_id) == null) {
+                    const owned_id = validator.allocator.dupe(u8, group_id) catch {
+                        validator.current_group_id = null;
+                        return;
+                    };
+                    var term_list = std.ArrayList([]const u8).empty;
+                    for (scope.items) |acc| {
+                        const owned = validator.allocator.dupe(u8, acc) catch {
+                            for (term_list.items) |t| validator.allocator.free(t);
+                            term_list.deinit(validator.allocator);
+                            validator.allocator.free(owned_id);
+                            validator.current_group_id = null;
+                            return;
+                        };
+                        term_list.append(validator.allocator, owned) catch {
+                            validator.allocator.free(owned);
+                            for (term_list.items) |t| validator.allocator.free(t);
+                            term_list.deinit(validator.allocator);
+                            validator.allocator.free(owned_id);
+                            validator.current_group_id = null;
+                            return;
+                        };
+                    }
+                    validator.param_groups.put(owned_id, term_list) catch {
+                        validator.allocator.free(owned_id);
+                        for (term_list.items) |t| validator.allocator.free(t);
+                        term_list.deinit(validator.allocator);
+                    };
+                }
+                validator.current_group_id = null;
+            }
+        }
+
         // Check rules for required terms and contradictions.
         const rules = validator.rule_engine.rulesFor(path);
         for (rules) |rule| {
@@ -441,7 +516,7 @@ pub const SemanticValidator = struct {
                 }
                 if (or_matched > 1) {
                     validator.diagnostics.append(validator.allocator, .{
-                        .severity = .@"error",
+                        .severity = .warning,
                         .rule = RuleId.mzml_cv_contradiction,
                         .location = .{ .byte_offset = end.byte_offset },
                         .path = validator.path,

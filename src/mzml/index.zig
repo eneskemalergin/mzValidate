@@ -270,7 +270,8 @@ pub const IndexValidator = struct {
 
         // Close fileChecksum.
         if (end.name.matches(mzml_namespace, "fileChecksum")) {
-            const hex = validator.text_buf.items;
+            const raw = validator.text_buf.items;
+            const hex = std.mem.trim(u8, raw, " \t\r\n");
             if (hex.len != 40 or !isHexString(hex)) {
                 validator.appendDiagnostic(
                     validator.file_checksum_byte_offset orelse 0,
@@ -327,18 +328,35 @@ pub const IndexValidator = struct {
         if (validator.index_list_offset_value) |declared| {
             if (validator.index_list_actual_offset) |actual| {
                 if (declared != actual) {
-                    validator.appendDiagnostic(
-                        validator.index_list_offset_byte_offset orelse validator.index_list_actual_offset orelse 0,
-                        RuleId.mzml_index_offset_list,
-                        "declared indexListOffset does not match actual position of indexList",
-                    ) catch {};
+                    // Accept offset pointing to whitespace before element
+                    // (e.g. ThermoRawFileParser writes line-start offsets).
+                    if (!offsetsMatchWithWhitespace(file_bytes, declared, actual)) {
+                        validator.appendDiagnostic(
+                            validator.index_list_offset_byte_offset orelse validator.index_list_actual_offset orelse 0,
+                            RuleId.mzml_index_offset_list,
+                            "declared indexListOffset does not match actual position of indexList",
+                        ) catch {};
+                    }
                 }
             }
         }
 
         // --- Cross-check each index entry ---
         var prev_offset: ?u64 = null;
+        var seen_ids = std.StringHashMap(void).init(validator.allocator);
+        defer seen_ids.deinit();
         for (validator.index_entries.items) |entry| {
+            // Check for duplicate idRef in index.
+            if (seen_ids.contains(entry.id_ref)) {
+                validator.appendDiagnostic(
+                    entry.offset,
+                    RuleId.mzml_index_offset,
+                    "duplicate idRef in index",
+                ) catch {};
+            } else {
+                seen_ids.put(entry.id_ref, {}) catch {};
+            }
+
             // Check monotonic ordering.
             if (prev_offset) |prev| {
                 if (entry.offset < prev) {
@@ -376,11 +394,15 @@ pub const IndexValidator = struct {
                 };
 
             if (entry.offset != recorded_offset) {
-                validator.appendDiagnostic(
-                    entry.offset,
-                    RuleId.mzml_index_offset,
-                    "index offset does not match actual byte position",
-                ) catch {};
+                // Accept offset pointing to whitespace before the element
+                // (ThermoRawFileParser convention: line-start offset).
+                if (!offsetsMatchWithWhitespace(file_bytes, entry.offset, recorded_offset)) {
+                    validator.appendDiagnostic(
+                        entry.offset,
+                        RuleId.mzml_index_offset,
+                        "index offset does not match actual byte position",
+                    ) catch {};
+                }
             }
         }
 
@@ -502,6 +524,27 @@ fn freeIndexEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(IndexE
     for (entries.items) |entry| {
         allocator.free(entry.id_ref);
     }
+}
+
+/// Checks whether two byte offsets can be considered a match.
+/// Exact match is always accepted.  If `declared` is before `actual`
+/// and the bytes between them are only whitespace (spaces, tabs, newlines),
+/// the offset is also accepted.  This handles tools that write index offsets
+/// pointing to the start of the line rather than the start of the element tag
+/// (e.g. ThermoRawFileParser).  When `file_bytes` is null, falls back to
+/// exact match only.
+fn offsetsMatchWithWhitespace(file_bytes: ?[]const u8, declared: u64, actual: u64) bool {
+    if (declared == actual) return true;
+    if (declared > actual) return false;
+    const bytes = file_bytes orelse return false;
+    if (actual > bytes.len) return false;
+    for (bytes[declared..actual]) |b| {
+        switch (b) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 // --- Tests ---
@@ -788,6 +831,81 @@ test "IndexValidator: valid SHA-1 checksum produces no diagnostic" {
     v.finish(file_bytes);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "IndexValidator: fileChecksum with surrounding whitespace passes validation" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    const prefix = "<?xml version=\"1.0\"?><mzML><run id=\"r\"></run>";
+    var expected_sha: [20]u8 = undefined;
+    {
+        var ctx = std.crypto.hash.Sha1.init(.{});
+        ctx.update(prefix);
+        ctx.final(&expected_sha);
+    }
+    var hex_buf: [40]u8 = undefined;
+    for (0..20) |i| {
+        const hi = expected_sha[i] >> 4;
+        const lo = expected_sha[i] & 0xf;
+        hex_buf[2 * i] = hexChar(@as(u4, @intCast(hi)));
+        hex_buf[2 * i + 1] = hexChar(@as(u4, @intCast(lo)));
+    }
+    const hex_str = hex_buf[0..];
+
+    // fileChecksum with leading and trailing whitespace (valid XML).
+    const file_bytes = prefix ++ "<fileChecksum>\n  " ++ hex_str ++ "\n</fileChecksum>";
+
+    try v.consumeStart(makeStart("mzML", &.{}, 0), 0);
+    try v.consumeStart(makeStart("run", &.{attr("id", "r")}, 10), 1);
+    v.consumeEnd(makeEnd("run"), 1);
+    try v.consumeStart(makeStart("fileChecksum", &.{}, @intCast(prefix.len)), 1);
+    try v.consumeText(makeText("\n  "), 2);
+    try v.consumeText(makeText(hex_str), 2);
+    try v.consumeText(makeText("\n"), 2);
+    v.consumeEnd(makeEnd("fileChecksum"), 1);
+    v.consumeEnd(makeEnd("mzML"), 0);
+
+    v.finish(file_bytes);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "IndexValidator: duplicate index entries produce diagnostic" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(makeStart("mzML", &.{}, 0), 0);
+    try v.consumeStart(makeStart("run", &.{attr("id", "run1")}, 10), 1);
+    try v.consumeStart(makeStart("spectrum", &.{attr("id", "s1")}, 100), 2);
+    v.consumeEnd(makeEnd("spectrum"), 2);
+    v.consumeEnd(makeEnd("run"), 1);
+
+    // index with duplicate entries for s1
+    try v.consumeStart(makeStart("indexList", &.{attr("count", "1")}, 500), 1);
+    try v.consumeStart(makeStart("index", &.{attr("name", "spectrum")}, 510), 2);
+    try v.consumeStart(makeStart("offset", &.{attr("idRef", "s1")}, 520), 3);
+    try v.consumeText(makeText("100"), 4);
+    v.consumeEnd(makeEnd("offset"), 3);
+    try v.consumeStart(makeStart("offset", &.{attr("idRef", "s1")}, 540), 3);
+    try v.consumeText(makeText("100"), 4);
+    v.consumeEnd(makeEnd("offset"), 3);
+    v.consumeEnd(makeEnd("index"), 2);
+    v.consumeEnd(makeEnd("indexList"), 1);
+    v.consumeEnd(makeEnd("mzML"), 0);
+
+    v.finish(null);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
 }
 
 fn hexChar(nibble: u4) u8 {

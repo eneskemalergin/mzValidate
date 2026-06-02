@@ -387,14 +387,14 @@ pub const StructuralValidator = struct {
         }
 
         // Handle elements that appear as direct children of <indexedmzML>
-        // but OUTSIDE <mzML> — i.e. indexList, indexListOffset, fileChecksum.
+        // but OUTSIDE <mzML> i.e. indexList, indexListOffset, fileChecksum.
         // These run after </mzML> closes (mzml_depth = null) so the normal
         // isWithinMzmlStartScope check on line 369 would skip them.
         if (validator.indexed_mzml_depth != null and
             element_depth == validator.indexed_mzml_depth.? + 1 and
             (start.name.matches(mzml_namespace, "indexList") or
-             start.name.matches(mzml_namespace, "indexListOffset") or
-             start.name.matches(mzml_namespace, "fileChecksum")))
+                start.name.matches(mzml_namespace, "indexListOffset") or
+                start.name.matches(mzml_namespace, "fileChecksum")))
         {
             if (start.name.matches(mzml_namespace, "indexList")) {
                 if (validator.index_list_seen) {
@@ -596,7 +596,7 @@ pub const StructuralValidator = struct {
             validator.chromatogram_list_depth = element_depth;
             try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
             try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
-            validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 0);
+            validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
             return;
         }
 

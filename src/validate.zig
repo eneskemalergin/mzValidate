@@ -468,7 +468,8 @@ test "checkPath_indexedSha_valid_noChecksumError" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true, .skip_semantic = true,
+        .skip_binary = true,
+        .skip_semantic = true,
     });
 
     // Assert. No checksum error.
@@ -518,7 +519,9 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true, .skip_semantic = true, .mmap = true,
+        .skip_binary = true,
+        .skip_semantic = true,
+        .mmap = true,
     });
 
     // Assert. No checksum error.
@@ -568,7 +571,9 @@ test "checkPath_indexedSha_skipIndex_noShaCheck" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true, .skip_semantic = true, .skip_index = true,
+        .skip_binary = true,
+        .skip_semantic = true,
+        .skip_index = true,
     });
 
     // Assert. No index work at all.
@@ -594,7 +599,8 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true, .skip_semantic = true,
+        .skip_binary = true,
+        .skip_semantic = true,
     });
 
     // Assert. The wrong checksum must produce a mismatch diagnostic.
@@ -637,7 +643,8 @@ test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true, .skip_semantic = true,
+        .skip_binary = true,
+        .skip_semantic = true,
     });
 
     // Assert. Clean. No SHA-1 check because no index elements.
@@ -717,10 +724,10 @@ test "checkPath_mmap_fallsBackToStreamingOnMissingFile" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act — mmap on a missing file: openFile fails before mmap even starts.
+    // Act. mmap on a missing file: openFile fails before mmap even starts.
     try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .mmap = true });
 
-    // Assert — should report file open error, not mmap error.
+    // Assert. should report file open error, not mmap error.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }

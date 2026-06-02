@@ -25,6 +25,7 @@ pub const CombinationLogic = enum(u8) {
 pub const MappingTerm = struct {
     accession: []const u8,
     allow_children: bool,
+    is_repeatable: bool,
 };
 
 pub const MappingRule = struct {
@@ -57,24 +58,23 @@ pub const RuleEngine = struct {
     }
 
     /// Linear scan to find rules for a given element path.
-    /// Only 27 rules in practice — O(n) is fine.
+    /// Only 34 rules in practice. Returns a slice of the internal rules array.
+    /// The caller must not rely on this slice being valid after the engine is mutated.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
-        // Use a small fixed-size buffer for matched rules (max 3 per path).
-        var buf: [8]usize = undefined;
-        var count: usize = 0;
+        var start: ?usize = null;
+        var end: usize = 0;
         for (engine.rules, 0..) |rule, i| {
             if (std.mem.eql(u8, rule.element_path, element_path)) {
-                if (count < buf.len) {
-                    buf[count] = i;
-                    count += 1;
-                }
+                if (start == null) start = i;
+                end = i + 1;
+            } else if (start != null) {
+                // Rules for the same path are grouped in the XML, so once
+                // we see a non-match after a match, we're done.
+                break;
             }
         }
-        // Return a sub-slice of engine.rules containing the matched rules.
-        // This requires the rules to be contiguous for each path, which they
-        // are because the XML parsing preserves document order.
-        if (count == 0) return &.{};
-        return engine.rules[buf[0] .. buf[0] + count];
+        if (start) |s| return engine.rules[s..end];
+        return &.{};
     }
 };
 
@@ -94,12 +94,21 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
 
     var pos: usize = 0;
     while (pos < xml.len) {
-        // Skip XML comments, the mapping file has commented-out rules
-        // that must not be parsed (e.g. sourcefile_must).
-        if (std.mem.startsWith(u8, xml[pos..], "<!--")) {
-            const comment_end = std.mem.indexOfPos(u8, xml, pos, "-->") orelse break;
-            pos = comment_end + 3;
-            continue;
+        // Skip whitespace and XML comments before each rule.
+        // Comments in the mapping file contain disabled rules (e.g. sourcefile_must)
+        // that must not be parsed.
+        while (true) {
+            // Skip whitespace before checking for comment marker.
+            while (pos < xml.len and switch (xml[pos]) {
+                ' ', '\n', '\r', '\t' => true,
+                else => false,
+            }) pos += 1;
+            if (std.mem.startsWith(u8, xml[pos..], "<!--")) {
+                const comment_end = std.mem.indexOfPos(u8, xml, pos, "-->") orelse break;
+                pos = comment_end + 3;
+            } else {
+                break;
+            }
         }
 
         // Find the next <CvMappingRule> tag (note: trailing space avoids matching <CvMappingRuleList>)
@@ -131,6 +140,7 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         var inner_pos = inner_start;
         while (inner_pos < inner_end) {
             const term_start = std.mem.indexOfPos(u8, xml, inner_pos, "<CvTerm") orelse break;
+            if (term_start >= inner_end) break;
             const term_close = std.mem.indexOfPos(u8, xml, term_start, ">") orelse break;
             const is_self_closing = term_close > 0 and xml[term_close - 1] == '/';
             const term_tag = xml[term_start..term_close];
@@ -144,9 +154,12 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                 const owned = try allocator.dupe(u8, acc);
                 const allow_children_str = extractAttr(term_tag, "allowChildren=\"");
                 const allow_children = if (allow_children_str) |s| std.mem.eql(u8, s, "true") else false;
+                const repeatable_str = extractAttr(term_tag, "isRepeatable=\"");
+                const is_repeatable = if (repeatable_str) |s| std.mem.eql(u8, s, "true") else false;
                 try terms.append(allocator, .{
                     .accession = owned,
                     .allow_children = allow_children,
+                    .is_repeatable = is_repeatable,
                 });
             }
         }
@@ -217,4 +230,15 @@ test "RuleEngine.rulesFor returns empty for unknown path" {
 
     const rules = engine.rulesFor("/nonexistent/path");
     try std.testing.expectEqual(@as(usize, 0), rules.len);
+}
+
+test "RuleEngine does not parse commented-out rules" {
+    const allocator = std.testing.allocator;
+    const xml = @embedFile("../data/ms-mapping.xml");
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    // sourcefile_must is inside <!-- --> and must not be parsed.
+    const src_rules = engine.rulesFor("/mzML/fileDescription/sourceFileList/sourceFile");
+    try std.testing.expectEqual(@as(usize, 0), src_rules.len);
 }

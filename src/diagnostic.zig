@@ -30,6 +30,8 @@ pub const RuleId = struct {
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
     /// Binary payload encodedLength exceeds the -max-binary-size limit.
     pub const mzml_binary_oversized = "mzml.binary.oversized";
+    /// Binary data array type is incompatible with the declared data type.
+    pub const mzml_binary_type_mismatch = "mzml.binary.type-mismatch";
 
     // Index and checksum rules (Phase 2).
     /// Declared indexListOffset does not match the actual byte offset of indexList.
@@ -57,6 +59,8 @@ pub const RuleId = struct {
     pub const mzml_cv_recommended = "mzml.cv.recommended";
     /// Mutually exclusive CV terms appear on the same element.
     pub const mzml_cv_contradiction = "mzml.cv.contradiction";
+    /// Non-repeatable CV term appears more than once on the same element.
+    pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";
     /// A *Ref attribute does not resolve to any declared id.
     pub const mzml_ref_unresolved = "mzml.ref.unresolved";
     /// Two or more elements share the same id.

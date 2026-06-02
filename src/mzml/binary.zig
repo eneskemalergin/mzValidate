@@ -747,7 +747,7 @@ fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
 
 /// All `is_a: MS:1000572` (binary data compression type) terms from the
 /// PSI-MS controlled vocabulary. Unsupported terms are accepted for
-/// recognition and diagnostic reporting — they produce a
+/// recognition and diagnostic reporting; they produce a
 /// `mzml.binary.compression` diagnostic rather than being silently
 /// treated as "no compression".
 fn isCompressionAccession(accession: []const u8) bool {
