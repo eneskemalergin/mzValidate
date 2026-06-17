@@ -18,6 +18,7 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
     const release_version = b.option([]const u8, "release-version", "Semantic version for the bump-version step, for example 0.0.3");
+    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Enable opt-in libdeflate zlib decode spike") orelse false;
 
     // --- Version tool ---
 
@@ -55,6 +56,9 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    const mzvalidate_options = b.addOptions();
+    mzvalidate_options.addOption(bool, "enable_libdeflate", enable_libdeflate);
+    mzvalidate_mod.addOptions("build_options", mzvalidate_options);
 
     const xml_fuzz_target = b.addExecutable(.{
         .name = "xml_fuzz_target",
@@ -112,6 +116,13 @@ pub fn build(b: *std.Build) void {
     const xml_fuzz_bin_path = "zig-out/bin/xml_fuzz_target";
     const binary_fuzz_bin_path = "zig-out/bin/binary_fuzz_target";
 
+    if (enable_libdeflate) {
+        linkLibdeflate(exe);
+        linkLibdeflate(bench_exe);
+        linkLibdeflate(xml_fuzz_target);
+        linkLibdeflate(binary_fuzz_target);
+    }
+
     b.installArtifact(exe);
     b.installArtifact(bench_exe);
     b.installArtifact(benchmark_tool);
@@ -145,6 +156,11 @@ pub fn build(b: *std.Build) void {
         .root_module = benchmark_tool.root_module,
     });
     const run_benchmark_tests = b.addRunArtifact(benchmark_tests);
+
+    if (enable_libdeflate) {
+        linkLibdeflate(mod_tests);
+        linkLibdeflate(exe_tests);
+    }
 
     // --- CLI contract ---
 
@@ -240,6 +256,11 @@ pub fn build(b: *std.Build) void {
 /// Appends each fixture path as a CLI argument to `run`.
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
     for (fixtures) |fixture| run.addArg(fixture);
+}
+
+fn linkLibdeflate(compile: *std.Build.Step.Compile) void {
+    compile.root_module.linkSystemLibrary("c", .{});
+    compile.root_module.linkSystemLibrary("deflate", .{});
 }
 
 /// Walks `root`, collects paths of all `.mzML` files, and returns them sorted.

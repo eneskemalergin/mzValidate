@@ -3,14 +3,18 @@
 //! Decodes base64, decompresses zlib, and validates array lengths against
 //! `defaultArrayLength` and declared precision. Skips materializing the
 //! decoded output for uncompressed arrays (streaming base64 counter).
-//! For zlib arrays, decompresses into a scratch buffer reused between
-//! arrays to keep allocator churn low.
+//! For zlib arrays, streams base64 into reusable compressed-byte scratch
+//! and counts decompressed bytes without keeping the decoded numeric array.
 
 const std = @import("std");
+const build_options = @import("build_options");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
 const xml_parse_errors = @import("../xml/parse_errors.zig");
+const libdeflate = if (build_options.enable_libdeflate) @cImport({
+    @cInclude("libdeflate.h");
+}) else struct {};
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
@@ -24,6 +28,10 @@ const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const base64_simd_chunk_len = 32;
 const base64_scalar_short_len = 64;
+const flate_buffer_len = 128 * 1024;
+const libdeflate_max_output_bytes = 8 * 1024 * 1024;
+const LibdeflateDecompressor = if (build_options.enable_libdeflate) libdeflate.libdeflate_decompressor else opaque {};
+const OptionalLibdeflateDecompressor = if (build_options.enable_libdeflate) ?*LibdeflateDecompressor else void;
 
 const Compression = enum {
     none,
@@ -172,6 +180,126 @@ const StreamingBase64Counter = struct {
     }
 };
 
+// Decodes base64 payload text into compressed bytes as XML text chunks arrive.
+// Diagnostics are still emitted later, after the existing declaration checks.
+const StreamingBase64Decoder = struct {
+    sig_len: usize = 0,
+    padding: usize = 0,
+    saw_pad: bool = false,
+    errored: bool = false,
+    quad: [4]u8 = undefined,
+    quad_len: usize = 0,
+
+    fn feed(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), chunk: []const u8) !void {
+        if (self.errored) return;
+
+        var offset: usize = 0;
+        while (offset < chunk.len) {
+            if (!self.saw_pad and self.quad_len == 0 and chunk.len - offset >= base64_scalar_short_len) {
+                const clean_prefix = cleanBase64DataPrefixLen(chunk[offset..]);
+                const bulk_len = clean_prefix - (clean_prefix % 4);
+                if (bulk_len >= base64_scalar_short_len) {
+                    try self.decodeCleanRun(allocator, out, chunk[offset..][0..bulk_len]);
+                    offset += bulk_len;
+                    continue;
+                }
+            }
+
+            try self.feedByte(allocator, out, chunk[offset]);
+            offset += 1;
+            if (self.errored) return;
+        }
+    }
+
+    fn feedByte(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), c: u8) !void {
+        switch (c) {
+            ' ', '\t', '\r', '\n' => {},
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => {
+                if (self.saw_pad) {
+                    self.errored = true;
+                    return;
+                }
+                self.sig_len += 1;
+                try self.pushSextet(allocator, out, base64Value(c));
+            },
+            '=' => {
+                self.padding += 1;
+                self.saw_pad = true;
+                self.sig_len += 1;
+                if (self.padding > 2) {
+                    self.errored = true;
+                    return;
+                }
+                try self.pushSextet(allocator, out, 0);
+            },
+            else => {
+                self.errored = true;
+                return;
+            },
+        }
+    }
+
+    fn finish(self: *const @This()) error{InvalidBase64}!void {
+        if (self.errored) return error.InvalidBase64;
+        if (self.sig_len % 4 != 0) return error.InvalidBase64;
+        if (self.quad_len != 0) return error.InvalidBase64;
+    }
+
+    fn pushSextet(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), value: u8) !void {
+        self.quad[self.quad_len] = value;
+        self.quad_len += 1;
+        if (self.quad_len < 4) return;
+
+        try out.append(allocator, (self.quad[0] << 2) | (self.quad[1] >> 4));
+        if (self.padding < 2) {
+            try out.append(allocator, ((self.quad[1] & 0x0f) << 4) | (self.quad[2] >> 2));
+        }
+        if (self.padding == 0) {
+            try out.append(allocator, ((self.quad[2] & 0x03) << 6) | self.quad[3]);
+        }
+
+        self.quad_len = 0;
+    }
+
+    fn decodeCleanRun(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), encoded: []const u8) !void {
+        std.debug.assert(encoded.len % 4 == 0);
+
+        const decoded_len = (encoded.len / 4) * 3;
+        const start = out.items.len;
+        try out.resize(allocator, start + decoded_len);
+        std.base64.standard.Decoder.decode(out.items[start..][0..decoded_len], encoded) catch unreachable;
+        self.sig_len += encoded.len;
+    }
+
+    fn cleanBase64DataPrefixLen(bytes: []const u8) usize {
+        var offset: usize = 0;
+        while (offset + base64_simd_chunk_len <= bytes.len) {
+            const chunk = StreamingBase64Counter.loadBase64Chunk(bytes, offset);
+            if (!@reduce(.And, StreamingBase64Counter.base64CharLanes(chunk))) break;
+            offset += base64_simd_chunk_len;
+        }
+
+        while (offset < bytes.len) : (offset += 1) {
+            switch (bytes[offset]) {
+                'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => {},
+                else => break,
+            }
+        }
+        return offset;
+    }
+
+    fn base64Value(c: u8) u8 {
+        return switch (c) {
+            'A'...'Z' => c - 'A',
+            'a'...'z' => c - 'a' + 26,
+            '0'...'9' => c - '0' + 52,
+            '+' => 62,
+            '/' => 63,
+            else => unreachable,
+        };
+    }
+};
+
 const OwnerState = struct {
     depth: usize,
     index: ?usize,
@@ -196,6 +324,8 @@ const BinaryArrayState = struct {
     binary_depth: ?usize = null,
     binary_byte_offset: ?u64 = null,
     base64_stream: StreamingBase64Counter = .{},
+    zlib_base64_stream: StreamingBase64Decoder = .{},
+    zlib_encoded_len: usize = 0,
     skipped: bool = false,
 
     fn init(
@@ -232,9 +362,12 @@ pub const BinaryValidator = struct {
     chromatogram: ?OwnerState = null,
     binary_array: ?BinaryArrayState = null,
 
-    /// Scratch buffer reused across binary arrays to reduce allocator churn.
+    /// Compressed zlib bytes decoded from base64 as text chunks arrive.
     /// Cleared with `clearRetainingCapacity` at the start of each binary element.
-    scratch_payload: std.ArrayList(u8) = .empty,
+    compressed_payload: std.ArrayList(u8) = .empty,
+    flate_buffer: std.ArrayList(u8) = .empty,
+    libdeflate_output: std.ArrayList(u8) = .empty,
+    libdeflate_decompressor: OptionalLibdeflateDecompressor = if (build_options.enable_libdeflate) null else {},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -249,21 +382,32 @@ pub const BinaryValidator = struct {
     }
 
     pub fn deinit(validator: *BinaryValidator) void {
-        validator.scratch_payload.deinit(validator.allocator);
+        if (comptime build_options.enable_libdeflate) {
+            if (validator.libdeflate_decompressor) |decompressor| {
+                libdeflate.libdeflate_free_decompressor(decompressor);
+            }
+        }
+        validator.compressed_payload.deinit(validator.allocator);
+        validator.flate_buffer.deinit(validator.allocator);
+        validator.libdeflate_output.deinit(validator.allocator);
         validator.* = undefined;
     }
 
     // Prevent a single oversized array from hogging scratch capacity.
     // Only kicks in when capacity > 1 MiB AND 4x the actual data.
     fn maybeShrinkScratch(validator: *BinaryValidator) void {
-        const used: usize = validator.scratch_payload.items.len;
+        validator.maybeShrinkPayload(&validator.compressed_payload, validator.compressed_payload.items.len);
+        validator.maybeShrinkPayload(&validator.libdeflate_output, validator.libdeflate_output.items.len);
+    }
+
+    fn maybeShrinkPayload(validator: *BinaryValidator, payload: *std.ArrayList(u8), used: usize) void {
         if (used == 0) return;
         const min_threshold: usize = 1024 * 1024; // 1 MiB
         const max_headroom: usize = 4;
-        if (validator.scratch_payload.capacity > min_threshold and
-            validator.scratch_payload.capacity > used * max_headroom)
+        if (payload.capacity > min_threshold and
+            payload.capacity > used * max_headroom)
         {
-            validator.scratch_payload.shrinkAndFree(validator.allocator, used);
+            payload.shrinkAndFree(validator.allocator, used);
         }
     }
 
@@ -487,7 +631,7 @@ pub const BinaryValidator = struct {
                     if (element_depth == state.depth + 1) {
                         state.binary_depth = element_depth;
                         state.binary_byte_offset = start.byte_offset;
-                        validator.scratch_payload.clearRetainingCapacity();
+                        validator.compressed_payload.clearRetainingCapacity();
                         if (state.encoded_length) |encoded_length| {
                             if (encoded_length == 0) {
                                 // encodedLength=0 is suspicious; allow it but flag
@@ -508,7 +652,10 @@ pub const BinaryValidator = struct {
                                 }
                             }
                             if (state.saw_zlib_compression) {
-                                try validator.scratch_payload.ensureTotalCapacity(validator.allocator, encoded_length);
+                                try validator.compressed_payload.ensureTotalCapacity(
+                                    validator.allocator,
+                                    base64_decoder.calcSizeUpperBound(encoded_length),
+                                );
                                 state.encoded_length = null;
                             }
                         }
@@ -565,7 +712,8 @@ pub const BinaryValidator = struct {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
                 if (state.saw_zlib_compression) {
-                    try validator.scratch_payload.appendSlice(validator.allocator, value);
+                    state.zlib_encoded_len += value.len;
+                    try state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, value);
                 } else {
                     state.base64_stream.feed(value);
                 }
@@ -579,7 +727,7 @@ pub const BinaryValidator = struct {
         // Check encodedLength sanity: if declared as 0 but we have content.
         if (state.encoded_length_declared) |declared| {
             const has_content = if (state.saw_zlib_compression)
-                validator.scratch_payload.items.len > 0
+                state.zlib_encoded_len > 0
             else
                 state.base64_stream.sig_len > 0;
             if (declared == 0 and has_content) {
@@ -638,7 +786,7 @@ pub const BinaryValidator = struct {
         if (state.encoded_length_declared == null) {
             if (validator.max_binary_size) |max_size| {
                 const actual = if (state.saw_zlib_compression)
-                    validator.scratch_payload.items.len
+                    state.zlib_encoded_len
                 else
                     state.base64_stream.sig_len;
                 if (actual > max_size) {
@@ -681,13 +829,7 @@ pub const BinaryValidator = struct {
 
         const decoded_bytes = blk: {
             if (state.saw_zlib_compression) {
-                const encoded = validator.scratch_payload.items;
-                if (encoded.len == 0) break :blk @as(usize, 0);
-                const decoded_upper_bound = base64_decoder.calcSizeUpperBound(encoded.len);
-                const decoded_buffer = try validator.allocator.alloc(u8, decoded_upper_bound);
-                defer validator.allocator.free(decoded_buffer);
-
-                const decoded_len = base64_decoder.decode(decoded_buffer, encoded) catch {
+                state.zlib_base64_stream.finish() catch {
                     try validator.appendDiagnostic(.{
                         .severity = .@"error",
                         .rule = RuleId.mzml_binary_base64,
@@ -697,16 +839,34 @@ pub const BinaryValidator = struct {
                     });
                     return;
                 };
+                if (state.zlib_encoded_len == 0) break :blk 0;
 
-                break :blk (inflateCount(decoded_buffer[0..decoded_len]) catch {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_decompress,
-                        .location = location,
-                        .path = validator.path,
-                        .message = "binary payload is not valid zlib data",
-                    });
-                    return;
+                const expected_decoded_bytes = if (state.default_array_length) |count|
+                    std.math.mul(usize, count, width) catch null
+                else
+                    null;
+                break :blk (validator.inflateDecodedZlib(validator.compressed_payload.items, expected_decoded_bytes) catch |err| switch (err) {
+                    error.InvalidBase64 => {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_base64,
+                            .location = location,
+                            .path = validator.path,
+                            .message = "binary payload is not valid base64",
+                        });
+                        return;
+                    },
+                    error.InvalidBinaryPayload => {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_decompress,
+                            .location = location,
+                            .path = validator.path,
+                            .message = "binary payload is not valid zlib data",
+                        });
+                        return;
+                    },
+                    error.OutOfMemory => |oom| return oom,
                 });
             } else {
                 break :blk state.base64_stream.result() catch {
@@ -781,6 +941,64 @@ pub const BinaryValidator = struct {
         return element_depth >= validator.mzml_depth.?;
     }
 
+    fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory }!usize) {
+        if (comptime build_options.enable_libdeflate) {
+            if (expected_decoded_bytes) |expected| {
+                if (expected <= libdeflate_max_output_bytes) {
+                    if (try validator.inflateWithLibdeflate(compressed, expected)) |decoded_bytes| {
+                        return decoded_bytes;
+                    }
+                }
+            }
+        }
+
+        try validator.flate_buffer.resize(validator.allocator, flate_buffer_len);
+        return inflateCountWithBuffer(compressed, validator.flate_buffer.items);
+    }
+
+    fn inflateWithLibdeflate(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: usize) (error{ InvalidBinaryPayload, OutOfMemory }!?usize) {
+        if (comptime build_options.enable_libdeflate) {
+            const decompressor = try validator.ensureLibdeflateDecompressor();
+            try validator.libdeflate_output.resize(validator.allocator, expected_decoded_bytes);
+
+            var actual_in: usize = 0;
+            var actual_out: usize = 0;
+            const output_ptr = if (expected_decoded_bytes == 0) null else validator.libdeflate_output.items.ptr;
+            const result = libdeflate.libdeflate_zlib_decompress_ex(
+                decompressor,
+                compressed.ptr,
+                compressed.len,
+                output_ptr,
+                expected_decoded_bytes,
+                &actual_in,
+                &actual_out,
+            );
+
+            return switch (result) {
+                libdeflate.LIBDEFLATE_SUCCESS => if (actual_in == compressed.len and actual_out == expected_decoded_bytes)
+                    expected_decoded_bytes
+                else
+                    null,
+                libdeflate.LIBDEFLATE_BAD_DATA => error.InvalidBinaryPayload,
+                libdeflate.LIBDEFLATE_SHORT_OUTPUT, libdeflate.LIBDEFLATE_INSUFFICIENT_SPACE => null,
+                else => error.InvalidBinaryPayload,
+            };
+        }
+
+        unreachable;
+    }
+
+    fn ensureLibdeflateDecompressor(validator: *BinaryValidator) error{OutOfMemory}!*LibdeflateDecompressor {
+        if (comptime build_options.enable_libdeflate) {
+            if (validator.libdeflate_decompressor) |decompressor| return decompressor;
+            const decompressor = libdeflate.libdeflate_alloc_decompressor() orelse return error.OutOfMemory;
+            validator.libdeflate_decompressor = decompressor;
+            return decompressor;
+        }
+
+        unreachable;
+    }
+
     fn appendDiagnostic(validator: *BinaryValidator, item: Diagnostic) !void {
         try validator.diagnostics.append(validator.allocator, item);
     }
@@ -789,9 +1007,13 @@ pub const BinaryValidator = struct {
 // Streaming inflate: decompresses zlib data and returns the decoded byte count
 // without materializing the decompressed output. Uses a small stack buffer.
 fn inflateCount(compressed: []const u8) error{InvalidBinaryPayload}!usize {
-    var input = std.Io.Reader.fixed(compressed);
     var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-    var decompress: std.compress.flate.Decompress = .init(&input, .zlib, &flate_buffer);
+    return inflateCountWithBuffer(compressed, &flate_buffer);
+}
+
+fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{InvalidBinaryPayload}!usize {
+    var input = std.Io.Reader.fixed(compressed);
+    var decompress: std.compress.flate.Decompress = .init(&input, .zlib, flate_buffer);
 
     var count: usize = 0;
     const max_peek = flate_buffer.len - std.compress.flate.history_len;
@@ -1033,6 +1255,34 @@ test "streaming base64 counter C.1 SIMD rejects invalid byte after counted prefi
 
     try std.testing.expect(counter.errored);
     try std.testing.expectError(error.InvalidBase64, counter.result());
+}
+
+test "streaming base64 decoder decodes split chunks and whitespace" {
+    const allocator = std.testing.allocator;
+
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+
+    var stream: StreamingBase64Decoder = .{};
+    try stream.feed(allocator, &decoded, "QU");
+    try stream.feed(allocator, &decoded, "JD\n");
+    try stream.feed(allocator, &decoded, "REVG");
+    try stream.finish();
+
+    try std.testing.expectEqualStrings("ABCDEF", decoded.items);
+}
+
+test "streaming base64 decoder preserves invalid padding behavior" {
+    const allocator = std.testing.allocator;
+
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+
+    var stream: StreamingBase64Decoder = .{};
+    try stream.feed(allocator, &decoded, "AA=A");
+
+    try std.testing.expect(stream.errored);
+    try std.testing.expectError(error.InvalidBase64, stream.finish());
 }
 
 test "binary validator accepts clean single spectrum fixture" {
@@ -1384,6 +1634,33 @@ test "binary validator rejects short and mutated invalid base64 payload matrix" 
     // Act.
     inline for (payloads) |payload| {
         const fixture = minimalSpectrumMzml(payload, 1, "MS:1000576");
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        // Assert.
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_base64,
+            "binary payload is not valid base64",
+        );
+    }
+}
+
+test "binary validator rejects invalid zlib base64 before inflate" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const payloads = [_][]const u8{
+        "%",
+        "A",
+        "AA=A",
+        "A===",
+        "AA!A",
+        "~!@#",
+    };
+
+    // Act.
+    inline for (payloads) |payload| {
+        const fixture = minimalSpectrumMzml(payload, 1, "MS:1000574");
         var diagnostics = try runBinaryValidation(allocator, io, fixture);
         defer diagnostics.deinit(allocator);
 
