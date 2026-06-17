@@ -238,6 +238,12 @@ pub const BinaryValidator = struct {
         try validator.handleText(text.value);
     }
 
+    /// True while inside a `<binary>` element for the active `binaryDataArray`.
+    pub fn wantsText(validator: *const BinaryValidator) bool {
+        if (validator.binary_array) |state| return state.binary_depth != null;
+        return false;
+    }
+
     pub fn finish(validator: *BinaryValidator) !void {
         _ = validator;
     }

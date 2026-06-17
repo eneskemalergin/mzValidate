@@ -260,15 +260,16 @@ pub const IndexValidator = struct {
         element_depth: usize,
     ) !void {
         _ = element_depth;
-        if (validator.mzml_depth == null) return;
+        if (!validator.wantsText()) return;
+        try validator.text_buf.appendSlice(validator.allocator, text.value);
+    }
 
-        // Only accumulate text inside elements we care about.
-        if (validator.offset_id_ref_owned != null or
+    /// True when accumulating offset, indexListOffset, or fileChecksum text.
+    pub fn wantsText(validator: *const IndexValidator) bool {
+        if (validator.mzml_depth == null) return false;
+        return validator.offset_id_ref_owned != null or
             validator.index_list_offset_depth != null or
-            validator.file_checksum_depth != null)
-        {
-            try validator.text_buf.appendSlice(validator.allocator, text.value);
-        }
+            validator.file_checksum_depth != null;
     }
 
     /// After the document is fully parsed, cross-check all collected data.

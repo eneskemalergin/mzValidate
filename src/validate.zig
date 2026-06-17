@@ -269,9 +269,16 @@ fn runValidation(
                 element_depth -= 1;
             },
             .text => |text| {
-                try structural_validator.consumeText(text);
-                if (binary_validator) |*validator| try validator.consumeText(text);
-                if (index_validator) |*validator| try validator.consumeText(text, element_depth);
+                // Structural: only depth==0 can diagnose text outside root (B.7).
+                if (structural_validator.depth == 0) {
+                    try structural_validator.consumeText(text);
+                }
+                if (binary_validator) |*validator| {
+                    if (validator.wantsText()) try validator.consumeText(text);
+                }
+                if (index_validator) |*validator| {
+                    if (validator.wantsText()) try validator.consumeText(text, element_depth);
+                }
             },
         }
     }
@@ -970,6 +977,36 @@ test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
         RuleId.mzml_structure_root,
         "root element must be mzML in the http://psi.hupo.org/ms/mzml namespace",
     );
+}
+
+test "checkReader_text_before_root_reports_structure_xml_diagnostic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml =
+        "junk before root\n" ++
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "  <run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">\n" ++
+        "    <spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>\n" ++
+        "  </run>\n" ++
+        "</mzML>\n";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-text-before-root.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true }, null);
+
+    var found = false;
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_structure_xml) and
+            std.mem.eql(u8, d.message, "text outside the mzML root element is not allowed"))
+        {
+            found = true;
+            break;
+        }
+    }
+    try std.testing.expect(found);
 }
 
 test "checkReader_prefixed_psi_namespace_root_runs_clean_when_skipping_binary" {
