@@ -3,9 +3,11 @@
 //! Key steps:
 //!   test          - run all unit tests
 //!   cli-contract  - run the binary against valid and expected-invalid fixtures
-//!   ci            - test + cli-contract (what CI runs)
-//!   resource-check - profile representative workloads with zebrac and gate peak RSS
-//!   throughput-baseline - record and gate representative throughput metrics with zebrac
+//!   ci            - test + cli-contract + fuzz-smoke + benchmark-ci + resource-check
+//!   resource-check - gate peak RSS (`benchmark resource`)
+//!   benchmark-ci - CI throughput gates (fixtures only)
+//!   benchmark-record - write JSON report, no gate failure
+//!   benchmark-local - opt-in `data/` scenarios with gates
 //!   fuzz-smoke    - run deterministic random and mutation-based smoke fuzzing
 //!   bump-version  - rewrite version.zig and build.zig.zon
 //!   run           - execute the binary directly
@@ -28,19 +30,10 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const resource_check_tool = b.addExecutable(.{
-        .name = "resource_check",
+    const benchmark_tool = b.addExecutable(.{
+        .name = "benchmark",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/resource_check.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-
-    const throughput_baseline_tool = b.addExecutable(.{
-        .name = "throughput_baseline",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/throughput_baseline.zig"),
+            .root_source_file = b.path("tools/benchmark_runner.zig"),
             .target = b.graph.host,
             .optimize = .Debug,
         }),
@@ -99,8 +92,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const throughput_bench_exe = b.addExecutable(.{
-        .name = "mzValidate_throughput",
+    const bench_exe = b.addExecutable(.{
+        .name = "mzValidate_bench",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,
@@ -111,7 +104,20 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    const rm_legacy_bench = b.addSystemCommand(&.{ "rm", "-f", "zig-out/bin/mzValidate_throughput" });
+    const install_step = b.getInstallStep();
+    const bench_bin_path = "zig-out/bin/mzValidate_bench";
+    const benchmark_bin_path = "zig-out/bin/benchmark";
+    const fuzz_smoke_bin_path = "zig-out/bin/fuzz_smoke";
+    const xml_fuzz_bin_path = "zig-out/bin/xml_fuzz_target";
+    const binary_fuzz_bin_path = "zig-out/bin/binary_fuzz_target";
+
     b.installArtifact(exe);
+    b.installArtifact(bench_exe);
+    b.installArtifact(benchmark_tool);
+    b.installArtifact(fuzz_smoke_tool);
+    b.installArtifact(xml_fuzz_target);
+    b.installArtifact(binary_fuzz_target);
 
     // --- Run step ---
 
@@ -134,6 +140,11 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
+
+    const benchmark_tests = b.addTest(.{
+        .root_module = benchmark_tool.root_module,
+    });
+    const run_benchmark_tests = b.addRunArtifact(benchmark_tests);
 
     // --- CLI contract ---
 
@@ -161,9 +172,10 @@ pub fn build(b: *std.Build) void {
 
     // --- Build steps ---
 
-    const test_step = b.step("test", "Run unit tests");
+    const test_step = b.step("test", "Run unit tests (library, CLI, benchmark tools; GPA leak detection)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
+    test_step.dependOn(&run_benchmark_tests.step);
 
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
@@ -172,19 +184,33 @@ pub fn build(b: *std.Build) void {
     const legacy_cli_step = b.step("test-cli", "Alias for cli-contract");
     legacy_cli_step.dependOn(cli_contract_step);
 
-    const ci_step = b.step("ci", "Run unit tests and CLI contract checks");
+    const ci_step = b.step("ci", "test + cli-contract + fuzz-smoke + benchmark-ci + resource-check");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
 
-    const resource_check_step = b.step("resource-check", "Profile representative workloads and gate peak RSS with zebrac");
-    const resource_check_cmd = b.addRunArtifact(resource_check_tool);
-    resource_check_cmd.step.dependOn(b.getInstallStep());
+    const resource_check_step = b.step("resource-check", "Gate peak RSS on synthetic workloads (ReleaseFast bench binary)");
+    const resource_check_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "resource", bench_bin_path });
+    resource_check_cmd.step.dependOn(&rm_legacy_bench.step);
+    resource_check_cmd.step.dependOn(install_step);
     resource_check_step.dependOn(&resource_check_cmd.step);
 
-    const throughput_baseline_step = b.step("throughput-baseline", "Record and gate representative throughput baselines with zebrac");
-    const throughput_baseline_cmd = b.addRunArtifact(throughput_baseline_tool);
-    throughput_baseline_cmd.addArtifactArg(throughput_bench_exe);
-    throughput_baseline_step.dependOn(&throughput_baseline_cmd.step);
+    const benchmark_ci_step = b.step("benchmark-ci", "CI throughput gates on fixture files (~15 s)");
+    const benchmark_ci_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "throughput-ci", bench_bin_path });
+    benchmark_ci_cmd.step.dependOn(&rm_legacy_bench.step);
+    benchmark_ci_cmd.step.dependOn(install_step);
+    benchmark_ci_step.dependOn(&benchmark_ci_cmd.step);
+
+    const benchmark_record_step = b.step("benchmark-record", "Record CI + local throughput to .zig-cache/benchmark-report.json");
+    const benchmark_record_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "record", bench_bin_path });
+    benchmark_record_cmd.step.dependOn(&rm_legacy_bench.step);
+    benchmark_record_cmd.step.dependOn(install_step);
+    benchmark_record_step.dependOn(&benchmark_record_cmd.step);
+
+    const benchmark_local_step = b.step("benchmark-local", "Gate opt-in data/ fixtures (skips missing files)");
+    const benchmark_local_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "local", bench_bin_path });
+    benchmark_local_cmd.step.dependOn(&rm_legacy_bench.step);
+    benchmark_local_cmd.step.dependOn(install_step);
+    benchmark_local_step.dependOn(&benchmark_local_cmd.step);
 
     const xml_fuzz_target_step = b.step("xml-fuzz-target", "Build the focused XML fuzz-entry executable");
     xml_fuzz_target_step.dependOn(&xml_fuzz_target.step);
@@ -197,13 +223,13 @@ pub fn build(b: *std.Build) void {
     fuzz_targets_step.dependOn(binary_fuzz_target_step);
 
     const fuzz_smoke_step = b.step("fuzz-smoke", "Run deterministic random and mutation-based smoke fuzzing");
-    const fuzz_smoke_cmd = b.addRunArtifact(fuzz_smoke_tool);
-    fuzz_smoke_cmd.addArtifactArg(xml_fuzz_target);
-    fuzz_smoke_cmd.addArtifactArg(binary_fuzz_target);
+    const fuzz_smoke_cmd = b.addSystemCommand(&.{ fuzz_smoke_bin_path, xml_fuzz_bin_path, binary_fuzz_bin_path });
+    fuzz_smoke_cmd.step.dependOn(install_step);
     fuzz_smoke_step.dependOn(&fuzz_smoke_cmd.step);
 
     ci_step.dependOn(fuzz_smoke_step);
-    ci_step.dependOn(throughput_baseline_step);
+    ci_step.dependOn(benchmark_ci_step);
+    ci_step.dependOn(resource_check_step);
 
     const bump_version_step = b.step("bump-version", "Update the project version and manifest fingerprint");
     const bump_version_cmd = b.addRunArtifact(version_tool);

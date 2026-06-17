@@ -22,13 +22,13 @@
 
 What works today and what is coming. Each format is validated against its published specification.
 
-| Format                    | Status    | Structural | Binary  |  Index  | Semantic |
-| ------------------------- | --------- | :--------: | :-----: | :-----: | :------: |
-| **mzML** 1.1.0            | ready     |   ready    |  ready  |  ready  |  ready   |
-| **imzML** 1.0             | planned   |  planned   | planned |    -    | planned  |
-| **SDRF-Proteomics** 1.1.0 | planned   |  planned   |    -    |    -    | planned  |
-| **mzIdentML** 1.2         | planned   |  planned   |    -    | planned | planned  |
-| **mzTab** 1.0             | planned   |  planned   |    -    |    -    | planned  |
+| Format                    | Status  | Structural | Binary  |  Index  | Semantic |
+| ------------------------- | ------- | :--------: | :-----: | :-----: | :------: |
+| **mzML** 1.1.0            | ready   |   ready    |  ready  |  ready  |  ready   |
+| **imzML** 1.0             | planned |  planned   | planned |    -    | planned  |
+| **SDRF-Proteomics** 1.1.0 | planned |  planned   |    -    |    -    | planned  |
+| **mzIdentML** 1.2         | planned |  planned   |    -    | planned | planned  |
+| **mzTab** 1.0             | planned |  planned   |    -    |    -    | planned  |
 
 No XML schema is embedded or required. All validation is driven by format-aware rules compiled into the binary.
 
@@ -82,7 +82,7 @@ mzValidate check -summary file1.mzML file2.mzML
 
 | Flag                 | Description                                                   |
 | -------------------- | ------------------------------------------------------------- |
-| *(default)*          | Human-readable text, one line per diagnostic                  |
+| _(default)_          | Human-readable text, one line per diagnostic                  |
 | `-summary`           | Single-line status                                            |
 | `-brief`             | Grouped by rule with occurrence counts                        |
 | `-json`              | Stable JSON array of all diagnostics                          |
@@ -154,9 +154,9 @@ CV accession validation against the PSI-MS controlled vocabulary (psi-ms.obo 4.1
 | `mzml.cv.required`               | Missing required CV term on element                                            |
 | `mzml.cv.recommended`            | Missing recommended CV term (warning)                                          |
 | `mzml.cv.contradiction`          | Mutually exclusive CV terms on same element                                    |
-| `mzml.ref.unresolved`            | *Ref attribute does not resolve to any declared id                             |
+| `mzml.ref.unresolved`            | \*Ref attribute does not resolve to any declared id                            |
 | `mzml.ref.duplicate-id`          | Two or more elements share the same id                                         |
-| `mzml.ref.missing`               | Required *Ref attribute is missing                                             |
+| `mzml.ref.missing`               | Required \*Ref attribute is missing                                            |
 
 ## Architecture
 
@@ -180,23 +180,33 @@ Four renderers from the same diagnostic model. Text for interactive use. JSON fo
 zig build test                # Unit tests with leak detection
 zig build cli-contract        # Valid and invalid fixture checks
 zig build fuzz-smoke          # Random and mutation-based fuzzing
-zig build resource-check      # Peak RSS profiling
-zig build throughput-baseline # Release-mode throughput metrics
-zig build ci                 # test + cli-contract + fuzz-smoke + throughput-baseline
+zig build benchmark-ci        # ReleaseFast throughput gates (~15 s)
+zig build resource-check      # Peak RSS gates on synthetic workloads
+zig build ci                  # test + cli-contract + fuzz-smoke + benchmark-ci + resource-check
 ```
+
+Binaries after `zig build install`:
+
+| Path                           | Purpose                           |
+| ------------------------------ | --------------------------------- |
+| `zig-out/bin/mzValidate`       | CLI (`-Doptimize` from build)     |
+| `zig-out/bin/mzValidate_bench` | ReleaseFast binary for benchmarks |
+| `zig-out/bin/benchmark`        | Benchmark runner                  |
 
 ## Build steps
 
-| Command                            | What it does           |
-| ---------------------------------- | ---------------------- |
-| `zig build`                        | Build debug binary     |
-| `zig build -Doptimize=ReleaseFast` | Build release binary   |
-| `zig build test`                   | Run all unit tests     |
-| `zig build cli-contract`           | Run CLI contract tests |
-| `zig build fuzz-smoke`             | Run fuzz targets       |
-| `zig build resource-check`         | Profile peak RSS       |
-| `zig build throughput-baseline`    | Benchmark throughput   |
-| `zig build run -- check file.mzML` | Build and run          |
+| Command                            | What it does               |
+| ---------------------------------- | -------------------------- |
+| `zig build`                        | Build debug binary         |
+| `zig build -Doptimize=ReleaseFast` | Build release binary       |
+| `zig build test`                   | Run all unit tests         |
+| `zig build cli-contract`           | Run CLI contract tests     |
+| `zig build fuzz-smoke`             | Run fuzz targets           |
+| `zig build benchmark-ci`           | CI throughput gates        |
+| `zig build resource-check`         | Peak RSS gates             |
+| `zig build benchmark-record`       | JSON report (no gates)     |
+| `zig build benchmark-local`        | Large-file gates (`data/`) |
+| `zig build run -- check file.mzML` | Build and run              |
 
 ## Roadmap
 
