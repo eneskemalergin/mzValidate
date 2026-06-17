@@ -175,98 +175,106 @@ pub const SemanticValidator = struct {
     }
 
     pub fn consumeStart(validator: *SemanticValidator, start: StartElement, _: usize) !void {
-        if (start.resolvedId() == .cv) {
-            if (attributeValue(start.attributes, "id")) |id| {
-                const owned = try validator.allocator.dupe(u8, id);
-                validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
-            }
-            return;
+        const tag = start.resolvedId();
+
+        switch (tag) {
+            .cv => {
+                if (attributeValue(start.attributes, "id")) |id| {
+                    const owned = try validator.allocator.dupe(u8, id);
+                    validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
+                }
+                return;
+            },
+            else => {},
         }
 
-        // Reference resolution: track id declarations and *Ref attributes.
-        if (start.resolvedId() != .cvParam and start.resolvedId() != .userParam) {
-            var path_buf: [4096]u8 = undefined;
-            var pos: usize = 0;
-            path_buf[pos] = '/';
-            pos += 1;
-            for (validator.element_names.items, 0..) |name, i| {
-                if (i > 0) {
-                    if (pos + 1 >= path_buf.len) return;
-                    path_buf[pos] = '/';
-                    pos += 1;
+        switch (tag) {
+            .cvParam, .userParam => {},
+            else => {
+                var path_buf: [4096]u8 = undefined;
+                var pos: usize = 0;
+                path_buf[pos] = '/';
+                pos += 1;
+                for (validator.element_names.items, 0..) |name, i| {
+                    if (i > 0) {
+                        if (pos + 1 >= path_buf.len) return;
+                        path_buf[pos] = '/';
+                        pos += 1;
+                    }
+                    if (pos + name.len > path_buf.len) return;
+                    @memcpy(path_buf[pos..][0..name.len], name);
+                    pos += name.len;
                 }
-                if (pos + name.len > path_buf.len) return;
-                @memcpy(path_buf[pos..][0..name.len], name);
-                pos += name.len;
-            }
-            if (pos + start.name.local_name.len > path_buf.len) return;
-            @memcpy(path_buf[pos..][0..start.name.local_name.len], start.name.local_name);
-            pos += start.name.local_name.len;
-            const cur_path = path_buf[0..pos];
+                if (pos + start.name.local_name.len > path_buf.len) return;
+                @memcpy(path_buf[pos..][0..start.name.local_name.len], start.name.local_name);
+                pos += start.name.local_name.len;
+                const cur_path = path_buf[0..pos];
 
-            // Record id declaration.
-            if (attributeValue(start.attributes, "id")) |id| {
-                if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
-                    try validator.diagnostics.append(validator.allocator, .{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_ref_duplicate_id,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "duplicate id",
-                    });
-                }
-            }
-
-            // Queue *Ref attributes for deferred resolution.
-            for (start.attributes) |attr| {
-                const name = attr.name.local_name;
-                if (isRefAttr(name)) {
-                    try validator.ref_table.addRef(name, attr.value, cur_path, start.byte_offset);
-                }
-            }
-        }
-
-        if (start.resolvedId() == .cvParam or start.resolvedId() == .userParam) {
-            if (attributeValue(start.attributes, "accession")) |acc| {
-                if (validator.scope_terms.items.len > 0) {
-                    const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
-                    const owned = try validator.allocator.dupe(u8, acc);
-                    list.append(validator.allocator, owned) catch validator.allocator.free(owned);
-                }
-            }
-        } else {
-            const owned = try validator.allocator.dupe(u8, start.name.local_name);
-            try validator.element_names.append(validator.allocator, owned);
-            try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
-
-            // Track referenceableParamGroup id for later capture.
-            if (start.resolvedId() == .referenceableParamGroup) {
-                validator.current_group_id = attributeValue(start.attributes, "id");
-            }
-
-            // Resolve referenceableParamGroupRef: add group's cvParams to parent scope.
-            if (start.resolvedId() == .referenceableParamGroupRef) {
-                if (attributeValue(start.attributes, "ref")) |ref_id| {
-                    if (validator.param_groups.get(ref_id)) |group_terms| {
-                        if (validator.scope_terms.items.len >= 2) {
-                            const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
-                            for (group_terms.items) |acc| {
-                                const owned_acc = try validator.allocator.dupe(u8, acc);
-                                parent.append(validator.allocator, owned_acc) catch {
-                                    validator.allocator.free(owned_acc);
-                                    return;
-                                };
-                            }
-                        }
+                if (attributeValue(start.attributes, "id")) |id| {
+                    if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
+                        try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_ref_duplicate_id,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "duplicate id",
+                        });
                     }
                 }
-            }
+
+                for (start.attributes) |attr| {
+                    const name = attr.name.local_name;
+                    if (isRefAttr(name)) {
+                        try validator.ref_table.addRef(name, attr.value, cur_path, start.byte_offset);
+                    }
+                }
+            },
+        }
+
+        switch (tag) {
+            .cvParam, .userParam => {
+                if (attributeValue(start.attributes, "accession")) |acc| {
+                    if (validator.scope_terms.items.len > 0) {
+                        const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
+                        const owned = try validator.allocator.dupe(u8, acc);
+                        list.append(validator.allocator, owned) catch validator.allocator.free(owned);
+                    }
+                }
+            },
+            else => {
+                const owned = try validator.allocator.dupe(u8, start.name.local_name);
+                try validator.element_names.append(validator.allocator, owned);
+                try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
+
+                switch (tag) {
+                    .referenceableParamGroup => {
+                        validator.current_group_id = attributeValue(start.attributes, "id");
+                    },
+                    .referenceableParamGroupRef => {
+                        if (attributeValue(start.attributes, "ref")) |ref_id| {
+                            if (validator.param_groups.get(ref_id)) |group_terms| {
+                                if (validator.scope_terms.items.len >= 2) {
+                                    const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
+                                    for (group_terms.items) |acc| {
+                                        const owned_acc = try validator.allocator.dupe(u8, acc);
+                                        parent.append(validator.allocator, owned_acc) catch {
+                                            validator.allocator.free(owned_acc);
+                                            return;
+                                        };
+                                    }
+                                }
+                            }
+                        }
+                    },
+                    else => {},
+                }
+            },
         }
 
         const accession = attributeValue(start.attributes, "accession") orelse return;
         const cv_ref = if (attributeValue(start.attributes, "cvRef")) |ref|
             ref
-        else if (start.resolvedId() == .userParam) blk: {
+        else if (tag == .userParam) blk: {
             const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
             break :blk accession[0..colon];
         } else return;
@@ -376,8 +384,11 @@ pub const SemanticValidator = struct {
 
     pub fn consumeEnd(validator: *SemanticValidator, end: EndElement, _: usize) !void {
         const tag = end.resolvedId();
-        if (tag == .cvParam or tag == .userParam) return;
-        if (tag == .cv) return;
+
+        switch (tag) {
+            .cv, .cvParam, .userParam => return,
+            else => {},
+        }
 
         var path_buf: [4096]u8 = undefined;
         var pos: usize = 0;
@@ -408,27 +419,30 @@ pub const SemanticValidator = struct {
         }
 
         // Capture referenceableParamGroup cvParams for later ref resolution.
-        if (tag == .referenceableParamGroup) {
-            if (validator.current_group_id) |group_id| {
-                if (validator.param_groups.get(group_id) == null) {
-                    const owned_id = try validator.allocator.dupe(u8, group_id);
-                    var term_list = std.ArrayList([]const u8).empty;
-                    errdefer {
-                        for (term_list.items) |t| validator.allocator.free(t);
-                        term_list.deinit(validator.allocator);
+        switch (tag) {
+            .referenceableParamGroup => {
+                if (validator.current_group_id) |group_id| {
+                    if (validator.param_groups.get(group_id) == null) {
+                        const owned_id = try validator.allocator.dupe(u8, group_id);
+                        var term_list = std.ArrayList([]const u8).empty;
+                        errdefer {
+                            for (term_list.items) |t| validator.allocator.free(t);
+                            term_list.deinit(validator.allocator);
+                        }
+                        for (scope.items) |acc| {
+                            const owned = try validator.allocator.dupe(u8, acc);
+                            try term_list.append(validator.allocator, owned);
+                        }
+                        validator.param_groups.put(owned_id, term_list) catch {
+                            validator.allocator.free(owned_id);
+                            for (term_list.items) |t| validator.allocator.free(t);
+                            term_list.deinit(validator.allocator);
+                        };
                     }
-                    for (scope.items) |acc| {
-                        const owned = try validator.allocator.dupe(u8, acc);
-                        try term_list.append(validator.allocator, owned);
-                    }
-                    validator.param_groups.put(owned_id, term_list) catch {
-                        validator.allocator.free(owned_id);
-                        for (term_list.items) |t| validator.allocator.free(t);
-                        term_list.deinit(validator.allocator);
-                    };
+                    validator.current_group_id = null;
                 }
-                validator.current_group_id = null;
-            }
+            },
+            else => {},
         }
 
         // Check rules for required terms and contradictions.

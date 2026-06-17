@@ -118,97 +118,77 @@ pub const IndexValidator = struct {
         start: StartElement,
         element_depth: usize,
     ) !void {
+        const tag = start.resolvedId();
         validator.depth = element_depth;
 
-        // Handle indexedmzML wrapper (contains mzML as a child).
-        if (start.resolvedId() == .indexedmzML) {
-            validator.indexed_mzml_depth = element_depth;
-            return;
-        }
-
-        // Track mzML element depth. May appear at depth 0 (standalone) or
-        // as a child of indexedmzML.
-        if (start.resolvedId() == .mzML and
-            (validator.mzml_depth == null or element_depth < validator.mzml_depth.?))
-        {
-            validator.mzml_depth = element_depth;
-            return;
+        switch (tag) {
+            .indexedmzML => {
+                validator.indexed_mzml_depth = element_depth;
+                return;
+            },
+            .mzML => {
+                if (validator.mzml_depth == null or element_depth < validator.mzml_depth.?) {
+                    validator.mzml_depth = element_depth;
+                }
+                return;
+            },
+            else => {},
         }
 
         if (validator.mzml_depth == null) return;
         if (element_depth < validator.mzml_depth.?) return;
 
-        // Track spectrum and chromatogram start offsets.
-        if (start.resolvedId() == .spectrum) {
-            try recordContainerOffset(validator, start, &validator.spectrum_offsets);
-            return;
-        }
-        if (start.resolvedId() == .chromatogram) {
-            try recordContainerOffset(validator, start, &validator.chromatogram_offsets);
-            return;
-        }
-
-        // indexList
-        if (start.resolvedId() == .indexList) {
-            validator.index_list_depth = element_depth;
-            validator.index_list_actual_offset = start.byte_offset;
-            validator.saw_index_elements = true;
-            // Capture declared count from attribute.
-            const count_attr = attributeValue(start.attributes, "count");
-            validator.index_list_declared_count = if (count_attr) |c|
-                std.fmt.parseUnsigned(u64, c, 10) catch null
-            else
-                null;
-            return;
-        }
-
-        // <index name="spectrum"> or <index name="chromatogram">
-        if (start.resolvedId() == .index) {
-            if (validator.index_list_depth == null) return;
-            if (element_depth != validator.index_list_depth.? + 1) return;
-            validator.index_list_actual_count += 1;
-            const name = attributeValue(start.attributes, "name") orelse {
-                try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
-                return;
-            };
-            validator.current_index_kind = if (std.mem.eql(u8, name, "spectrum"))
-                IndexKind.spectrum
-            else if (std.mem.eql(u8, name, "chromatogram"))
-                IndexKind.chromatogram
-            else blk: {
-                try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index name must be \"spectrum\" or \"chromatogram\"");
-                break :blk null;
-            };
-            return;
-        }
-
-        // <offset idRef="X">
-        if (start.resolvedId() == .offset) {
-            if (validator.current_index_kind == null) return;
-            const id_ref = attributeValue(start.attributes, "idRef") orelse {
-                try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
-                return;
-            };
-            if (validator.offset_id_ref_owned) |owned| validator.allocator.free(owned);
-            validator.offset_id_ref_owned = try validator.allocator.dupe(u8, id_ref);
-            validator.text_buf.clearRetainingCapacity();
-            return;
-        }
-
-        // indexListOffset
-        if (start.resolvedId() == .indexListOffset) {
-            validator.index_list_offset_byte_offset = start.byte_offset;
-            validator.index_list_offset_depth = element_depth;
-            validator.text_buf.clearRetainingCapacity();
-            return;
-        }
-
-        // fileChecksum
-        if (start.resolvedId() == .fileChecksum) {
-            validator.file_checksum_depth = element_depth;
-            validator.file_checksum_byte_offset = start.byte_offset + "<fileChecksum>".len;
-            validator.text_buf.clearRetainingCapacity();
-            return;
+        switch (tag) {
+            .spectrum => try recordContainerOffset(validator, start, &validator.spectrum_offsets),
+            .chromatogram => try recordContainerOffset(validator, start, &validator.chromatogram_offsets),
+            .indexList => {
+                validator.index_list_depth = element_depth;
+                validator.index_list_actual_offset = start.byte_offset;
+                validator.saw_index_elements = true;
+                const count_attr = attributeValue(start.attributes, "count");
+                validator.index_list_declared_count = if (count_attr) |c|
+                    std.fmt.parseUnsigned(u64, c, 10) catch null
+                else
+                    null;
+            },
+            .index => {
+                if (validator.index_list_depth == null) return;
+                if (element_depth != validator.index_list_depth.? + 1) return;
+                validator.index_list_actual_count += 1;
+                const name = attributeValue(start.attributes, "name") orelse {
+                    try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
+                    return;
+                };
+                validator.current_index_kind = if (std.mem.eql(u8, name, "spectrum"))
+                    IndexKind.spectrum
+                else if (std.mem.eql(u8, name, "chromatogram"))
+                    IndexKind.chromatogram
+                else blk: {
+                    try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index name must be \"spectrum\" or \"chromatogram\"");
+                    break :blk null;
+                };
+            },
+            .offset => {
+                if (validator.current_index_kind == null) return;
+                const id_ref = attributeValue(start.attributes, "idRef") orelse {
+                    try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
+                    return;
+                };
+                if (validator.offset_id_ref_owned) |owned| validator.allocator.free(owned);
+                validator.offset_id_ref_owned = try validator.allocator.dupe(u8, id_ref);
+                validator.text_buf.clearRetainingCapacity();
+            },
+            .indexListOffset => {
+                validator.index_list_offset_byte_offset = start.byte_offset;
+                validator.index_list_offset_depth = element_depth;
+                validator.text_buf.clearRetainingCapacity();
+            },
+            .fileChecksum => {
+                validator.file_checksum_depth = element_depth;
+                validator.file_checksum_byte_offset = start.byte_offset + "<fileChecksum>".len;
+                validator.text_buf.clearRetainingCapacity();
+            },
+            else => {},
         }
     }
 
@@ -218,74 +198,59 @@ pub const IndexValidator = struct {
         element_depth: usize,
     ) void {
         if (validator.mzml_depth == null) return;
-        if (element_depth < validator.mzml_depth.?) {
-            return;
-        }
+        if (element_depth < validator.mzml_depth.?) return;
 
-        // Close offset → create index entry.
-        if (end.resolvedId() == .offset and
-            validator.current_index_kind != null and
-            validator.offset_id_ref_owned != null)
-        {
-            const id_ref_owned = validator.offset_id_ref_owned.?;
-            validator.offset_id_ref_owned = null;
-            const offset = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
-                validator.allocator.free(id_ref_owned);
-                return;
-            };
-            validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset }) catch {
-                validator.allocator.free(id_ref_owned);
-                return;
-            };
-            return;
-        }
+        const tag = end.resolvedId();
 
-        // Close index.
-        if (end.resolvedId() == .index) {
-            validator.current_index_kind = null;
-            return;
-        }
-
-        // Close indexList.
-        if (end.resolvedId() == .indexList) {
-            validator.index_list_depth = null;
-            validator.index_list_offset_value = null;
-            return;
-        }
-
-        // Close indexListOffset.
-        if (end.resolvedId() == .indexListOffset) {
-            const parsed = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10);
-            validator.index_list_offset_value = parsed catch |err| blk: {
-                if (err == error.InvalidCharacter) {
+        switch (tag) {
+            .offset => {
+                if (validator.current_index_kind == null or validator.offset_id_ref_owned == null) return;
+                const id_ref_owned = validator.offset_id_ref_owned.?;
+                validator.offset_id_ref_owned = null;
+                const offset = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
+                    validator.allocator.free(id_ref_owned);
+                    return;
+                };
+                validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset }) catch {
+                    validator.allocator.free(id_ref_owned);
+                    return;
+                };
+            },
+            .index => validator.current_index_kind = null,
+            .indexList => {
+                validator.index_list_depth = null;
+                validator.index_list_offset_value = null;
+            },
+            .indexListOffset => {
+                const parsed = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10);
+                validator.index_list_offset_value = parsed catch |err| blk: {
+                    if (err == error.InvalidCharacter) {
+                        validator.appendDiagnostic(
+                            validator.index_list_offset_byte_offset orelse 0,
+                            RuleId.mzml_index_offset_list,
+                            "indexListOffset value is not a valid integer",
+                        ) catch {};
+                    }
+                    break :blk null;
+                };
+                validator.index_list_offset_depth = null;
+            },
+            .fileChecksum => {
+                const raw = validator.text_buf.items;
+                const hex = std.mem.trim(u8, raw, " \t\r\n");
+                if (hex.len != 40 or !isHexString(hex)) {
                     validator.appendDiagnostic(
-                        validator.index_list_offset_byte_offset orelse 0,
-                        RuleId.mzml_index_offset_list,
-                        "indexListOffset value is not a valid integer",
+                        validator.file_checksum_byte_offset orelse 0,
+                        RuleId.mzml_index_checksum,
+                        "fileChecksum must be a 40-character hexadecimal string",
                     ) catch {};
+                } else {
+                    decodeHex(hex, &validator.file_checksum_raw);
+                    validator.file_checksum_ok = true;
                 }
-                break :blk null;
-            };
-            validator.index_list_offset_depth = null;
-            return;
-        }
-
-        // Close fileChecksum.
-        if (end.resolvedId() == .fileChecksum) {
-            const raw = validator.text_buf.items;
-            const hex = std.mem.trim(u8, raw, " \t\r\n");
-            if (hex.len != 40 or !isHexString(hex)) {
-                validator.appendDiagnostic(
-                    validator.file_checksum_byte_offset orelse 0,
-                    RuleId.mzml_index_checksum,
-                    "fileChecksum must be a 40-character hexadecimal string",
-                ) catch {};
-            } else {
-                decodeHex(hex, &validator.file_checksum_raw);
-                validator.file_checksum_ok = true;
-            }
-            validator.file_checksum_depth = null;
-            return;
+                validator.file_checksum_depth = null;
+            },
+            else => {},
         }
     }
 
