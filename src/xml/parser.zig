@@ -13,6 +13,7 @@
 
 const std = @import("std");
 const events = @import("events.zig");
+const scan = @import("scan.zig");
 
 const Attribute = events.Attribute;
 const EndElement = events.EndElement;
@@ -197,6 +198,8 @@ pub const Parser = struct {
     fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!?Event {
         try parser.appendDecodedTextByte(first_byte);
 
+        try parser.consumeSliceTextPlainRun();
+
         while (true) {
             const next_byte = try parser.peekOptionalByte();
             if (next_byte == null or next_byte.? == '<') break;
@@ -315,6 +318,7 @@ pub const Parser = struct {
 
         const value_start = parser.token_len;
         while (true) {
+            try parser.consumeSliceAttrValuePlainRun(quote);
             const next_byte = try parser.takeRequiredByte();
             if (next_byte == quote) break;
             try parser.appendDecodedTextByte(next_byte);
@@ -446,6 +450,8 @@ pub const Parser = struct {
     fn parseName(parser: *Parser, first_byte: u8) ParseError!NameParts {
         const start = parser.token_len;
         try parser.appendTokenByte(first_byte);
+
+        try parser.consumeSliceNameCharRun();
 
         while (true) {
             const next_byte = try parser.peekOptionalByte();
@@ -679,10 +685,67 @@ pub const Parser = struct {
     }
 
     fn skipWhitespace(parser: *Parser) ParseError!void {
+        if (parser.lookahead == null) {
+            if (parser.consumeSliceWhitespaceRun()) return;
+        }
+
         while (try parser.peekOptionalByte()) |byte| {
             if (!std.ascii.isWhitespace(byte)) break;
             _ = try parser.takeRequiredByte();
         }
+    }
+
+    fn sliceTail(parser: *Parser) ?[]const u8 {
+        return switch (parser.input) {
+            .slice => |*slice| if (slice.pos >= slice.bytes.len) null else slice.bytes[slice.pos..],
+            .reader => null,
+        };
+    }
+
+    fn consumeSliceBytes(parser: *Parser, count: usize) void {
+        switch (parser.input) {
+            .slice => |*slice| {
+                slice.pos += count;
+                parser.absolute_offset += @intCast(count);
+                if (count > 0) parser.last_byte_offset = parser.absolute_offset - 1;
+            },
+            .reader => {},
+        }
+    }
+
+    fn consumeSliceWhitespaceRun(parser: *Parser) bool {
+        const tail = parser.sliceTail() orelse return false;
+        const run_len = scan.skipWhitespaceRun(tail);
+        if (run_len == 0) return false;
+        parser.consumeSliceBytes(run_len);
+        return true;
+    }
+
+    fn consumeSliceNameCharRun(parser: *Parser) ParseError!void {
+        if (parser.lookahead != null) return;
+        const tail = parser.sliceTail() orelse return;
+        const run_len = scan.nameCharRunLen(tail);
+        if (run_len == 0) return;
+        try parser.appendTokenSlice(tail[0..run_len]);
+        parser.consumeSliceBytes(run_len);
+    }
+
+    fn consumeSliceTextPlainRun(parser: *Parser) ParseError!void {
+        if (parser.lookahead != null) return;
+        const tail = parser.sliceTail() orelse return;
+        const run_len = scan.textPlainRunLen(tail);
+        if (run_len == 0) return;
+        try parser.appendTokenSlice(tail[0..run_len]);
+        parser.consumeSliceBytes(run_len);
+    }
+
+    fn consumeSliceAttrValuePlainRun(parser: *Parser, quote: u8) ParseError!void {
+        if (parser.lookahead != null) return;
+        const tail = parser.sliceTail() orelse return;
+        const run_len = scan.attrValuePlainRunLen(tail, quote);
+        if (run_len == 0) return;
+        try parser.appendTokenSlice(tail[0..run_len]);
+        parser.consumeSliceBytes(run_len);
     }
 
     fn expectByte(parser: *Parser, expected: u8) ParseError!void {
