@@ -13,6 +13,7 @@
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
+const elements = @import("mzml/elements.zig");
 const mzml_index = @import("mzml/index.zig");
 const obo_parser = @import("obo/parser.zig");
 const rule_engine = @import("obo/rule_engine.zig");
@@ -226,6 +227,8 @@ fn runValidation(
     defer if (cv_table) |*t| t.deinit();
 
     var element_depth: usize = 0;
+    const active = elements.activeMask(options.skip_binary, options.skip_index, options.skip_semantic);
+    const fuse_index_semantic = index_validator != null or semantic_validator != null;
 
     while (true) {
         const maybe_event = parser.next() catch |err| {
@@ -249,14 +252,20 @@ fn runValidation(
                 element_depth += 1;
                 try structural_validator.consumeStart(start);
                 if (binary_validator) |*validator| try validator.consumeStart(start);
-                if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
-                if (semantic_validator) |*validator| try validator.consumeStart(start, element_depth);
+                if (fuse_index_semantic) {
+                    const needed = elements.startMask(start.resolvedId()).intersect(active);
+                    if (needed.index) if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
+                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeStart(start, element_depth);
+                }
             },
             .end_element => |end| {
                 try structural_validator.consumeEnd(end);
                 if (binary_validator) |*validator| try validator.consumeEnd(end);
-                if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
-                if (semantic_validator) |*validator| try validator.consumeEnd(end, element_depth);
+                if (fuse_index_semantic) {
+                    const needed = elements.endMask(end.resolvedId()).intersect(active);
+                    if (needed.index) if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
+                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeEnd(end, element_depth);
+                }
                 element_depth -= 1;
             },
             .text => |text| {

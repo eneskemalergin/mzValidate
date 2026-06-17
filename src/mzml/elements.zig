@@ -135,7 +135,7 @@ fn comptimeMask(structural: bool, binary: bool, index: bool, semantic: bool) Val
 /// `false` means the validator is a no-op for that event and may be skipped.
 fn startMaskFor(comptime tag: ElementId) ValidatorMask {
     return switch (tag) {
-        .unknown => .none,
+        .unknown => comptimeMask(true, false, false, false),
         .activation, .contact, .isolationWindow, .paramGroupRef, .sourceFileRef, .sourceFileRefList, .target, .targetList =>
             comptimeMask(false, false, false, true),
         .cvParam => comptimeMask(false, true, false, true),
@@ -248,7 +248,7 @@ test "dispatch masks hand-traced spot checks" {
     try std.testing.expectEqual(all, startMask(.chromatogram));
     try std.testing.expectEqual(bin_cv, startMask(.cvParam));
     try std.testing.expectEqual(sem_only, startMask(.activation));
-    try std.testing.expectEqual(ValidatorMask.none, startMask(.unknown));
+    try std.testing.expectEqual(comptimeMask(true, false, false, false), startMask(.unknown));
     try std.testing.expectEqual(idx_wrap, startMask(.indexList));
     try std.testing.expectEqual(comptimeMask(true, true, false, true), endMask(.spectrum));
     try std.testing.expectEqual(ValidatorMask.none, endMask(.cvParam));
