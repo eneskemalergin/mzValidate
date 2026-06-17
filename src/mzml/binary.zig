@@ -10,16 +10,6 @@ const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 
-const elements = @import("elements.zig");
-
-fn startId(start: StartElement) elements.ElementId {
-    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
-}
-
-fn endId(end: EndElement) elements.ElementId {
-    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
-}
-
 const xml_parser = @import("../xml/parser.zig");
 
 const Attribute = xml_events.Attribute;
@@ -280,11 +270,11 @@ pub const BinaryValidator = struct {
 
     fn handleStart(validator: *BinaryValidator, start: StartElement, element_depth: usize) !void {
         if (validator.mzml_depth == null) {
-            if (validator.indexed_mzml_depth == null and startId(start) == .indexedmzML) {
+            if (validator.indexed_mzml_depth == null and start.resolvedId() == .indexedmzML) {
                 validator.indexed_mzml_depth = element_depth;
                 return;
             }
-            if (startId(start) == .mzML) {
+            if (start.resolvedId() == .mzML) {
                 if (validator.indexed_mzml_depth) |indexed_depth| {
                     if (element_depth != indexed_depth + 1) return;
                 }
@@ -295,7 +285,7 @@ pub const BinaryValidator = struct {
 
         if (!validator.isWithinMzmlScope(element_depth)) return;
 
-        if (startId(start) == .spectrum) {
+        if (start.resolvedId() == .spectrum) {
             const index_attr = attributeValue(start.attributes, "index");
             const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
             const index = parseOptionalUnsigned(index_attr);
@@ -326,7 +316,7 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (startId(start) == .chromatogram) {
+        if (start.resolvedId() == .chromatogram) {
             const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
             const dal = parseOptionalUnsigned(dal_attr);
             if (dal_attr != null and dal == null) {
@@ -346,7 +336,7 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (startId(start) == .binaryDataArray) {
+        if (start.resolvedId() == .binaryDataArray) {
             if (validator.binary_array != null) return;
             const enc_attr = attributeValue(start.attributes, "encodedLength");
             const encoded_length = parseOptionalUnsigned(enc_attr);
@@ -370,7 +360,7 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (startId(start) == .cvParam) {
+        if (start.resolvedId() == .cvParam) {
             if (validator.binary_array) |*state| {
                 if (element_depth != state.depth + 1) return;
                 const accession = attributeValue(start.attributes, "accession") orelse return;
@@ -410,7 +400,7 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (startId(start) == .binary) {
+        if (start.resolvedId() == .binary) {
             if (validator.binary_array) |*state| {
                 if (element_depth == state.depth + 1) {
                     state.binary_depth = element_depth;
@@ -449,7 +439,7 @@ pub const BinaryValidator = struct {
         if (validator.mzml_depth == null) return;
         if (!validator.isWithinMzmlScope(element_depth)) return;
 
-        if (endId(end) == .binary) {
+        if (end.resolvedId() == .binary) {
             if (validator.binary_array) |*state| {
                 if (state.binary_depth == element_depth) {
                     state.binary_depth = null;
@@ -458,7 +448,7 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (endId(end) == .binaryDataArray) {
+        if (end.resolvedId() == .binaryDataArray) {
             if (validator.binary_array) |*state| {
                 if (state.depth == element_depth) {
                     try validator.validateBinaryArray(state);
@@ -469,21 +459,21 @@ pub const BinaryValidator = struct {
             return;
         }
 
-        if (endId(end) == .spectrum) {
+        if (end.resolvedId() == .spectrum) {
             if (validator.spectrum) |state| {
                 if (state.depth == element_depth) validator.spectrum = null;
             }
             return;
         }
 
-        if (endId(end) == .chromatogram) {
+        if (end.resolvedId() == .chromatogram) {
             if (validator.chromatogram) |state| {
                 if (state.depth == element_depth) validator.chromatogram = null;
             }
             return;
         }
 
-        if (endId(end) == .mzML and validator.mzml_depth == element_depth) {
+        if (end.resolvedId() == .mzML and validator.mzml_depth == element_depth) {
             validator.mzml_depth = null;
         }
     }

@@ -15,17 +15,7 @@ const diagnostic = @import("../diagnostic.zig");
 const obo = @import("../obo/parser.zig");
 const rule_engine = @import("../obo/rule_engine.zig");
 const xml_events = @import("../xml/events.zig");
-
 const elements = @import("elements.zig");
-
-fn startId(start: StartElement) elements.ElementId {
-    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
-}
-
-fn endId(end: EndElement) elements.ElementId {
-    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
-}
-
 
 const Attribute = xml_events.Attribute;
 const CvTable = obo.CvTable;
@@ -185,7 +175,7 @@ pub const SemanticValidator = struct {
     }
 
     pub fn consumeStart(validator: *SemanticValidator, start: StartElement, _: usize) !void {
-        if (startId(start) == .cv) {
+        if (start.resolvedId() == .cv) {
             if (attributeValue(start.attributes, "id")) |id| {
                 const owned = try validator.allocator.dupe(u8, id);
                 validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
@@ -194,7 +184,7 @@ pub const SemanticValidator = struct {
         }
 
         // Reference resolution: track id declarations and *Ref attributes.
-        if (startId(start) != .cvParam and startId(start) != .userParam) {
+        if (start.resolvedId() != .cvParam and start.resolvedId() != .userParam) {
             var path_buf: [4096]u8 = undefined;
             var pos: usize = 0;
             path_buf[pos] = '/';
@@ -236,7 +226,7 @@ pub const SemanticValidator = struct {
             }
         }
 
-        if (startId(start) == .cvParam or startId(start) == .userParam) {
+        if (start.resolvedId() == .cvParam or start.resolvedId() == .userParam) {
             if (attributeValue(start.attributes, "accession")) |acc| {
                 if (validator.scope_terms.items.len > 0) {
                     const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
@@ -250,12 +240,12 @@ pub const SemanticValidator = struct {
             try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
 
             // Track referenceableParamGroup id for later capture.
-            if (startId(start) == .referenceableParamGroup) {
+            if (start.resolvedId() == .referenceableParamGroup) {
                 validator.current_group_id = attributeValue(start.attributes, "id");
             }
 
             // Resolve referenceableParamGroupRef: add group's cvParams to parent scope.
-            if (startId(start) == .referenceableParamGroupRef) {
+            if (start.resolvedId() == .referenceableParamGroupRef) {
                 if (attributeValue(start.attributes, "ref")) |ref_id| {
                     if (validator.param_groups.get(ref_id)) |group_terms| {
                         if (validator.scope_terms.items.len >= 2) {
@@ -276,7 +266,7 @@ pub const SemanticValidator = struct {
         const accession = attributeValue(start.attributes, "accession") orelse return;
         const cv_ref = if (attributeValue(start.attributes, "cvRef")) |ref|
             ref
-        else if (startId(start) == .userParam) blk: {
+        else if (start.resolvedId() == .userParam) blk: {
             const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
             break :blk accession[0..colon];
         } else return;
@@ -385,8 +375,9 @@ pub const SemanticValidator = struct {
     }
 
     pub fn consumeEnd(validator: *SemanticValidator, end: EndElement, _: usize) !void {
-        if (endId(end) == .cvParam or endId(end) == .userParam) return;
-        if (endId(end) == .cv) return;
+        const tag = end.resolvedId();
+        if (tag == .cvParam or tag == .userParam) return;
+        if (tag == .cv) return;
 
         var path_buf: [4096]u8 = undefined;
         var pos: usize = 0;
@@ -404,7 +395,6 @@ pub const SemanticValidator = struct {
         }
         const path = path_buf[0..pos];
 
-        // Pop scope and element name.
         if (validator.element_names.items.len == 0) return;
         const name = validator.element_names.items[validator.element_names.items.len - 1];
         validator.allocator.free(name);
@@ -418,7 +408,7 @@ pub const SemanticValidator = struct {
         }
 
         // Capture referenceableParamGroup cvParams for later ref resolution.
-        if (endId(end) == .referenceableParamGroup) {
+        if (tag == .referenceableParamGroup) {
             if (validator.current_group_id) |group_id| {
                 if (validator.param_groups.get(group_id) == null) {
                     const owned_id = try validator.allocator.dupe(u8, group_id);
@@ -569,6 +559,7 @@ fn makeCvParam(accession: []const u8, cv_ref: []const u8, byte_offset: u64) Star
     return .{
         .byte_offset = byte_offset,
         .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
         .attributes = &.{
             .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
             .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
@@ -581,6 +572,7 @@ fn makeCv(id: []const u8) StartElement {
     return .{
         .byte_offset = 0,
         .name = .{ .local_name = "cv", .namespace_uri = mzml_namespace },
+        .element_id = .cv,
         .attributes = &.{
             .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = id },
             .{ .byte_offset = 0, .name = .{ .local_name = "fullName" }, .value = "test" },
@@ -593,6 +585,7 @@ fn makeUnitParam(accession: []const u8, cv_ref: []const u8, unit_acc: []const u8
     return .{
         .byte_offset = byte_offset,
         .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
         .attributes = &.{
             .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
             .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
@@ -607,6 +600,7 @@ fn makeUnitParamWithName(accession: []const u8, cv_ref: []const u8, unit_acc: []
     return .{
         .byte_offset = byte_offset,
         .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
         .attributes = &.{
             .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
             .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
@@ -622,6 +616,7 @@ fn makeUserParamNoAccession(byte_offset: u64) StartElement {
     return .{
         .byte_offset = byte_offset,
         .name = .{ .local_name = "userParam", .namespace_uri = mzml_namespace },
+        .element_id = .userParam,
         .attributes = &.{
             .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = "some param" },
         },
@@ -629,14 +624,43 @@ fn makeUserParamNoAccession(byte_offset: u64) StartElement {
     };
 }
 
-// --- Test helpers ---
+fn internId(local_name: []const u8) xml_events.ElementId {
+    return elements.idFromParts(local_name, mzml_namespace);
+}
+
+fn makeStart(byte_offset: u64, local_name: []const u8, attributes: []const Attribute) StartElement {
+    return .{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
+        .element_id = internId(local_name),
+        .attributes = attributes,
+        .self_closing = false,
+    };
+}
+
+fn makeEnd(byte_offset: u64, local_name: []const u8) EndElement {
+    return .{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
+        .element_id = internId(local_name),
+    };
+}
+
+fn makeUserParam(byte_offset: u64, accession: []const u8, name: []const u8) StartElement {
+    return .{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = "userParam", .namespace_uri = mzml_namespace },
+        .element_id = .userParam,
+        .attributes = &.{
+            .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
+            .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = name },
+        },
+        .self_closing = false,
+    };
+}
 
 fn testEngine(allocator: std.mem.Allocator) !RuleEngine {
     return try RuleEngine.init(allocator, "<CvMapping><CvMappingRuleList></CvMappingRuleList></CvMapping>");
-}
-
-fn makeEnd(name: []const u8) EndElement {
-    return .{ .byte_offset = 0, .name = .{ .local_name = name, .namespace_uri = mzml_namespace } };
 }
 
 test "SemanticValidator: valid accession produces no diagnostic" {
@@ -672,6 +696,29 @@ test "SemanticValidator: invalid accession produces error" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
     try sv.consumeStart(makeCvParam("MS:9999999", "MS", 100), 2);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: cvParam with unknown intern id still validates accession" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try sv.consumeStart(makeCv("MS"), 1);
+
+    var param = makeCvParam("MS:9999999", "MS", 100);
+    param.element_id = .unknown;
+    try sv.consumeStart(param, 2);
+
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
 }
@@ -784,18 +831,12 @@ test "SemanticValidator: unitCvRef mismatch produces error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
     try sv.consumeStart(makeCv("UO"), 1);
-    // unitCvRef=MS but term namespace=UO -> mismatch
-    try sv.consumeStart(.{
-        .byte_offset = 100,
-        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "UO:0000000" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = "UO" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = "UO:0000000" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = "MS" },
-        },
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(100, "cvParam", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "UO:0000000" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = "UO" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = "UO:0000000" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = "MS" },
+    }), 2);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
 }
@@ -851,7 +892,6 @@ test "SemanticValidator: cvRef after cvList declaration works" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    // Process cv elements FIRST (as they appear in a real file), then cvParam.
     try sv.consumeStart(makeCv("MS"), 1);
     try sv.consumeStart(makeCv("UO"), 1);
     try sv.consumeStart(makeCvParam("MS:1000001", "MS", 0), 2);
@@ -872,7 +912,6 @@ test "SemanticValidator: multiple diagnostics on one cvParam" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    // Not registering any cv -> cvRef fails -> returns early -> only 1 diagnostic.
     try sv.consumeStart(makeCvParam("MS:9999999", "NONEXISTENT", 100), 1);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
 }
@@ -899,19 +938,11 @@ test "SemanticValidator: no contradiction with single term" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    // Open a scope element (spectrum)
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "spectrum", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "spectrum", &.{}), 2);
 
-    // Add only ONE cvParam - no contradiction expected.
     try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10), 3);
 
-    // Close spectrum - no contradiction
-    try sv.consumeEnd(.{ .byte_offset = 30, .name = .{ .local_name = "spectrum", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(30, "spectrum"), 2);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -937,19 +968,11 @@ test "SemanticValidator: must rule fires when term missing" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    // Open source element
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
 
-    // Add a wrong cvParam that IS in the CV but does NOT match the MUST rule
     try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
 
-    // Close source - MUST rule should fire (MS:1000482 != MS:1000008)
-    try sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(20, "source"), 2);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
 }
@@ -974,19 +997,11 @@ test "SemanticValidator: must rule passes when term present" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    // Open source element
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
 
-    // Add the required term
     try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
 
-    // Close source - MUST rule satisfied
-    try sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(20, "source"), 2);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1014,17 +1029,11 @@ test "SemanticValidator: must or rule fires when no term matches" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
 
-    // Add wrong term - MS:1000482 is neither MS:1000008 nor MS:1000443
     try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
 
-    try sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(20, "source"), 2);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
 }
@@ -1051,17 +1060,11 @@ test "SemanticValidator: must or rule passes when one term present" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "source", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
 
-    // Add one matching term - OR rule satisfied
     try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
 
-    try sv.consumeEnd(.{ .byte_offset = 20, .name = .{ .local_name = "source", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(20, "source"), 2);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1079,27 +1082,15 @@ test "SemanticValidator: declared id resolves in finish" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    // Declare a software element with id="SW1"
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "software", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "version" }, .value = "1.0" },
-        },
-        .self_closing = false,
-    }, 1);
+    try sv.consumeStart(makeStart(0, "software", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "version" }, .value = "1.0" },
+    }), 1);
 
-    // Declare an instrument configuration with softwareRef="SW1"
-    try sv.consumeStart(.{
-        .byte_offset = 10,
-        .name = .{ .local_name = "instrumentConfiguration", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "IC1" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
-        },
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(10, "instrumentConfiguration", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "IC1" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
+    }), 2);
 
     sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -1119,15 +1110,9 @@ test "SemanticValidator: unresolved ref produces error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    // softwareRef="NONEXISTENT" with no matching id declaration.
-    try sv.consumeStart(.{
-        .byte_offset = 10,
-        .name = .{ .local_name = "instrumentConfiguration", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "NONEXISTENT" },
-        },
-        .self_closing = false,
-    }, 1);
+    try sv.consumeStart(makeStart(10, "instrumentConfiguration", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "NONEXISTENT" },
+    }), 1);
 
     sv.finish();
     try expectEqual(@as(usize, 1), diagnostics.items.len);
@@ -1148,19 +1133,12 @@ test "SemanticValidator: duplicate id produces error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    // Two elements with the same id.
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "software", .namespace_uri = mzml_namespace },
-        .attributes = &.{.{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" }},
-        .self_closing = false,
-    }, 1);
-    try sv.consumeStart(.{
-        .byte_offset = 10,
-        .name = .{ .local_name = "software", .namespace_uri = mzml_namespace },
-        .attributes = &.{.{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" }},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "software", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
+    }), 1);
+    try sv.consumeStart(makeStart(10, "software", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
+    }), 2);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
@@ -1180,19 +1158,12 @@ test "SemanticValidator: forward reference resolves in finish" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    // Reference appears BEFORE the declaration.
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "instrumentConfiguration", .namespace_uri = mzml_namespace },
-        .attributes = &.{.{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" }},
-        .self_closing = false,
-    }, 1);
-    try sv.consumeStart(.{
-        .byte_offset = 10,
-        .name = .{ .local_name = "software", .namespace_uri = mzml_namespace },
-        .attributes = &.{.{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" }},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "instrumentConfiguration", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
+    }), 1);
+    try sv.consumeStart(makeStart(10, "software", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
+    }), 2);
 
     sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -1240,16 +1211,7 @@ test "SemanticValidator: userParam with valid accession triggers CV validation" 
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    // userParam with accession and no cvRef; derive cvRef from prefix "MS".
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "userParam", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "MS:1000001" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = "test param" },
-        },
-        .self_closing = false,
-    }, 1);
+    try sv.consumeStart(makeUserParam(0, "MS:1000001", "test param"), 1);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1268,16 +1230,7 @@ test "SemanticValidator: userParam with invalid accession produces error" {
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    // userParam with nonexistent accession; should produce error.
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "userParam", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "MS:9999999" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = "test param" },
-        },
-        .self_closing = false,
-    }, 1);
+    try sv.consumeStart(makeUserParam(0, "MS:9999999", "test param"), 1);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
 }
@@ -1298,16 +1251,7 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    // BTO term; not in psi-ms.obo but should be silently accepted.
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
-        .attributes = &.{
-            .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "BTO:0000001" },
-            .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = "BTO" },
-        },
-        .self_closing = false,
-    }, 1);
+    try sv.consumeStart(makeCvParam("BTO:0000001", "BTO", 0), 1);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1336,18 +1280,12 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     defer sv.deinit();
     try sv.consumeStart(makeCv("MS"), 1);
 
-    try sv.consumeStart(.{
-        .byte_offset = 0,
-        .name = .{ .local_name = "spectrum", .namespace_uri = mzml_namespace },
-        .attributes = &.{},
-        .self_closing = false,
-    }, 2);
+    try sv.consumeStart(makeStart(0, "spectrum", &.{}), 2);
 
-    // Both alternatives present; contradiction.
     try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10), 3);
     try sv.consumeStart(makeCvParam("MS:1000129", "MS", 20), 3);
 
-    try sv.consumeEnd(.{ .byte_offset = 30, .name = .{ .local_name = "spectrum", .namespace_uri = mzml_namespace } }, 2);
+    try sv.consumeEnd(makeEnd(30, "spectrum"), 2);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_contradiction, diagnostics.items[0].rule);
 }

@@ -14,17 +14,8 @@
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
-const xml_events = @import("../xml/events.zig");
-
 const elements = @import("elements.zig");
-
-fn startId(start: StartElement) elements.ElementId {
-    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
-}
-
-fn endId(end: EndElement) elements.ElementId {
-    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
-}
+const xml_events = @import("../xml/events.zig");
 
 const xml_parser = @import("../xml/parser.zig");
 
@@ -366,12 +357,12 @@ pub const StructuralValidator = struct {
         if (!validator.root_seen) {
             validator.root_seen = true;
             validator.root_byte_offset = start.byte_offset;
-            if (startId(start) == .indexedmzML) {
+            if (start.resolvedId() == .indexedmzML) {
                 validator.indexed_mzml_depth = element_depth;
                 return;
             }
 
-            validator.root_valid = startId(start) == .mzML;
+            validator.root_valid = start.resolvedId() == .mzML;
             if (!validator.root_valid) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
@@ -387,7 +378,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (!validator.root_valid and validator.indexed_mzml_depth != null and startId(start) == .mzML) {
+        if (!validator.root_valid and validator.indexed_mzml_depth != null and start.resolvedId() == .mzML) {
             if (element_depth != validator.indexed_mzml_depth.? + 1) {
                 try validator.nestingError(start.byte_offset, "mzML must be a direct child of indexedmzML");
                 return;
@@ -402,92 +393,92 @@ pub const StructuralValidator = struct {
         // indexList, indexListOffset, fileChecksum sit outside <mzML> under
         // <indexedmzML>. Need explicit handling since mzml_depth is null.
         if (validator.indexed_mzml_depth != null and
-            element_depth == validator.indexed_mzml_depth.? + 1 and
-            (startId(start) == .indexList or
-                startId(start) == .indexListOffset or
-                startId(start) == .fileChecksum))
+            element_depth == validator.indexed_mzml_depth.? + 1)
         {
-            if (startId(start) == .indexList) {
-                if (validator.index_list_seen) {
-                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
-                } else {
-                    validator.index_list_seen = true;
+            const tag = start.resolvedId();
+            if (tag == .indexList or tag == .indexListOffset or tag == .fileChecksum) {
+                if (tag == .indexList) {
+                    if (validator.index_list_seen) {
+                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
+                    } else {
+                        validator.index_list_seen = true;
+                    }
+                    try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
+                } else if (tag == .indexListOffset) {
+                    if (validator.index_list_offset_seen) {
+                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
+                    } else {
+                        validator.index_list_offset_seen = true;
+                    }
+                } else if (tag == .fileChecksum) {
+                    if (validator.file_checksum_seen) {
+                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
+                    } else {
+                        validator.file_checksum_seen = true;
+                    }
                 }
-                try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
-            } else if (startId(start) == .indexListOffset) {
-                if (validator.index_list_offset_seen) {
-                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
-                } else {
-                    validator.index_list_offset_seen = true;
-                }
-            } else if (startId(start) == .fileChecksum) {
-                if (validator.file_checksum_seen) {
-                    try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
-                } else {
-                    validator.file_checksum_seen = true;
-                }
+                return;
             }
-            return;
         }
 
         if (!validator.isWithinMzmlStartScope()) return;
 
-        if (startId(start) == .cvList) {
+        if (start.resolvedId() == .cvList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
             try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
             validator.cv_list = validator.initListCountState(start, element_depth, "cvList", "cv", 1);
             return;
         }
 
-        if (startId(start) == .fileDescription) {
+        if (start.resolvedId() == .fileDescription) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_description_seen, "fileDescription", .file_description);
             validator.file_description = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (startId(start) == .referenceableParamGroupList) {
+        if (start.resolvedId() == .referenceableParamGroupList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
             try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
             validator.referenceable_param_group_list = validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
             return;
         }
 
-        if (startId(start) == .sampleList) {
+        if (start.resolvedId() == .sampleList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
             try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
             validator.sample_list = validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
             return;
         }
 
-        if (startId(start) == .softwareList) {
+        if (start.resolvedId() == .softwareList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
             try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
             validator.software_list = validator.initListCountState(start, element_depth, "softwareList", "software", 1);
             return;
         }
 
-        if (startId(start) == .scanSettingsList) {
+        if (start.resolvedId() == .scanSettingsList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
             try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
             validator.scan_settings_list = validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
             return;
         }
 
-        if (startId(start) == .instrumentConfigurationList) {
+        if (start.resolvedId() == .instrumentConfigurationList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
             try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
             validator.instrument_configuration_list = validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
             return;
         }
 
-        if (startId(start) == .dataProcessingList) {
+        if (start.resolvedId() == .dataProcessingList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
             try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
             validator.data_processing_list = validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
             return;
         }
 
-        if (startId(start) == .run) {
+        if (start.resolvedId() == .run) {
             if (element_depth != validator.topLevelChildDepth()) {
                 try validator.nestingError(start.byte_offset, "run must be a direct child of mzML");
                 return;
@@ -507,7 +498,7 @@ pub const StructuralValidator = struct {
         // Post-run: indexList > indexListOffset > fileChecksum.
         // Content validation delegated to IndexValidator.
 
-        if (startId(start) == .indexList) {
+        if (start.resolvedId() == .indexList) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "indexList must appear after run");
                 return;
@@ -517,7 +508,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .indexListOffset) {
+        if (start.resolvedId() == .indexListOffset) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
                 return;
@@ -526,7 +517,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .fileChecksum) {
+        if (start.resolvedId() == .fileChecksum) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
                 return;
@@ -535,7 +526,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .fileContent) {
+        if (start.resolvedId() == .fileContent) {
             if (validator.file_description) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "fileContent must be a direct child of fileDescription");
@@ -554,7 +545,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .sourceFileList) {
+        if (start.resolvedId() == .sourceFileList) {
             if (validator.file_description) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "sourceFileList must be a direct child of fileDescription");
@@ -573,7 +564,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .sourceFile) {
+        if (start.resolvedId() == .sourceFile) {
             validator.bumpListItemCount(&validator.source_file_list, element_depth);
             try validator.requireAttribute(start, "id", "sourceFile is missing required attribute id");
             try validator.requireAttribute(start, "name", "sourceFile is missing required attribute name");
@@ -581,7 +572,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .spectrumList) {
+        if (start.resolvedId() == .spectrumList) {
             try validator.noteRunChild(start.byte_offset, .spectrum_list);
             if (validator.run_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "spectrumList must be a child of run");
@@ -595,7 +586,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .chromatogramList) {
+        if (start.resolvedId() == .chromatogramList) {
             try validator.noteRunChild(start.byte_offset, .chromatogram_list);
             if (validator.run_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "chromatogramList must be a child of run");
@@ -609,7 +600,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .spectrum) {
+        if (start.resolvedId() == .spectrum) {
             validator.bumpListItemCount(&validator.spectrum_list, element_depth);
             if (validator.spectrum_list_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
@@ -619,7 +610,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .chromatogram) {
+        if (start.resolvedId() == .chromatogram) {
             validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
             if (validator.chromatogram_list_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
@@ -629,7 +620,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .cv) {
+        if (start.resolvedId() == .cv) {
             validator.bumpListItemCount(&validator.cv_list, element_depth);
             try validator.requireAttribute(start, "id", "cv is missing required attribute id");
             try validator.requireAttribute(start, "fullName", "cv is missing required attribute fullName");
@@ -637,39 +628,39 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .referenceableParamGroup) {
+        if (start.resolvedId() == .referenceableParamGroup) {
             validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
             try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
             return;
         }
 
-        if (startId(start) == .sample) {
+        if (start.resolvedId() == .sample) {
             validator.bumpListItemCount(&validator.sample_list, element_depth);
             try validator.requireAttribute(start, "id", "sample is missing required attribute id");
             return;
         }
 
-        if (startId(start) == .software) {
+        if (start.resolvedId() == .software) {
             validator.bumpListItemCount(&validator.software_list, element_depth);
             try validator.requireAttribute(start, "id", "software is missing required attribute id");
             try validator.requireAttribute(start, "version", "software is missing required attribute version");
             return;
         }
 
-        if (startId(start) == .scanSettings) {
+        if (start.resolvedId() == .scanSettings) {
             validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
             try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
             return;
         }
 
-        if (startId(start) == .instrumentConfiguration) {
+        if (start.resolvedId() == .instrumentConfiguration) {
             validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
             try validator.requireAttribute(start, "id", "instrumentConfiguration is missing required attribute id");
             validator.instrument_configuration = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (startId(start) == .componentList) {
+        if (start.resolvedId() == .componentList) {
             if (validator.instrument_configuration) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "componentList must be a direct child of instrumentConfiguration");
@@ -693,7 +684,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .softwareRef) {
+        if (start.resolvedId() == .softwareRef) {
             if (validator.instrument_configuration) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "softwareRef must be a direct child of instrumentConfiguration");
@@ -708,35 +699,35 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .source) {
+        if (start.resolvedId() == .source) {
             try validator.noteComponentChild(start.byte_offset, .source);
             try validator.requireAttribute(start, "order", "source is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "source");
             return;
         }
 
-        if (startId(start) == .analyzer) {
+        if (start.resolvedId() == .analyzer) {
             try validator.noteComponentChild(start.byte_offset, .analyzer);
             try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "analyzer");
             return;
         }
 
-        if (startId(start) == .detector) {
+        if (start.resolvedId() == .detector) {
             try validator.noteComponentChild(start.byte_offset, .detector);
             try validator.requireAttribute(start, "order", "detector is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "detector");
             return;
         }
 
-        if (startId(start) == .dataProcessing) {
+        if (start.resolvedId() == .dataProcessing) {
             validator.bumpListItemCount(&validator.data_processing_list, element_depth);
             try validator.requireAttribute(start, "id", "dataProcessing is missing required attribute id");
             validator.data_processing = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (startId(start) == .processingMethod) {
+        if (start.resolvedId() == .processingMethod) {
             if (validator.data_processing) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "processingMethod must be a direct child of dataProcessing");
@@ -750,7 +741,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .scanList) {
+        if (start.resolvedId() == .scanList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "scanList must be a child of spectrum");
             }
@@ -760,7 +751,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .precursorList) {
+        if (start.resolvedId() == .precursorList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "precursorList must be a child of spectrum");
             }
@@ -770,7 +761,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .productList) {
+        if (start.resolvedId() == .productList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "productList must be a child of spectrum");
             }
@@ -780,7 +771,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .precursor) {
+        if (start.resolvedId() == .precursor) {
             if (validator.chromatogram) |state| {
                 if (state.depth + 1 == element_depth) {
                     try validator.noteChromatogramChild(start.byte_offset, .precursor);
@@ -797,7 +788,7 @@ pub const StructuralValidator = struct {
             }
         }
 
-        if (startId(start) == .product) {
+        if (start.resolvedId() == .product) {
             if (validator.chromatogram) |state| {
                 if (state.depth + 1 == element_depth) {
                     try validator.noteChromatogramChild(start.byte_offset, .product);
@@ -814,34 +805,34 @@ pub const StructuralValidator = struct {
             }
         }
 
-        if (startId(start) == .scan) {
+        if (start.resolvedId() == .scan) {
             validator.bumpListItemCount(&validator.scan_list, element_depth);
             return;
         }
 
-        if (startId(start) == .scanWindowList) {
+        if (start.resolvedId() == .scanWindowList) {
             try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
             validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
             return;
         }
 
-        if (startId(start) == .scanWindow) {
+        if (start.resolvedId() == .scanWindow) {
             validator.bumpListItemCount(&validator.scan_window_list, element_depth);
             return;
         }
 
-        if (startId(start) == .selectedIonList) {
+        if (start.resolvedId() == .selectedIonList) {
             try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
             validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
             return;
         }
 
-        if (startId(start) == .selectedIon) {
+        if (start.resolvedId() == .selectedIon) {
             validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
-        if (startId(start) == .binaryDataArrayList) {
+        if (start.resolvedId() == .binaryDataArrayList) {
             try validator.noteBinaryDataArrayListChild(start.byte_offset);
             try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
             validator.binary_data_array_list = validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
@@ -859,14 +850,14 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (startId(start) == .binaryDataArray) {
+        if (start.resolvedId() == .binaryDataArray) {
             validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
             return;
         }
 
         // Handled by SemanticValidator. Return early to avoid the catch-all.
-        if (startId(start) == .cvParam) return;
-        if (startId(start) == .userParam) return;
+        if (start.resolvedId() == .cvParam) return;
+        if (start.resolvedId() == .userParam) return;
 
         // Unrecognized element inside mzML scope.
         if (validator.isWithinMzmlStartScope()) {
@@ -889,12 +880,12 @@ pub const StructuralValidator = struct {
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
         if (!validator.isWithinMzmlEndScope(element_depth)) return;
 
-        if (endId(end) == .mzML and validator.mzml_depth == element_depth) {
+        if (end.resolvedId() == .mzML and validator.mzml_depth == element_depth) {
             validator.mzml_depth = null;
             return;
         }
 
-        if (endId(end) == .run) {
+        if (end.resolvedId() == .run) {
             if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
@@ -909,7 +900,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (endId(end) == .fileDescription) {
+        if (end.resolvedId() == .fileDescription) {
             if (validator.file_description) |state| {
                 if (!state.has_file_content) {
                     try validator.appendDiagnostic(.{
@@ -925,57 +916,57 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (endId(end) == .cvList) {
+        if (end.resolvedId() == .cvList) {
             try validator.finishListCount(&validator.cv_list, element_depth);
             return;
         }
 
-        if (endId(end) == .sourceFileList) {
+        if (end.resolvedId() == .sourceFileList) {
             try validator.finishListCount(&validator.source_file_list, element_depth);
             return;
         }
 
-        if (endId(end) == .referenceableParamGroupList) {
+        if (end.resolvedId() == .referenceableParamGroupList) {
             try validator.finishListCount(&validator.referenceable_param_group_list, element_depth);
             return;
         }
 
-        if (endId(end) == .sampleList) {
+        if (end.resolvedId() == .sampleList) {
             try validator.finishListCount(&validator.sample_list, element_depth);
             return;
         }
 
-        if (endId(end) == .softwareList) {
+        if (end.resolvedId() == .softwareList) {
             try validator.finishListCount(&validator.software_list, element_depth);
             return;
         }
 
-        if (endId(end) == .scanSettingsList) {
+        if (end.resolvedId() == .scanSettingsList) {
             try validator.finishListCount(&validator.scan_settings_list, element_depth);
             return;
         }
 
-        if (endId(end) == .instrumentConfigurationList) {
+        if (end.resolvedId() == .instrumentConfigurationList) {
             try validator.finishListCount(&validator.instrument_configuration_list, element_depth);
             return;
         }
 
-        if (endId(end) == .componentList) {
+        if (end.resolvedId() == .componentList) {
             try validator.finishComponentList(element_depth);
             return;
         }
 
-        if (endId(end) == .instrumentConfiguration) {
+        if (end.resolvedId() == .instrumentConfiguration) {
             validator.instrument_configuration = null;
             return;
         }
 
-        if (endId(end) == .dataProcessingList) {
+        if (end.resolvedId() == .dataProcessingList) {
             try validator.finishListCount(&validator.data_processing_list, element_depth);
             return;
         }
 
-        if (endId(end) == .dataProcessing) {
+        if (end.resolvedId() == .dataProcessing) {
             if (validator.data_processing) |state| {
                 if (!state.processing_method_seen) {
                     try validator.appendDiagnostic(.{
@@ -991,49 +982,49 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (endId(end) == .spectrumList and validator.spectrum_list_depth == element_depth) {
+        if (end.resolvedId() == .spectrumList and validator.spectrum_list_depth == element_depth) {
             try validator.finishListCount(&validator.spectrum_list, element_depth);
             validator.spectrum_list_depth = null;
             return;
         }
 
-        if (endId(end) == .chromatogramList and validator.chromatogram_list_depth == element_depth) {
+        if (end.resolvedId() == .chromatogramList and validator.chromatogram_list_depth == element_depth) {
             try validator.finishListCount(&validator.chromatogram_list, element_depth);
             validator.chromatogram_list_depth = null;
             return;
         }
 
-        if (endId(end) == .scanList) {
+        if (end.resolvedId() == .scanList) {
             try validator.finishListCount(&validator.scan_list, element_depth);
             return;
         }
 
-        if (endId(end) == .binaryDataArrayList) {
+        if (end.resolvedId() == .binaryDataArrayList) {
             try validator.finishListCount(&validator.binary_data_array_list, element_depth);
             return;
         }
 
-        if (endId(end) == .precursorList) {
+        if (end.resolvedId() == .precursorList) {
             try validator.finishListCount(&validator.precursor_list, element_depth);
             return;
         }
 
-        if (endId(end) == .productList) {
+        if (end.resolvedId() == .productList) {
             try validator.finishListCount(&validator.product_list, element_depth);
             return;
         }
 
-        if (endId(end) == .scanWindowList) {
+        if (end.resolvedId() == .scanWindowList) {
             try validator.finishListCount(&validator.scan_window_list, element_depth);
             return;
         }
 
-        if (endId(end) == .selectedIonList) {
+        if (end.resolvedId() == .selectedIonList) {
             try validator.finishListCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
-        if (endId(end) == .spectrum) {
+        if (end.resolvedId() == .spectrum) {
             if (validator.spectrum) |state| {
                 if (!state.has_binary_data_array_list) {
                     try validator.appendDiagnostic(.{
@@ -1049,7 +1040,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (endId(end) == .chromatogram) {
+        if (end.resolvedId() == .chromatogram) {
             if (validator.chromatogram) |state| {
                 if (!state.has_binary_data_array_list) {
                     try validator.appendDiagnostic(.{

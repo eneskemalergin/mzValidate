@@ -53,12 +53,30 @@ pub const StartElement = struct {
     element_id: ElementId = .unknown,
     attributes: []const Attribute,
     self_closing: bool,
+
+    /// Parser-filled intern ID, or derived from `name` for hand-built events.
+    pub fn resolvedId(self: StartElement) ElementId {
+        return elements.resolveId(
+            self.element_id,
+            self.name.local_name,
+            self.name.namespace_uri,
+        );
+    }
 };
 
 pub const EndElement = struct {
     byte_offset: u64,
     name: QName,
     element_id: ElementId = .unknown,
+
+    /// Parser-filled intern ID, or derived from `name` for hand-built events.
+    pub fn resolvedId(self: EndElement) ElementId {
+        return elements.resolveId(
+            self.element_id,
+            self.name.local_name,
+            self.name.namespace_uri,
+        );
+    }
 };
 
 /// `from_cdata` distinguishes CDATA from normal text, so validators can
@@ -81,3 +99,41 @@ pub const Event = union(EventKind) {
     end_element: EndElement,
     text: Text,
 };
+
+// --- Tests ---
+
+const diagnostic = @import("../diagnostic.zig");
+
+test "StartElement.resolvedId prefers parser intern id" {
+    const start = StartElement{
+        .byte_offset = 0,
+        .name = .{ .local_name = "spectrum", .namespace_uri = diagnostic.mzml_namespace },
+        .element_id = .chromatogram,
+        .attributes = &.{},
+        .self_closing = false,
+    };
+    try std.testing.expectEqual(ElementId.chromatogram, start.resolvedId());
+}
+
+test "StartElement.resolvedId falls back to element name" {
+    const start = StartElement{
+        .byte_offset = 0,
+        .name = .{ .local_name = "cvParam", .namespace_uri = diagnostic.mzml_namespace },
+        .attributes = &.{},
+        .self_closing = false,
+    };
+    try std.testing.expectEqual(ElementId.cvParam, start.resolvedId());
+}
+
+test "EndElement.resolvedId matches start for same local name" {
+    const name = QName{ .local_name = "source", .namespace_uri = diagnostic.mzml_namespace };
+    const start = StartElement{
+        .byte_offset = 0,
+        .name = name,
+        .element_id = .source,
+        .attributes = &.{},
+        .self_closing = false,
+    };
+    const end = EndElement{ .byte_offset = 10, .name = name, .element_id = .unknown };
+    try std.testing.expectEqual(start.resolvedId(), end.resolvedId());
+}

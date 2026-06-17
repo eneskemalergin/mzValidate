@@ -1,7 +1,7 @@
 //! mzML 1.1.0 element intern IDs for hot-path dispatch.
 //!
-//! `unknown` covers non-mzML XML and unrecognized local names. Validators
-//! should use `resolveId` so hand-built test events still work.
+//! `unknown` covers non-mzML XML and unrecognized local names.
+//! Validators call `StartElement.resolvedId` / `EndElement.resolvedId`.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -103,18 +103,12 @@ pub fn isKnownMzmlLocalName(local_name: []const u8) bool {
 // --- Tests ---
 
 test "idFromLocalName maps schema element names" {
-    // Arrange.
-    // Act.
-    // Assert.
     try std.testing.expectEqual(ElementId.spectrum, idFromLocalName("spectrum"));
     try std.testing.expectEqual(ElementId.indexedmzML, idFromLocalName("indexedmzML"));
     try std.testing.expectEqual(ElementId.unknown, idFromLocalName("notAnElement"));
 }
 
 test "every ElementId tag maps back from its local name" {
-    // Arrange.
-    // Act.
-    // Assert.
     inline for (std.meta.fields(ElementId)) |field| {
         if (!std.mem.eql(u8, field.name, "unknown")) {
             try std.testing.expectEqual(
@@ -126,8 +120,5 @@ test "every ElementId tag maps back from its local name" {
 }
 
 test "idFromParts rejects foreign namespaces" {
-    // Arrange.
-    // Act.
-    // Assert.
     try std.testing.expectEqual(ElementId.unknown, idFromParts("spectrum", "urn:other"));
 }

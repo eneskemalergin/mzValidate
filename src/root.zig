@@ -32,11 +32,13 @@ pub const validate = @import("validate.zig");
 pub const xml = struct {
     pub const events = @import("xml/events.zig");
     pub const parser = @import("xml/parser.zig");
+    pub const scan = @import("xml/scan.zig");
 };
 // I/O helpers live here when extracted from validate.zig.
 pub const io = struct {};
 /// mzML validators for focused tooling.
 pub const mzml = struct {
+    pub const elements = @import("mzml/elements.zig");
     pub const structural = @import("mzml/structural.zig");
     pub const binary = @import("mzml/binary.zig");
     pub const index = @import("mzml/index.zig");
@@ -69,6 +71,8 @@ pub fn run(init: std.process.Init) !u8 {
 test {
     _ = @import("xml/events.zig");
     _ = @import("xml/parser.zig");
+    _ = @import("xml/scan.zig");
+    _ = @import("mzml/elements.zig");
     _ = @import("mzml/structural.zig");
     _ = @import("mzml/binary.zig");
     _ = @import("mzml/index.zig");
