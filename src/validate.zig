@@ -21,13 +21,14 @@ const semantic = @import("mzml/semantic.zig");
 const structural = @import("mzml/structural.zig");
 const xml_events = @import("xml/events.zig");
 const xml_parser = @import("xml/parser.zig");
+const xml_parse_errors = @import("xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
-const ParseError = xml_parser.ParseError;
 const RuleId = diagnostic.RuleId;
 const max_validation_token_bytes = 1024 * 1024;
 
+/// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
@@ -37,6 +38,7 @@ pub const CheckOptions = struct {
     obo_path: ?[]const u8 = null,
 };
 
+/// Validates an mzML file on disk (mmap when possible).
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -116,8 +118,7 @@ pub fn checkSlice(
     });
 }
 
-/// Public one-pass seam for library callers. Keeps parser state,
-/// structural state, and at most one active binary workspace alive.
+/// Validates mzML from a streaming `std.Io.Reader` (stdin, pipes).
 pub fn checkReader(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -237,7 +238,7 @@ fn runValidation(
                 .rule = RuleId.mzml_structure_xml,
                 .location = .{ .byte_offset = parser.byteOffset() },
                 .path = path,
-                .message = parseErrorMessage(err),
+                .message = xml_parse_errors.parseErrorMessage(err),
             });
             return;
         };
@@ -255,7 +256,7 @@ fn runValidation(
                 if (fuse_index_semantic) {
                     const needed = elements.startMask(start.resolvedId()).intersect(active);
                     if (needed.index) if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
-                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeStart(start, element_depth);
+                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeStart(start);
                 }
             },
             .end_element => |end| {
@@ -264,12 +265,12 @@ fn runValidation(
                 if (fuse_index_semantic) {
                     const needed = elements.endMask(end.resolvedId()).intersect(active);
                     if (needed.index) if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
-                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeEnd(end, element_depth);
+                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeEnd(end);
                 }
                 element_depth -= 1;
             },
             .text => |text| {
-                // Structural: only depth==0 can diagnose text outside root (B.7).
+                // Text outside the root element is only visible when depth is still zero.
                 if (structural_validator.depth == 0) {
                     try structural_validator.consumeText(text);
                 }
@@ -277,7 +278,7 @@ fn runValidation(
                     if (validator.wantsText()) try validator.consumeText(text);
                 }
                 if (index_validator) |*validator| {
-                    if (validator.wantsText()) try validator.consumeText(text, element_depth);
+                    if (validator.wantsText()) try validator.consumeText(text);
                 }
             },
         }
@@ -285,26 +286,6 @@ fn runValidation(
 
     try structural_validator.finish();
     if (binary_validator) |*validator| try validator.finish();
-}
-
-fn parseErrorMessage(err: ParseError) []const u8 {
-    return switch (err) {
-        error.UnexpectedEof => "unexpected end of XML input",
-        error.InvalidUtf8 => "invalid UTF-8 in XML input",
-        error.TokenTooLong => "XML token exceeds the configured parser buffer",
-        error.TooManyAttributes => "XML element has more attributes than the configured parser limit",
-        error.MismatchedEndTag => "closing tag does not match the most recent opening tag",
-        error.UnknownEntity => "unknown XML entity reference",
-        error.UnsupportedMarkup => "DTD or unsupported XML construct",
-        error.TooManyNamespaces,
-        error.NamespaceStorageExceeded,
-        error.ElementNestingTooDeep,
-        error.ElementStorageExceeded,
-        error.MalformedXml,
-        error.InvalidCharacterReference,
-        error.ReadFailed,
-        => "malformed XML input",
-    };
 }
 
 // Tests: file and reader entry points.

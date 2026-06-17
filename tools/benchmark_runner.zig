@@ -16,13 +16,13 @@ const ZebracProfile = manifest.ZebracProfile;
 
 pub const Mode = enum {
     throughput_ci,
-    @"resource",
+    resource,
     record,
     local,
 
     pub fn parse(text: []const u8) ?Mode {
         if (std.mem.eql(u8, text, "throughput-ci")) return .throughput_ci;
-        if (std.mem.eql(u8, text, "resource")) return .@"resource";
+        if (std.mem.eql(u8, text, "resource")) return .resource;
         if (std.mem.eql(u8, text, "record")) return .record;
         if (std.mem.eql(u8, text, "local")) return .local;
         inline for (std.meta.fields(Mode)) |field| {
@@ -115,7 +115,7 @@ pub fn run(init: std.process.Init, mode: Mode, bench_path: []const u8) !void {
             try writeReport(allocator, io, repo_root, bench_path, json_path, rows.items);
             try stdout.print("benchmark-report={s}\n", .{json_path});
         },
-        .@"resource" => try runResource(allocator, io, stdout, repo_root, zebrac_path, bench_path),
+        .resource => try runResource(allocator, io, stdout, repo_root, zebrac_path, bench_path),
     }
 }
 
@@ -610,7 +610,7 @@ fn fail(io: std.Io, comptime fmt: []const u8, args: anytype) !noreturn {
 
 test "mode parse accepts hyphenated names" {
     try std.testing.expectEqual(Mode.throughput_ci, Mode.parse("throughput-ci").?);
-    try std.testing.expectEqual(Mode.@"resource", Mode.parse("resource").?);
+    try std.testing.expectEqual(Mode.resource, Mode.parse("resource").?);
     try std.testing.expectEqual(Mode.record, Mode.parse("record").?);
 }
 

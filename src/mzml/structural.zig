@@ -16,8 +16,8 @@ const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const elements = @import("elements.zig");
 const xml_events = @import("../xml/events.zig");
-
 const xml_parser = @import("../xml/parser.zig");
+const xml_parse_errors = @import("../xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
@@ -136,6 +136,7 @@ const ComponentListState = struct {
     last_child_slot: u8 = 0,
 };
 
+/// mzML 1.1 structural schema validator (nesting, order, required attributes).
 pub const StructuralValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),
@@ -157,8 +158,8 @@ pub const StructuralValidator = struct {
     instrument_configuration_list_seen: bool = false,
     data_processing_list_seen: bool = false,
     last_top_level_slot: u8 = 0,
-    // Bitmask of TopLevelSlot values whose duplicate diagnostic has already
-    // been emitted.  Prevents N duplicates from producing N-1 error messages.
+    // Bitmask of TopLevelSlot values already reported as duplicates.
+    // Stops N duplicate children from emitting N-1 identical errors.
     dup_reported_mask: u32 = 0,
 
     run_seen: bool = false,
@@ -338,7 +339,7 @@ pub const StructuralValidator = struct {
                     .rule = RuleId.mzml_structure_xml,
                     .location = .{ .byte_offset = parser.byteOffset() },
                     .path = validator.path,
-                    .message = parseErrorMessage(err),
+                    .message = xml_parse_errors.parseErrorMessage(err),
                 });
                 return;
             };
@@ -1085,7 +1086,7 @@ pub const StructuralValidator = struct {
     }
 
     fn parseCountAttribute(validator: *StructuralValidator, start: StartElement, label: []const u8) ?usize {
-        const value = attributeValue(start.attributes, "count") orelse return null;
+        const value = xml_events.attributeByLocalName(start.attributes, "count") orelse return null;
         return std.fmt.parseUnsigned(usize, value, 10) catch {
             validator.countError(start.byte_offset, invalidCountMessage(label)) catch {};
             return null;
@@ -1219,7 +1220,7 @@ pub const StructuralValidator = struct {
 
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
         _ = element_label;
-        const value = attributeValue(start.attributes, attribute_name) orelse return;
+        const value = xml_events.attributeByLocalName(start.attributes, attribute_name) orelse return;
         if (value.len > 0 and value[0] == '-') {
             validator.attributeError(start.byte_offset, "attribute must not be negative") catch {};
         }
@@ -1266,14 +1267,6 @@ fn hasAttribute(attributes: []const Attribute, local_name: []const u8) bool {
         if (std.mem.eql(u8, attribute.name.local_name, local_name)) return true;
     }
     return false;
-}
-
-fn attributeValue(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
-    for (attributes) |attribute| {
-        if (attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
-    }
-    return null;
 }
 
 fn topLevelDirectChildMessage(element_name: []const u8) []const u8 {
@@ -1390,25 +1383,9 @@ fn componentChildOutOfOrderMessage(slot: ComponentChildSlot) []const u8 {
     };
 }
 
-fn parseErrorMessage(err: ParseError) []const u8 {
-    return switch (err) {
-        error.UnexpectedEof => "unexpected end of XML input",
-        error.InvalidUtf8 => "invalid UTF-8 in XML input",
-        error.TokenTooLong => "XML token exceeds the configured parser buffer",
-        error.TooManyAttributes => "XML element has more attributes than the configured parser limit",
-        error.TooManyNamespaces,
-        error.NamespaceStorageExceeded,
-        error.ElementNestingTooDeep,
-        error.ElementStorageExceeded,
-        error.MalformedXml,
-        error.UnknownEntity,
-        error.InvalidCharacterReference,
-        error.UnsupportedMarkup,
-        error.MismatchedEndTag,
-        error.ReadFailed,
-        => "malformed XML input",
-    };
-}
+// --- Unit tests ---
+
+const test_events = @import("test_events.zig");
 
 // Tests: valid fixtures.
 
@@ -1468,29 +1445,15 @@ test "structural validator cvParam with unknown intern id does not report unreco
     var validator = StructuralValidator.init(allocator, &diagnostics, null);
     defer validator.deinit();
 
-    try validator.consumeStart(handStart("mzML", &.{handAttr("version", "1.1.0")}, 0));
-    try validator.consumeStart(handStart("run", &.{handAttr("id", "run1")}, 10));
-    try validator.consumeStart(handStart("spectrumList", &.{handAttr("count", "1")}, 20));
-    try validator.consumeStart(handStart("spectrum", &.{ handAttr("index", "0"), handAttr("id", "s1"), handAttr("defaultArrayLength", "1") }, 30));
-    try validator.consumeStart(handStart("cvParam", &.{handAttr("accession", "MS:1000576")}, 40));
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
+    try validator.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10));
+    try validator.consumeStart(test_events.startUnknown("spectrumList", &.{test_events.attr("count", "1")}, 20));
+    try validator.consumeStart(test_events.startUnknown("spectrum", &.{ test_events.attr("index", "0"), test_events.attr("id", "s1"), test_events.attr("defaultArrayLength", "1") }, 30));
+    try validator.consumeStart(test_events.startUnknown("cvParam", &.{test_events.attr("accession", "MS:1000576")}, 40));
 
     for (diagnostics.items) |diag| {
         try std.testing.expect(!std.mem.eql(u8, diag.message, "unrecognized element in mzML scope"));
     }
-}
-
-fn handAttr(name: []const u8, value: []const u8) Attribute {
-    return .{ .byte_offset = 0, .name = .{ .local_name = name }, .value = value };
-}
-
-fn handStart(local_name: []const u8, attributes: []const Attribute, byte_offset: u64) StartElement {
-    return .{
-        .byte_offset = byte_offset,
-        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
-        .element_id = .unknown,
-        .attributes = attributes,
-        .self_closing = false,
-    };
 }
 
 // Tests: required children and attributes.

@@ -75,6 +75,7 @@ pub const ElementFrame = struct {
     synthetic_end_byte_offset: ?u64 = null,
 };
 
+/// Caller-owned scratch for one parser event. Size for worst-case token and nesting depth.
 pub const Buffers = struct {
     token: []u8,
     attributes: []Attribute,
@@ -91,11 +92,13 @@ const SliceInput = struct {
     pos: usize,
 };
 
+/// Reader-backed or mmap slice input for `Parser`.
 pub const Input = union(enum) {
     reader: *std.Io.Reader,
     slice: SliceInput,
 };
 
+/// Streaming pull parser. Emits borrowed events; call `next()` until `null`.
 pub const Parser = struct {
     input: Input,
     token_buffer: []u8,
@@ -150,6 +153,7 @@ pub const Parser = struct {
         };
     }
 
+    /// Returns the next event, `null` at EOF, or a parse error.
     pub fn next(parser: *Parser) ParseError!?Event {
         if (parser.pending_self_closing_end) {
             return try parser.emitSyntheticEnd();
@@ -803,9 +807,8 @@ pub const Parser = struct {
         return (try parser.peekOptionalByte()) orelse error.UnexpectedEof;
     }
 
-    // Check for UTF-8 BOM (EF BB BF) using a temp buffer so we don't
-    // permanently consume 0xEF if the full BOM does not follow.  If it
-    // is not a BOM the first byte goes back into lookahead; bytes 1-2
+    // UTF-8 BOM: peek three bytes so a lone 0xEF at file start stays in lookahead.
+    // If it is not a BOM the first byte goes back into lookahead; bytes 1-2
     // are lost but 0xEF at position 0 without the rest of the BOM is
     // already invalid UTF-8 anyway.
     fn skipBom(parser: *Parser) ParseError!void {

@@ -141,6 +141,7 @@ pub const Summary = struct {
     }
 };
 
+/// Tallies diagnostics by severity for renderers and exit-code mapping.
 pub fn count(diagnostics: []const Diagnostic) Totals {
     var totals: Totals = .{};
     for (diagnostics) |diagnostic| {
@@ -153,6 +154,7 @@ pub fn count(diagnostics: []const Diagnostic) Totals {
     return totals;
 }
 
+/// Bundles severity counts with the derived run status.
 pub fn summarize(diagnostics: []const Diagnostic) Summary {
     return .{ .totals = count(diagnostics) };
 }

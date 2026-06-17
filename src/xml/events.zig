@@ -46,6 +46,15 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
+/// Looks up mzML attributes by local name, ignoring `xmlns*` declarations.
+pub fn attributeByLocalName(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
+    for (attributes) |attr| {
+        if (attr.is_namespace_declaration) continue;
+        if (std.mem.eql(u8, attr.name.local_name, local_name)) return attr.value;
+    }
+    return null;
+}
+
 /// Borrowed attribute views. Valid until the next `Parser.next()` call.
 pub const StartElement = struct {
     byte_offset: u64,
@@ -54,7 +63,7 @@ pub const StartElement = struct {
     attributes: []const Attribute,
     self_closing: bool,
 
-    /// Parser-filled intern ID, or derived from `name` for hand-built events.
+    /// Intern ID from the parser when set; otherwise derived from the QName.
     pub fn resolvedId(self: StartElement) ElementId {
         return elements.resolveId(
             self.element_id,
@@ -69,7 +78,7 @@ pub const EndElement = struct {
     name: QName,
     element_id: ElementId = .unknown,
 
-    /// Parser-filled intern ID, or derived from `name` for hand-built events.
+    /// Intern ID from the parser when set; otherwise derived from the QName.
     pub fn resolvedId(self: EndElement) ElementId {
         return elements.resolveId(
             self.element_id,

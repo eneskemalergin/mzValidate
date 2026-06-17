@@ -1,12 +1,12 @@
 //! OBO format 1.4 parser for psi-ms.obo controlled vocabularies.
 //!
 //! Parses stanzas (`[Term]`, `[Typedef]`), tag-value pairs, line
-//! continuations, and escape sequences.  Builds a `CvTable` keyed by
+//! continuations, and escape sequences. Builds a `CvTable` keyed by
 //! accession for fast lookup of CV terms, relationships, synonyms,
 //! and metadata (obsoletion, unit constraints, xsd types).
 //!
 //! The table is embedded at compile time via `@embedFile("data/psi-ms.obo")`
-//! and overridable at runtime with `-obo`.  Callers get a read-only view:
+//! and overridable at runtime with `-obo`. Callers get a read-only view:
 //!
 //!   var table = try CvTable.init(allocator, obo_text);
 //!   defer table.deinit();
@@ -37,6 +37,7 @@ pub const CvTerm = struct {
     binary_data_types: [][]const u8 = &.{},
 };
 
+/// Accession-keyed lookup table built from an OBO text buffer.
 pub const CvTable = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap(CvTerm),
@@ -158,7 +159,13 @@ pub const CvTable = struct {
             if (line[0] == '[') {
                 if (in_term) {
                     try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, xsd_type, &is_a_list, &rel_list, &syn_list, &unit_list, &binary_type_list);
-                    id = null; name = null; def_val = null; namespace = null; is_obsolete = false; replaced_by = null; xsd_type = null;
+                    id = null;
+                    name = null;
+                    def_val = null;
+                    namespace = null;
+                    is_obsolete = false;
+                    replaced_by = null;
+                    xsd_type = null;
                     is_a_list.clearRetainingCapacity();
                     rel_list.clearRetainingCapacity();
                     syn_list.clearRetainingCapacity();

@@ -2,7 +2,7 @@
 //!
 //! Re-exports every submodule and the most common types (Diagnostic,
 //! Severity, OutputMode, CheckOptions) so callers do not dig through
-//! internal paths.  Import as `mzvalidate` from executables, tests,
+//! internal paths. Import as `mzvalidate` from executables, tests,
 //! or downstream tools that want to reuse the validation engine.
 //!
 //! Namespace layout:
@@ -34,7 +34,6 @@ pub const xml = struct {
     pub const parser = @import("xml/parser.zig");
     pub const scan = @import("xml/scan.zig");
 };
-// I/O helpers live here when extracted from validate.zig.
 pub const io = struct {};
 /// mzML validators for focused tooling.
 pub const mzml = struct {
@@ -62,6 +61,7 @@ pub const OutputMode = output.OutputMode;
 /// Check options. Avoid reaching through `validate.CheckOptions`.
 pub const CheckOptions = validate.CheckOptions;
 
+/// CLI entry for library consumers (tests, downstream tools).
 pub fn run(init: std.process.Init) !u8 {
     return cli.run(init);
 }
@@ -70,6 +70,7 @@ pub fn run(init: std.process.Init) !u8 {
 
 test {
     _ = @import("xml/events.zig");
+    _ = @import("xml/parse_errors.zig");
     _ = @import("xml/parser.zig");
     _ = @import("xml/scan.zig");
     _ = @import("mzml/elements.zig");

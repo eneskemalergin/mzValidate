@@ -1,7 +1,7 @@
 //! Binary integrity checks for mzML payloads.
 //!
 //! Decodes base64, decompresses zlib, and validates array lengths against
-//! `defaultArrayLength` and declared precision.  Skips materializing the
+//! `defaultArrayLength` and declared precision. Skips materializing the
 //! decoded output for uncompressed arrays (streaming base64 counter).
 //! For zlib arrays, decompresses into a scratch buffer reused between
 //! arrays to keep allocator churn low.
@@ -9,13 +9,12 @@
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
-
 const xml_parser = @import("../xml/parser.zig");
+const xml_parse_errors = @import("../xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
 const EndElement = xml_events.EndElement;
-const ParseError = xml_parser.ParseError;
 const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
@@ -143,6 +142,7 @@ const BinaryArrayState = struct {
     }
 };
 
+/// Base64, zlib, and length/precision checks for `binaryDataArray` payloads.
 pub const BinaryValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),
@@ -238,12 +238,13 @@ pub const BinaryValidator = struct {
         try validator.handleText(text.value);
     }
 
-    /// True while inside a `<binary>` element for the active `binaryDataArray`.
+    /// Used by `runValidation` to avoid feeding text to binary unless a payload is open.
     pub fn wantsText(validator: *const BinaryValidator) bool {
         if (validator.binary_array) |state| return state.binary_depth != null;
         return false;
     }
 
+    /// No document-level finalization; kept for symmetry with other validators.
     pub fn finish(validator: *BinaryValidator) !void {
         _ = validator;
     }
@@ -258,7 +259,7 @@ pub const BinaryValidator = struct {
                     .rule = RuleId.mzml_structure_xml,
                     .location = .{ .byte_offset = parser.byteOffset() },
                     .path = validator.path,
-                    .message = parseErrorMessage(err),
+                    .message = xml_parse_errors.parseErrorMessage(err),
                 });
                 return;
             };
@@ -300,144 +301,144 @@ pub const BinaryValidator = struct {
         switch (tag) {
             .cv, .userParam => return,
             .spectrum => {
-            const index_attr = attributeValue(start.attributes, "index");
-            const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
-            const index = parseOptionalUnsigned(index_attr);
-            const dal = parseOptionalUnsigned(dal_attr);
-            if (index_attr != null and index == null) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_binary_base64,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "spectrum index must be a non-negative integer",
-                });
-            }
-            if (dal_attr != null and dal == null) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_binary_base64,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "spectrum defaultArrayLength must be a non-negative integer",
-                });
-            }
-            validator.spectrum = .{
-                .depth = element_depth,
-                .index = index,
-                .default_array_length = dal,
-            };
+                const index_attr = xml_events.attributeByLocalName(start.attributes, "index");
+                const dal_attr = xml_events.attributeByLocalName(start.attributes, "defaultArrayLength");
+                const index = parseOptionalUnsigned(index_attr);
+                const dal = parseOptionalUnsigned(dal_attr);
+                if (index_attr != null and index == null) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_base64,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "spectrum index must be a non-negative integer",
+                    });
+                }
+                if (dal_attr != null and dal == null) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_base64,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "spectrum defaultArrayLength must be a non-negative integer",
+                    });
+                }
+                validator.spectrum = .{
+                    .depth = element_depth,
+                    .index = index,
+                    .default_array_length = dal,
+                };
             },
             .chromatogram => {
-            const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
-            const dal = parseOptionalUnsigned(dal_attr);
-            if (dal_attr != null and dal == null) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_binary_base64,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "chromatogram defaultArrayLength must be a non-negative integer",
-                });
-            }
-            validator.chromatogram = .{
-                .depth = element_depth,
-                .index = null,
-                .default_array_length = dal,
-            };
+                const dal_attr = xml_events.attributeByLocalName(start.attributes, "defaultArrayLength");
+                const dal = parseOptionalUnsigned(dal_attr);
+                if (dal_attr != null and dal == null) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_base64,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "chromatogram defaultArrayLength must be a non-negative integer",
+                    });
+                }
+                validator.chromatogram = .{
+                    .depth = element_depth,
+                    .index = null,
+                    .default_array_length = dal,
+                };
             },
             .binaryDataArray => {
-            if (validator.binary_array != null) return;
-            const enc_attr = attributeValue(start.attributes, "encodedLength");
-            const encoded_length = parseOptionalUnsigned(enc_attr);
-            if (enc_attr != null and encoded_length == null) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_binary_base64,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "binaryDataArray encodedLength must be a non-negative integer",
-                });
-            }
-            if (validator.spectrum) |owner| {
-                validator.binary_array = BinaryArrayState.init(validator.allocator, start.byte_offset, element_depth, owner, encoded_length);
-                return;
-            }
-            if (validator.chromatogram) |owner| {
-                validator.binary_array = BinaryArrayState.init(validator.allocator, start.byte_offset, element_depth, owner, encoded_length);
-                return;
-            }
+                if (validator.binary_array != null) return;
+                const enc_attr = xml_events.attributeByLocalName(start.attributes, "encodedLength");
+                const encoded_length = parseOptionalUnsigned(enc_attr);
+                if (enc_attr != null and encoded_length == null) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_binary_base64,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "binaryDataArray encodedLength must be a non-negative integer",
+                    });
+                }
+                if (validator.spectrum) |owner| {
+                    validator.binary_array = BinaryArrayState.init(validator.allocator, start.byte_offset, element_depth, owner, encoded_length);
+                    return;
+                }
+                if (validator.chromatogram) |owner| {
+                    validator.binary_array = BinaryArrayState.init(validator.allocator, start.byte_offset, element_depth, owner, encoded_length);
+                    return;
+                }
             },
             .cvParam => {
-            if (validator.binary_array) |*state| {
-                if (element_depth != state.depth + 1) return;
-                const accession = attributeValue(start.attributes, "accession") orelse return;
-                if (std.mem.eql(u8, accession, "MS:1000574")) {
-                    state.saw_zlib_compression = true;
-                    return;
+                if (validator.binary_array) |*state| {
+                    if (element_depth != state.depth + 1) return;
+                    const accession = xml_events.attributeByLocalName(start.attributes, "accession") orelse return;
+                    if (std.mem.eql(u8, accession, "MS:1000574")) {
+                        state.saw_zlib_compression = true;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000576")) {
+                        state.saw_no_compression = true;
+                        return;
+                    }
+                    if (std.mem.startsWith(u8, accession, "MS:") and isCompressionAccession(accession)) {
+                        state.saw_unsupported_compression = true;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000521") or std.mem.eql(u8, accession, "MS:1000519")) {
+                        state.saw_precision_32 = true;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000523") or std.mem.eql(u8, accession, "MS:1000522")) {
+                        state.saw_precision_64 = true;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000514")) {
+                        state.array_kind = .mz;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000515")) {
+                        state.array_kind = .intensity;
+                        return;
+                    }
+                    if (std.mem.eql(u8, accession, "MS:1000595")) {
+                        state.array_kind = .time;
+                        return;
+                    }
                 }
-                if (std.mem.eql(u8, accession, "MS:1000576")) {
-                    state.saw_no_compression = true;
-                    return;
-                }
-                if (std.mem.startsWith(u8, accession, "MS:") and isCompressionAccession(accession)) {
-                    state.saw_unsupported_compression = true;
-                    return;
-                }
-                if (std.mem.eql(u8, accession, "MS:1000521") or std.mem.eql(u8, accession, "MS:1000519")) {
-                    state.saw_precision_32 = true;
-                    return;
-                }
-                if (std.mem.eql(u8, accession, "MS:1000523") or std.mem.eql(u8, accession, "MS:1000522")) {
-                    state.saw_precision_64 = true;
-                    return;
-                }
-                if (std.mem.eql(u8, accession, "MS:1000514")) {
-                    state.array_kind = .mz;
-                    return;
-                }
-                if (std.mem.eql(u8, accession, "MS:1000515")) {
-                    state.array_kind = .intensity;
-                    return;
-                }
-                if (std.mem.eql(u8, accession, "MS:1000595")) {
-                    state.array_kind = .time;
-                    return;
-                }
-            }
             },
             .binary => {
-            if (validator.binary_array) |*state| {
-                if (element_depth == state.depth + 1) {
-                    state.binary_depth = element_depth;
-                    state.binary_byte_offset = start.byte_offset;
-                    validator.scratch_payload.clearRetainingCapacity();
-                    if (state.encoded_length) |encoded_length| {
-                        if (encoded_length == 0) {
-                            // encodedLength=0 is suspicious; allow it but flag
-                            // if the actual payload is non-empty (caught below).
-                        }
-                        if (validator.max_binary_size) |max_size| {
-                            if (encoded_length > max_size) {
-                                try validator.appendDiagnostic(.{
-                                    .severity = .@"error",
-                                    .rule = RuleId.mzml_binary_oversized,
-                                    .location = .{ .byte_offset = start.byte_offset },
-                                    .path = validator.path,
-                                    .message = "binary payload exceeds -max-binary-size limit",
-                                });
-                                state.skipped = true;
-                                state.binary_depth = null;
-                                return;
+                if (validator.binary_array) |*state| {
+                    if (element_depth == state.depth + 1) {
+                        state.binary_depth = element_depth;
+                        state.binary_byte_offset = start.byte_offset;
+                        validator.scratch_payload.clearRetainingCapacity();
+                        if (state.encoded_length) |encoded_length| {
+                            if (encoded_length == 0) {
+                                // encodedLength=0 is suspicious; allow it but flag
+                                // if the actual payload is non-empty (caught below).
                             }
-                        }
-                        if (state.saw_zlib_compression) {
-                            try validator.scratch_payload.ensureTotalCapacity(validator.allocator, encoded_length);
-                            state.encoded_length = null;
+                            if (validator.max_binary_size) |max_size| {
+                                if (encoded_length > max_size) {
+                                    try validator.appendDiagnostic(.{
+                                        .severity = .@"error",
+                                        .rule = RuleId.mzml_binary_oversized,
+                                        .location = .{ .byte_offset = start.byte_offset },
+                                        .path = validator.path,
+                                        .message = "binary payload exceeds -max-binary-size limit",
+                                    });
+                                    state.skipped = true;
+                                    state.binary_depth = null;
+                                    return;
+                                }
+                            }
+                            if (state.saw_zlib_compression) {
+                                try validator.scratch_payload.ensureTotalCapacity(validator.allocator, encoded_length);
+                                state.encoded_length = null;
+                            }
                         }
                     }
                 }
-            }
             },
             else => {},
         }
@@ -675,8 +676,7 @@ pub const BinaryValidator = struct {
         }
 
         const element_count = decoded_bytes / width;
-        // TODO: when defaultArrayLength is null and the payload has data,
-        // we skip the length check entirely.  That is a false negative.
+        // TODO: missing defaultArrayLength lets non-empty payloads slip through unchecked.
         const declared_count = state.default_array_length orelse return;
         if (element_count == declared_count) return;
 
@@ -735,14 +735,6 @@ fn inflateCount(compressed: []const u8) error{InvalidBinaryPayload}!usize {
     return count;
 }
 
-fn attributeValue(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
-    for (attributes) |attribute| {
-        if (attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
-    }
-    return null;
-}
-
 fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
     const slice = value orelse return null;
     return std.fmt.parseUnsigned(usize, slice, 10) catch null;
@@ -777,25 +769,9 @@ fn precisionDeclaredMismatchMessage(precision: Precision) []const u8 {
     };
 }
 
-fn parseErrorMessage(err: ParseError) []const u8 {
-    return switch (err) {
-        error.UnexpectedEof => "unexpected end of XML input",
-        error.InvalidUtf8 => "invalid UTF-8 in XML input",
-        error.TokenTooLong => "XML token exceeds the configured parser buffer",
-        error.TooManyAttributes => "XML element has more attributes than the configured parser limit",
-        error.TooManyNamespaces,
-        error.NamespaceStorageExceeded,
-        error.ElementNestingTooDeep,
-        error.ElementStorageExceeded,
-        error.MalformedXml,
-        error.UnknownEntity,
-        error.InvalidCharacterReference,
-        error.UnsupportedMarkup,
-        error.MismatchedEndTag,
-        error.ReadFailed,
-        => "malformed XML input",
-    };
-}
+// --- Unit tests ---
+
+const test_events = @import("test_events.zig");
 
 // Tests: valid fixtures.
 
@@ -895,55 +871,33 @@ test "binary validator cvParam with unknown intern id still records zlib compres
     var validator = BinaryValidator.init(allocator, &diagnostics, null);
     defer validator.deinit();
 
-    const a = handBinaryAttr;
-    try validator.consumeStart(handBinaryStart("mzML", &.{}, 0));
-    try validator.consumeStart(handBinaryStart("run", &.{a("id", "run1")}, 10));
-    try validator.consumeStart(handBinaryStart("spectrumList", &.{a("count", "1")}, 20));
-    try validator.consumeStart(handBinaryStart("spectrum", &.{ a("index", "0"), a("id", "s1"), a("defaultArrayLength", "1") }, 30));
-    try validator.consumeStart(handBinaryStart("binaryDataArrayList", &.{a("count", "1")}, 40));
-    try validator.consumeStart(handBinaryStart("binaryDataArray", &.{a("encodedLength", "12")}, 50));
-    try validator.consumeStart(handBinaryStart("cvParam", &.{a("accession", "MS:1000521")}, 60));
-    try validator.consumeEnd(handBinaryEnd("cvParam"));
-    var zlib_param = handBinaryStart("cvParam", &.{a("accession", "MS:1000574")}, 70);
+    const a = test_events.attr;
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{}, 0));
+    try validator.consumeStart(test_events.startUnknown("run", &.{a("id", "run1")}, 10));
+    try validator.consumeStart(test_events.startUnknown("spectrumList", &.{a("count", "1")}, 20));
+    try validator.consumeStart(test_events.startUnknown("spectrum", &.{ a("index", "0"), a("id", "s1"), a("defaultArrayLength", "1") }, 30));
+    try validator.consumeStart(test_events.startUnknown("binaryDataArrayList", &.{a("count", "1")}, 40));
+    try validator.consumeStart(test_events.startUnknown("binaryDataArray", &.{a("encodedLength", "12")}, 50));
+    try validator.consumeStart(test_events.startUnknown("cvParam", &.{a("accession", "MS:1000521")}, 60));
+    try validator.consumeEnd(test_events.endUnknown("cvParam"));
+    var zlib_param = test_events.startUnknown("cvParam", &.{a("accession", "MS:1000574")}, 70);
     zlib_param.element_id = .unknown;
     try validator.consumeStart(zlib_param);
-    try validator.consumeEnd(handBinaryEnd("cvParam"));
-    try validator.consumeStart(handBinaryStart("cvParam", &.{a("accession", "MS:1000515")}, 80));
-    try validator.consumeEnd(handBinaryEnd("cvParam"));
-    try validator.consumeStart(handBinaryStart("binary", &.{}, 90));
+    try validator.consumeEnd(test_events.endUnknown("cvParam"));
+    try validator.consumeStart(test_events.startUnknown("cvParam", &.{a("accession", "MS:1000515")}, 80));
+    try validator.consumeEnd(test_events.endUnknown("cvParam"));
+    try validator.consumeStart(test_events.startUnknown("binary", &.{}, 90));
     try validator.consumeText(.{ .byte_offset = 100, .value = "eJxjYGBgAAAA", .from_cdata = false });
-    try validator.consumeEnd(handBinaryEnd("binary"));
-    try validator.consumeEnd(handBinaryEnd("binaryDataArray"));
-    try validator.consumeEnd(handBinaryEnd("binaryDataArrayList"));
-    try validator.consumeEnd(handBinaryEnd("spectrum"));
-    try validator.consumeEnd(handBinaryEnd("spectrumList"));
-    try validator.consumeEnd(handBinaryEnd("run"));
-    try validator.consumeEnd(handBinaryEnd("mzML"));
+    try validator.consumeEnd(test_events.endUnknown("binary"));
+    try validator.consumeEnd(test_events.endUnknown("binaryDataArray"));
+    try validator.consumeEnd(test_events.endUnknown("binaryDataArrayList"));
+    try validator.consumeEnd(test_events.endUnknown("spectrum"));
+    try validator.consumeEnd(test_events.endUnknown("spectrumList"));
+    try validator.consumeEnd(test_events.endUnknown("run"));
+    try validator.consumeEnd(test_events.endUnknown("mzML"));
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
-}
-
-fn handBinaryAttr(name: []const u8, value: []const u8) Attribute {
-    return .{ .byte_offset = 0, .name = .{ .local_name = name }, .value = value };
-}
-
-fn handBinaryStart(local_name: []const u8, attributes: []const Attribute, byte_offset: u64) StartElement {
-    return .{
-        .byte_offset = byte_offset,
-        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
-        .element_id = .unknown,
-        .attributes = attributes,
-        .self_closing = false,
-    };
-}
-
-fn handBinaryEnd(local_name: []const u8) EndElement {
-    return .{
-        .byte_offset = 0,
-        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
-        .element_id = .unknown,
-    };
 }
 
 test "binary validator reports precision mismatch" {

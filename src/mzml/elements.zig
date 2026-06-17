@@ -73,6 +73,7 @@ pub const ElementId = enum(u7) {
     userParam,
 };
 
+/// Maps a local name to an intern ID, or `.unknown` when unrecognized.
 pub fn idFromLocalName(local_name: []const u8) ElementId {
     inline for (std.meta.fields(ElementId)) |field| {
         if (!std.mem.eql(u8, field.name, "unknown") and
@@ -84,6 +85,7 @@ pub fn idFromLocalName(local_name: []const u8) ElementId {
     return .unknown;
 }
 
+/// Like `idFromLocalName`, but requires the mzML namespace URI.
 pub fn idFromParts(local_name: []const u8, namespace_uri: ?[]const u8) ElementId {
     if (namespace_uri) |ns| {
         if (!std.mem.eql(u8, ns, mzml_namespace)) return .unknown;
@@ -91,88 +93,70 @@ pub fn idFromParts(local_name: []const u8, namespace_uri: ?[]const u8) ElementId
     return idFromLocalName(local_name);
 }
 
+/// Parser intern ID when known; otherwise falls back to QName lookup.
 pub fn resolveId(id: ElementId, local_name: []const u8, namespace_uri: ?[]const u8) ElementId {
     if (id != .unknown) return id;
     return idFromParts(local_name, namespace_uri);
 }
 
+/// True when `local_name` is a defined mzML 1.1.0 element.
 pub fn isKnownMzmlLocalName(local_name: []const u8) bool {
     return idFromLocalName(local_name) != .unknown;
 }
 
-/// Which validators may do work on a given element tag (start or end event).
-/// Used by `runValidation` outer fusion (Slice B.6). Bits are ANDed with the
-/// active mask from `CheckOptions` skip flags.
-pub const ValidatorMask = packed struct(u4) {
-    structural: bool = false,
-    binary: bool = false,
+/// Per-tag fusion mask for index and semantic validators in `runValidation`.
+/// Structural and binary validators are always invoked on the hot path; only
+/// these bits gate `IndexValidator` / `SemanticValidator` calls.
+pub const IndexSemanticMask = packed struct(u2) {
     index: bool = false,
     semantic: bool = false,
 
-    pub const none = ValidatorMask{};
+    pub const none = IndexSemanticMask{};
 
-    pub fn any(self: ValidatorMask) bool {
-        return @as(u4, @bitCast(self)) != 0;
+    pub fn any(self: IndexSemanticMask) bool {
+        return @as(u2, @bitCast(self)) != 0;
     }
 
-    pub fn intersect(self: ValidatorMask, other: ValidatorMask) ValidatorMask {
-        return @bitCast(@as(u4, @bitCast(self)) & @as(u4, @bitCast(other)));
+    pub fn intersect(self: IndexSemanticMask, other: IndexSemanticMask) IndexSemanticMask {
+        return @bitCast(@as(u2, @bitCast(self)) & @as(u2, @bitCast(other)));
     }
 };
 
 pub const mask_table_len = 128;
 
-fn comptimeMask(structural: bool, binary: bool, index: bool, semantic: bool) ValidatorMask {
-    return .{
-        .structural = structural,
-        .binary = binary,
-        .index = index,
-        .semantic = semantic,
-    };
+fn comptimeMask(index: bool, semantic: bool) IndexSemanticMask {
+    return .{ .index = index, .semantic = semantic };
 }
 
-/// Hand-traced from structural/binary/index/semantic `switch (tag)` prongs.
-/// `false` means the validator is a no-op for that event and may be skipped.
-fn startMaskFor(comptime tag: ElementId) ValidatorMask {
+/// Hand-traced from index/semantic `switch (tag)` prongs.
+/// `false` means that validator is a no-op for the event and may be skipped.
+fn startMaskFor(comptime tag: ElementId) IndexSemanticMask {
     return switch (tag) {
-        .unknown => comptimeMask(true, false, false, false),
-        .activation, .contact, .isolationWindow, .paramGroupRef, .sourceFileRef, .sourceFileRefList, .target, .targetList =>
-            comptimeMask(false, false, false, true),
-        .cvParam => comptimeMask(false, true, false, true),
-        .userParam => comptimeMask(false, false, false, true),
-        .binary => comptimeMask(false, true, false, true),
-        .indexedmzML, .mzML, .spectrum, .chromatogram =>
-            comptimeMask(true, true, true, true),
-        .indexList, .indexListOffset, .fileChecksum =>
-            comptimeMask(true, false, true, true),
-        .index, .offset => comptimeMask(false, false, true, true),
-        .binaryDataArray => comptimeMask(true, true, false, true),
-        else => comptimeMask(true, false, false, true),
+        .unknown => .none,
+        .activation, .contact, .isolationWindow, .paramGroupRef, .sourceFileRef, .sourceFileRefList, .target, .targetList => comptimeMask(false, true),
+        .cvParam, .userParam, .binary => comptimeMask(false, true),
+        .indexedmzML, .mzML, .spectrum, .chromatogram => comptimeMask(true, true),
+        .indexList, .indexListOffset, .fileChecksum, .index, .offset => comptimeMask(true, true),
+        .binaryDataArray => comptimeMask(false, true),
+        else => comptimeMask(false, true),
     };
 }
 
-fn endMaskFor(comptime tag: ElementId) ValidatorMask {
+fn endMaskFor(comptime tag: ElementId) IndexSemanticMask {
     return switch (tag) {
         .unknown, .cv, .cvParam, .userParam => .none,
-        .binary, .binaryDataArray, .spectrum, .chromatogram, .mzML =>
-            comptimeMask(true, true, false, true),
-        .index, .offset, .indexList, .indexListOffset, .fileChecksum =>
-            comptimeMask(false, false, true, true),
-        .run, .fileDescription, .cvList, .sourceFileList, .referenceableParamGroupList,
-        .sampleList, .softwareList, .scanSettingsList, .instrumentConfigurationList,
-        .componentList, .instrumentConfiguration, .dataProcessingList, .dataProcessing,
-        .spectrumList, .chromatogramList, .scanList, .binaryDataArrayList, .precursorList,
-        .productList, .scanWindowList, .selectedIonList =>
-            comptimeMask(true, false, false, true),
-        else => comptimeMask(false, false, false, true),
+        .index, .offset, .indexList, .indexListOffset, .fileChecksum => comptimeMask(true, true),
+        else => comptimeMask(false, true),
     };
 }
 
-pub const start_masks: [mask_table_len]ValidatorMask = buildMaskTable(startMaskFor);
-pub const end_masks: [mask_table_len]ValidatorMask = buildMaskTable(endMaskFor);
+/// Comptime tables: which index/semantic handlers may run per start tag.
+pub const start_masks: [mask_table_len]IndexSemanticMask = buildMaskTable(startMaskFor);
+/// Comptime tables: which index/semantic handlers may run per end tag.
+pub const end_masks: [mask_table_len]IndexSemanticMask = buildMaskTable(endMaskFor);
 
-fn buildMaskTable(comptime mask_fn: anytype) [mask_table_len]ValidatorMask {
-    var table: [mask_table_len]ValidatorMask = @splat(.none);
+fn buildMaskTable(comptime mask_fn: anytype) [mask_table_len]IndexSemanticMask {
+    var table: [mask_table_len]IndexSemanticMask = @splat(.none);
     inline for (std.meta.fields(ElementId)) |field| {
         const tag = @field(ElementId, field.name);
         table[@intFromEnum(tag)] = mask_fn(tag);
@@ -180,18 +164,20 @@ fn buildMaskTable(comptime mask_fn: anytype) [mask_table_len]ValidatorMask {
     return table;
 }
 
-pub fn startMask(id: ElementId) ValidatorMask {
+/// Start-event fusion mask for `tag` (index and semantic bits only).
+pub fn startMask(id: ElementId) IndexSemanticMask {
     return start_masks[@intFromEnum(id)];
 }
 
-pub fn endMask(id: ElementId) ValidatorMask {
+/// End-event fusion mask for `tag` (index and semantic bits only).
+pub fn endMask(id: ElementId) IndexSemanticMask {
     return end_masks[@intFromEnum(id)];
 }
 
-pub fn activeMask(skip_binary: bool, skip_index: bool, skip_semantic: bool) ValidatorMask {
+/// Applies CLI skip flags to the fusion mask (`skip_binary` is handled separately).
+pub fn activeMask(_skip_binary: bool, skip_index: bool, skip_semantic: bool) IndexSemanticMask {
+    _ = _skip_binary;
     return .{
-        .structural = true,
-        .binary = !skip_binary,
         .index = !skip_index,
         .semantic = !skip_semantic,
     };
@@ -239,28 +225,25 @@ test "dispatch mask tables match comptime tracers" {
 }
 
 test "dispatch masks hand-traced spot checks" {
-    const all = comptimeMask(true, true, true, true);
-    const sem_only = comptimeMask(false, false, false, true);
-    const bin_cv = comptimeMask(false, true, false, true);
-    const idx_wrap = comptimeMask(true, false, true, true);
+    const all = comptimeMask(true, true);
+    const sem_only = comptimeMask(false, true);
+    const idx_sem = comptimeMask(true, true);
 
     try std.testing.expectEqual(all, startMask(.spectrum));
     try std.testing.expectEqual(all, startMask(.chromatogram));
-    try std.testing.expectEqual(bin_cv, startMask(.cvParam));
+    try std.testing.expectEqual(sem_only, startMask(.cvParam));
     try std.testing.expectEqual(sem_only, startMask(.activation));
-    try std.testing.expectEqual(comptimeMask(true, false, false, false), startMask(.unknown));
-    try std.testing.expectEqual(idx_wrap, startMask(.indexList));
-    try std.testing.expectEqual(comptimeMask(true, true, false, true), endMask(.spectrum));
-    try std.testing.expectEqual(ValidatorMask.none, endMask(.cvParam));
-    try std.testing.expectEqual(comptimeMask(false, false, true, true), endMask(.offset));
+    try std.testing.expectEqual(IndexSemanticMask.none, startMask(.unknown));
+    try std.testing.expectEqual(idx_sem, startMask(.indexList));
+    try std.testing.expectEqual(sem_only, endMask(.spectrum));
+    try std.testing.expectEqual(IndexSemanticMask.none, endMask(.cvParam));
+    try std.testing.expectEqual(idx_sem, endMask(.offset));
 }
 
 test "activeMask respects skip flags" {
-    const full = comptimeMask(true, true, true, true);
-    const l1 = activeMask(true, false, true);
-    try std.testing.expectEqual(comptimeMask(true, false, true, false), l1);
-    try std.testing.expectEqual(full, activeMask(false, false, false));
-    try std.testing.expectEqual(comptimeMask(true, false, false, false), activeMask(true, true, true));
+    try std.testing.expectEqual(comptimeMask(true, true), activeMask(false, false, false));
+    try std.testing.expectEqual(comptimeMask(true, false), activeMask(true, false, true));
+    try std.testing.expectEqual(IndexSemanticMask.none, activeMask(true, true, true));
 }
 
 test "dispatch masks align with tiny mzML fixture tags" {

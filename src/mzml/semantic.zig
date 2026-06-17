@@ -1,7 +1,7 @@
 //! CV validation, scope tracking, contradiction detection, and reference resolution.
 //!
 //! Validates every `<cvParam>` and `<userParam>` against the CvTable built
-//! from psi-ms.obo.  Checks:
+//! from psi-ms.obo. Checks:
 //!   - cvRef resolves to a declared `<cv>` entry in `<cvList>`
 //!   - Accession exists in the CV
 //!   - Term is not obsolete
@@ -41,8 +41,7 @@ const UnresolvedRef = struct {
     byte_offset: u64,
 };
 
-// Accumulates id declarations and deferred *Ref attributes, then resolves
-// them in finish().  Owns all strings via the parent allocator.
+// Defers *Ref resolution until the document end so forward references work.
 const RefTable = struct {
     allocator: std.mem.Allocator,
     declarations: std.StringHashMap(Declaration),
@@ -112,6 +111,7 @@ const RefTable = struct {
     }
 };
 
+/// CV terms, scope rules, contradictions, and id/*Ref resolution.
 pub const SemanticValidator = struct {
     allocator: std.mem.Allocator,
     cv_table: *const CvTable,
@@ -174,12 +174,12 @@ pub const SemanticValidator = struct {
         validator.ref_table.deinit();
     }
 
-    pub fn consumeStart(validator: *SemanticValidator, start: StartElement, _: usize) !void {
+    pub fn consumeStart(validator: *SemanticValidator, start: StartElement) !void {
         const tag = start.resolvedId();
 
         switch (tag) {
             .cv => {
-                if (attributeValue(start.attributes, "id")) |id| {
+                if (xml_events.attributeByLocalName(start.attributes, "id")) |id| {
                     const owned = try validator.allocator.dupe(u8, id);
                     validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
                 }
@@ -210,7 +210,7 @@ pub const SemanticValidator = struct {
                 pos += start.name.local_name.len;
                 const cur_path = path_buf[0..pos];
 
-                if (attributeValue(start.attributes, "id")) |id| {
+                if (xml_events.attributeByLocalName(start.attributes, "id")) |id| {
                     if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
                         try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
@@ -233,7 +233,7 @@ pub const SemanticValidator = struct {
 
         switch (tag) {
             .cvParam, .userParam => {
-                if (attributeValue(start.attributes, "accession")) |acc| {
+                if (xml_events.attributeByLocalName(start.attributes, "accession")) |acc| {
                     if (validator.scope_terms.items.len > 0) {
                         const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
                         const owned = try validator.allocator.dupe(u8, acc);
@@ -248,10 +248,10 @@ pub const SemanticValidator = struct {
 
                 switch (tag) {
                     .referenceableParamGroup => {
-                        validator.current_group_id = attributeValue(start.attributes, "id");
+                        validator.current_group_id = xml_events.attributeByLocalName(start.attributes, "id");
                     },
                     .referenceableParamGroupRef => {
-                        if (attributeValue(start.attributes, "ref")) |ref_id| {
+                        if (xml_events.attributeByLocalName(start.attributes, "ref")) |ref_id| {
                             if (validator.param_groups.get(ref_id)) |group_terms| {
                                 if (validator.scope_terms.items.len >= 2) {
                                     const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
@@ -271,8 +271,8 @@ pub const SemanticValidator = struct {
             },
         }
 
-        const accession = attributeValue(start.attributes, "accession") orelse return;
-        const cv_ref = if (attributeValue(start.attributes, "cvRef")) |ref|
+        const accession = xml_events.attributeByLocalName(start.attributes, "accession") orelse return;
+        const cv_ref = if (xml_events.attributeByLocalName(start.attributes, "cvRef")) |ref|
             ref
         else if (tag == .userParam) blk: {
             const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
@@ -331,9 +331,9 @@ pub const SemanticValidator = struct {
         }
 
         // Unit term validation.
-        if (attributeValue(start.attributes, "unitAccession")) |unit_acc| {
-            const unit_cv_ref = attributeValue(start.attributes, "unitCvRef");
-            const unit_name = attributeValue(start.attributes, "unitName");
+        if (xml_events.attributeByLocalName(start.attributes, "unitAccession")) |unit_acc| {
+            const unit_cv_ref = xml_events.attributeByLocalName(start.attributes, "unitCvRef");
+            const unit_name = xml_events.attributeByLocalName(start.attributes, "unitName");
 
             if (validator.cv_table.lookup(unit_acc)) |unit_term| {
                 if (unit_cv_ref) |ref| {
@@ -382,7 +382,7 @@ pub const SemanticValidator = struct {
         }
     }
 
-    pub fn consumeEnd(validator: *SemanticValidator, end: EndElement, _: usize) !void {
+    pub fn consumeEnd(validator: *SemanticValidator, end: EndElement) !void {
         const tag = end.resolvedId();
 
         switch (tag) {
@@ -555,15 +555,9 @@ fn isRefAttr(name: []const u8) bool {
     return name.len >= 3 and std.mem.eql(u8, name[name.len - 3 ..], "Ref");
 }
 
-fn attributeValue(attributes: []const Attribute, name: []const u8) ?[]const u8 {
-    for (attributes) |a| {
-        if (a.name.matches(null, name)) return a.value;
-    }
-    return null;
-}
-
 // --- Unit tests ---
 
+const test_events = @import("test_events.zig");
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectEqualStrings = testing.expectEqualStrings;
@@ -638,28 +632,6 @@ fn makeUserParamNoAccession(byte_offset: u64) StartElement {
     };
 }
 
-fn internId(local_name: []const u8) xml_events.ElementId {
-    return elements.idFromParts(local_name, mzml_namespace);
-}
-
-fn makeStart(byte_offset: u64, local_name: []const u8, attributes: []const Attribute) StartElement {
-    return .{
-        .byte_offset = byte_offset,
-        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
-        .element_id = internId(local_name),
-        .attributes = attributes,
-        .self_closing = false,
-    };
-}
-
-fn makeEnd(byte_offset: u64, local_name: []const u8) EndElement {
-    return .{
-        .byte_offset = byte_offset,
-        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
-        .element_id = internId(local_name),
-    };
-}
-
 fn makeUserParam(byte_offset: u64, accession: []const u8, name: []const u8) StartElement {
     return .{
         .byte_offset = byte_offset,
@@ -690,8 +662,8 @@ test "SemanticValidator: valid accession produces no diagnostic" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 0), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 0));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -708,8 +680,8 @@ test "SemanticValidator: invalid accession produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCvParam("MS:9999999", "MS", 100), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCvParam("MS:9999999", "MS", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
 }
@@ -727,11 +699,11 @@ test "SemanticValidator: cvParam with unknown intern id still validates accessio
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
     var param = makeCvParam("MS:9999999", "MS", 100);
     param.element_id = .unknown;
-    try sv.consumeStart(param, 2);
+    try sv.consumeStart(param);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
@@ -750,8 +722,8 @@ test "SemanticValidator: obsolete accession produces warning" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 100), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_obsolete, diagnostics.items[0].rule);
 }
@@ -769,8 +741,8 @@ test "SemanticValidator: mismatched cvRef/namespace produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCvParam("MS:1000001", "UO", 100), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCvParam("MS:1000001", "UO", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
 }
@@ -788,7 +760,7 @@ test "SemanticValidator: cvRef not in cvList produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCvParam("MS:1000001", "NONEXISTENT", 100), 1);
+    try sv.consumeStart(makeCvParam("MS:1000001", "NONEXISTENT", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
 }
@@ -806,9 +778,9 @@ test "SemanticValidator: valid unit accession produces no diagnostic" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCv("UO"), 1);
-    try sv.consumeStart(makeUnitParam("MS:1000001", "MS", "UO:0000000", 100), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCv("UO"));
+    try sv.consumeStart(makeUnitParam("MS:1000001", "MS", "UO:0000000", 100));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -825,8 +797,8 @@ test "SemanticValidator: invalid unit accession produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeUnitParam("MS:1000001", "MS", "UO:9999999", 100), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeUnitParam("MS:1000001", "MS", "UO:9999999", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_unit, diagnostics.items[0].rule);
 }
@@ -844,13 +816,13 @@ test "SemanticValidator: unitCvRef mismatch produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("UO"), 1);
-    try sv.consumeStart(makeStart(100, "cvParam", &.{
+    try sv.consumeStart(makeCv("UO"));
+    try sv.consumeStart(test_events.startInterned("cvParam", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "UO:0000000" },
         .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = "UO" },
         .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = "UO:0000000" },
         .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = "MS" },
-    }), 2);
+    }, 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
 }
@@ -868,8 +840,8 @@ test "SemanticValidator: unitName mismatch produces info" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("UO"), 1);
-    try sv.consumeStart(makeUnitParamWithName("UO:0000000", "UO", "UO:0000000", "wrong name", 100), 2);
+    try sv.consumeStart(makeCv("UO"));
+    try sv.consumeStart(makeUnitParamWithName("UO:0000000", "UO", "UO:0000000", "wrong name", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_unit, diagnostics.items[0].rule);
     try expectEqual(Severity.info, diagnostics.items[0].severity);
@@ -888,7 +860,7 @@ test "SemanticValidator: userParam without accession is skipped" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeUserParamNoAccession(0), 2);
+    try sv.consumeStart(makeUserParamNoAccession(0));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -906,9 +878,9 @@ test "SemanticValidator: cvRef after cvList declaration works" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
-    try sv.consumeStart(makeCv("UO"), 1);
-    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 0), 2);
+    try sv.consumeStart(makeCv("MS"));
+    try sv.consumeStart(makeCv("UO"));
+    try sv.consumeStart(makeCvParam("MS:1000001", "MS", 0));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -926,7 +898,7 @@ test "SemanticValidator: multiple diagnostics on one cvParam" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCvParam("MS:9999999", "NONEXISTENT", 100), 1);
+    try sv.consumeStart(makeCvParam("MS:9999999", "NONEXISTENT", 100));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
 }
 
@@ -950,13 +922,13 @@ test "SemanticValidator: no contradiction with single term" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "spectrum", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10), 3);
+    try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10));
 
-    try sv.consumeEnd(makeEnd(30, "spectrum"), 2);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 30));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -980,13 +952,13 @@ test "SemanticValidator: must rule fires when term missing" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
+    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10));
 
-    try sv.consumeEnd(makeEnd(20, "source"), 2);
+    try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
 }
@@ -1009,13 +981,13 @@ test "SemanticValidator: must rule passes when term present" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
+    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10));
 
-    try sv.consumeEnd(makeEnd(20, "source"), 2);
+    try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1041,13 +1013,13 @@ test "SemanticValidator: must or rule fires when no term matches" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10), 3);
+    try sv.consumeStart(makeCvParam("MS:1000482", "MS", 10));
 
-    try sv.consumeEnd(makeEnd(20, "source"), 2);
+    try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
 }
@@ -1072,13 +1044,13 @@ test "SemanticValidator: must or rule passes when one term present" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "source", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10), 3);
+    try sv.consumeStart(makeCvParam("MS:1000008", "MS", 10));
 
-    try sv.consumeEnd(makeEnd(20, "source"), 2);
+    try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1096,15 +1068,15 @@ test "SemanticValidator: declared id resolves in finish" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try sv.consumeStart(makeStart(0, "software", &.{
+    try sv.consumeStart(test_events.startInterned("software", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
         .{ .byte_offset = 0, .name = .{ .local_name = "version" }, .value = "1.0" },
-    }), 1);
+    }, 0));
 
-    try sv.consumeStart(makeStart(10, "instrumentConfiguration", &.{
+    try sv.consumeStart(test_events.startInterned("instrumentConfiguration", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "IC1" },
         .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
-    }), 2);
+    }, 10));
 
     sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -1124,9 +1096,9 @@ test "SemanticValidator: unresolved ref produces error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try sv.consumeStart(makeStart(10, "instrumentConfiguration", &.{
+    try sv.consumeStart(test_events.startInterned("instrumentConfiguration", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "NONEXISTENT" },
-    }), 1);
+    }, 10));
 
     sv.finish();
     try expectEqual(@as(usize, 1), diagnostics.items.len);
@@ -1147,12 +1119,12 @@ test "SemanticValidator: duplicate id produces error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try sv.consumeStart(makeStart(0, "software", &.{
+    try sv.consumeStart(test_events.startInterned("software", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
-    }), 1);
-    try sv.consumeStart(makeStart(10, "software", &.{
+    }, 0));
+    try sv.consumeStart(test_events.startInterned("software", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
-    }), 2);
+    }, 10));
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
@@ -1172,12 +1144,12 @@ test "SemanticValidator: forward reference resolves in finish" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try sv.consumeStart(makeStart(0, "instrumentConfiguration", &.{
+    try sv.consumeStart(test_events.startInterned("instrumentConfiguration", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
-    }), 1);
-    try sv.consumeStart(makeStart(10, "software", &.{
+    }, 0));
+    try sv.consumeStart(test_events.startInterned("software", &.{
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
-    }), 2);
+    }, 10));
 
     sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -1196,14 +1168,14 @@ test "SemanticValidator: IM-MS and DIA CV terms are recognised" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeCvParam("MS:1002476", "MS", 0), 2);
-    try sv.consumeStart(makeCvParam("MS:1002815", "MS", 10), 2);
-    try sv.consumeStart(makeCvParam("MS:1002836", "MS", 20), 2);
-    try sv.consumeStart(makeCvParam("MS:1000826", "MS", 30), 2);
-    try sv.consumeStart(makeCvParam("MS:1002446", "MS", 40), 2);
-    try sv.consumeStart(makeCvParam("MS:1002687", "MS", 50), 2);
+    try sv.consumeStart(makeCvParam("MS:1002476", "MS", 0));
+    try sv.consumeStart(makeCvParam("MS:1002815", "MS", 10));
+    try sv.consumeStart(makeCvParam("MS:1002836", "MS", 20));
+    try sv.consumeStart(makeCvParam("MS:1000826", "MS", 30));
+    try sv.consumeStart(makeCvParam("MS:1002446", "MS", 40));
+    try sv.consumeStart(makeCvParam("MS:1002687", "MS", 50));
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
@@ -1223,9 +1195,9 @@ test "SemanticValidator: userParam with valid accession triggers CV validation" 
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeUserParam(0, "MS:1000001", "test param"), 1);
+    try sv.consumeStart(makeUserParam(0, "MS:1000001", "test param"));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1242,9 +1214,9 @@ test "SemanticValidator: userParam with invalid accession produces error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeUserParam(0, "MS:9999999", "test param"), 1);
+    try sv.consumeStart(makeUserParam(0, "MS:9999999", "test param"));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
 }
@@ -1265,7 +1237,7 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try sv.consumeStart(makeCvParam("BTO:0000001", "BTO", 0), 1);
+    try sv.consumeStart(makeCvParam("BTO:0000001", "BTO", 0));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1292,14 +1264,14 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
-    try sv.consumeStart(makeCv("MS"), 1);
+    try sv.consumeStart(makeCv("MS"));
 
-    try sv.consumeStart(makeStart(0, "spectrum", &.{}), 2);
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
 
-    try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10), 3);
-    try sv.consumeStart(makeCvParam("MS:1000129", "MS", 20), 3);
+    try sv.consumeStart(makeCvParam("MS:1000130", "MS", 10));
+    try sv.consumeStart(makeCvParam("MS:1000129", "MS", 20));
 
-    try sv.consumeEnd(makeEnd(30, "spectrum"), 2);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 30));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_contradiction, diagnostics.items[0].rule);
 }

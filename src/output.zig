@@ -17,6 +17,7 @@ const Diagnostic = diagnostic.Diagnostic;
 const Severity = diagnostic.Severity;
 
 // --- Types ---
+
 /// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,

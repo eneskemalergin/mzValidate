@@ -36,6 +36,7 @@ pub const MappingRule = struct {
     terms: []const MappingTerm,
 };
 
+/// Path-indexed PSI-MS mapping rules from `ms-mapping.xml`.
 pub const RuleEngine = struct {
     allocator: std.mem.Allocator,
     rules: []MappingRule,

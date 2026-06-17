@@ -16,6 +16,7 @@ const validate = @import("validate.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
+/// Parsed `check` subcommand flags and input paths.
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
@@ -32,6 +33,7 @@ pub const CheckCommand = struct {
     }
 };
 
+/// Top-level CLI command after parsing.
 pub const Command = union(enum) {
     check: CheckCommand,
 
@@ -55,6 +57,7 @@ const ParseError = error{
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
+/// Juicy Main entry: parse argv, run checks, render output, return exit code.
 pub fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(gpa);

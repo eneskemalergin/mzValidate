@@ -48,7 +48,7 @@ fn isWhitespaceByte(byte: u8) bool {
     };
 }
 
-/// Counts leading ASCII whitespace bytes.
+/// Leading ASCII whitespace run length (SIMD on the slice path).
 pub fn skipWhitespaceRun(bytes: []const u8) usize {
     var offset: usize = 0;
     while (offset + chunk_len <= bytes.len) {
@@ -73,19 +73,19 @@ pub fn skipWhitespaceRun(bytes: []const u8) usize {
 
 const name_terminators = [_]u8{ ' ', '\t', '\r', '\n', '/', '>', '=', '?', '"', '\'' };
 
-/// Counts bytes until a name terminator or end of `bytes`.
+/// Run of XML name characters before a delimiter or end of slice.
 pub fn nameCharRunLen(bytes: []const u8) usize {
     return firstIndexOfAny(bytes, &name_terminators) orelse bytes.len;
 }
 
 const text_stops = [_]u8{ '<', '&' };
 
-/// Counts plain text bytes until `<` or `&`.
+/// Plain text run before `<` or `&` (no entity decoding needed).
 pub fn textPlainRunLen(bytes: []const u8) usize {
     return firstIndexOfAny(bytes, &text_stops) orelse bytes.len;
 }
 
-/// Length of CDATA content before the first `]]>` terminator.
+/// CDATA payload length before `]]>`, or `null` if unterminated.
 pub fn cdataContentLen(bytes: []const u8) ?usize {
     var offset: usize = 0;
     while (offset < bytes.len) {
@@ -101,7 +101,7 @@ pub fn cdataContentLen(bytes: []const u8) ?usize {
     return null;
 }
 
-/// Counts attribute value bytes until `quote` or `&`.
+/// Quoted attribute value run before the closing quote or `&`.
 pub fn attrValuePlainRunLen(bytes: []const u8, quote: u8) usize {
     const stops = [_]u8{ quote, '&' };
     return firstIndexOfAny(bytes, &stops) orelse bytes.len;
