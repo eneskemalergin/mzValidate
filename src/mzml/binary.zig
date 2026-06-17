@@ -22,6 +22,8 @@ const StartElement = xml_events.StartElement;
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
+const base64_simd_chunk_len = 32;
+const base64_scalar_short_len = 64;
 
 const Compression = enum {
     none,
@@ -64,6 +66,45 @@ const StreamingBase64Counter = struct {
 
     fn feed(self: *@This(), chunk: []const u8) void {
         if (self.errored) return;
+        if (chunk.len < base64_scalar_short_len or self.saw_pad) {
+            self.feedScalar(chunk);
+            return;
+        }
+
+        var offset: usize = 0;
+        while (offset + base64_simd_chunk_len <= chunk.len) {
+            const bytes = loadBase64Chunk(chunk, offset);
+            const base64_chars = base64CharLanes(bytes);
+            const whitespace = whitespaceLanes(bytes);
+            const pre_pad_allowed = base64_chars | whitespace;
+
+            if (@reduce(.And, base64_chars)) {
+                self.sig_len += base64_simd_chunk_len;
+                offset += base64_simd_chunk_len;
+                continue;
+            }
+
+            if (@reduce(.And, pre_pad_allowed)) {
+                self.sig_len += countTrueLanes(base64_chars);
+                offset += base64_simd_chunk_len;
+                continue;
+            }
+
+            // Padding and errors are rare, but order-sensitive. Let the scalar
+            // path preserve the exact pre-SIMD state transition.
+            self.feedScalar(chunk[offset..][0..base64_simd_chunk_len]);
+            if (self.errored) return;
+            offset += base64_simd_chunk_len;
+            if (self.saw_pad) {
+                self.feedScalar(chunk[offset..]);
+                return;
+            }
+        }
+
+        self.feedScalar(chunk[offset..]);
+    }
+
+    fn feedScalar(self: *@This(), chunk: []const u8) void {
         for (chunk) |c| switch (c) {
             ' ', '\t', '\r', '\n' => {},
             'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => {
@@ -87,6 +128,40 @@ const StreamingBase64Counter = struct {
                 return;
             },
         };
+    }
+
+    fn loadBase64Chunk(bytes: []const u8, offset: usize) @Vector(base64_simd_chunk_len, u8) {
+        var buf: [base64_simd_chunk_len]u8 = undefined;
+        @memcpy(&buf, bytes[offset..][0..base64_simd_chunk_len]);
+        return buf;
+    }
+
+    fn splatByte(byte: u8) @Vector(base64_simd_chunk_len, u8) {
+        return @as(@Vector(base64_simd_chunk_len, u8), @splat(byte));
+    }
+
+    fn base64CharLanes(bytes: @Vector(base64_simd_chunk_len, u8)) @Vector(base64_simd_chunk_len, bool) {
+        const upper = (bytes >= splatByte('A')) & (bytes <= splatByte('Z'));
+        const lower = (bytes >= splatByte('a')) & (bytes <= splatByte('z'));
+        const digit = (bytes >= splatByte('0')) & (bytes <= splatByte('9'));
+        const symbol = (bytes == splatByte('+')) | (bytes == splatByte('/'));
+        return upper | lower | digit | symbol;
+    }
+
+    fn whitespaceLanes(bytes: @Vector(base64_simd_chunk_len, u8)) @Vector(base64_simd_chunk_len, bool) {
+        return (bytes == splatByte(' ')) |
+            (bytes == splatByte('\t')) |
+            (bytes == splatByte('\r')) |
+            (bytes == splatByte('\n'));
+    }
+
+    fn countTrueLanes(lanes: @Vector(base64_simd_chunk_len, bool)) usize {
+        const values: [base64_simd_chunk_len]bool = lanes;
+        var count: usize = 0;
+        for (values) |value| {
+            count += @intFromBool(value);
+        }
+        return count;
     }
 
     fn result(self: *const @This()) error{InvalidBase64}!usize {
@@ -775,6 +850,191 @@ const test_events = @import("test_events.zig");
 
 // Tests: valid fixtures.
 
+test "binary validator C.0 parity snapshots fixture diagnostics" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(clean_fixture);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, clean_fixture, &.{});
+
+    const small_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/small.pwiz.1.1.mzML", allocator, .limited(6 * 1024 * 1024));
+    defer allocator.free(small_fixture);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, small_fixture, &.{});
+
+    const small_zlib_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML", allocator, .limited(6 * 1024 * 1024));
+    defer allocator.free(small_zlib_fixture);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, small_zlib_fixture, &.{});
+
+    const invalid_base64 = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(invalid_base64);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, invalid_base64, &.{
+        .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_base64,
+            .byte_offset = binaryTagOffset(invalid_base64, 0),
+            .spectrum_index = 7,
+            .message = "binary payload is not valid base64",
+        },
+    });
+
+    const invalid_zlib = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-zlib.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(invalid_zlib);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, invalid_zlib, &.{
+        .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_decompress,
+            .byte_offset = binaryTagOffset(invalid_zlib, 0),
+            .spectrum_index = 4,
+            .message = "binary payload is not valid zlib data",
+        },
+    });
+
+    const conflicting_compression = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/conflicting-compression.mzML", allocator, .limited(64 * 1024));
+    defer allocator.free(conflicting_compression);
+    try expectBinaryDiagnosticsSnapshot(allocator, io, conflicting_compression, &.{
+        .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_compression,
+            .byte_offset = binaryTagOffset(conflicting_compression, 0),
+            .spectrum_index = 3,
+            .message = "binaryDataArray declares conflicting compression terms",
+        },
+    });
+}
+
+test "binary validator C.0 parity snapshots decision order edge cases" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const missing_compression =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"11\" id=\"scan=11\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+    try expectBinaryDiagnosticsSnapshot(allocator, io, missing_compression, &.{
+        .{
+            .severity = .info,
+            .rule = RuleId.mzml_binary_compression,
+            .byte_offset = binaryTagOffset(missing_compression, 0),
+            .spectrum_index = 11,
+            .message = "binaryDataArray is missing a compression type declaration",
+        },
+    });
+
+    const encoded_zero_with_payload =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"12\" id=\"scan=12\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"0\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+    try expectBinaryDiagnosticsSnapshot(allocator, io, encoded_zero_with_payload, &.{
+        .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_length_mismatch,
+            .byte_offset = binaryTagOffset(encoded_zero_with_payload, 0),
+            .spectrum_index = null,
+            .message = "binaryDataArray declares encodedLength=0 but contains data",
+        },
+    });
+
+    const no_default_array_length =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"13\" id=\"scan=13\">" ++
+        "<binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum>" ++
+        "</spectrumList></run></mzML>";
+    try expectBinaryDiagnosticsSnapshot(allocator, io, no_default_array_length, &.{});
+}
+
+test "streaming base64 counter C.2 scalar short path stays exact" {
+    var counter: StreamingBase64Counter = .{};
+    counter.feed("AAAAAA==");
+
+    try std.testing.expectEqual(@as(usize, 8), counter.sig_len);
+    try std.testing.expectEqual(@as(usize, 2), counter.padding);
+    try std.testing.expectEqual(@as(usize, 4), try counter.result());
+}
+
+test "streaming base64 counter C.1 SIMD counts long clean and whitespace runs" {
+    var payload: [160]u8 = undefined;
+    @memset(payload[0..64], 'A');
+    payload[64] = '\n';
+    payload[65] = '\t';
+    @memset(payload[66..130], 'A');
+    payload[130] = '\r';
+    payload[131] = ' ';
+    @memset(payload[132..160], 'A');
+
+    var counter: StreamingBase64Counter = .{};
+    counter.feed(&payload);
+
+    try std.testing.expectEqual(@as(usize, 156), counter.sig_len);
+    try std.testing.expectEqual(@as(usize, 0), counter.padding);
+    try std.testing.expectEqual(@as(usize, 117), try counter.result());
+}
+
+test "streaming base64 counter C.1 SIMD preserves padding boundary behavior" {
+    var payload: [64]u8 = undefined;
+    @memset(&payload, 'A');
+    payload[62] = '=';
+    payload[63] = '=';
+
+    var counter: StreamingBase64Counter = .{};
+    counter.feed(&payload);
+
+    try std.testing.expectEqual(@as(usize, 64), counter.sig_len);
+    try std.testing.expectEqual(@as(usize, 2), counter.padding);
+    try std.testing.expectEqual(@as(usize, 46), try counter.result());
+}
+
+test "streaming base64 counter C.1 SIMD rejects valid data after padding" {
+    var payload: [65]u8 = undefined;
+    @memset(&payload, 'A');
+    payload[62] = '=';
+    payload[63] = '=';
+    payload[64] = 'A';
+
+    var counter: StreamingBase64Counter = .{};
+    counter.feed(&payload);
+
+    try std.testing.expect(counter.errored);
+    try std.testing.expectError(error.InvalidBase64, counter.result());
+}
+
+test "streaming base64 counter C.1 SIMD rejects invalid byte after counted prefix" {
+    var payload: [96]u8 = undefined;
+    @memset(&payload, 'A');
+    payload[70] = '!';
+
+    var counter: StreamingBase64Counter = .{};
+    counter.feed(&payload);
+
+    try std.testing.expect(counter.errored);
+    try std.testing.expectError(error.InvalidBase64, counter.result());
+}
+
 test "binary validator accepts clean single spectrum fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1210,6 +1470,59 @@ fn expectSingleBinaryDiagnostic(diagnostics: []const Diagnostic, expected_rule: 
     if (expected_message) |message| {
         try std.testing.expectEqualStrings(message, diagnostics[0].message);
     }
+}
+
+const ExpectedBinaryDiagnostic = struct {
+    severity: diagnostic.Severity,
+    rule: []const u8,
+    byte_offset: ?u64 = null,
+    spectrum_index: ?usize = null,
+    path: ?[]const u8 = "fixture",
+    message: []const u8,
+};
+
+fn expectBinaryDiagnosticsSnapshot(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: []const u8,
+    expected: []const ExpectedBinaryDiagnostic,
+) !void {
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectEqual(expected.len, diagnostics.items.len);
+    for (expected, 0..) |want, index| {
+        const got = diagnostics.items[index];
+        try std.testing.expectEqual(want.severity, got.severity);
+        try std.testing.expectEqualStrings(want.rule, got.rule);
+        try std.testing.expectEqual(want.byte_offset, got.location.byte_offset);
+        try std.testing.expectEqual(want.spectrum_index, got.location.spectrum_index);
+        try expectOptionalStringEqual(want.path, got.path);
+        try std.testing.expectEqualStrings(want.message, got.message);
+    }
+}
+
+fn expectOptionalStringEqual(expected: ?[]const u8, actual: ?[]const u8) !void {
+    if (expected) |expected_value| {
+        if (actual) |actual_value| {
+            try std.testing.expectEqualStrings(expected_value, actual_value);
+            return;
+        }
+        try std.testing.expect(false);
+        return;
+    }
+    try std.testing.expect(actual == null);
+}
+
+fn binaryTagOffset(fixture: []const u8, occurrence: usize) u64 {
+    var cursor: usize = 0;
+    var seen: usize = 0;
+    while (std.mem.indexOfPos(u8, fixture, cursor, "<binary>")) |pos| {
+        if (seen == occurrence) return @intCast(pos);
+        seen += 1;
+        cursor = pos + "<binary>".len;
+    }
+    std.debug.panic("missing <binary> occurrence {d} in test fixture", .{occurrence});
 }
 
 test "binary validator oversized payload produces diagnostic" {
