@@ -1,5 +1,11 @@
 const std = @import("std");
 
+// Opt-in manual benchmarks (not in CI; `data/` is local):
+// - Astral 2.1 GiB L1 parser: data/20240614_Astral_Neo6_TH026_AU25_DI_run69p2_H460_50SPD_E3.mzML
+//   with -skip-binary -skip-semantic (clean, large).
+// - Small slow full validation: data/1fmol_HSP90_SILpepmix_PRM.mzML (~15 MiB, ~6 s;
+//   thousands of info diagnostics; exercises L2 zlib + semantic, not parser alone).
+
 const Scenario = struct {
     name: []const u8,
     input_path: []const u8,

@@ -196,6 +196,24 @@ pub const Parser = struct {
     }
 
     fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!?Event {
+        if (parser.lookahead == null and parser.input == .slice and first_byte != '&') {
+            const slice = &parser.input.slice;
+            const start = slice.pos - 1;
+            const tail = slice.bytes[slice.pos..];
+            const plain_len = scan.textPlainRunLen(tail);
+            if (plain_len == tail.len or tail[plain_len] != '&') {
+                const value = slice.bytes[start .. start + 1 + plain_len];
+                parser.consumeSliceBytes(plain_len);
+                if (!from_cdata and isWhitespaceOnly(value)) return null;
+                if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+                return .{ .text = .{
+                    .byte_offset = byte_offset,
+                    .value = value,
+                    .from_cdata = from_cdata,
+                } };
+            }
+        }
+
         try parser.appendDecodedTextByte(first_byte);
 
         try parser.consumeSliceTextPlainRun();
@@ -388,6 +406,21 @@ pub const Parser = struct {
     }
 
     fn parseCdata(parser: *Parser, byte_offset: u64) ParseError!Event {
+        if (parser.lookahead == null and parser.input == .slice) {
+            const slice = &parser.input.slice;
+            const start = slice.pos;
+            const tail = slice.bytes[start..];
+            const content_len = scan.cdataContentLen(tail) orelse return error.UnexpectedEof;
+            const value = slice.bytes[start..][0..content_len];
+            parser.consumeSliceBytes(content_len + 3);
+            if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+            return .{ .text = .{
+                .byte_offset = byte_offset,
+                .value = value,
+                .from_cdata = true,
+            } };
+        }
+
         while (true) {
             const byte = try parser.takeRequiredByte();
             if (byte == ']') {
@@ -844,6 +877,42 @@ fn optionalSliceEql(left: ?[]const u8, right: ?[]const u8) bool {
     return right == null;
 }
 
+fn qnameEql(left: QName, right: QName) bool {
+    return optionalSliceEql(left.prefix, right.prefix) and
+        std.mem.eql(u8, left.local_name, right.local_name) and
+        optionalSliceEql(left.namespace_uri, right.namespace_uri);
+}
+
+fn eventsSemanticallyEqual(left: Event, right: Event) bool {
+    switch (left) {
+        .start_element => |left_start| {
+            const right_start = right.start_element;
+            if (!qnameEql(left_start.name, right_start.name)) return false;
+            if (left_start.byte_offset != right_start.byte_offset) return false;
+            if (left_start.self_closing != right_start.self_closing) return false;
+            if (left_start.attributes.len != right_start.attributes.len) return false;
+            for (left_start.attributes, right_start.attributes) |left_attr, right_attr| {
+                if (!qnameEql(left_attr.name, right_attr.name)) return false;
+                if (!std.mem.eql(u8, left_attr.value, right_attr.value)) return false;
+                if (left_attr.byte_offset != right_attr.byte_offset) return false;
+                if (left_attr.is_namespace_declaration != right_attr.is_namespace_declaration) return false;
+            }
+            return true;
+        },
+        .end_element => |left_end| {
+            const right_end = right.end_element;
+            return left_end.byte_offset == right_end.byte_offset and
+                qnameEql(left_end.name, right_end.name);
+        },
+        .text => |left_text| {
+            const right_text = right.text;
+            return left_text.byte_offset == right_text.byte_offset and
+                left_text.from_cdata == right_text.from_cdata and
+                std.mem.eql(u8, left_text.value, right_text.value);
+        },
+    }
+}
+
 fn isNameTerminator(byte: u8) bool {
     return std.ascii.isWhitespace(byte) or switch (byte) {
         '/', '>', '=', '?', '"', '\'' => true,
@@ -944,8 +1013,42 @@ test "initSlice parses identically to init on a fixed reader" {
         if (slice_event == null and reader_event == null) break;
         try std.testing.expect(slice_event != null);
         try std.testing.expect(reader_event != null);
-        try std.testing.expectEqual(slice_event.?, reader_event.?);
+        try std.testing.expect(eventsSemanticallyEqual(slice_event.?, reader_event.?));
     }
+}
+
+test "initSlice zero-copies plain text and cdata from input bytes" {
+    const xml = "<root>ABCDEF<![CDATA[base64+/=]]></root>";
+
+    // Arrange.
+    var token_buffer: [4096]u8 = undefined;
+    var attributes: [64]Attribute = undefined;
+    var namespace_bindings: [32]NamespaceBinding = undefined;
+    var namespace_bytes: [256]u8 = undefined;
+    var element_stack: [16]ElementFrame = undefined;
+    var element_bytes: [256]u8 = undefined;
+    const buffers = Buffers{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    };
+    var parser = Parser.initSlice(xml, buffers);
+
+    // Act.
+    _ = (try parser.next()).?.start_element;
+    const plain = (try parser.next()).?.text;
+    const cdata = (try parser.next()).?.text;
+
+    // Assert.
+    try std.testing.expectEqualStrings("ABCDEF", plain.value);
+    try std.testing.expect(plain.value.ptr == xml.ptr + 6);
+    try std.testing.expect(!plain.from_cdata);
+    try std.testing.expectEqualStrings("base64+/=", cdata.value);
+    try std.testing.expect(cdata.value.ptr == xml.ptr + 21);
+    try std.testing.expect(cdata.from_cdata);
 }
 
 test "parser skips comments and processing instructions and emits cdata as text" {

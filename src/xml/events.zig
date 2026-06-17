@@ -1,8 +1,9 @@
 //! Event types the streaming parser emits.
 //!
-//! Every slice field borrows from the parser's caller-supplied buffers.
-//! They are only valid until the next `Parser.next()` call. Copy anything
-//! you need to keep.
+//! Every slice field borrows from the parser input or caller-supplied
+//! buffers. Text values on the mmap slice path point into the mapped
+//! bytes. Other fields use the token buffer. All slices are only valid
+//! until the next `Parser.next()` call. Copy anything you need to keep.
 //!
 //! Types:
 //!   StartElement: opening tag with name, attributes, self-closing flag

@@ -85,6 +85,22 @@ pub fn textPlainRunLen(bytes: []const u8) usize {
     return firstIndexOfAny(bytes, &text_stops) orelse bytes.len;
 }
 
+/// Length of CDATA content before the first `]]>` terminator.
+pub fn cdataContentLen(bytes: []const u8) ?usize {
+    var offset: usize = 0;
+    while (offset < bytes.len) {
+        if (bytes[offset] != ']') {
+            offset += 1;
+            continue;
+        }
+        if (offset + 2 < bytes.len and bytes[offset + 1] == ']' and bytes[offset + 2] == '>') {
+            return offset;
+        }
+        offset += 1;
+    }
+    return null;
+}
+
 /// Counts attribute value bytes until `quote` or `&`.
 pub fn attrValuePlainRunLen(bytes: []const u8, quote: u8) usize {
     const stops = [_]u8{ quote, '&' };
@@ -126,6 +142,18 @@ test "textPlainRunLen stops at lt or ampersand" {
     try std.testing.expectEqual(@as(usize, 4), textPlainRunLen(plain));
     try std.testing.expectEqual(@as(usize, 3), textPlainRunLen(at_lt));
     try std.testing.expectEqual(@as(usize, 2), textPlainRunLen(at_amp));
+}
+
+test "cdataContentLen finds terminator" {
+    // Arrange.
+    const terminated = "abcd]]>more";
+    const with_fake = "a]]b]]>rest";
+
+    // Act.
+    // Assert.
+    try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(terminated));
+    try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(with_fake));
+    try std.testing.expectEqual(@as(?usize, null), cdataContentLen("no end"));
 }
 
 test "attrValuePlainRunLen stops at quote or entity" {
