@@ -354,15 +354,17 @@ pub const StructuralValidator = struct {
     }
 
     fn handleStart(validator: *StructuralValidator, start: StartElement, element_depth: usize) !void {
+        const tag = start.resolvedId();
+
         if (!validator.root_seen) {
             validator.root_seen = true;
             validator.root_byte_offset = start.byte_offset;
-            if (start.resolvedId() == .indexedmzML) {
+            if (tag == .indexedmzML) {
                 validator.indexed_mzml_depth = element_depth;
                 return;
             }
 
-            validator.root_valid = start.resolvedId() == .mzML;
+            validator.root_valid = tag == .mzML;
             if (!validator.root_valid) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
@@ -378,7 +380,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (!validator.root_valid and validator.indexed_mzml_depth != null and start.resolvedId() == .mzML) {
+        if (!validator.root_valid and validator.indexed_mzml_depth != null and tag == .mzML) {
             if (element_depth != validator.indexed_mzml_depth.? + 1) {
                 try validator.nestingError(start.byte_offset, "mzML must be a direct child of indexedmzML");
                 return;
@@ -395,667 +397,509 @@ pub const StructuralValidator = struct {
         if (validator.indexed_mzml_depth != null and
             element_depth == validator.indexed_mzml_depth.? + 1)
         {
-            const tag = start.resolvedId();
-            if (tag == .indexList or tag == .indexListOffset or tag == .fileChecksum) {
-                if (tag == .indexList) {
+            switch (tag) {
+                .indexList => {
                     if (validator.index_list_seen) {
                         try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
                     } else {
                         validator.index_list_seen = true;
                     }
                     try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
-                } else if (tag == .indexListOffset) {
+                    return;
+                },
+                .indexListOffset => {
                     if (validator.index_list_offset_seen) {
                         try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
                     } else {
                         validator.index_list_offset_seen = true;
                     }
-                } else if (tag == .fileChecksum) {
+                    return;
+                },
+                .fileChecksum => {
                     if (validator.file_checksum_seen) {
                         try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
                     } else {
                         validator.file_checksum_seen = true;
                     }
-                }
-                return;
+                    return;
+                },
+                else => {},
             }
         }
 
         if (!validator.isWithinMzmlStartScope()) return;
 
-        if (start.resolvedId() == .cvList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
-            try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
-            validator.cv_list = validator.initListCountState(start, element_depth, "cvList", "cv", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .fileDescription) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_description_seen, "fileDescription", .file_description);
-            validator.file_description = .{ .byte_offset = start.byte_offset, .depth = element_depth };
-            return;
-        }
-
-        if (start.resolvedId() == .referenceableParamGroupList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
-            try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
-            validator.referenceable_param_group_list = validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .sampleList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
-            try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
-            validator.sample_list = validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .softwareList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
-            try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
-            validator.software_list = validator.initListCountState(start, element_depth, "softwareList", "software", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .scanSettingsList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
-            try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
-            validator.scan_settings_list = validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .instrumentConfigurationList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
-            try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
-            validator.instrument_configuration_list = validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .dataProcessingList) {
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
-            try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
-            validator.data_processing_list = validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .run) {
-            if (element_depth != validator.topLevelChildDepth()) {
-                try validator.nestingError(start.byte_offset, "run must be a direct child of mzML");
-                return;
-            }
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.run_seen, "run", .run);
-            validator.run_seen = true;
-            validator.run_depth = element_depth;
-            validator.run_byte_offset = start.byte_offset;
-            validator.run_has_spectrum_list = false;
-            validator.run_has_chromatogram_list = false;
-            validator.run_last_child_slot = 0;
-            try validator.requireAttribute(start, "id", "run is missing required attribute id");
-            try validator.requireAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
-            return;
-        }
-
-        // Post-run: indexList > indexListOffset > fileChecksum.
-        // Content validation delegated to IndexValidator.
-
-        if (start.resolvedId() == .indexList) {
-            if (!validator.run_seen) {
-                try validator.nestingError(start.byte_offset, "indexList must appear after run");
-                return;
-            }
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_seen, "indexList", .index_list);
-            try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
-            return;
-        }
-
-        if (start.resolvedId() == .indexListOffset) {
-            if (!validator.run_seen) {
-                try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
-                return;
-            }
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_offset_seen, "indexListOffset", .index_list_offset);
-            return;
-        }
-
-        if (start.resolvedId() == .fileChecksum) {
-            if (!validator.run_seen) {
-                try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
-                return;
-            }
-            try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_checksum_seen, "fileChecksum", .file_checksum);
-            return;
-        }
-
-        if (start.resolvedId() == .fileContent) {
-            if (validator.file_description) |*state| {
-                if (state.depth + 1 != element_depth) {
-                    try validator.nestingError(start.byte_offset, "fileContent must be a direct child of fileDescription");
+        switch (tag) {
+            .cvList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
+                try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
+                validator.cv_list = validator.initListCountState(start, element_depth, "cvList", "cv", 1);
+            },
+            .fileDescription => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_description_seen, "fileDescription", .file_description);
+                validator.file_description = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+            },
+            .referenceableParamGroupList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
+                try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
+                validator.referenceable_param_group_list = validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
+            },
+            .sampleList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
+                try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
+                validator.sample_list = validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
+            },
+            .softwareList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
+                try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
+                validator.software_list = validator.initListCountState(start, element_depth, "softwareList", "software", 1);
+            },
+            .scanSettingsList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
+                try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
+                validator.scan_settings_list = validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
+            },
+            .instrumentConfigurationList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
+                try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
+                validator.instrument_configuration_list = validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
+            },
+            .dataProcessingList => {
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
+                try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
+                validator.data_processing_list = validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
+            },
+            .run => {
+                if (element_depth != validator.topLevelChildDepth()) {
+                    try validator.nestingError(start.byte_offset, "run must be a direct child of mzML");
+                    return;
+                }
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.run_seen, "run", .run);
+                validator.run_seen = true;
+                validator.run_depth = element_depth;
+                validator.run_byte_offset = start.byte_offset;
+                validator.run_has_spectrum_list = false;
+                validator.run_has_chromatogram_list = false;
+                validator.run_last_child_slot = 0;
+                try validator.requireAttribute(start, "id", "run is missing required attribute id");
+                try validator.requireAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
+            },
+            // Post-run: indexList > indexListOffset > fileChecksum.
+            // Content validation delegated to IndexValidator.
+            .indexList => {
+                if (!validator.run_seen) {
+                    try validator.nestingError(start.byte_offset, "indexList must appear after run");
+                    return;
+                }
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_seen, "indexList", .index_list);
+                try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
+            },
+            .indexListOffset => {
+                if (!validator.run_seen) {
+                    try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
+                    return;
+                }
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_offset_seen, "indexListOffset", .index_list_offset);
+            },
+            .fileChecksum => {
+                if (!validator.run_seen) {
+                    try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
+                    return;
+                }
+                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_checksum_seen, "fileChecksum", .file_checksum);
+            },
+            .fileContent => {
+                if (validator.file_description) |*state| {
+                    if (state.depth + 1 != element_depth) {
+                        try validator.nestingError(start.byte_offset, "fileContent must be a direct child of fileDescription");
+                    } else {
+                        if (state.has_file_content) {
+                            try validator.nestingError(start.byte_offset, "fileDescription must not contain more than one fileContent");
+                            return;
+                        }
+                        if (state.source_file_list_seen) {
+                            try validator.nestingError(start.byte_offset, "fileContent appears out of order under fileDescription");
+                            return;
+                        }
+                        state.has_file_content = true;
+                    }
+                }
+            },
+            .sourceFileList => {
+                if (validator.file_description) |*state| {
+                    if (state.depth + 1 != element_depth) {
+                        try validator.nestingError(start.byte_offset, "sourceFileList must be a direct child of fileDescription");
+                    } else {
+                        if (state.source_file_list_seen) {
+                            try validator.nestingError(start.byte_offset, "fileDescription must not contain more than one sourceFileList");
+                        }
+                        state.source_file_list_seen = true;
+                        if (!state.has_file_content) {
+                            try validator.nestingError(start.byte_offset, "sourceFileList appears out of order under fileDescription");
+                        }
+                    }
+                }
+                try validator.requireAttribute(start, "count", "sourceFileList is missing required attribute count");
+                validator.source_file_list = validator.initListCountState(start, element_depth, "sourceFileList", "sourceFile", 1);
+            },
+            .sourceFile => {
+                validator.bumpListItemCount(&validator.source_file_list, element_depth);
+                try validator.requireAttribute(start, "id", "sourceFile is missing required attribute id");
+                try validator.requireAttribute(start, "name", "sourceFile is missing required attribute name");
+                try validator.requireAttribute(start, "location", "sourceFile is missing required attribute location");
+            },
+            .spectrumList => {
+                try validator.noteRunChild(start.byte_offset, .spectrum_list);
+                if (validator.run_depth != element_depth - 1) {
+                    try validator.nestingError(start.byte_offset, "spectrumList must be a child of run");
                 } else {
-                    if (state.has_file_content) {
-                        try validator.nestingError(start.byte_offset, "fileDescription must not contain more than one fileContent");
-                        return;
-                    }
-                    if (state.source_file_list_seen) {
-                        try validator.nestingError(start.byte_offset, "fileContent appears out of order under fileDescription");
-                        return;
-                    }
-                    state.has_file_content = true;
+                    validator.run_has_spectrum_list = true;
                 }
-            }
-            return;
-        }
-
-        if (start.resolvedId() == .sourceFileList) {
-            if (validator.file_description) |*state| {
-                if (state.depth + 1 != element_depth) {
-                    try validator.nestingError(start.byte_offset, "sourceFileList must be a direct child of fileDescription");
+                validator.spectrum_list_depth = element_depth;
+                try validator.requireAttribute(start, "count", "spectrumList is missing required attribute count");
+                try validator.requireAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
+                validator.spectrum_list = validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
+            },
+            .chromatogramList => {
+                try validator.noteRunChild(start.byte_offset, .chromatogram_list);
+                if (validator.run_depth != element_depth - 1) {
+                    try validator.nestingError(start.byte_offset, "chromatogramList must be a child of run");
                 } else {
-                    if (state.source_file_list_seen) {
-                        try validator.nestingError(start.byte_offset, "fileDescription must not contain more than one sourceFileList");
-                    }
-                    state.source_file_list_seen = true;
-                    if (!state.has_file_content) {
-                        try validator.nestingError(start.byte_offset, "sourceFileList appears out of order under fileDescription");
+                    validator.run_has_chromatogram_list = true;
+                }
+                validator.chromatogram_list_depth = element_depth;
+                try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
+                try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
+                validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
+            },
+            .spectrum => {
+                validator.bumpListItemCount(&validator.spectrum_list, element_depth);
+                if (validator.spectrum_list_depth != element_depth - 1) {
+                    try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
+                }
+                validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .spectrum };
+                try validator.requireSpectrumLikeAttributes(start, .spectrum);
+            },
+            .chromatogram => {
+                validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
+                if (validator.chromatogram_list_depth != element_depth - 1) {
+                    try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
+                }
+                validator.chromatogram = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .chromatogram };
+                try validator.requireSpectrumLikeAttributes(start, .chromatogram);
+            },
+            .cv => {
+                validator.bumpListItemCount(&validator.cv_list, element_depth);
+                try validator.requireAttribute(start, "id", "cv is missing required attribute id");
+                try validator.requireAttribute(start, "fullName", "cv is missing required attribute fullName");
+                try validator.requireAttribute(start, "URI", "cv is missing required attribute URI");
+            },
+            .referenceableParamGroup => {
+                validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
+                try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
+            },
+            .sample => {
+                validator.bumpListItemCount(&validator.sample_list, element_depth);
+                try validator.requireAttribute(start, "id", "sample is missing required attribute id");
+            },
+            .software => {
+                validator.bumpListItemCount(&validator.software_list, element_depth);
+                try validator.requireAttribute(start, "id", "software is missing required attribute id");
+                try validator.requireAttribute(start, "version", "software is missing required attribute version");
+            },
+            .scanSettings => {
+                validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
+                try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
+            },
+            .instrumentConfiguration => {
+                validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
+                try validator.requireAttribute(start, "id", "instrumentConfiguration is missing required attribute id");
+                validator.instrument_configuration = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+            },
+            .componentList => {
+                if (validator.instrument_configuration) |*state| {
+                    if (state.depth + 1 != element_depth) {
+                        try validator.nestingError(start.byte_offset, "componentList must be a direct child of instrumentConfiguration");
+                    } else {
+                        if (state.component_list_seen) {
+                            try validator.nestingError(start.byte_offset, "instrumentConfiguration must not contain more than one componentList");
+                        }
+                        if (state.software_ref_seen) {
+                            try validator.nestingError(start.byte_offset, "componentList appears out of order under instrumentConfiguration");
+                        }
+                        state.component_list_seen = true;
                     }
                 }
-            }
-            try validator.requireAttribute(start, "count", "sourceFileList is missing required attribute count");
-            validator.source_file_list = validator.initListCountState(start, element_depth, "sourceFileList", "sourceFile", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .sourceFile) {
-            validator.bumpListItemCount(&validator.source_file_list, element_depth);
-            try validator.requireAttribute(start, "id", "sourceFile is missing required attribute id");
-            try validator.requireAttribute(start, "name", "sourceFile is missing required attribute name");
-            try validator.requireAttribute(start, "location", "sourceFile is missing required attribute location");
-            return;
-        }
-
-        if (start.resolvedId() == .spectrumList) {
-            try validator.noteRunChild(start.byte_offset, .spectrum_list);
-            if (validator.run_depth != element_depth - 1) {
-                try validator.nestingError(start.byte_offset, "spectrumList must be a child of run");
-            } else {
-                validator.run_has_spectrum_list = true;
-            }
-            validator.spectrum_list_depth = element_depth;
-            try validator.requireAttribute(start, "count", "spectrumList is missing required attribute count");
-            try validator.requireAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
-            validator.spectrum_list = validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
-            return;
-        }
-
-        if (start.resolvedId() == .chromatogramList) {
-            try validator.noteRunChild(start.byte_offset, .chromatogram_list);
-            if (validator.run_depth != element_depth - 1) {
-                try validator.nestingError(start.byte_offset, "chromatogramList must be a child of run");
-            } else {
-                validator.run_has_chromatogram_list = true;
-            }
-            validator.chromatogram_list_depth = element_depth;
-            try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
-            try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
-            validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .spectrum) {
-            validator.bumpListItemCount(&validator.spectrum_list, element_depth);
-            if (validator.spectrum_list_depth != element_depth - 1) {
-                try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
-            }
-            validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .spectrum };
-            try validator.requireSpectrumLikeAttributes(start, .spectrum);
-            return;
-        }
-
-        if (start.resolvedId() == .chromatogram) {
-            validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
-            if (validator.chromatogram_list_depth != element_depth - 1) {
-                try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
-            }
-            validator.chromatogram = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .chromatogram };
-            try validator.requireSpectrumLikeAttributes(start, .chromatogram);
-            return;
-        }
-
-        if (start.resolvedId() == .cv) {
-            validator.bumpListItemCount(&validator.cv_list, element_depth);
-            try validator.requireAttribute(start, "id", "cv is missing required attribute id");
-            try validator.requireAttribute(start, "fullName", "cv is missing required attribute fullName");
-            try validator.requireAttribute(start, "URI", "cv is missing required attribute URI");
-            return;
-        }
-
-        if (start.resolvedId() == .referenceableParamGroup) {
-            validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
-            try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
-            return;
-        }
-
-        if (start.resolvedId() == .sample) {
-            validator.bumpListItemCount(&validator.sample_list, element_depth);
-            try validator.requireAttribute(start, "id", "sample is missing required attribute id");
-            return;
-        }
-
-        if (start.resolvedId() == .software) {
-            validator.bumpListItemCount(&validator.software_list, element_depth);
-            try validator.requireAttribute(start, "id", "software is missing required attribute id");
-            try validator.requireAttribute(start, "version", "software is missing required attribute version");
-            return;
-        }
-
-        if (start.resolvedId() == .scanSettings) {
-            validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
-            try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
-            return;
-        }
-
-        if (start.resolvedId() == .instrumentConfiguration) {
-            validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
-            try validator.requireAttribute(start, "id", "instrumentConfiguration is missing required attribute id");
-            validator.instrument_configuration = .{ .byte_offset = start.byte_offset, .depth = element_depth };
-            return;
-        }
-
-        if (start.resolvedId() == .componentList) {
-            if (validator.instrument_configuration) |*state| {
-                if (state.depth + 1 != element_depth) {
-                    try validator.nestingError(start.byte_offset, "componentList must be a direct child of instrumentConfiguration");
+                try validator.requireAttribute(start, "count", "componentList is missing required attribute count");
+                const count_state = validator.initListCountState(start, element_depth, "componentList", "component", 3);
+                if (count_state) |active| {
+                    validator.component_list = .{ .count_state = active };
                 } else {
-                    if (state.component_list_seen) {
-                        try validator.nestingError(start.byte_offset, "instrumentConfiguration must not contain more than one componentList");
+                    validator.component_list = null;
+                }
+            },
+            .softwareRef => {
+                if (validator.instrument_configuration) |*state| {
+                    if (state.depth + 1 != element_depth) {
+                        try validator.nestingError(start.byte_offset, "softwareRef must be a direct child of instrumentConfiguration");
+                    } else {
+                        if (state.software_ref_seen) {
+                            try validator.nestingError(start.byte_offset, "instrumentConfiguration must not contain more than one softwareRef");
+                        }
+                        state.software_ref_seen = true;
                     }
-                    if (state.software_ref_seen) {
-                        try validator.nestingError(start.byte_offset, "componentList appears out of order under instrumentConfiguration");
+                }
+                try validator.requireAttribute(start, "ref", "softwareRef is missing required attribute ref");
+            },
+            .source => {
+                try validator.noteComponentChild(start.byte_offset, .source);
+                try validator.requireAttribute(start, "order", "source is missing required attribute order");
+                validator.requireNonNegativeAttribute(start, "order", "source");
+            },
+            .analyzer => {
+                try validator.noteComponentChild(start.byte_offset, .analyzer);
+                try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
+                validator.requireNonNegativeAttribute(start, "order", "analyzer");
+            },
+            .detector => {
+                try validator.noteComponentChild(start.byte_offset, .detector);
+                try validator.requireAttribute(start, "order", "detector is missing required attribute order");
+                validator.requireNonNegativeAttribute(start, "order", "detector");
+            },
+            .dataProcessing => {
+                validator.bumpListItemCount(&validator.data_processing_list, element_depth);
+                try validator.requireAttribute(start, "id", "dataProcessing is missing required attribute id");
+                validator.data_processing = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+            },
+            .processingMethod => {
+                if (validator.data_processing) |*state| {
+                    if (state.depth + 1 != element_depth) {
+                        try validator.nestingError(start.byte_offset, "processingMethod must be a direct child of dataProcessing");
+                    } else {
+                        state.processing_method_seen = true;
                     }
-                    state.component_list_seen = true;
                 }
-            }
-            try validator.requireAttribute(start, "count", "componentList is missing required attribute count");
-            const count_state = validator.initListCountState(start, element_depth, "componentList", "component", 3);
-            if (count_state) |active| {
-                validator.component_list = .{ .count_state = active };
-            } else {
-                validator.component_list = null;
-            }
-            return;
-        }
-
-        if (start.resolvedId() == .softwareRef) {
-            if (validator.instrument_configuration) |*state| {
-                if (state.depth + 1 != element_depth) {
-                    try validator.nestingError(start.byte_offset, "softwareRef must be a direct child of instrumentConfiguration");
-                } else {
-                    if (state.software_ref_seen) {
-                        try validator.nestingError(start.byte_offset, "instrumentConfiguration must not contain more than one softwareRef");
+                try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
+                validator.requireNonNegativeAttribute(start, "order", "processingMethod");
+                try validator.requireAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
+            },
+            .scanList => {
+                if (validator.spectrum == null) {
+                    try validator.nestingError(start.byte_offset, "scanList must be a child of spectrum");
+                }
+                try validator.noteSpectrumChild(start.byte_offset, .scan_list);
+                try validator.requireAttribute(start, "count", "scanList is missing required attribute count");
+                validator.scan_list = validator.initListCountState(start, element_depth, "scanList", "scan", 1);
+            },
+            .precursorList => {
+                if (validator.spectrum == null) {
+                    try validator.nestingError(start.byte_offset, "precursorList must be a child of spectrum");
+                }
+                try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
+                try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
+                validator.precursor_list = validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
+            },
+            .productList => {
+                if (validator.spectrum == null) {
+                    try validator.nestingError(start.byte_offset, "productList must be a child of spectrum");
+                }
+                try validator.noteSpectrumChild(start.byte_offset, .product_list);
+                try validator.requireAttribute(start, "count", "productList is missing required attribute count");
+                validator.product_list = validator.initListCountState(start, element_depth, "productList", "product", 0);
+            },
+            .precursor => {
+                if (validator.chromatogram) |state| {
+                    if (state.depth + 1 == element_depth) {
+                        try validator.noteChromatogramChild(start.byte_offset, .precursor);
                     }
-                    state.software_ref_seen = true;
+                    return;
                 }
-            }
-            try validator.requireAttribute(start, "ref", "softwareRef is missing required attribute ref");
-            return;
-        }
-
-        if (start.resolvedId() == .source) {
-            try validator.noteComponentChild(start.byte_offset, .source);
-            try validator.requireAttribute(start, "order", "source is missing required attribute order");
-            validator.requireNonNegativeAttribute(start, "order", "source");
-            return;
-        }
-
-        if (start.resolvedId() == .analyzer) {
-            try validator.noteComponentChild(start.byte_offset, .analyzer);
-            try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
-            validator.requireNonNegativeAttribute(start, "order", "analyzer");
-            return;
-        }
-
-        if (start.resolvedId() == .detector) {
-            try validator.noteComponentChild(start.byte_offset, .detector);
-            try validator.requireAttribute(start, "order", "detector is missing required attribute order");
-            validator.requireNonNegativeAttribute(start, "order", "detector");
-            return;
-        }
-
-        if (start.resolvedId() == .dataProcessing) {
-            validator.bumpListItemCount(&validator.data_processing_list, element_depth);
-            try validator.requireAttribute(start, "id", "dataProcessing is missing required attribute id");
-            validator.data_processing = .{ .byte_offset = start.byte_offset, .depth = element_depth };
-            return;
-        }
-
-        if (start.resolvedId() == .processingMethod) {
-            if (validator.data_processing) |*state| {
-                if (state.depth + 1 != element_depth) {
-                    try validator.nestingError(start.byte_offset, "processingMethod must be a direct child of dataProcessing");
-                } else {
-                    state.processing_method_seen = true;
+                if (validator.spectrum != null) {
+                    validator.bumpListItemCount(&validator.precursor_list, element_depth);
+                    return;
                 }
-            }
-            try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
-            validator.requireNonNegativeAttribute(start, "order", "processingMethod");
-            try validator.requireAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
-            return;
-        }
-
-        if (start.resolvedId() == .scanList) {
-            if (validator.spectrum == null) {
-                try validator.nestingError(start.byte_offset, "scanList must be a child of spectrum");
-            }
-            try validator.noteSpectrumChild(start.byte_offset, .scan_list);
-            try validator.requireAttribute(start, "count", "scanList is missing required attribute count");
-            validator.scan_list = validator.initListCountState(start, element_depth, "scanList", "scan", 1);
-            return;
-        }
-
-        if (start.resolvedId() == .precursorList) {
-            if (validator.spectrum == null) {
-                try validator.nestingError(start.byte_offset, "precursorList must be a child of spectrum");
-            }
-            try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
-            try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
-            validator.precursor_list = validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
-            return;
-        }
-
-        if (start.resolvedId() == .productList) {
-            if (validator.spectrum == null) {
-                try validator.nestingError(start.byte_offset, "productList must be a child of spectrum");
-            }
-            try validator.noteSpectrumChild(start.byte_offset, .product_list);
-            try validator.requireAttribute(start, "count", "productList is missing required attribute count");
-            validator.product_list = validator.initListCountState(start, element_depth, "productList", "product", 0);
-            return;
-        }
-
-        if (start.resolvedId() == .precursor) {
-            if (validator.chromatogram) |state| {
-                if (state.depth + 1 == element_depth) {
-                    try validator.noteChromatogramChild(start.byte_offset, .precursor);
-                }
-                return;
-            }
-            if (validator.spectrum != null) {
-                validator.bumpListItemCount(&validator.precursor_list, element_depth);
-                return;
-            }
-            {
                 try validator.nestingError(start.byte_offset, "precursor must be a child of chromatogram");
-                return;
-            }
-        }
-
-        if (start.resolvedId() == .product) {
-            if (validator.chromatogram) |state| {
-                if (state.depth + 1 == element_depth) {
-                    try validator.noteChromatogramChild(start.byte_offset, .product);
+            },
+            .product => {
+                if (validator.chromatogram) |state| {
+                    if (state.depth + 1 == element_depth) {
+                        try validator.noteChromatogramChild(start.byte_offset, .product);
+                    }
+                    return;
                 }
-                return;
-            }
-            if (validator.spectrum != null) {
-                validator.bumpListItemCount(&validator.product_list, element_depth);
-                return;
-            }
-            {
+                if (validator.spectrum != null) {
+                    validator.bumpListItemCount(&validator.product_list, element_depth);
+                    return;
+                }
                 try validator.nestingError(start.byte_offset, "product must be a child of chromatogram");
-                return;
-            }
-        }
+            },
+            .scan => {
+                validator.bumpListItemCount(&validator.scan_list, element_depth);
+            },
+            .scanWindowList => {
+                try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
+                validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
+            },
+            .scanWindow => {
+                validator.bumpListItemCount(&validator.scan_window_list, element_depth);
+            },
+            .selectedIonList => {
+                try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
+                validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
+            },
+            .selectedIon => {
+                validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
+            },
+            .binaryDataArrayList => {
+                try validator.noteBinaryDataArrayListChild(start.byte_offset);
+                try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
+                validator.binary_data_array_list = validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
 
-        if (start.resolvedId() == .scan) {
-            validator.bumpListItemCount(&validator.scan_list, element_depth);
-            return;
-        }
+                if (validator.spectrum != null and validator.spectrum_list_depth != null and validator.spectrum_list_depth.? < element_depth) {
+                    validator.spectrum.?.has_binary_data_array_list = true;
+                    return;
+                }
+                if (validator.chromatogram != null and validator.chromatogram_list_depth != null and validator.chromatogram_list_depth.? < element_depth) {
+                    validator.chromatogram.?.has_binary_data_array_list = true;
+                    return;
+                }
 
-        if (start.resolvedId() == .scanWindowList) {
-            try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
-            validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
-            return;
-        }
-
-        if (start.resolvedId() == .scanWindow) {
-            validator.bumpListItemCount(&validator.scan_window_list, element_depth);
-            return;
-        }
-
-        if (start.resolvedId() == .selectedIonList) {
-            try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
-            validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
-            return;
-        }
-
-        if (start.resolvedId() == .selectedIon) {
-            validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
-            return;
-        }
-
-        if (start.resolvedId() == .binaryDataArrayList) {
-            try validator.noteBinaryDataArrayListChild(start.byte_offset);
-            try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
-            validator.binary_data_array_list = validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
-
-            if (validator.spectrum != null and validator.spectrum_list_depth != null and validator.spectrum_list_depth.? < element_depth) {
-                validator.spectrum.?.has_binary_data_array_list = true;
-                return;
-            }
-            if (validator.chromatogram != null and validator.chromatogram_list_depth != null and validator.chromatogram_list_depth.? < element_depth) {
-                validator.chromatogram.?.has_binary_data_array_list = true;
-                return;
-            }
-
-            try validator.nestingError(start.byte_offset, "binaryDataArrayList must be a child of spectrum or chromatogram");
-            return;
-        }
-
-        if (start.resolvedId() == .binaryDataArray) {
-            validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
-            return;
-        }
-
-        // Handled by SemanticValidator. Return early to avoid the catch-all.
-        if (start.resolvedId() == .cvParam) return;
-        if (start.resolvedId() == .userParam) return;
-
-        // Unrecognized element inside mzML scope.
-        if (validator.isWithinMzmlStartScope()) {
-            const in_mzml_ns = if (start.name.namespace_uri) |ns|
-                std.mem.eql(u8, ns, mzml_namespace)
-            else
-                true;
-            if (in_mzml_ns and !elements.isKnownMzmlLocalName(start.name.local_name)) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_structure_nesting,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "unrecognized element in mzML scope",
-                });
-            }
+                try validator.nestingError(start.byte_offset, "binaryDataArrayList must be a child of spectrum or chromatogram");
+            },
+            .binaryDataArray => {
+                validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
+            },
+            // Handled by SemanticValidator. Return early to avoid the catch-all.
+            .cvParam, .userParam => return,
+            else => {
+                const in_mzml_ns = if (start.name.namespace_uri) |ns|
+                    std.mem.eql(u8, ns, mzml_namespace)
+                else
+                    true;
+                if (in_mzml_ns and !elements.isKnownMzmlLocalName(start.name.local_name)) {
+                    try validator.appendDiagnostic(.{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_structure_nesting,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "unrecognized element in mzML scope",
+                    });
+                }
+            },
         }
     }
 
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
         if (!validator.isWithinMzmlEndScope(element_depth)) return;
 
-        if (end.resolvedId() == .mzML and validator.mzml_depth == element_depth) {
-            validator.mzml_depth = null;
-            return;
-        }
+        const tag = end.resolvedId();
 
-        if (end.resolvedId() == .run) {
-            if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_structure_missing_child,
-                    .location = .{ .byte_offset = validator.run_byte_offset },
-                    .path = validator.path,
-                    .message = "run must contain spectrumList or chromatogramList",
-                });
-            }
-            validator.run_depth = null;
-            validator.run_byte_offset = null;
-            return;
-        }
-
-        if (end.resolvedId() == .fileDescription) {
-            if (validator.file_description) |state| {
-                if (!state.has_file_content) {
+        switch (tag) {
+            .mzML => {
+                if (validator.mzml_depth == element_depth) {
+                    validator.mzml_depth = null;
+                }
+            },
+            .run => {
+                if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
                     try validator.appendDiagnostic(.{
                         .severity = .@"error",
                         .rule = RuleId.mzml_structure_missing_child,
-                        .location = .{ .byte_offset = state.byte_offset },
+                        .location = .{ .byte_offset = validator.run_byte_offset },
                         .path = validator.path,
-                        .message = "fileDescription is missing required child fileContent",
+                        .message = "run must contain spectrumList or chromatogramList",
                     });
                 }
-            }
-            validator.file_description = null;
-            return;
-        }
-
-        if (end.resolvedId() == .cvList) {
-            try validator.finishListCount(&validator.cv_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .sourceFileList) {
-            try validator.finishListCount(&validator.source_file_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .referenceableParamGroupList) {
-            try validator.finishListCount(&validator.referenceable_param_group_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .sampleList) {
-            try validator.finishListCount(&validator.sample_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .softwareList) {
-            try validator.finishListCount(&validator.software_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .scanSettingsList) {
-            try validator.finishListCount(&validator.scan_settings_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .instrumentConfigurationList) {
-            try validator.finishListCount(&validator.instrument_configuration_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .componentList) {
-            try validator.finishComponentList(element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .instrumentConfiguration) {
-            validator.instrument_configuration = null;
-            return;
-        }
-
-        if (end.resolvedId() == .dataProcessingList) {
-            try validator.finishListCount(&validator.data_processing_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .dataProcessing) {
-            if (validator.data_processing) |state| {
-                if (!state.processing_method_seen) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_structure_missing_child,
-                        .location = .{ .byte_offset = state.byte_offset },
-                        .path = validator.path,
-                        .message = "dataProcessing is missing required child processingMethod",
-                    });
+                validator.run_depth = null;
+                validator.run_byte_offset = null;
+            },
+            .fileDescription => {
+                if (validator.file_description) |state| {
+                    if (!state.has_file_content) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_structure_missing_child,
+                            .location = .{ .byte_offset = state.byte_offset },
+                            .path = validator.path,
+                            .message = "fileDescription is missing required child fileContent",
+                        });
+                    }
                 }
-            }
-            validator.data_processing = null;
-            return;
-        }
-
-        if (end.resolvedId() == .spectrumList and validator.spectrum_list_depth == element_depth) {
-            try validator.finishListCount(&validator.spectrum_list, element_depth);
-            validator.spectrum_list_depth = null;
-            return;
-        }
-
-        if (end.resolvedId() == .chromatogramList and validator.chromatogram_list_depth == element_depth) {
-            try validator.finishListCount(&validator.chromatogram_list, element_depth);
-            validator.chromatogram_list_depth = null;
-            return;
-        }
-
-        if (end.resolvedId() == .scanList) {
-            try validator.finishListCount(&validator.scan_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .binaryDataArrayList) {
-            try validator.finishListCount(&validator.binary_data_array_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .precursorList) {
-            try validator.finishListCount(&validator.precursor_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .productList) {
-            try validator.finishListCount(&validator.product_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .scanWindowList) {
-            try validator.finishListCount(&validator.scan_window_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .selectedIonList) {
-            try validator.finishListCount(&validator.selected_ion_list, element_depth);
-            return;
-        }
-
-        if (end.resolvedId() == .spectrum) {
-            if (validator.spectrum) |state| {
-                if (!state.has_binary_data_array_list) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_structure_missing_child,
-                        .location = .{ .byte_offset = state.byte_offset },
-                        .path = validator.path,
-                        .message = "spectrum is missing required child binaryDataArrayList",
-                    });
+                validator.file_description = null;
+            },
+            .cvList => try validator.finishListCount(&validator.cv_list, element_depth),
+            .sourceFileList => try validator.finishListCount(&validator.source_file_list, element_depth),
+            .referenceableParamGroupList => try validator.finishListCount(&validator.referenceable_param_group_list, element_depth),
+            .sampleList => try validator.finishListCount(&validator.sample_list, element_depth),
+            .softwareList => try validator.finishListCount(&validator.software_list, element_depth),
+            .scanSettingsList => try validator.finishListCount(&validator.scan_settings_list, element_depth),
+            .instrumentConfigurationList => try validator.finishListCount(&validator.instrument_configuration_list, element_depth),
+            .componentList => try validator.finishComponentList(element_depth),
+            .instrumentConfiguration => validator.instrument_configuration = null,
+            .dataProcessingList => try validator.finishListCount(&validator.data_processing_list, element_depth),
+            .dataProcessing => {
+                if (validator.data_processing) |state| {
+                    if (!state.processing_method_seen) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_structure_missing_child,
+                            .location = .{ .byte_offset = state.byte_offset },
+                            .path = validator.path,
+                            .message = "dataProcessing is missing required child processingMethod",
+                        });
+                    }
                 }
-            }
-            validator.spectrum = null;
-            return;
-        }
-
-        if (end.resolvedId() == .chromatogram) {
-            if (validator.chromatogram) |state| {
-                if (!state.has_binary_data_array_list) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_structure_missing_child,
-                        .location = .{ .byte_offset = state.byte_offset },
-                        .path = validator.path,
-                        .message = "chromatogram is missing required child binaryDataArrayList",
-                    });
+                validator.data_processing = null;
+            },
+            .spectrumList => {
+                if (validator.spectrum_list_depth == element_depth) {
+                    try validator.finishListCount(&validator.spectrum_list, element_depth);
+                    validator.spectrum_list_depth = null;
                 }
-            }
-            validator.chromatogram = null;
+            },
+            .chromatogramList => {
+                if (validator.chromatogram_list_depth == element_depth) {
+                    try validator.finishListCount(&validator.chromatogram_list, element_depth);
+                    validator.chromatogram_list_depth = null;
+                }
+            },
+            .scanList => try validator.finishListCount(&validator.scan_list, element_depth),
+            .binaryDataArrayList => try validator.finishListCount(&validator.binary_data_array_list, element_depth),
+            .precursorList => try validator.finishListCount(&validator.precursor_list, element_depth),
+            .productList => try validator.finishListCount(&validator.product_list, element_depth),
+            .scanWindowList => try validator.finishListCount(&validator.scan_window_list, element_depth),
+            .selectedIonList => try validator.finishListCount(&validator.selected_ion_list, element_depth),
+            .spectrum => {
+                if (validator.spectrum) |state| {
+                    if (!state.has_binary_data_array_list) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_structure_missing_child,
+                            .location = .{ .byte_offset = state.byte_offset },
+                            .path = validator.path,
+                            .message = "spectrum is missing required child binaryDataArrayList",
+                        });
+                    }
+                }
+                validator.spectrum = null;
+            },
+            .chromatogram => {
+                if (validator.chromatogram) |state| {
+                    if (!state.has_binary_data_array_list) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_structure_missing_child,
+                            .location = .{ .byte_offset = state.byte_offset },
+                            .path = validator.path,
+                            .message = "chromatogram is missing required child binaryDataArrayList",
+                        });
+                    }
+                }
+                validator.chromatogram = null;
+            },
+            else => {},
         }
     }
-
     fn handleText(validator: *StructuralValidator, value: []const u8, byte_offset: u64) !void {
         if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return;
         if (validator.depth == 0) {
