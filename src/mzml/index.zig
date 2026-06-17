@@ -585,6 +585,26 @@ test "IndexValidator: records spectrum and chromatogram offsets" {
     try expectEqual(@as(u64, 200), v.chromatogram_offsets.get("c1").?);
 }
 
+test "IndexValidator: spectrum with unknown intern id still records offsets" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(makeStart("mzML", &.{}, 0), 0);
+    try v.consumeStart(makeStart("run", &.{attr("id", "run1")}, 10), 1);
+    var spectrum = makeStart("spectrum", &.{attr("id", "s1")}, 100);
+    spectrum.element_id = .unknown;
+    try v.consumeStart(spectrum, 2);
+    v.consumeEnd(makeEnd("spectrum"), 2);
+    v.consumeEnd(makeEnd("run"), 1);
+    v.consumeEnd(makeEnd("mzML"), 0);
+
+    try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?);
+}
+
 test "IndexValidator: valid indexed mzML cross-checks correctly" {
     const allocator = testing.allocator;
     var diagnostics: std.ArrayList(Diagnostic) = .empty;

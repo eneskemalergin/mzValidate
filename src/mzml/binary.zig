@@ -298,6 +298,7 @@ pub const BinaryValidator = struct {
         if (!validator.isWithinMzmlScope(element_depth)) return;
 
         switch (tag) {
+            .cv, .userParam => return,
             .spectrum => {
             const index_attr = attributeValue(start.attributes, "index");
             const dal_attr = attributeValue(start.attributes, "defaultArrayLength");
@@ -883,6 +884,66 @@ test "binary validator reports invalid zlib payload" {
     // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
+}
+
+test "binary validator cvParam with unknown intern id still records zlib compression" {
+    const allocator = std.testing.allocator;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = BinaryValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    const a = handBinaryAttr;
+    try validator.consumeStart(handBinaryStart("mzML", &.{}, 0));
+    try validator.consumeStart(handBinaryStart("run", &.{a("id", "run1")}, 10));
+    try validator.consumeStart(handBinaryStart("spectrumList", &.{a("count", "1")}, 20));
+    try validator.consumeStart(handBinaryStart("spectrum", &.{ a("index", "0"), a("id", "s1"), a("defaultArrayLength", "1") }, 30));
+    try validator.consumeStart(handBinaryStart("binaryDataArrayList", &.{a("count", "1")}, 40));
+    try validator.consumeStart(handBinaryStart("binaryDataArray", &.{a("encodedLength", "12")}, 50));
+    try validator.consumeStart(handBinaryStart("cvParam", &.{a("accession", "MS:1000521")}, 60));
+    try validator.consumeEnd(handBinaryEnd("cvParam"));
+    var zlib_param = handBinaryStart("cvParam", &.{a("accession", "MS:1000574")}, 70);
+    zlib_param.element_id = .unknown;
+    try validator.consumeStart(zlib_param);
+    try validator.consumeEnd(handBinaryEnd("cvParam"));
+    try validator.consumeStart(handBinaryStart("cvParam", &.{a("accession", "MS:1000515")}, 80));
+    try validator.consumeEnd(handBinaryEnd("cvParam"));
+    try validator.consumeStart(handBinaryStart("binary", &.{}, 90));
+    try validator.consumeText(.{ .byte_offset = 100, .value = "eJxjYGBgAAAA", .from_cdata = false });
+    try validator.consumeEnd(handBinaryEnd("binary"));
+    try validator.consumeEnd(handBinaryEnd("binaryDataArray"));
+    try validator.consumeEnd(handBinaryEnd("binaryDataArrayList"));
+    try validator.consumeEnd(handBinaryEnd("spectrum"));
+    try validator.consumeEnd(handBinaryEnd("spectrumList"));
+    try validator.consumeEnd(handBinaryEnd("run"));
+    try validator.consumeEnd(handBinaryEnd("mzML"));
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
+}
+
+fn handBinaryAttr(name: []const u8, value: []const u8) Attribute {
+    return .{ .byte_offset = 0, .name = .{ .local_name = name }, .value = value };
+}
+
+fn handBinaryStart(local_name: []const u8, attributes: []const Attribute, byte_offset: u64) StartElement {
+    return .{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
+        .element_id = .unknown,
+        .attributes = attributes,
+        .self_closing = false,
+    };
+}
+
+fn handBinaryEnd(local_name: []const u8) EndElement {
+    return .{
+        .byte_offset = 0,
+        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
+        .element_id = .unknown,
+    };
 }
 
 test "binary validator reports precision mismatch" {

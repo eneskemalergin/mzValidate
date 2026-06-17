@@ -795,6 +795,7 @@ pub const StructuralValidator = struct {
         const tag = end.resolvedId();
 
         switch (tag) {
+            .cv, .cvParam, .userParam => return,
             .mzML => {
                 if (validator.mzml_depth == element_depth) {
                     validator.mzml_depth = null;
@@ -1457,6 +1458,39 @@ test "structural validator accepts valid chromatogram fixture" {
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "structural validator cvParam with unknown intern id does not report unrecognized element" {
+    const allocator = std.testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(handStart("mzML", &.{handAttr("version", "1.1.0")}, 0));
+    try validator.consumeStart(handStart("run", &.{handAttr("id", "run1")}, 10));
+    try validator.consumeStart(handStart("spectrumList", &.{handAttr("count", "1")}, 20));
+    try validator.consumeStart(handStart("spectrum", &.{ handAttr("index", "0"), handAttr("id", "s1"), handAttr("defaultArrayLength", "1") }, 30));
+    try validator.consumeStart(handStart("cvParam", &.{handAttr("accession", "MS:1000576")}, 40));
+
+    for (diagnostics.items) |diag| {
+        try std.testing.expect(!std.mem.eql(u8, diag.message, "unrecognized element in mzML scope"));
+    }
+}
+
+fn handAttr(name: []const u8, value: []const u8) Attribute {
+    return .{ .byte_offset = 0, .name = .{ .local_name = name }, .value = value };
+}
+
+fn handStart(local_name: []const u8, attributes: []const Attribute, byte_offset: u64) StartElement {
+    return .{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = local_name, .namespace_uri = mzml_namespace },
+        .element_id = .unknown,
+        .attributes = attributes,
+        .self_closing = false,
+    };
 }
 
 // Tests: required children and attributes.
