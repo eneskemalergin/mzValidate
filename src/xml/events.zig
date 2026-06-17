@@ -15,6 +15,9 @@
 //!   EventKind:    enum discriminators for the union
 
 const std = @import("std");
+const elements = @import("../mzml/elements.zig");
+
+pub const ElementId = elements.ElementId;
 
 // --- Types ---
 
@@ -47,6 +50,7 @@ pub const Attribute = struct {
 pub const StartElement = struct {
     byte_offset: u64,
     name: QName,
+    element_id: ElementId = .unknown,
     attributes: []const Attribute,
     self_closing: bool,
 };
@@ -54,6 +58,7 @@ pub const StartElement = struct {
 pub const EndElement = struct {
     byte_offset: u64,
     name: QName,
+    element_id: ElementId = .unknown,
 };
 
 /// `from_cdata` distinguishes CDATA from normal text, so validators can

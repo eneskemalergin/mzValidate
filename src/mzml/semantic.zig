@@ -16,6 +16,17 @@ const obo = @import("../obo/parser.zig");
 const rule_engine = @import("../obo/rule_engine.zig");
 const xml_events = @import("../xml/events.zig");
 
+const elements = @import("elements.zig");
+
+fn startId(start: StartElement) elements.ElementId {
+    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
+}
+
+fn endId(end: EndElement) elements.ElementId {
+    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
+}
+
+
 const Attribute = xml_events.Attribute;
 const CvTable = obo.CvTable;
 const Diagnostic = diagnostic.Diagnostic;
@@ -174,7 +185,7 @@ pub const SemanticValidator = struct {
     }
 
     pub fn consumeStart(validator: *SemanticValidator, start: StartElement, _: usize) !void {
-        if (start.name.matches(mzml_namespace, "cv")) {
+        if (startId(start) == .cv) {
             if (attributeValue(start.attributes, "id")) |id| {
                 const owned = try validator.allocator.dupe(u8, id);
                 validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
@@ -183,7 +194,7 @@ pub const SemanticValidator = struct {
         }
 
         // Reference resolution: track id declarations and *Ref attributes.
-        if (!start.name.matches(mzml_namespace, "cvParam") and !start.name.matches(mzml_namespace, "userParam")) {
+        if (startId(start) != .cvParam and startId(start) != .userParam) {
             var path_buf: [4096]u8 = undefined;
             var pos: usize = 0;
             path_buf[pos] = '/';
@@ -225,7 +236,7 @@ pub const SemanticValidator = struct {
             }
         }
 
-        if (start.name.matches(mzml_namespace, "cvParam") or start.name.matches(mzml_namespace, "userParam")) {
+        if (startId(start) == .cvParam or startId(start) == .userParam) {
             if (attributeValue(start.attributes, "accession")) |acc| {
                 if (validator.scope_terms.items.len > 0) {
                     const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
@@ -239,12 +250,12 @@ pub const SemanticValidator = struct {
             try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
 
             // Track referenceableParamGroup id for later capture.
-            if (start.name.matches(mzml_namespace, "referenceableParamGroup")) {
+            if (startId(start) == .referenceableParamGroup) {
                 validator.current_group_id = attributeValue(start.attributes, "id");
             }
 
             // Resolve referenceableParamGroupRef: add group's cvParams to parent scope.
-            if (start.name.matches(mzml_namespace, "referenceableParamGroupRef")) {
+            if (startId(start) == .referenceableParamGroupRef) {
                 if (attributeValue(start.attributes, "ref")) |ref_id| {
                     if (validator.param_groups.get(ref_id)) |group_terms| {
                         if (validator.scope_terms.items.len >= 2) {
@@ -265,7 +276,7 @@ pub const SemanticValidator = struct {
         const accession = attributeValue(start.attributes, "accession") orelse return;
         const cv_ref = if (attributeValue(start.attributes, "cvRef")) |ref|
             ref
-        else if (start.name.matches(mzml_namespace, "userParam")) blk: {
+        else if (startId(start) == .userParam) blk: {
             const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
             break :blk accession[0..colon];
         } else return;
@@ -374,8 +385,8 @@ pub const SemanticValidator = struct {
     }
 
     pub fn consumeEnd(validator: *SemanticValidator, end: EndElement, _: usize) !void {
-        if (end.name.matches(mzml_namespace, "cvParam") or end.name.matches(mzml_namespace, "userParam")) return;
-        if (end.name.matches(mzml_namespace, "cv")) return;
+        if (endId(end) == .cvParam or endId(end) == .userParam) return;
+        if (endId(end) == .cv) return;
 
         var path_buf: [4096]u8 = undefined;
         var pos: usize = 0;
@@ -407,7 +418,7 @@ pub const SemanticValidator = struct {
         }
 
         // Capture referenceableParamGroup cvParams for later ref resolution.
-        if (end.name.matches(mzml_namespace, "referenceableParamGroup")) {
+        if (endId(end) == .referenceableParamGroup) {
             if (validator.current_group_id) |group_id| {
                 if (validator.param_groups.get(group_id) == null) {
                     const owned_id = try validator.allocator.dupe(u8, group_id);

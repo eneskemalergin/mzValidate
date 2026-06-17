@@ -12,6 +12,7 @@
 //! - DTD declarations (`<!...>`) are rejected. mzML does not need them.
 
 const std = @import("std");
+const elements = @import("../mzml/elements.zig");
 const events = @import("events.zig");
 const scan = @import("scan.zig");
 
@@ -70,6 +71,7 @@ pub const ElementFrame = struct {
     prefix: ?Range,
     local_name: Range,
     namespace_uri: ?Range,
+    element_id: elements.ElementId = .unknown,
     synthetic_end_byte_offset: ?u64 = null,
 };
 
@@ -291,10 +293,12 @@ pub const Parser = struct {
         const name = try parser.resolveQName(name_parts, true);
         try parser.resolveAttributeNamespaces();
         try parser.pushElementFrame(name, namespace_count_before, namespace_bytes_before, synthetic_end_byte_offset);
+        const element_id = elements.idFromParts(name.local_name, name.namespace_uri);
 
         return .{ .start_element = .{
             .byte_offset = byte_offset,
             .name = name,
+            .element_id = element_id,
             .attributes = parser.attribute_storage[0..parser.attribute_count],
             .self_closing = self_closing,
         } };
@@ -312,11 +316,13 @@ pub const Parser = struct {
         if (!parser.frameMatches(frame, actual_name)) return error.MismatchedEndTag;
 
         const event_name = try parser.materializeFrameName(frame);
+        const element_id = frame.element_id;
         parser.popElementFrame();
 
         return .{ .end_element = .{
             .byte_offset = byte_offset,
             .name = event_name,
+            .element_id = element_id,
         } };
     }
 
@@ -377,10 +383,12 @@ pub const Parser = struct {
         parser.pending_self_closing_end = false;
         parser.resetEventStorage();
         const name = try parser.materializeFrameName(frame);
+        const element_id = frame.element_id;
         parser.popElementFrame();
         return .{ .end_element = .{
             .byte_offset = byte_offset,
             .name = name,
+            .element_id = element_id,
         } };
     }
 
@@ -592,6 +600,7 @@ pub const Parser = struct {
             .prefix = prefix_range,
             .local_name = local_name_range,
             .namespace_uri = namespace_uri_range,
+            .element_id = elements.idFromParts(name.local_name, name.namespace_uri),
             .synthetic_end_byte_offset = synthetic_end_byte_offset,
         };
         parser.element_count += 1;
@@ -889,6 +898,7 @@ fn eventsSemanticallyEqual(left: Event, right: Event) bool {
             const right_start = right.start_element;
             if (!qnameEql(left_start.name, right_start.name)) return false;
             if (left_start.byte_offset != right_start.byte_offset) return false;
+            if (left_start.element_id != right_start.element_id) return false;
             if (left_start.self_closing != right_start.self_closing) return false;
             if (left_start.attributes.len != right_start.attributes.len) return false;
             for (left_start.attributes, right_start.attributes) |left_attr, right_attr| {
@@ -902,6 +912,7 @@ fn eventsSemanticallyEqual(left: Event, right: Event) bool {
         .end_element => |left_end| {
             const right_end = right.end_element;
             return left_end.byte_offset == right_end.byte_offset and
+                left_end.element_id == right_end.element_id and
                 qnameEql(left_end.name, right_end.name);
         },
         .text => |left_text| {
@@ -1015,6 +1026,40 @@ test "initSlice parses identically to init on a fixed reader" {
         try std.testing.expect(reader_event != null);
         try std.testing.expect(eventsSemanticallyEqual(slice_event.?, reader_event.?));
     }
+}
+
+test "initSlice assigns mzML element intern ids" {
+    const xml =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"r\" defaultInstrumentConfigurationRef=\"ic\"/>" ++
+        "</mzML>";
+
+    // Arrange.
+    var token_buffer: [4096]u8 = undefined;
+    var attributes: [64]Attribute = undefined;
+    var namespace_bindings: [32]NamespaceBinding = undefined;
+    var namespace_bytes: [256]u8 = undefined;
+    var element_stack: [16]ElementFrame = undefined;
+    var element_bytes: [256]u8 = undefined;
+    const buffers = Buffers{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    };
+    var parser = Parser.initSlice(xml, buffers);
+
+    // Act.
+    const root = (try parser.next()).?.start_element;
+    const run = (try parser.next()).?.start_element;
+    const run_end = (try parser.next()).?.end_element;
+
+    // Assert.
+    try std.testing.expectEqual(elements.ElementId.mzML, root.element_id);
+    try std.testing.expectEqual(elements.ElementId.run, run.element_id);
+    try std.testing.expectEqual(elements.ElementId.run, run_end.element_id);
 }
 
 test "initSlice zero-copies plain text and cdata from input bytes" {

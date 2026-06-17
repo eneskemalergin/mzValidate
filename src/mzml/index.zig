@@ -12,6 +12,17 @@ const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 
+const elements = @import("elements.zig");
+
+fn startId(start: StartElement) elements.ElementId {
+    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
+}
+
+fn endId(end: EndElement) elements.ElementId {
+    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
+}
+
+
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
 const EndElement = xml_events.EndElement;
@@ -121,14 +132,14 @@ pub const IndexValidator = struct {
         validator.depth = element_depth;
 
         // Handle indexedmzML wrapper (contains mzML as a child).
-        if (start.name.matches(mzml_namespace, "indexedmzML")) {
+        if (startId(start) == .indexedmzML) {
             validator.indexed_mzml_depth = element_depth;
             return;
         }
 
         // Track mzML element depth. May appear at depth 0 (standalone) or
         // as a child of indexedmzML.
-        if (start.name.matches(mzml_namespace, "mzML") and
+        if (startId(start) == .mzML and
             (validator.mzml_depth == null or element_depth < validator.mzml_depth.?))
         {
             validator.mzml_depth = element_depth;
@@ -139,17 +150,17 @@ pub const IndexValidator = struct {
         if (element_depth < validator.mzml_depth.?) return;
 
         // Track spectrum and chromatogram start offsets.
-        if (start.name.matches(mzml_namespace, "spectrum")) {
+        if (startId(start) == .spectrum) {
             try recordContainerOffset(validator, start, &validator.spectrum_offsets);
             return;
         }
-        if (start.name.matches(mzml_namespace, "chromatogram")) {
+        if (startId(start) == .chromatogram) {
             try recordContainerOffset(validator, start, &validator.chromatogram_offsets);
             return;
         }
 
         // indexList
-        if (start.name.matches(mzml_namespace, "indexList")) {
+        if (startId(start) == .indexList) {
             validator.index_list_depth = element_depth;
             validator.index_list_actual_offset = start.byte_offset;
             validator.saw_index_elements = true;
@@ -163,7 +174,7 @@ pub const IndexValidator = struct {
         }
 
         // <index name="spectrum"> or <index name="chromatogram">
-        if (start.name.matches(mzml_namespace, "index")) {
+        if (startId(start) == .index) {
             if (validator.index_list_depth == null) return;
             if (element_depth != validator.index_list_depth.? + 1) return;
             validator.index_list_actual_count += 1;
@@ -183,7 +194,7 @@ pub const IndexValidator = struct {
         }
 
         // <offset idRef="X">
-        if (start.name.matches(mzml_namespace, "offset")) {
+        if (startId(start) == .offset) {
             if (validator.current_index_kind == null) return;
             const id_ref = attributeValue(start.attributes, "idRef") orelse {
                 try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
@@ -196,7 +207,7 @@ pub const IndexValidator = struct {
         }
 
         // indexListOffset
-        if (start.name.matches(mzml_namespace, "indexListOffset")) {
+        if (startId(start) == .indexListOffset) {
             validator.index_list_offset_byte_offset = start.byte_offset;
             validator.index_list_offset_depth = element_depth;
             validator.text_buf.clearRetainingCapacity();
@@ -204,7 +215,7 @@ pub const IndexValidator = struct {
         }
 
         // fileChecksum
-        if (start.name.matches(mzml_namespace, "fileChecksum")) {
+        if (startId(start) == .fileChecksum) {
             validator.file_checksum_depth = element_depth;
             validator.file_checksum_byte_offset = start.byte_offset + "<fileChecksum>".len;
             validator.text_buf.clearRetainingCapacity();
@@ -223,7 +234,7 @@ pub const IndexValidator = struct {
         }
 
         // Close offset → create index entry.
-        if (end.name.matches(mzml_namespace, "offset") and
+        if (endId(end) == .offset and
             validator.current_index_kind != null and
             validator.offset_id_ref_owned != null)
         {
@@ -241,20 +252,20 @@ pub const IndexValidator = struct {
         }
 
         // Close index.
-        if (end.name.matches(mzml_namespace, "index")) {
+        if (endId(end) == .index) {
             validator.current_index_kind = null;
             return;
         }
 
         // Close indexList.
-        if (end.name.matches(mzml_namespace, "indexList")) {
+        if (endId(end) == .indexList) {
             validator.index_list_depth = null;
             validator.index_list_offset_value = null;
             return;
         }
 
         // Close indexListOffset.
-        if (end.name.matches(mzml_namespace, "indexListOffset")) {
+        if (endId(end) == .indexListOffset) {
             const parsed = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10);
             validator.index_list_offset_value = parsed catch |err| blk: {
                 if (err == error.InvalidCharacter) {
@@ -271,7 +282,7 @@ pub const IndexValidator = struct {
         }
 
         // Close fileChecksum.
-        if (end.name.matches(mzml_namespace, "fileChecksum")) {
+        if (endId(end) == .fileChecksum) {
             const raw = validator.text_buf.items;
             const hex = std.mem.trim(u8, raw, " \t\r\n");
             if (hex.len != 40 or !isHexString(hex)) {

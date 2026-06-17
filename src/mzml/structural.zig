@@ -15,6 +15,17 @@
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
+
+const elements = @import("elements.zig");
+
+fn startId(start: StartElement) elements.ElementId {
+    return elements.resolveId(start.element_id, start.name.local_name, start.name.namespace_uri);
+}
+
+fn endId(end: EndElement) elements.ElementId {
+    return elements.resolveId(end.element_id, end.name.local_name, end.name.namespace_uri);
+}
+
 const xml_parser = @import("../xml/parser.zig");
 
 const Attribute = xml_events.Attribute;
@@ -355,12 +366,12 @@ pub const StructuralValidator = struct {
         if (!validator.root_seen) {
             validator.root_seen = true;
             validator.root_byte_offset = start.byte_offset;
-            if (start.name.matches(mzml_namespace, "indexedmzML")) {
+            if (startId(start) == .indexedmzML) {
                 validator.indexed_mzml_depth = element_depth;
                 return;
             }
 
-            validator.root_valid = start.name.matches(mzml_namespace, "mzML");
+            validator.root_valid = startId(start) == .mzML;
             if (!validator.root_valid) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
@@ -376,7 +387,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (!validator.root_valid and validator.indexed_mzml_depth != null and start.name.matches(mzml_namespace, "mzML")) {
+        if (!validator.root_valid and validator.indexed_mzml_depth != null and startId(start) == .mzML) {
             if (element_depth != validator.indexed_mzml_depth.? + 1) {
                 try validator.nestingError(start.byte_offset, "mzML must be a direct child of indexedmzML");
                 return;
@@ -392,24 +403,24 @@ pub const StructuralValidator = struct {
         // <indexedmzML>. Need explicit handling since mzml_depth is null.
         if (validator.indexed_mzml_depth != null and
             element_depth == validator.indexed_mzml_depth.? + 1 and
-            (start.name.matches(mzml_namespace, "indexList") or
-                start.name.matches(mzml_namespace, "indexListOffset") or
-                start.name.matches(mzml_namespace, "fileChecksum")))
+            (startId(start) == .indexList or
+                startId(start) == .indexListOffset or
+                startId(start) == .fileChecksum))
         {
-            if (start.name.matches(mzml_namespace, "indexList")) {
+            if (startId(start) == .indexList) {
                 if (validator.index_list_seen) {
                     try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
                 } else {
                     validator.index_list_seen = true;
                 }
                 try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
-            } else if (start.name.matches(mzml_namespace, "indexListOffset")) {
+            } else if (startId(start) == .indexListOffset) {
                 if (validator.index_list_offset_seen) {
                     try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
                 } else {
                     validator.index_list_offset_seen = true;
                 }
-            } else if (start.name.matches(mzml_namespace, "fileChecksum")) {
+            } else if (startId(start) == .fileChecksum) {
                 if (validator.file_checksum_seen) {
                     try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
                 } else {
@@ -421,62 +432,62 @@ pub const StructuralValidator = struct {
 
         if (!validator.isWithinMzmlStartScope()) return;
 
-        if (start.name.matches(mzml_namespace, "cvList")) {
+        if (startId(start) == .cvList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
             try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
             validator.cv_list = validator.initListCountState(start, element_depth, "cvList", "cv", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "fileDescription")) {
+        if (startId(start) == .fileDescription) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_description_seen, "fileDescription", .file_description);
             validator.file_description = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "referenceableParamGroupList")) {
+        if (startId(start) == .referenceableParamGroupList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
             try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
             validator.referenceable_param_group_list = validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "sampleList")) {
+        if (startId(start) == .sampleList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
             try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
             validator.sample_list = validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "softwareList")) {
+        if (startId(start) == .softwareList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
             try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
             validator.software_list = validator.initListCountState(start, element_depth, "softwareList", "software", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "scanSettingsList")) {
+        if (startId(start) == .scanSettingsList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
             try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
             validator.scan_settings_list = validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "instrumentConfigurationList")) {
+        if (startId(start) == .instrumentConfigurationList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
             try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
             validator.instrument_configuration_list = validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "dataProcessingList")) {
+        if (startId(start) == .dataProcessingList) {
             try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
             try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
             validator.data_processing_list = validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "run")) {
+        if (startId(start) == .run) {
             if (element_depth != validator.topLevelChildDepth()) {
                 try validator.nestingError(start.byte_offset, "run must be a direct child of mzML");
                 return;
@@ -496,7 +507,7 @@ pub const StructuralValidator = struct {
         // Post-run: indexList > indexListOffset > fileChecksum.
         // Content validation delegated to IndexValidator.
 
-        if (start.name.matches(mzml_namespace, "indexList")) {
+        if (startId(start) == .indexList) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "indexList must appear after run");
                 return;
@@ -506,7 +517,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "indexListOffset")) {
+        if (startId(start) == .indexListOffset) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
                 return;
@@ -515,7 +526,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "fileChecksum")) {
+        if (startId(start) == .fileChecksum) {
             if (!validator.run_seen) {
                 try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
                 return;
@@ -524,7 +535,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "fileContent")) {
+        if (startId(start) == .fileContent) {
             if (validator.file_description) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "fileContent must be a direct child of fileDescription");
@@ -543,7 +554,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "sourceFileList")) {
+        if (startId(start) == .sourceFileList) {
             if (validator.file_description) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "sourceFileList must be a direct child of fileDescription");
@@ -562,7 +573,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "sourceFile")) {
+        if (startId(start) == .sourceFile) {
             validator.bumpListItemCount(&validator.source_file_list, element_depth);
             try validator.requireAttribute(start, "id", "sourceFile is missing required attribute id");
             try validator.requireAttribute(start, "name", "sourceFile is missing required attribute name");
@@ -570,7 +581,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "spectrumList")) {
+        if (startId(start) == .spectrumList) {
             try validator.noteRunChild(start.byte_offset, .spectrum_list);
             if (validator.run_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "spectrumList must be a child of run");
@@ -584,7 +595,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "chromatogramList")) {
+        if (startId(start) == .chromatogramList) {
             try validator.noteRunChild(start.byte_offset, .chromatogram_list);
             if (validator.run_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "chromatogramList must be a child of run");
@@ -598,7 +609,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "spectrum")) {
+        if (startId(start) == .spectrum) {
             validator.bumpListItemCount(&validator.spectrum_list, element_depth);
             if (validator.spectrum_list_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
@@ -608,7 +619,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "chromatogram")) {
+        if (startId(start) == .chromatogram) {
             validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
             if (validator.chromatogram_list_depth != element_depth - 1) {
                 try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
@@ -618,7 +629,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "cv")) {
+        if (startId(start) == .cv) {
             validator.bumpListItemCount(&validator.cv_list, element_depth);
             try validator.requireAttribute(start, "id", "cv is missing required attribute id");
             try validator.requireAttribute(start, "fullName", "cv is missing required attribute fullName");
@@ -626,39 +637,39 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "referenceableParamGroup")) {
+        if (startId(start) == .referenceableParamGroup) {
             validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
             try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "sample")) {
+        if (startId(start) == .sample) {
             validator.bumpListItemCount(&validator.sample_list, element_depth);
             try validator.requireAttribute(start, "id", "sample is missing required attribute id");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "software")) {
+        if (startId(start) == .software) {
             validator.bumpListItemCount(&validator.software_list, element_depth);
             try validator.requireAttribute(start, "id", "software is missing required attribute id");
             try validator.requireAttribute(start, "version", "software is missing required attribute version");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "scanSettings")) {
+        if (startId(start) == .scanSettings) {
             validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
             try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "instrumentConfiguration")) {
+        if (startId(start) == .instrumentConfiguration) {
             validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
             try validator.requireAttribute(start, "id", "instrumentConfiguration is missing required attribute id");
             validator.instrument_configuration = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "componentList")) {
+        if (startId(start) == .componentList) {
             if (validator.instrument_configuration) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "componentList must be a direct child of instrumentConfiguration");
@@ -682,7 +693,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "softwareRef")) {
+        if (startId(start) == .softwareRef) {
             if (validator.instrument_configuration) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "softwareRef must be a direct child of instrumentConfiguration");
@@ -697,35 +708,35 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "source")) {
+        if (startId(start) == .source) {
             try validator.noteComponentChild(start.byte_offset, .source);
             try validator.requireAttribute(start, "order", "source is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "source");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "analyzer")) {
+        if (startId(start) == .analyzer) {
             try validator.noteComponentChild(start.byte_offset, .analyzer);
             try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "analyzer");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "detector")) {
+        if (startId(start) == .detector) {
             try validator.noteComponentChild(start.byte_offset, .detector);
             try validator.requireAttribute(start, "order", "detector is missing required attribute order");
             validator.requireNonNegativeAttribute(start, "order", "detector");
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "dataProcessing")) {
+        if (startId(start) == .dataProcessing) {
             validator.bumpListItemCount(&validator.data_processing_list, element_depth);
             try validator.requireAttribute(start, "id", "dataProcessing is missing required attribute id");
             validator.data_processing = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "processingMethod")) {
+        if (startId(start) == .processingMethod) {
             if (validator.data_processing) |*state| {
                 if (state.depth + 1 != element_depth) {
                     try validator.nestingError(start.byte_offset, "processingMethod must be a direct child of dataProcessing");
@@ -739,7 +750,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "scanList")) {
+        if (startId(start) == .scanList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "scanList must be a child of spectrum");
             }
@@ -749,7 +760,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "precursorList")) {
+        if (startId(start) == .precursorList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "precursorList must be a child of spectrum");
             }
@@ -759,7 +770,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "productList")) {
+        if (startId(start) == .productList) {
             if (validator.spectrum == null) {
                 try validator.nestingError(start.byte_offset, "productList must be a child of spectrum");
             }
@@ -769,7 +780,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "precursor")) {
+        if (startId(start) == .precursor) {
             if (validator.chromatogram) |state| {
                 if (state.depth + 1 == element_depth) {
                     try validator.noteChromatogramChild(start.byte_offset, .precursor);
@@ -786,7 +797,7 @@ pub const StructuralValidator = struct {
             }
         }
 
-        if (start.name.matches(mzml_namespace, "product")) {
+        if (startId(start) == .product) {
             if (validator.chromatogram) |state| {
                 if (state.depth + 1 == element_depth) {
                     try validator.noteChromatogramChild(start.byte_offset, .product);
@@ -803,34 +814,34 @@ pub const StructuralValidator = struct {
             }
         }
 
-        if (start.name.matches(mzml_namespace, "scan")) {
+        if (startId(start) == .scan) {
             validator.bumpListItemCount(&validator.scan_list, element_depth);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "scanWindowList")) {
+        if (startId(start) == .scanWindowList) {
             try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
             validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "scanWindow")) {
+        if (startId(start) == .scanWindow) {
             validator.bumpListItemCount(&validator.scan_window_list, element_depth);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "selectedIonList")) {
+        if (startId(start) == .selectedIonList) {
             try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
             validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "selectedIon")) {
+        if (startId(start) == .selectedIon) {
             validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "binaryDataArrayList")) {
+        if (startId(start) == .binaryDataArrayList) {
             try validator.noteBinaryDataArrayListChild(start.byte_offset);
             try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
             validator.binary_data_array_list = validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
@@ -848,14 +859,14 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (start.name.matches(mzml_namespace, "binaryDataArray")) {
+        if (startId(start) == .binaryDataArray) {
             validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
             return;
         }
 
         // Handled by SemanticValidator. Return early to avoid the catch-all.
-        if (start.name.matches(mzml_namespace, "cvParam")) return;
-        if (start.name.matches(mzml_namespace, "userParam")) return;
+        if (startId(start) == .cvParam) return;
+        if (startId(start) == .userParam) return;
 
         // Unrecognized element inside mzML scope.
         if (validator.isWithinMzmlStartScope()) {
@@ -863,7 +874,7 @@ pub const StructuralValidator = struct {
                 std.mem.eql(u8, ns, mzml_namespace)
             else
                 true;
-            if (in_mzml_ns and !isKnownMzmlElement(start.name.local_name)) {
+            if (in_mzml_ns and !elements.isKnownMzmlLocalName(start.name.local_name)) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
                     .rule = RuleId.mzml_structure_nesting,
@@ -875,79 +886,15 @@ pub const StructuralValidator = struct {
         }
     }
 
-    // Returns true for every element name defined in the mzML 1.1.0 schema.
-    fn isKnownMzmlElement(name: []const u8) bool {
-        return std.mem.eql(u8, name, "activation") or
-            std.mem.eql(u8, name, "analyzer") or
-            std.mem.eql(u8, name, "binary") or
-            std.mem.eql(u8, name, "binaryDataArray") or
-            std.mem.eql(u8, name, "binaryDataArrayList") or
-            std.mem.eql(u8, name, "chromatogram") or
-            std.mem.eql(u8, name, "chromatogramList") or
-            std.mem.eql(u8, name, "componentList") or
-            std.mem.eql(u8, name, "contact") or
-            std.mem.eql(u8, name, "cv") or
-            std.mem.eql(u8, name, "cvList") or
-            std.mem.eql(u8, name, "cvParam") or
-            std.mem.eql(u8, name, "dataProcessing") or
-            std.mem.eql(u8, name, "dataProcessingList") or
-            std.mem.eql(u8, name, "detector") or
-            std.mem.eql(u8, name, "fileChecksum") or
-            std.mem.eql(u8, name, "fileContent") or
-            std.mem.eql(u8, name, "fileDescription") or
-            std.mem.eql(u8, name, "index") or
-            std.mem.eql(u8, name, "indexList") or
-            std.mem.eql(u8, name, "indexListOffset") or
-            std.mem.eql(u8, name, "indexedmzML") or
-            std.mem.eql(u8, name, "instrumentConfiguration") or
-            std.mem.eql(u8, name, "instrumentConfigurationList") or
-            std.mem.eql(u8, name, "isolationWindow") or
-            std.mem.eql(u8, name, "mzML") or
-            std.mem.eql(u8, name, "offset") or
-            std.mem.eql(u8, name, "paramGroupRef") or
-            std.mem.eql(u8, name, "precursor") or
-            std.mem.eql(u8, name, "precursorList") or
-            std.mem.eql(u8, name, "processingMethod") or
-            std.mem.eql(u8, name, "product") or
-            std.mem.eql(u8, name, "productList") or
-            std.mem.eql(u8, name, "referenceableParamGroup") or
-            std.mem.eql(u8, name, "referenceableParamGroupList") or
-            std.mem.eql(u8, name, "referenceableParamGroupRef") or
-            std.mem.eql(u8, name, "run") or
-            std.mem.eql(u8, name, "sample") or
-            std.mem.eql(u8, name, "sampleList") or
-            std.mem.eql(u8, name, "scan") or
-            std.mem.eql(u8, name, "scanList") or
-            std.mem.eql(u8, name, "scanSettings") or
-            std.mem.eql(u8, name, "scanSettingsList") or
-            std.mem.eql(u8, name, "scanWindow") or
-            std.mem.eql(u8, name, "scanWindowList") or
-            std.mem.eql(u8, name, "selectedIon") or
-            std.mem.eql(u8, name, "selectedIonList") or
-            std.mem.eql(u8, name, "software") or
-            std.mem.eql(u8, name, "softwareList") or
-            std.mem.eql(u8, name, "softwareRef") or
-            std.mem.eql(u8, name, "source") or
-            std.mem.eql(u8, name, "sourceFile") or
-            std.mem.eql(u8, name, "sourceFileList") or
-            std.mem.eql(u8, name, "sourceFileRef") or
-            std.mem.eql(u8, name, "sourceFileRefList") or
-            std.mem.eql(u8, name, "spectrum") or
-            std.mem.eql(u8, name, "spectrumList") or
-            std.mem.eql(u8, name, "target") or
-            std.mem.eql(u8, name, "targetList") or
-            std.mem.eql(u8, name, "userParam");
-    }
-
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
         if (!validator.isWithinMzmlEndScope(element_depth)) return;
 
-        if (end.name.matches(mzml_namespace, "mzML") and validator.mzml_depth == element_depth) {
+        if (endId(end) == .mzML and validator.mzml_depth == element_depth) {
             validator.mzml_depth = null;
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "run")) {
+        if (endId(end) == .run) {
             if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
@@ -962,7 +909,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "fileDescription")) {
+        if (endId(end) == .fileDescription) {
             if (validator.file_description) |state| {
                 if (!state.has_file_content) {
                     try validator.appendDiagnostic(.{
@@ -978,57 +925,57 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "cvList")) {
+        if (endId(end) == .cvList) {
             try validator.finishListCount(&validator.cv_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "sourceFileList")) {
+        if (endId(end) == .sourceFileList) {
             try validator.finishListCount(&validator.source_file_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "referenceableParamGroupList")) {
+        if (endId(end) == .referenceableParamGroupList) {
             try validator.finishListCount(&validator.referenceable_param_group_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "sampleList")) {
+        if (endId(end) == .sampleList) {
             try validator.finishListCount(&validator.sample_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "softwareList")) {
+        if (endId(end) == .softwareList) {
             try validator.finishListCount(&validator.software_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "scanSettingsList")) {
+        if (endId(end) == .scanSettingsList) {
             try validator.finishListCount(&validator.scan_settings_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "instrumentConfigurationList")) {
+        if (endId(end) == .instrumentConfigurationList) {
             try validator.finishListCount(&validator.instrument_configuration_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "componentList")) {
+        if (endId(end) == .componentList) {
             try validator.finishComponentList(element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "instrumentConfiguration")) {
+        if (endId(end) == .instrumentConfiguration) {
             validator.instrument_configuration = null;
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "dataProcessingList")) {
+        if (endId(end) == .dataProcessingList) {
             try validator.finishListCount(&validator.data_processing_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "dataProcessing")) {
+        if (endId(end) == .dataProcessing) {
             if (validator.data_processing) |state| {
                 if (!state.processing_method_seen) {
                     try validator.appendDiagnostic(.{
@@ -1044,49 +991,49 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "spectrumList") and validator.spectrum_list_depth == element_depth) {
+        if (endId(end) == .spectrumList and validator.spectrum_list_depth == element_depth) {
             try validator.finishListCount(&validator.spectrum_list, element_depth);
             validator.spectrum_list_depth = null;
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "chromatogramList") and validator.chromatogram_list_depth == element_depth) {
+        if (endId(end) == .chromatogramList and validator.chromatogram_list_depth == element_depth) {
             try validator.finishListCount(&validator.chromatogram_list, element_depth);
             validator.chromatogram_list_depth = null;
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "scanList")) {
+        if (endId(end) == .scanList) {
             try validator.finishListCount(&validator.scan_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "binaryDataArrayList")) {
+        if (endId(end) == .binaryDataArrayList) {
             try validator.finishListCount(&validator.binary_data_array_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "precursorList")) {
+        if (endId(end) == .precursorList) {
             try validator.finishListCount(&validator.precursor_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "productList")) {
+        if (endId(end) == .productList) {
             try validator.finishListCount(&validator.product_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "scanWindowList")) {
+        if (endId(end) == .scanWindowList) {
             try validator.finishListCount(&validator.scan_window_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "selectedIonList")) {
+        if (endId(end) == .selectedIonList) {
             try validator.finishListCount(&validator.selected_ion_list, element_depth);
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "spectrum")) {
+        if (endId(end) == .spectrum) {
             if (validator.spectrum) |state| {
                 if (!state.has_binary_data_array_list) {
                     try validator.appendDiagnostic(.{
@@ -1102,7 +1049,7 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (end.name.matches(mzml_namespace, "chromatogram")) {
+        if (endId(end) == .chromatogram) {
             if (validator.chromatogram) |state| {
                 if (!state.has_binary_data_array_list) {
                     try validator.appendDiagnostic(.{
