@@ -83,8 +83,18 @@ pub const Buffers = struct {
 
 // --- Parser ---
 
-pub const Parser = struct {
+const SliceInput = struct {
+    bytes: []const u8,
+    pos: usize,
+};
+
+pub const Input = union(enum) {
     reader: *std.Io.Reader,
+    slice: SliceInput,
+};
+
+pub const Parser = struct {
+    input: Input,
     token_buffer: []u8,
     attribute_storage: []Attribute,
     namespace_storage: []NamespaceBinding,
@@ -113,7 +123,21 @@ pub const Parser = struct {
     /// attribute counts before calling `next` in a loop.
     pub fn init(reader: *std.Io.Reader, buffers: Buffers) Parser {
         return .{
-            .reader = reader,
+            .input = .{ .reader = reader },
+            .token_buffer = buffers.token,
+            .attribute_storage = buffers.attributes,
+            .namespace_storage = buffers.namespace_bindings,
+            .namespace_bytes = buffers.namespace_bytes,
+            .element_storage = buffers.element_stack,
+            .element_bytes = buffers.element_bytes,
+        };
+    }
+
+    /// Like `init`, but reads directly from a contiguous byte slice with no
+    /// `std.Io.Reader` per-byte overhead. Used for mmap'd mzML files.
+    pub fn initSlice(bytes: []const u8, buffers: Buffers) Parser {
+        return .{
+            .input = .{ .slice = .{ .bytes = bytes, .pos = 0 } },
             .token_buffer = buffers.token,
             .attribute_storage = buffers.attributes,
             .namespace_storage = buffers.namespace_bindings,
@@ -699,10 +723,20 @@ pub const Parser = struct {
     fn peekOptionalByte(parser: *Parser) ParseError!?u8 {
         if (parser.lookahead) |byte| return byte;
 
-        const byte = parser.reader.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return null,
-            error.ReadFailed => return error.ReadFailed,
+        const byte = switch (parser.input) {
+            .reader => |reader| reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return null,
+                error.ReadFailed => return error.ReadFailed,
+            },
+            .slice => |*slice| blk: {
+                if (slice.pos >= slice.bytes.len) return null;
+                break :blk slice.bytes[slice.pos];
+            },
         };
+        switch (parser.input) {
+            .slice => |*slice| slice.pos += 1,
+            .reader => {},
+        }
         parser.lookahead = byte;
         parser.lookahead_offset = parser.absolute_offset;
         parser.last_byte_offset = parser.absolute_offset;
@@ -717,9 +751,17 @@ pub const Parser = struct {
             return byte;
         }
 
-        const byte = parser.reader.takeByte() catch |err| switch (err) {
-            error.EndOfStream => return null,
-            error.ReadFailed => return error.ReadFailed,
+        const byte = switch (parser.input) {
+            .reader => |reader| reader.takeByte() catch |err| switch (err) {
+                error.EndOfStream => return null,
+                error.ReadFailed => return error.ReadFailed,
+            },
+            .slice => |*slice| blk: {
+                if (slice.pos >= slice.bytes.len) return null;
+                const b = slice.bytes[slice.pos];
+                slice.pos += 1;
+                break :blk b;
+            },
         };
         parser.last_byte_offset = parser.absolute_offset;
         parser.absolute_offset += 1;
@@ -807,6 +849,40 @@ test "parser emits elements text attributes and namespaces" {
 
     const terminal = try harness.parser.next();
     try std.testing.expectEqual(@as(?Event, null), terminal);
+}
+
+test "initSlice parses identically to init on a fixed reader" {
+    const xml = "<root><child>text</child></root>";
+
+    // Arrange.
+    var token_buffer: [4096]u8 = undefined;
+    var attributes: [64]Attribute = undefined;
+    var namespace_bindings: [32]NamespaceBinding = undefined;
+    var namespace_bytes: [256]u8 = undefined;
+    var element_stack: [16]ElementFrame = undefined;
+    var element_bytes: [256]u8 = undefined;
+    const buffers = Buffers{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    };
+
+    var slice_parser = Parser.initSlice(xml, buffers);
+    var reader = std.Io.Reader.fixed(xml);
+    var reader_parser = Parser.init(&reader, buffers);
+
+    // Act and assert.
+    while (true) {
+        const slice_event = try slice_parser.next();
+        const reader_event = try reader_parser.next();
+        if (slice_event == null and reader_event == null) break;
+        try std.testing.expect(slice_event != null);
+        try std.testing.expect(reader_event != null);
+        try std.testing.expectEqual(slice_event.?, reader_event.?);
+    }
 }
 
 test "parser skips comments and processing instructions and emits cdata as text" {

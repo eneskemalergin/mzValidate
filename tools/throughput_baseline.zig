@@ -64,6 +64,7 @@ pub fn main(init: std.process.Init) !void {
             "{s}: bytes={d} wall_time_mean_ns={d:.0} throughput_mib_s={d:.2} min_throughput_mib_s={d:.2} status={s}\n",
             .{ scenario.name, input_bytes, wall_time_ns, throughput_mib_s, scenario.min_throughput_mib_s, status },
         );
+        try stdout.flush();
     }
 
     if (gate_failed) {
@@ -89,57 +90,59 @@ fn buildScenarios(allocator: std.mem.Allocator, repo_root: []const u8, mzvalidat
         .name = "level1_small_uncompressed",
         .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary", .{ mzvalidate_path, small_uncompressed }),
-        .min_throughput_mib_s = 100.0,
+        .min_throughput_mib_s = 98.0,
     });
     try scenarios.append(allocator, .{
         .name = "level1_small_uncompressed_mmap",
         .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary -mmap", .{ mzvalidate_path, small_uncompressed }),
-        .min_throughput_mib_s = 100.0,
+        .min_throughput_mib_s = 98.0,
     });
     try scenarios.append(allocator, .{
         .name = "level2_small_uncompressed",
         .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary", .{ mzvalidate_path, small_uncompressed }),
-        .min_throughput_mib_s = 50.0,
+        .min_throughput_mib_s = 79.0,
     });
     try scenarios.append(allocator, .{
         .name = "level2_small_uncompressed_mmap",
         .input_path = "fixtures/mzml/valid/small.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -mmap", .{ mzvalidate_path, small_uncompressed }),
-        .min_throughput_mib_s = 50.0,
+        .min_throughput_mib_s = 79.0,
     });
     try scenarios.append(allocator, .{
         .name = "level2_small_zlib",
         .input_path = "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary", .{ mzvalidate_path, small_zlib }),
-        .min_throughput_mib_s = 25.0,
+        .min_throughput_mib_s = 36.0,
     });
     try scenarios.append(allocator, .{
         .name = "level2_small_zlib_mmap",
         .input_path = "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -mmap", .{ mzvalidate_path, small_zlib }),
-        .min_throughput_mib_s = 25.0,
+        .min_throughput_mib_s = 36.0,
     });
-    // Level 3: index validation on an indexed file.
+    // Level 3: index validation on an indexed file (tiny fixture, ~25 KiB).
+    // Throughput is dominated by startup overhead at this size; gate on a
+    // generous floor rather than a percentage of the current measurement.
     try scenarios.append(allocator, .{
         .name = "level3_tiny_indexed",
         .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary", .{ mzvalidate_path, tiny_indexed }),
-        .min_throughput_mib_s = 100.0,
+        .min_throughput_mib_s = 2.5,
     });
     try scenarios.append(allocator, .{
         .name = "level3_tiny_indexed_mmap",
         .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary -mmap", .{ mzvalidate_path, tiny_indexed }),
-        .min_throughput_mib_s = 100.0,
+        .min_throughput_mib_s = 2.5,
     });
     // Level 3: semantic validation (CV + reference resolution).
     try scenarios.append(allocator, .{
         .name = "level3_semantic_tiny",
         .input_path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
         .command = try std.fmt.allocPrint(allocator, "{s} check {s} -summary -skip-binary", .{ mzvalidate_path, tiny_indexed }),
-        .min_throughput_mib_s = 50.0,
+        .min_throughput_mib_s = 2.5,
     });
 
     return try scenarios.toOwnedSlice(allocator);

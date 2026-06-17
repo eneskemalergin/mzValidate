@@ -1,9 +1,9 @@
 //! Entry points for running validation against files or streams.
 //!
 //! Three I/O paths:
-//!   checkPath + skip_index  -> pure streaming from a file reader.
-//!   checkPath + index active -> mmap (preferred) or read-into-heap fallback.
-//!   checkReader              -> caller provides the reader and file_bytes.
+//!   checkPath                  -> mmap (preferred) or read-into-heap, slice parser.
+//!   checkSlice                 -> caller provides contiguous bytes, slice parser.
+//!   checkReader                -> caller provides a stream, reader parser.
 //!
 //! All validators (structural, binary, index, semantic) run in one
 //! forward pass over the event stream. State is bounded per phase:
@@ -55,19 +55,11 @@ pub fn checkPath(
     };
     defer file.close(io);
 
-    // Need raw file bytes for SHA-1. mmap preferred, heap fallback.
-    if (!options.skip_index) {
-        try checkPathWithIndex(allocator, io, file, diagnostics, path, options);
-    } else {
-        // Pure streaming: no index validation needed, no file bytes required.
-        var read_buffer: [4096]u8 = undefined;
-        var reader = file.readerStreaming(io, &read_buffer);
-        try checkReader(allocator, io, &reader.interface, diagnostics, path, options, null);
-    }
+    try checkPathMapped(allocator, io, file, diagnostics, path, options);
 }
 
-// mmap for random-access SHA-1, fall back to read-into-heap.
-fn checkPathWithIndex(
+// mmap for random-access index checks; fall back to read-into-heap.
+fn checkPathMapped(
     allocator: std.mem.Allocator,
     io: std.Io,
     file: std.Io.File,
@@ -90,18 +82,37 @@ fn checkPathWithIndex(
         .len = len,
         .protection = .{ .read = true },
     }) catch {
-        // mmap not available: read file into heap.
         const cwd = std.Io.Dir.cwd();
         const buf = try cwd.readFileAlloc(io, path, allocator, .unlimited);
         defer allocator.free(buf);
-        var fixed_reader = std.Io.Reader.fixed(buf);
-        try checkReader(allocator, io, &fixed_reader, diagnostics, path, options, buf);
+        const index_bytes = if (options.skip_index) null else buf;
+        try checkSlice(allocator, io, buf, diagnostics, path, options, index_bytes);
         return;
     };
     defer mm.destroy(io);
 
-    var reader = std.Io.Reader.fixed(mm.memory);
-    try checkReader(allocator, io, &reader, diagnostics, path, options, mm.memory);
+    const index_bytes = if (options.skip_index) null else mm.memory;
+    try checkSlice(allocator, io, mm.memory, diagnostics, path, options, index_bytes);
+}
+
+const ParserSource = union(enum) {
+    reader: *std.Io.Reader,
+    slice: []const u8,
+};
+
+/// Validates mzML from a contiguous byte slice (mmap or heap buffer).
+pub fn checkSlice(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+    file_bytes: ?[]const u8,
+) !void {
+    try runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
+        .slice = bytes,
+    });
 }
 
 /// Public one-pass seam for library callers. Keeps parser state,
@@ -115,6 +126,20 @@ pub fn checkReader(
     options: CheckOptions,
     file_bytes: ?[]const u8,
 ) !void {
+    try runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
+        .reader = reader,
+    });
+}
+
+fn runValidation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+    file_bytes: ?[]const u8,
+    source: ParserSource,
+) !void {
 
     // Bounded traversal: parser stacks, structural state, one binary workspace.
     // No accumulation across spectra; memory flat regardless of file size.
@@ -127,14 +152,19 @@ pub fn checkReader(
     var element_stack: [128]xml_parser.ElementFrame = undefined;
     var element_bytes: [4096]u8 = undefined;
 
-    var parser = xml_parser.Parser.init(reader, .{
+    const parser_buffers = xml_parser.Buffers{
         .token = token_buffer,
         .attributes = &attributes,
         .namespace_bindings = &namespace_bindings,
         .namespace_bytes = &namespace_bytes,
         .element_stack = &element_stack,
         .element_bytes = &element_bytes,
-    });
+    };
+
+    var parser = switch (source) {
+        .reader => |reader| xml_parser.Parser.init(reader, parser_buffers),
+        .slice => |bytes| xml_parser.Parser.initSlice(bytes, parser_buffers),
+    };
 
     var structural_validator = structural.StructuralValidator.init(allocator, diagnostics, path);
     defer structural_validator.deinit();
