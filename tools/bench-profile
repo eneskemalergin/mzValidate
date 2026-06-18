@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # bench-profile: Stage profiling for mzValidate
 #
-# Runs four reference configurations through zebrac, calculates derived
+# Runs five reference configurations through zebrac, calculates derived
 # metrics, and outputs a comparison table.
 #
 # Usage:
@@ -30,14 +30,15 @@ Usage:
 
 Examples:
   bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML
-  bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML -d 5000 -i 5
+  bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML -d 5000 -i 3
   bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML --json tmp/profiling/run1
   bench-profile --compare tmp/profiling/run1/baseline.json tmp/profiling/run2/baseline.json
 
-The script runs four configurations:
+The script runs five configurations:
   min:        -skip-binary -skip-semantic -skip-index (XML + Structural only)
-  no-sem:     -skip-semantic (XML + Structural + Index + Binary)
-  no-bin:     -skip-binary (XML + Structural + Index + Semantic)
+  idx:        -skip-binary -skip-semantic (adds Index)
+  no-sem:     -skip-semantic (adds Binary)
+  no-bin:     -skip-binary (adds Semantic)
   full:       no skips (all five stages)
 
 Dependencies: zebrac, jq, awk
@@ -136,12 +137,6 @@ calc() {
     awk "BEGIN { printf \"%.6f\", $1 }"
 }
 
-# Format number with commas (awk trick)
-# Usage: format_int <number>
-format_int() {
-    printf "%.0f" "$1" | awk '{ printf "%'\''d", $1 }'
-}
-
 # Format to fixed decimal places
 # Usage: format_dec <number> <places>
 format_dec() {
@@ -165,8 +160,6 @@ run_profile() {
     # Get file size
     local file_size
     file_size=$(stat -c%s "$fixture" 2>/dev/null || stat -f%z "$fixture" 2>/dev/null)
-    local file_size_mib
-    file_size_mib=$(calc "$file_size / 1048576.0")
 
     # Get fixture name for display
     local fixture_name
@@ -200,11 +193,10 @@ run_profile() {
         json_files+=("$json_file")
 
         local flags="${skip_flags[$i]}"
-        local cmd="$MZVALIDATE check $fixture -summary $flags"
 
         echo "Running $config..." >&2
         timeout 1800 "$ZEBRAC" "${ZEBRAC_FLAGS[@]}" --json "$json_file" \
-            "./zig-out/bin/mzValidate check $fixture -summary $flags" \
+            "$MZVALIDATE check $fixture -summary $flags" \
             >/dev/null 2>&1
         if [[ $? -eq 124 ]]; then
             echo "Error: $config timed out after 30 minutes" >&2
@@ -522,13 +514,13 @@ run_profile() {
     xml_rss_pct=$(calc "${row_rss_mib[0]} / ${row_rss_mib[4]} * 100.0")
     printf "  %-10s %6s%%\n" "XML+Struct" "$(format_dec "$xml_rss_pct" 1)"
 
-        # Save JSON if requested
-        if [[ -n "$JSON_DIR" ]]; then
-            mkdir -p "$JSON_DIR"
-            local baseline_json="$JSON_DIR/baseline.json"
+    # Save JSON if requested
+    if [[ -n "$JSON_DIR" ]]; then
+        mkdir -p "$JSON_DIR"
+        local baseline_json="$JSON_DIR/baseline.json"
 
-            # Build combined JSON
-            cat > "$baseline_json" <<EOF
+        # Build combined JSON
+        cat > "$baseline_json" <<EOF
 {
   "fixture": "$fixture_name",
   "file_size_bytes": $file_size,
@@ -537,8 +529,8 @@ run_profile() {
   "runs": {
 EOF
 
-            for i in "${!configs[@]}"; do
-                cat >> "$baseline_json" <<EOF
+        for i in "${!configs[@]}"; do
+            cat >> "$baseline_json" <<EOF
     "${configs[$i]}": {
       "config_name": "${config_names[$i]}",
       "wall_time_ns": $(extract_metric "${json_files[$i]}" "wall_time"),
@@ -552,16 +544,16 @@ EOF
       "wall_time_stddev_ns": $(extract_stddev "${json_files[$i]}" "wall_time")
     },
 EOF
-            done
+        done
 
-            # Remove trailing comma and close
-            sed -i '$ s/,$//' "$baseline_json"
-            echo "  }" >> "$baseline_json"
-            echo "}" >> "$baseline_json"
+        # Remove trailing comma and close
+        sed -i '$ s/,$//' "$baseline_json"
+        echo "  }" >> "$baseline_json"
+        echo "}" >> "$baseline_json"
 
-            echo ""
-            echo "JSON saved to: $baseline_json"
-        fi
+        echo ""
+        echo "JSON saved to: $baseline_json"
+    fi
 }
 
 # --- Compare Mode ---
