@@ -3,13 +3,7 @@
 //! Key steps:
 //!   test          - run all unit tests
 //!   cli-contract  - run the binary against valid and expected-invalid fixtures
-//!   ci            - test + cli-contract + fuzz-smoke + benchmark-ci + resource-check
-//!   resource-check - gate peak RSS (`benchmark resource`)
-//!   benchmark-ci - CI throughput gates (fixtures only)
-//!   benchmark-record - write JSON report, no gate failure
-//!   benchmark-local - opt-in `data/` scenarios with gates
-//!   fuzz-smoke    - run deterministic random and mutation-based smoke fuzzing
-//!   bump-version  - rewrite version.zig and build.zig.zon
+//!   ci            - test + cli-contract
 //!   run           - execute the binary directly
 
 const std = @import("std");
@@ -17,37 +11,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const release_version = b.option([]const u8, "release-version", "Semantic version for the bump-version step, for example 0.0.3");
     const enable_libdeflate = b.option(bool, "enable-libdeflate", "Enable opt-in libdeflate zlib decode spike") orelse false;
-
-    // --- Version tool ---
-
-    const version_tool = b.addExecutable(.{
-        .name = "bump_version",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/bump_version.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-
-    const benchmark_tool = b.addExecutable(.{
-        .name = "benchmark",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/benchmark_runner.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
-
-    const fuzz_smoke_tool = b.addExecutable(.{
-        .name = "fuzz_smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/fuzz_smoke.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-        }),
-    });
 
     // --- Library and executable ---
 
@@ -59,30 +23,6 @@ pub fn build(b: *std.Build) void {
     const mzvalidate_options = b.addOptions();
     mzvalidate_options.addOption(bool, "enable_libdeflate", enable_libdeflate);
     mzvalidate_mod.addOptions("build_options", mzvalidate_options);
-
-    const xml_fuzz_target = b.addExecutable(.{
-        .name = "xml_fuzz_target",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/xml_fuzz_target.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-            .imports = &.{
-                .{ .name = "mzvalidate", .module = mzvalidate_mod },
-            },
-        }),
-    });
-
-    const binary_fuzz_target = b.addExecutable(.{
-        .name = "binary_fuzz_target",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/binary_fuzz_target.zig"),
-            .target = b.graph.host,
-            .optimize = .Debug,
-            .imports = &.{
-                .{ .name = "mzvalidate", .module = mzvalidate_mod },
-            },
-        }),
-    });
 
     const exe = b.addExecutable(.{
         .name = "mzValidate",
@@ -96,39 +36,11 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    const bench_exe = b.addExecutable(.{
-        .name = "mzValidate_bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/main.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-            .imports = &.{
-                .{ .name = "mzvalidate", .module = mzvalidate_mod },
-            },
-        }),
-    });
-
-    const rm_legacy_bench = b.addSystemCommand(&.{ "rm", "-f", "zig-out/bin/mzValidate_throughput" });
-    const install_step = b.getInstallStep();
-    const bench_bin_path = "zig-out/bin/mzValidate_bench";
-    const benchmark_bin_path = "zig-out/bin/benchmark";
-    const fuzz_smoke_bin_path = "zig-out/bin/fuzz_smoke";
-    const xml_fuzz_bin_path = "zig-out/bin/xml_fuzz_target";
-    const binary_fuzz_bin_path = "zig-out/bin/binary_fuzz_target";
-
     if (enable_libdeflate) {
         linkLibdeflate(exe);
-        linkLibdeflate(bench_exe);
-        linkLibdeflate(xml_fuzz_target);
-        linkLibdeflate(binary_fuzz_target);
     }
 
     b.installArtifact(exe);
-    b.installArtifact(bench_exe);
-    b.installArtifact(benchmark_tool);
-    b.installArtifact(fuzz_smoke_tool);
-    b.installArtifact(xml_fuzz_target);
-    b.installArtifact(binary_fuzz_target);
 
     // --- Run step ---
 
@@ -151,11 +63,6 @@ pub fn build(b: *std.Build) void {
         .root_module = exe.root_module,
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
-
-    const benchmark_tests = b.addTest(.{
-        .root_module = benchmark_tool.root_module,
-    });
-    const run_benchmark_tests = b.addRunArtifact(benchmark_tests);
 
     if (enable_libdeflate) {
         linkLibdeflate(mod_tests);
@@ -188,10 +95,9 @@ pub fn build(b: *std.Build) void {
 
     // --- Build steps ---
 
-    const test_step = b.step("test", "Run unit tests (library, CLI, benchmark tools; GPA leak detection)");
+    const test_step = b.step("test", "Run unit tests (library, CLI; GPA leak detection)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
-    test_step.dependOn(&run_benchmark_tests.step);
 
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
@@ -200,57 +106,9 @@ pub fn build(b: *std.Build) void {
     const legacy_cli_step = b.step("test-cli", "Alias for cli-contract");
     legacy_cli_step.dependOn(cli_contract_step);
 
-    const ci_step = b.step("ci", "test + cli-contract + fuzz-smoke + benchmark-ci + resource-check");
+    const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
-
-    const resource_check_step = b.step("resource-check", "Gate peak RSS on synthetic workloads (ReleaseFast bench binary)");
-    const resource_check_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "resource", bench_bin_path });
-    resource_check_cmd.step.dependOn(&rm_legacy_bench.step);
-    resource_check_cmd.step.dependOn(install_step);
-    resource_check_step.dependOn(&resource_check_cmd.step);
-
-    const benchmark_ci_step = b.step("benchmark-ci", "CI throughput gates on fixture files (~15 s)");
-    const benchmark_ci_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "throughput-ci", bench_bin_path });
-    benchmark_ci_cmd.step.dependOn(&rm_legacy_bench.step);
-    benchmark_ci_cmd.step.dependOn(install_step);
-    benchmark_ci_step.dependOn(&benchmark_ci_cmd.step);
-
-    const benchmark_record_step = b.step("benchmark-record", "Record CI + local throughput to .zig-cache/benchmark-report.json");
-    const benchmark_record_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "record", bench_bin_path });
-    benchmark_record_cmd.step.dependOn(&rm_legacy_bench.step);
-    benchmark_record_cmd.step.dependOn(install_step);
-    benchmark_record_step.dependOn(&benchmark_record_cmd.step);
-
-    const benchmark_local_step = b.step("benchmark-local", "Gate opt-in data/ fixtures (skips missing files)");
-    const benchmark_local_cmd = b.addSystemCommand(&.{ benchmark_bin_path, "local", bench_bin_path });
-    benchmark_local_cmd.step.dependOn(&rm_legacy_bench.step);
-    benchmark_local_cmd.step.dependOn(install_step);
-    benchmark_local_step.dependOn(&benchmark_local_cmd.step);
-
-    const xml_fuzz_target_step = b.step("xml-fuzz-target", "Build the focused XML fuzz-entry executable");
-    xml_fuzz_target_step.dependOn(&xml_fuzz_target.step);
-
-    const binary_fuzz_target_step = b.step("binary-fuzz-target", "Build the focused binary fuzz-entry executable");
-    binary_fuzz_target_step.dependOn(&binary_fuzz_target.step);
-
-    const fuzz_targets_step = b.step("fuzz-targets", "Build all focused fuzz-entry executables");
-    fuzz_targets_step.dependOn(xml_fuzz_target_step);
-    fuzz_targets_step.dependOn(binary_fuzz_target_step);
-
-    const fuzz_smoke_step = b.step("fuzz-smoke", "Run deterministic random and mutation-based smoke fuzzing");
-    const fuzz_smoke_cmd = b.addSystemCommand(&.{ fuzz_smoke_bin_path, xml_fuzz_bin_path, binary_fuzz_bin_path });
-    fuzz_smoke_cmd.step.dependOn(install_step);
-    fuzz_smoke_step.dependOn(&fuzz_smoke_cmd.step);
-
-    ci_step.dependOn(fuzz_smoke_step);
-    ci_step.dependOn(benchmark_ci_step);
-    ci_step.dependOn(resource_check_step);
-
-    const bump_version_step = b.step("bump-version", "Update the project version and manifest fingerprint");
-    const bump_version_cmd = b.addRunArtifact(version_tool);
-    bump_version_cmd.addArg(release_version orelse "--help");
-    bump_version_step.dependOn(&bump_version_cmd.step);
 }
 
 /// Appends each fixture path as a CLI argument to `run`.

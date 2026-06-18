@@ -15,6 +15,7 @@ zig-*/
 *~
 
 # Ignored folders (dev only)
+tmp/
 ref/
 /data/
 plan/
