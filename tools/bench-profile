@@ -1,0 +1,751 @@
+#!/usr/bin/env bash
+# bench-profile: Stage profiling for mzValidate
+#
+# Runs four reference configurations through zebrac, calculates derived
+# metrics, and outputs a comparison table.
+#
+# Usage:
+#   bench-profile <fixture> [zebrac-flags...]
+#   bench-profile <fixture> --json <output-dir>
+#   bench-profile --compare <old.json> <new.json>
+#
+# Dependencies: zebrac, jq, awk
+
+set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ZEBRAC="$REPO_ROOT/tools/zebrac"
+MZVALIDATE="$REPO_ROOT/zig-out/bin/mzValidate"
+PROFILING_DIR="$REPO_ROOT/tmp/profiling"
+
+usage() {
+    cat <<'EOF'
+bench-profile: Stage profiling for mzValidate
+
+Usage:
+  bench-profile <fixture> [zebrac-flags...]
+  bench-profile <fixture> --json <output-dir>
+  bench-profile --compare <old.json> <new.json>
+
+Examples:
+  bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML
+  bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML -d 5000 -i 5
+  bench-profile fixtures/mzml/valid/small.pwiz.1.1.mzML --json tmp/profiling/run1
+  bench-profile --compare tmp/profiling/run1/baseline.json tmp/profiling/run2/baseline.json
+
+The script runs four configurations:
+  min:        -skip-binary -skip-semantic -skip-index (XML + Structural only)
+  no-sem:     -skip-semantic (XML + Structural + Index + Binary)
+  no-bin:     -skip-binary (XML + Structural + Index + Semantic)
+  full:       no skips (all five stages)
+
+Dependencies: zebrac, jq, awk
+EOF
+    exit 1
+}
+
+# --- Argument Parsing ---
+
+MODE="profile"
+FIXTURE=""
+ZEBRAC_FLAGS=()
+JSON_DIR=""
+COMPARE_OLD=""
+COMPARE_NEW=""
+
+if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
+    usage
+fi
+
+if [[ "${1:-}" == "--compare" ]]; then
+    MODE="compare"
+    COMPARE_OLD="${2:-}"
+    COMPARE_NEW="${3:-}"
+    if [[ -z "$COMPARE_OLD" || -z "$COMPARE_NEW" ]]; then
+        echo "Error: --compare requires <old.json> <new.json>" >&2
+        exit 1
+    fi
+else
+    FIXTURE="${1:-}"
+    if [[ -z "$FIXTURE" ]]; then
+        echo "Error: fixture path required" >&2
+        exit 1
+    fi
+    shift
+
+    # Parse remaining args: look for --json flag
+    remaining_args=("$@")
+    filtered_flags=()
+    i=0
+    while [[ $i -lt ${#remaining_args[@]} ]]; do
+        if [[ "${remaining_args[$i]}" == "--json" ]]; then
+            JSON_DIR="${remaining_args[$((i+1))]:-}"
+            i=$((i + 2))
+            continue
+        fi
+        filtered_flags+=("${remaining_args[$i]}")
+        i=$((i + 1))
+    done
+    ZEBRAC_FLAGS=("${filtered_flags[@]+"${filtered_flags[@]}"}")
+fi
+
+# --- Dependency Checks ---
+
+if [[ ! -x "$ZEBRAC" ]]; then
+    echo "Error: zebrac not found at $ZEBRAC" >&2
+    exit 1
+fi
+
+if ! command -v jq &>/dev/null; then
+    echo "Error: jq is required but not installed" >&2
+    exit 1
+fi
+
+if [[ "$MODE" == "compare" ]]; then
+    if [[ ! -f "$COMPARE_OLD" ]]; then
+        echo "Error: old JSON file not found: $COMPARE_OLD" >&2
+        exit 1
+    fi
+    if [[ ! -f "$COMPARE_NEW" ]]; then
+        echo "Error: new JSON file not found: $COMPARE_NEW" >&2
+        exit 1
+    fi
+fi
+
+# --- Metric Extraction ---
+
+# Extract a single metric value (mean) from zebrac JSON
+# Usage: extract_metric <json_file> <metric_name>
+extract_metric() {
+    local json_file="$1"
+    local metric="$2"
+    jq -r ".results[0].${metric}.mean // 0" "$json_file"
+}
+
+# Extract a single metric std_dev from zebrac JSON
+extract_stddev() {
+    local json_file="$1"
+    local metric="$2"
+    jq -r ".results[0].${metric}.std_dev // 0" "$json_file"
+}
+
+# Calculate derived metrics using awk
+# Usage: calc <expression>
+calc() {
+    awk "BEGIN { printf \"%.6f\", $1 }"
+}
+
+# Format number with commas (awk trick)
+# Usage: format_int <number>
+format_int() {
+    printf "%.0f" "$1" | awk '{ printf "%'\''d", $1 }'
+}
+
+# Format to fixed decimal places
+# Usage: format_dec <number> <places>
+format_dec() {
+    local places="${2:-1}"
+    awk -v val="$1" -v p="$places" 'BEGIN { printf "%.*f", p, val }'
+}
+
+# --- Profile Mode ---
+
+run_profile() {
+    local fixture="$1"
+    shift
+    local zebrac_flags=("$@")
+
+    # Validate fixture
+    if [[ ! -f "$fixture" ]]; then
+        echo "Error: fixture not found: $fixture" >&2
+        exit 1
+    fi
+
+    # Get file size
+    local file_size
+    file_size=$(stat -c%s "$fixture" 2>/dev/null || stat -f%z "$fixture" 2>/dev/null)
+    local file_size_mib
+    file_size_mib=$(calc "$file_size / 1048576.0")
+
+    # Get fixture name for display
+    local fixture_name
+    fixture_name=$(basename "$fixture")
+
+    # Setup output directory
+    mkdir -p "$PROFILING_DIR"
+
+    # Define configurations
+    local -a configs=("min" "idx" "no-sem" "no-bin" "full")
+    local -a skip_flags=(
+        "-skip-binary -skip-semantic -skip-index"
+        "-skip-binary -skip-semantic"
+        "-skip-semantic"
+        "-skip-binary"
+        ""
+    )
+    local -a config_names=(
+        "XML+Struct"
+        "+Index"
+        "+Index+Binary"
+        "+Index+Semantic"
+        "Full"
+    )
+
+    # Run zebrac for each configuration (30 minute timeout per run)
+    local json_files=()
+    for i in "${!configs[@]}"; do
+        local config="${configs[$i]}"
+        local json_file="$PROFILING_DIR/${config}.json"
+        json_files+=("$json_file")
+
+        local flags="${skip_flags[$i]}"
+        local cmd="$MZVALIDATE check $fixture -summary $flags"
+
+        echo "Running $config..." >&2
+        timeout 1800 "$ZEBRAC" "${ZEBRAC_FLAGS[@]}" --json "$json_file" \
+            "./zig-out/bin/mzValidate check $fixture -summary $flags" \
+            >/dev/null 2>&1
+        if [[ $? -eq 124 ]]; then
+            echo "Error: $config timed out after 30 minutes" >&2
+            exit 1
+        fi
+    done
+
+    # Extract metrics for each configuration
+    local -a wall_ms=()
+    local -a peak_rss=()
+    local -a cycles=()
+    local -a insns=()
+    local -a cache_ref=()
+    local -a cache_miss=()
+    local -a branch_miss=()
+    local -a wall_stddev=()
+
+    for json_file in "${json_files[@]}"; do
+        local raw_wall
+        raw_wall=$(extract_metric "$json_file" "wall_time")
+        wall_ms+=($(calc "$raw_wall / 1000000.0"))
+
+        local raw_rss
+        raw_rss=$(extract_metric "$json_file" "peak_rss")
+        peak_rss+=("$raw_rss")
+
+        cycles+=($(extract_metric "$json_file" "cpu_cycles"))
+        insns+=($(extract_metric "$json_file" "instructions"))
+        cache_ref+=($(extract_metric "$json_file" "cache_references"))
+        cache_miss+=($(extract_metric "$json_file" "cache_misses"))
+        branch_miss+=($(extract_metric "$json_file" "branch_misses"))
+
+        local raw_stddev
+        raw_stddev=$(extract_stddev "$json_file" "wall_time")
+        wall_stddev+=($(calc "$raw_stddev / 1000000.0"))
+    done
+
+    # Calculate derived metrics and store formatted strings
+    echo ""
+    echo "Fixture: $fixture_name ($(awk "BEGIN { printf \"%.1f\", $file_size / 1048576.0 }") MiB)"
+    echo ""
+
+    # Calculate all derived metrics using awk
+    local calc_output=""
+
+    # Calculate per-config metrics
+    for i in "${!configs[@]}"; do
+        calc_output+=$(awk -v fs="$file_size" -v w="${wall_ms[$i]}" -v r="${peak_rss[$i]}" -v c="${cycles[$i]}" -v ins="${insns[$i]}" \
+            -v cr="${cache_ref[$i]}" -v cm="${cache_miss[$i]}" -v bm="${branch_miss[$i]}" -v sv="${wall_stddev[$i]}" \
+            'BEGIN {
+            mibs = fs / (w / 1000.0) / 1048576.0
+            rss_mib = r / 1048576.0
+            rss_pct = r / fs * 100.0
+            cycles_m = c / 1000000.0
+            insns_m = ins / 1000000.0
+            ipc = (c != 0) ? ins / c : 0
+            cache_rate = (cr != 0) ? cm / cr * 100.0 : 0
+            branch_rate = (ins != 0) ? bm / ins * 100.0 : 0
+            cv = (w != 0) ? sv / w * 100.0 : 0
+            printf "%.1f %.1f %.2f %.1f %.1f %.1f %.2f %.1f %.2f %.1f\n", w, mibs, rss_pct, rss_mib, cycles_m, insns_m, ipc, cache_rate, branch_rate, cv
+        }')
+        calc_output+=$'\n'
+    done
+
+    # Calculate deltas
+    # Index: min (0) -> idx (1)
+    calc_output+=$(awk -v fs="$file_size" \
+        -v w0="${wall_ms[0]}" -v w1="${wall_ms[1]}" \
+        -v r0="${peak_rss[0]}" -v r1="${peak_rss[1]}" \
+        -v c0="${cycles[0]}" -v c1="${cycles[1]}" \
+        -v i0="${insns[0]}" -v i1="${insns[1]}" \
+        'BEGIN {
+        d_w = w1 - w0
+        d_m = fs/(w1/1000.0)/1048576.0 - fs/(w0/1000.0)/1048576.0
+        d_rp = (r1 - r0) / fs * 100.0
+        d_rm = (r1 - r0) / 1048576.0
+        d_c = (c1 - c0) / 1000000.0
+        d_i = (i1 - i0) / 1000000.0
+        printf "%.1f %.1f %.2f %.1f %.1f %.1f\n", d_w, d_m, d_rp, d_rm, d_c, d_i
+    }')
+    calc_output+=$'\n'
+
+    # Binary: idx (1) -> no-sem (2)
+    calc_output+=$(awk -v fs="$file_size" \
+        -v w1="${wall_ms[1]}" -v w2="${wall_ms[2]}" \
+        -v r1="${peak_rss[1]}" -v r2="${peak_rss[2]}" \
+        -v c1="${cycles[1]}" -v c2="${cycles[2]}" \
+        -v i1="${insns[1]}" -v i2="${insns[2]}" \
+        'BEGIN {
+        d_w = w2 - w1
+        d_m = fs/(w2/1000.0)/1048576.0 - fs/(w1/1000.0)/1048576.0
+        d_rp = (r2 - r1) / fs * 100.0
+        d_rm = (r2 - r1) / 1048576.0
+        d_c = (c2 - c1) / 1000000.0
+        d_i = (i2 - i1) / 1000000.0
+        printf "%.1f %.1f %.2f %.1f %.1f %.1f\n", d_w, d_m, d_rp, d_rm, d_c, d_i
+    }')
+    calc_output+=$'\n'
+
+    # Semantic: idx (1) -> no-bin (3)
+    calc_output+=$(awk -v fs="$file_size" \
+        -v w1="${wall_ms[1]}" -v w3="${wall_ms[3]}" \
+        -v r1="${peak_rss[1]}" -v r3="${peak_rss[3]}" \
+        -v c1="${cycles[1]}" -v c3="${cycles[3]}" \
+        -v i1="${insns[1]}" -v i3="${insns[3]}" \
+        'BEGIN {
+        d_w = w3 - w1
+        d_m = fs/(w3/1000.0)/1048576.0 - fs/(w1/1000.0)/1048576.0
+        d_rp = (r3 - r1) / fs * 100.0
+        d_rm = (r3 - r1) / 1048576.0
+        d_c = (c3 - c1) / 1000000.0
+        d_i = (i3 - i1) / 1000000.0
+        printf "%.1f %.1f %.2f %.1f %.1f %.1f\n", d_w, d_m, d_rp, d_rm, d_c, d_i
+    }')
+
+    # Parse awk output into arrays
+    local -a row_names=("XML+Struct" "+Index" "+Index+Binary" "+Index+Semantic" "Full")
+    local -a row_wall=()
+    local -a row_mibs=()
+    local -a row_rss_pct=()
+    local -a row_rss_mib=()
+    local -a row_cycles=()
+    local -a row_insns=()
+    local -a row_ipc=()
+    local -a row_cache=()
+    local -a row_branch=()
+    local -a row_cv=()
+
+    local line_num=0
+    while IFS=' ' read -r w m rp rm c i ipc cr br cv; do
+        if [[ $line_num -lt 5 ]]; then
+            row_wall+=("$w")
+            row_mibs+=("$m")
+            row_rss_pct+=("$rp")
+            row_rss_mib+=("$rm")
+            row_cycles+=("$c")
+            row_insns+=("$i")
+            row_ipc+=("$ipc")
+            row_cache+=("$cr")
+            row_branch+=("$br")
+            row_cv+=("$cv")
+        fi
+        line_num=$((line_num + 1))
+    done <<< "$calc_output"
+
+    # Calculate column widths (minimum width is header length)
+    local w_name=${#row_names[0]}
+    local w_wall=${#row_wall[0]}
+    local w_mibs=${#row_mibs[0]}
+    local w_rss_pct=${#row_rss_pct[0]}
+    local w_rss_mib=${#row_rss_mib[0]}
+    local w_cycles=${#row_cycles[0]}
+    local w_insns=${#row_insns[0]}
+    local w_ipc=${#row_ipc[0]}
+    local w_cache=${#row_cache[0]}
+    local w_branch=${#row_branch[0]}
+    local w_cv=${#row_cv[0]}
+
+    for i in "${!configs[@]}"; do
+        [[ ${#row_names[$i]} -gt $w_name ]] && w_name=${#row_names[$i]}
+        [[ ${#row_wall[$i]} -gt $w_wall ]] && w_wall=${#row_wall[$i]}
+        [[ ${#row_mibs[$i]} -gt $w_mibs ]] && w_mibs=${#row_mibs[$i]}
+        [[ ${#row_rss_pct[$i]} -gt $w_rss_pct ]] && w_rss_pct=${#row_rss_pct[$i]}
+        [[ ${#row_rss_mib[$i]} -gt $w_rss_mib ]] && w_rss_mib=${#row_rss_mib[$i]}
+        [[ ${#row_cycles[$i]} -gt $w_cycles ]] && w_cycles=${#row_cycles[$i]}
+        [[ ${#row_insns[$i]} -gt $w_insns ]] && w_insns=${#row_insns[$i]}
+        [[ ${#row_ipc[$i]} -gt $w_ipc ]] && w_ipc=${#row_ipc[$i]}
+        [[ ${#row_cache[$i]} -gt $w_cache ]] && w_cache=${#row_cache[$i]}
+        [[ ${#row_branch[$i]} -gt $w_branch ]] && w_branch=${#row_branch[$i]}
+        [[ ${#row_cv[$i]} -gt $w_cv ]] && w_cv=${#row_cv[$i]}
+    done
+
+    # Ensure minimum widths match headers
+    [[ $w_name -lt 14 ]] && w_name=14
+    [[ $w_wall -lt 7 ]] && w_wall=7
+    [[ $w_mibs -lt 6 ]] && w_mibs=6
+    [[ $w_rss_pct -lt 6 ]] && w_rss_pct=6
+    [[ $w_rss_mib -lt 7 ]] && w_rss_mib=7
+    [[ $w_cycles -lt 8 ]] && w_cycles=8
+    [[ $w_insns -lt 7 ]] && w_insns=7
+    [[ $w_ipc -lt 3 ]] && w_ipc=3
+    [[ $w_cache -lt 6 ]] && w_cache=6
+    [[ $w_branch -lt 7 ]] && w_branch=7
+    [[ $w_cv -lt 3 ]] && w_cv=3
+
+    # Print header
+    printf "%-${w_name}s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s\n" \
+        "Stage" $w_wall "wall_ms" $w_mibs "MiB/s" $w_rss_pct "RSS_%" $w_rss_mib "RSS_MiB" \
+        $w_cycles "cycles_M" $w_insns "insns_M" $w_ipc "IPC" $w_cache "cache%" $w_branch "branch%" $w_cv "CV%"
+
+    # Print separator
+    printf "%s" "$(printf '%*s' $w_name '' | tr ' ' '-')"
+    for w in $w_wall $w_mibs $w_rss_pct $w_rss_mib $w_cycles $w_insns $w_ipc $w_cache $w_branch $w_cv; do
+        printf " %s" "$(printf '%*s' $w '' | tr ' ' '-')"
+    done
+    echo ""
+
+    # Print data rows
+    for i in "${!configs[@]}"; do
+        printf "%-${w_name}s %*s %*s %*s %*s %*s %*s %*s %*s %*s %*s\n" \
+            "${row_names[$i]}" \
+            $w_wall "${row_wall[$i]}" \
+            $w_mibs "${row_mibs[$i]}" \
+            $w_rss_pct "${row_rss_pct[$i]}" \
+            $w_rss_mib "${row_rss_mib[$i]}" \
+            $w_cycles "${row_cycles[$i]}" \
+            $w_insns "${row_insns[$i]}" \
+            $w_ipc "${row_ipc[$i]}" \
+            $w_cache "${row_cache[$i]}" \
+            $w_branch "${row_branch[$i]}" \
+            $w_cv "${row_cv[$i]}"
+    done
+
+    # Stage deltas
+    echo ""
+    echo "Stage deltas:"
+
+    # Parse delta values from awk output
+    local -a delta_names=("Index" "Binary" "Semantic")
+    local -a delta_wall=()
+    local -a delta_mibs=()
+    local -a delta_rss_pct=()
+    local -a delta_rss_mib=()
+    local -a delta_cycles=()
+    local -a delta_insns=()
+
+    line_num=0
+    while IFS=' ' read -r w m rp rm c i; do
+        if [[ $line_num -ge 5 ]]; then
+            delta_wall+=("$w")
+            delta_mibs+=("$m")
+            delta_rss_pct+=("$rp")
+            delta_rss_mib+=("$rm")
+            delta_cycles+=("$c")
+            delta_insns+=("$i")
+        fi
+        line_num=$((line_num + 1))
+    done <<< "$calc_output"
+
+    # Calculate column widths for deltas
+    local dw_name=${#delta_names[0]}
+    local dw_wall=${#delta_wall[0]}
+    local dw_mibs=${#delta_mibs[0]}
+    local dw_rss_pct=${#delta_rss_pct[0]}
+    local dw_rss_mib=${#delta_rss_mib[0]}
+    local dw_cycles=${#delta_cycles[0]}
+    local dw_insns=${#delta_insns[0]}
+
+    for i in "${!delta_names[@]}"; do
+        [[ ${#delta_names[$i]} -gt $dw_name ]] && dw_name=${#delta_names[$i]}
+        [[ ${#delta_wall[$i]} -gt $dw_wall ]] && dw_wall=${#delta_wall[$i]}
+        [[ ${#delta_mibs[$i]} -gt $dw_mibs ]] && dw_mibs=${#delta_mibs[$i]}
+        [[ ${#delta_rss_pct[$i]} -gt $dw_rss_pct ]] && dw_rss_pct=${#delta_rss_pct[$i]}
+        [[ ${#delta_rss_mib[$i]} -gt $dw_rss_mib ]] && dw_rss_mib=${#delta_rss_mib[$i]}
+        [[ ${#delta_cycles[$i]} -gt $dw_cycles ]] && dw_cycles=${#delta_cycles[$i]}
+        [[ ${#delta_insns[$i]} -gt $dw_insns ]] && dw_insns=${#delta_insns[$i]}
+    done
+
+    # Ensure minimum widths match headers
+    [[ $dw_name -lt 8 ]] && dw_name=8
+    [[ $dw_wall -lt 6 ]] && dw_wall=6
+    [[ $dw_mibs -lt 7 ]] && dw_mibs=7
+    [[ $dw_rss_pct -lt 6 ]] && dw_rss_pct=6
+    [[ $dw_rss_mib -lt 9 ]] && dw_rss_mib=9
+    [[ $dw_cycles -lt 10 ]] && dw_cycles=10
+    [[ $dw_insns -lt 10 ]] && dw_insns=10
+
+    # Print delta header
+    printf "%-${dw_name}s %*s %*s %*s %*s %*s %*s\n" \
+        "" $dw_wall "Δ_wall" $dw_mibs "Δ_MiB/s" $dw_rss_pct "Δ_RSS%" $dw_rss_mib "Δ_RSS_MiB" \
+        $dw_cycles "Δ_cycles_M" $dw_insns "Δ_insns_M"
+
+    # Print delta separator
+    printf "%s" "$(printf '%*s' $dw_name '' | tr ' ' '-')"
+    for w in $dw_wall $dw_mibs $dw_rss_pct $dw_rss_mib $dw_cycles $dw_insns; do
+        printf " %s" "$(printf '%*s' $w '' | tr ' ' '-')"
+    done
+    echo ""
+
+    # Print delta rows
+    for i in "${!delta_names[@]}"; do
+        printf "%-${dw_name}s %*s %*s %*s %*s %*s %*s\n" \
+            "${delta_names[$i]}" \
+            $dw_wall "${delta_wall[$i]}" \
+            $dw_mibs "${delta_mibs[$i]}" \
+            $dw_rss_pct "${delta_rss_pct[$i]}" \
+            $dw_rss_mib "${delta_rss_mib[$i]}" \
+            $dw_cycles "${delta_cycles[$i]}" \
+            $dw_insns "${delta_insns[$i]}"
+    done
+
+    # Stage % of total
+    echo ""
+    echo "Stage % of total (wall_time):"
+    for i in "${!delta_names[@]}"; do
+        local pct
+        pct=$(calc "${delta_wall[$i]} / ${wall_ms[4]} * 100.0")
+        printf "  %-10s %6s%%\n" "${delta_names[$i]}" "$(format_dec "$pct" 1)"
+    done
+    # Add XML+Struct as baseline
+    local xml_pct
+    xml_pct=$(calc "${wall_ms[0]} / ${wall_ms[4]} * 100.0")
+    printf "  %-10s %6s%%\n" "XML+Struct" "$(format_dec "$xml_pct" 1)"
+
+    # Stage % of total memory
+    echo ""
+    echo "Stage % of total memory (RSS_MiB):"
+    for i in "${!delta_names[@]}"; do
+        local rss_pct
+        rss_pct=$(calc "${delta_rss_mib[$i]} / ${row_rss_mib[4]} * 100.0")
+        printf "  %-10s %6s%%\n" "${delta_names[$i]}" "$(format_dec "$rss_pct" 1)"
+    done
+    # Add XML+Struct as baseline
+    local xml_rss_pct
+    xml_rss_pct=$(calc "${row_rss_mib[0]} / ${row_rss_mib[4]} * 100.0")
+    printf "  %-10s %6s%%\n" "XML+Struct" "$(format_dec "$xml_rss_pct" 1)"
+
+        # Save JSON if requested
+        if [[ -n "$JSON_DIR" ]]; then
+            mkdir -p "$JSON_DIR"
+            local baseline_json="$JSON_DIR/baseline.json"
+
+            # Build combined JSON
+            cat > "$baseline_json" <<EOF
+{
+  "fixture": "$fixture_name",
+  "file_size_bytes": $file_size,
+  "file_size_mib": $(calc "$file_size / 1048576.0"),
+  "zebrac_flags": "$(printf '%s ' "${zebrac_flags[@]+"${zebrac_flags[@]}"}")",
+  "runs": {
+EOF
+
+            for i in "${!configs[@]}"; do
+                cat >> "$baseline_json" <<EOF
+    "${configs[$i]}": {
+      "config_name": "${config_names[$i]}",
+      "wall_time_ns": $(extract_metric "${json_files[$i]}" "wall_time"),
+      "wall_time_ms": $(calc "${wall_ms[$i]}"),
+      "peak_rss_bytes": $(extract_metric "${json_files[$i]}" "peak_rss"),
+      "cpu_cycles": $(extract_metric "${json_files[$i]}" "cpu_cycles"),
+      "instructions": $(extract_metric "${json_files[$i]}" "instructions"),
+      "cache_references": $(extract_metric "${json_files[$i]}" "cache_references"),
+      "cache_misses": $(extract_metric "${json_files[$i]}" "cache_misses"),
+      "branch_misses": $(extract_metric "${json_files[$i]}" "branch_misses"),
+      "wall_time_stddev_ns": $(extract_stddev "${json_files[$i]}" "wall_time")
+    },
+EOF
+            done
+
+            # Remove trailing comma and close
+            sed -i '$ s/,$//' "$baseline_json"
+            echo "  }" >> "$baseline_json"
+            echo "}" >> "$baseline_json"
+
+            echo ""
+            echo "JSON saved to: $baseline_json"
+        fi
+}
+
+# --- Compare Mode ---
+
+run_compare() {
+    local old_json="$1"
+    local new_json="$2"
+
+    # Extract fixture info
+    local old_fixture new_fixture
+    old_fixture=$(jq -r '.fixture // "unknown"' "$old_json")
+    new_fixture=$(jq -r '.fixture // "unknown"' "$new_json")
+
+    if [[ "$old_fixture" != "$new_fixture" ]]; then
+        echo "Warning: comparing different fixtures ($old_fixture vs $new_fixture)" >&2
+    fi
+
+    local old_size new_size
+    old_size=$(jq -r '.file_size_bytes // 0' "$old_json")
+    new_size=$(jq -r '.file_size_bytes // 0' "$new_json")
+
+    echo ""
+    echo "Comparing: $old_json"
+    echo "     with: $new_json"
+    echo "Fixture: $old_fixture ($(awk "BEGIN { printf \"%.1f\", $old_size / 1048576.0 }") MiB)"
+    echo ""
+
+    local -a configs=("min" "idx" "no-sem" "no-bin" "full")
+    local -a config_names=("XML+Struct" "+Index" "+Index+Binary" "+Index+Semantic" "Full")
+
+    # Calculate wall_time values
+    local -a old_wall=()
+    local -a new_wall=()
+    local -a delta_wall=()
+    local -a pct_wall=()
+
+    for i in "${!configs[@]}"; do
+        local config="${configs[$i]}"
+        local old_val new_val delta pct
+
+        old_val=$(jq -r ".runs[\"${config}\"].wall_time_ns // 0" "$old_json")
+        new_val=$(jq -r ".runs[\"${config}\"].wall_time_ns // 0" "$new_json")
+
+        old_val=$(awk "BEGIN { printf \"%.1f\", $old_val / 1000000.0 }")
+        new_val=$(awk "BEGIN { printf \"%.1f\", $new_val / 1000000.0 }")
+        delta=$(awk "BEGIN { printf \"%.1f\", $new_val - $old_val }")
+
+        if [[ "$old_val" != "0" ]]; then
+            pct=$(awk "BEGIN { printf \"%.1f\", ($new_val - $old_val) / $old_val * 100.0 }")
+        else
+            pct="0.0"
+        fi
+
+        old_wall+=("$old_val")
+        new_wall+=("$new_val")
+        delta_wall+=("$delta")
+        pct_wall+=("$pct")
+    done
+
+    # Calculate RSS values
+    local -a old_rss=()
+    local -a new_rss=()
+    local -a delta_rss=()
+    local -a pct_rss=()
+
+    for i in "${!configs[@]}"; do
+        local config="${configs[$i]}"
+        local old_val new_val delta pct
+
+        old_val=$(jq -r ".runs[\"${config}\"].peak_rss_bytes // 0" "$old_json")
+        new_val=$(jq -r ".runs[\"${config}\"].peak_rss_bytes // 0" "$new_json")
+
+        old_val=$(awk "BEGIN { printf \"%.1f\", $old_val / 1048576.0 }")
+        new_val=$(awk "BEGIN { printf \"%.1f\", $new_val / 1048576.0 }")
+        delta=$(awk "BEGIN { printf \"%.1f\", $new_val - $old_val }")
+
+        if [[ "$old_val" != "0" ]]; then
+            pct=$(awk "BEGIN { printf \"%.1f\", ($new_val - $old_val) / $old_val * 100.0 }")
+        else
+            pct="0.0"
+        fi
+
+        old_rss+=("$old_val")
+        new_rss+=("$new_val")
+        delta_rss+=("$delta")
+        pct_rss+=("$pct")
+    done
+
+    # Calculate column widths for wall_time table
+    local wc_name=${#config_names[0]}
+    local wc_old=${#old_wall[0]}
+    local wc_new=${#new_wall[0]}
+    local wc_delta=${#delta_wall[0]}
+    local wc_pct=${#pct_wall[0]}
+
+    for i in "${!configs[@]}"; do
+        [[ ${#config_names[$i]} -gt $wc_name ]] && wc_name=${#config_names[$i]}
+        [[ ${#old_wall[$i]} -gt $wc_old ]] && wc_old=${#old_wall[$i]}
+        [[ ${#new_wall[$i]} -gt $wc_new ]] && wc_new=${#new_wall[$i]}
+        [[ ${#delta_wall[$i]} -gt $wc_delta ]] && wc_delta=${#delta_wall[$i]}
+        [[ ${#pct_wall[$i]} -gt $wc_pct ]] && wc_pct=${#pct_wall[$i]}
+    done
+
+    # Ensure minimum widths match headers
+    [[ $wc_name -lt 14 ]] && wc_name=14
+    [[ $wc_old -lt 6 ]] && wc_old=6
+    [[ $wc_new -lt 6 ]] && wc_new=6
+    [[ $wc_delta -lt 8 ]] && wc_delta=8
+    [[ $wc_pct -lt 8 ]] && wc_pct=8
+
+    # Print wall_time header
+    printf "%-${wc_name}s %*s %*s %*s %*s%%\n" \
+        "Stage" $wc_old "old_ms" $wc_new "new_ms" $wc_delta "delta_ms" $wc_pct "change"
+
+    # Print wall_time separator
+    printf "%s" "$(printf '%*s' $wc_name '' | tr ' ' '-')"
+    for w in $wc_old $wc_new $wc_delta $wc_pct; do
+        printf " %s" "$(printf '%*s' $w '' | tr ' ' '-')"
+    done
+    echo ""
+
+    # Print wall_time rows
+    for i in "${!configs[@]}"; do
+        printf "%-${wc_name}s %*s %*s %*s %*s%%\n" \
+            "${config_names[$i]}" \
+            $wc_old "${old_wall[$i]}" \
+            $wc_new "${new_wall[$i]}" \
+            $wc_delta "${delta_wall[$i]}" \
+            $wc_pct "${pct_wall[$i]}"
+    done
+
+    # Calculate column widths for RSS table
+    local rc_name=${#config_names[0]}
+    local rc_old=${#old_rss[0]}
+    local rc_new=${#new_rss[0]}
+    local rc_delta=${#delta_rss[0]}
+    local rc_pct=${#pct_rss[0]}
+
+    for i in "${!configs[@]}"; do
+        [[ ${#config_names[$i]} -gt $rc_name ]] && rc_name=${#config_names[$i]}
+        [[ ${#old_rss[$i]} -gt $rc_old ]] && rc_old=${#old_rss[$i]}
+        [[ ${#new_rss[$i]} -gt $rc_new ]] && rc_new=${#new_rss[$i]}
+        [[ ${#delta_rss[$i]} -gt $rc_delta ]] && rc_delta=${#delta_rss[$i]}
+        [[ ${#pct_rss[$i]} -gt $rc_pct ]] && rc_pct=${#pct_rss[$i]}
+    done
+
+    # Ensure minimum widths match headers
+    [[ $rc_name -lt 14 ]] && rc_name=14
+    [[ $rc_old -lt 8 ]] && rc_old=8
+    [[ $rc_new -lt 8 ]] && rc_new=8
+    [[ $rc_delta -lt 10 ]] && rc_delta=10
+    [[ $rc_pct -lt 8 ]] && rc_pct=8
+
+    # Print RSS header
+    echo ""
+    echo "RSS comparison:"
+    printf "%-${rc_name}s %*s %*s %*s %*s%%\n" \
+        "Stage" $rc_old "old_MiB" $rc_new "new_MiB" $rc_delta "delta_MiB" $rc_pct "change"
+
+    # Print RSS separator
+    printf "%s" "$(printf '%*s' $rc_name '' | tr ' ' '-')"
+    for w in $rc_old $rc_new $rc_delta $rc_pct; do
+        printf " %s" "$(printf '%*s' $w '' | tr ' ' '-')"
+    done
+    echo ""
+
+    # Print RSS rows
+    for i in "${!configs[@]}"; do
+        printf "%-${rc_name}s %*s %*s %*s %*s%%\n" \
+            "${config_names[$i]}" \
+            $rc_old "${old_rss[$i]}" \
+            $rc_new "${new_rss[$i]}" \
+            $rc_delta "${delta_rss[$i]}" \
+            $rc_pct "${pct_rss[$i]}"
+    done
+}
+
+# --- Main ---
+
+case "$MODE" in
+    profile)
+        run_profile "$FIXTURE" "${ZEBRAC_FLAGS[@]+"${ZEBRAC_FLAGS[@]}"}"
+        ;;
+    compare)
+        run_compare "$COMPARE_OLD" "$COMPARE_NEW"
+        ;;
+esac
