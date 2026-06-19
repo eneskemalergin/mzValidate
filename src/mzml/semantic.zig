@@ -161,6 +161,8 @@ pub const SemanticValidator = struct {
             list.deinit(validator.allocator);
         }
         validator.scope_terms.deinit(validator.allocator);
+        // Free current_group_id.
+        if (validator.current_group_id) |id| validator.allocator.free(id);
         // Free param_groups entries.
         {
             var pg_it = validator.param_groups.iterator();
@@ -248,7 +250,15 @@ pub const SemanticValidator = struct {
 
                 switch (tag) {
                     .referenceableParamGroup => {
-                        validator.current_group_id = xml_events.attributeByLocalName(start.attributes, "id");
+                        const id_attr = xml_events.attributeByLocalName(start.attributes, "id");
+                        if (validator.current_group_id) |old_id| {
+                            validator.allocator.free(old_id);
+                        }
+                        if (id_attr) |id| {
+                            validator.current_group_id = try validator.allocator.dupe(u8, id);
+                        } else {
+                            validator.current_group_id = null;
+                        }
                     },
                     .referenceableParamGroupRef => {
                         if (xml_events.attributeByLocalName(start.attributes, "ref")) |ref_id| {
@@ -439,7 +449,10 @@ pub const SemanticValidator = struct {
                             term_list.deinit(validator.allocator);
                         };
                     }
-                    validator.current_group_id = null;
+                    if (validator.current_group_id) |id| {
+                        validator.allocator.free(id);
+                        validator.current_group_id = null;
+                    }
                 }
             },
             else => {},

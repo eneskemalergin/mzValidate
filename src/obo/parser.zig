@@ -433,3 +433,17 @@ test "CvTable parses is_a and relationship" {
     try std.testing.expectEqualStrings("part_of", t.?.relationships[0].name);
     try std.testing.expectEqualStrings("MS:1000001", t.?.relationships[0].target);
 }
+
+test "isDescendantOf traverses hierarchy in real OBO" {
+    const allocator = std.testing.allocator;
+    const obo = @embedFile("../data/psi-ms.obo");
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+
+    // MS:1003378 (Orbitrap Astral) -> MS:1000494 -> MS:1000483 -> MS:1000031 (instrument model)
+    try std.testing.expect(table.isDescendantOf("MS:1003378", "MS:1000031"));
+    // MS:1003378 is not a descendant of itself via is_a (identity check)
+    try std.testing.expect(table.isDescendantOf("MS:1003378", "MS:1003378"));
+    // MS:1000031 is not a descendant of MS:1003378
+    try std.testing.expect(!table.isDescendantOf("MS:1000031", "MS:1003378"));
+}
