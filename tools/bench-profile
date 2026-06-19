@@ -37,8 +37,8 @@ Examples:
 The script runs five configurations:
   min:        -skip-binary -skip-semantic -skip-index (XML + Structural only)
   idx:        -skip-binary -skip-semantic (adds Index)
-  no-sem:     -skip-semantic (adds Binary)
-  no-bin:     -skip-binary (adds Semantic)
+  bin:        -skip-semantic -skip-index (adds Binary)
+  sem:        -skip-binary -skip-index (adds Semantic)
   full:       no skips (all five stages)
 
 Dependencies: zebrac, jq, awk
@@ -169,19 +169,22 @@ run_profile() {
     mkdir -p "$PROFILING_DIR"
 
     # Define configurations
-    local -a configs=("min" "idx" "no-sem" "no-bin" "full")
+    # Each stage is measured independently against the XML+Struct baseline.
+    # All stages (Index, Binary, Semantic) are independent consumers of the
+    # same XML event stream — no data flows between them.
+    local -a configs=("min" "idx" "bin" "sem" "full")
     local -a skip_flags=(
         "-skip-binary -skip-semantic -skip-index"
         "-skip-binary -skip-semantic"
-        "-skip-semantic"
-        "-skip-binary"
+        "-skip-semantic -skip-index"
+        "-skip-binary -skip-index"
         ""
     )
     local -a config_names=(
-        "XML+Struct"
-        "+Index"
-        "+Index+Binary"
-        "+Index+Semantic"
+        "Struct"
+        "Index"
+        "Binary"
+        "Semantic"
         "Full"
     )
 
@@ -293,43 +296,43 @@ run_profile() {
     }')
     calc_output+=$'\n'
 
-    # Binary: idx (1) -> no-sem (2)
+    # Binary: min (0) -> bin (2)
     calc_output+=$(awk -v fs="$file_size" \
-        -v w1="${wall_ms[1]}" -v w2="${wall_ms[2]}" \
-        -v r1="${peak_rss[1]}" -v r2="${peak_rss[2]}" \
-        -v c1="${cycles[1]}" -v c2="${cycles[2]}" \
-        -v i1="${insns[1]}" -v i2="${insns[2]}" \
+        -v w0="${wall_ms[0]}" -v w2="${wall_ms[2]}" \
+        -v r0="${peak_rss[0]}" -v r2="${peak_rss[2]}" \
+        -v c0="${cycles[0]}" -v c2="${cycles[2]}" \
+        -v i0="${insns[0]}" -v i2="${insns[2]}" \
         'BEGIN {
-        d_w = w2 - w1
-        d_m = fs/(w2/1000.0)/1048576.0 - fs/(w1/1000.0)/1048576.0
-        d_rp = (r2 - r1) / fs * 100.0
-        d_rm = (r2 - r1) / 1048576.0
-        d_c = (c2 - c1) / 1000000.0
-        d_i = (i2 - i1) / 1000000.0
+        d_w = w2 - w0
+        d_m = fs/(w2/1000.0)/1048576.0 - fs/(w0/1000.0)/1048576.0
+        d_rp = (r2 - r0) / fs * 100.0
+        d_rm = (r2 - r0) / 1048576.0
+        d_c = (c2 - c0) / 1000000.0
+        d_i = (i2 - i0) / 1000000.0
         printf "%.1f %.1f %.2f %.1f %.1f %.1f\n", d_w, d_m, d_rp, d_rm, d_c, d_i
     }')
     calc_output+=$'\n'
 
-    # Semantic: idx (1) -> no-bin (3)
+    # Semantic: min (0) -> sem (3)
     calc_output+=$(awk -v fs="$file_size" \
-        -v w1="${wall_ms[1]}" -v w3="${wall_ms[3]}" \
-        -v r1="${peak_rss[1]}" -v r3="${peak_rss[3]}" \
-        -v c1="${cycles[1]}" -v c3="${cycles[3]}" \
-        -v i1="${insns[1]}" -v i3="${insns[3]}" \
+        -v w0="${wall_ms[0]}" -v w3="${wall_ms[3]}" \
+        -v r0="${peak_rss[0]}" -v r3="${peak_rss[3]}" \
+        -v c0="${cycles[0]}" -v c3="${cycles[3]}" \
+        -v i0="${insns[0]}" -v i3="${insns[3]}" \
         'BEGIN {
-        d_w = w3 - w1
-        d_m = fs/(w3/1000.0)/1048576.0 - fs/(w1/1000.0)/1048576.0
-        d_rp = (r3 - r1) / fs * 100.0
-        d_rm = (r3 - r1) / 1048576.0
-        d_c = (c3 - c1) / 1000000.0
-        d_i = (i3 - i1) / 1000000.0
+        d_w = w3 - w0
+        d_m = fs/(w3/1000.0)/1048576.0 - fs/(w0/1000.0)/1048576.0
+        d_rp = (r3 - r0) / fs * 100.0
+        d_rm = (r3 - r0) / 1048576.0
+        d_c = (c3 - c0) / 1000000.0
+        d_i = (i3 - i0) / 1000000.0
         printf "%.1f %.1f %.2f %.1f %.1f %.1f\n", d_w, d_m, d_rp, d_rm, d_c, d_i
     }')
 
     # Parse awk output into arrays
     # Append * to row names for configs that had validation errors
     local -a row_names=()
-    local -a base_names=("XML+Struct" "+Index" "+Index+Binary" "+Index+Semantic" "Full")
+    local -a base_names=("Struct" "Index" "Binary" "Semantic" "Full")
     for i in "${!base_names[@]}"; do
         if [[ ${exit_codes[$i]} -ne 0 ]]; then
             row_names+=("${base_names[$i]}*")
@@ -519,10 +522,10 @@ run_profile() {
         pct=$(calc "${delta_wall[$i]} / ${wall_ms[4]} * 100.0")
         printf "  %-10s %6s%%\n" "${delta_names[$i]}" "$(format_dec "$pct" 1)"
     done
-    # Add XML+Struct as baseline
+    # Add Struct as baseline
     local xml_pct
     xml_pct=$(calc "${wall_ms[0]} / ${wall_ms[4]} * 100.0")
-    printf "  %-10s %6s%%\n" "XML+Struct" "$(format_dec "$xml_pct" 1)"
+    printf "  %-10s %6s%%\n" "Struct" "$(format_dec "$xml_pct" 1)"
 
     # Stage % of total memory
     echo ""
@@ -532,10 +535,10 @@ run_profile() {
         rss_pct=$(calc "${delta_rss_mib[$i]} / ${row_rss_mib[4]} * 100.0")
         printf "  %-10s %6s%%\n" "${delta_names[$i]}" "$(format_dec "$rss_pct" 1)"
     done
-    # Add XML+Struct as baseline
+    # Add Struct as baseline
     local xml_rss_pct
     xml_rss_pct=$(calc "${row_rss_mib[0]} / ${row_rss_mib[4]} * 100.0")
-    printf "  %-10s %6s%%\n" "XML+Struct" "$(format_dec "$xml_rss_pct" 1)"
+    printf "  %-10s %6s%%\n" "Struct" "$(format_dec "$xml_rss_pct" 1)"
 
     # Print error note if any configs had validation errors
     local has_errors=0
@@ -547,7 +550,7 @@ run_profile() {
     done
     if [[ $has_errors -eq 1 ]]; then
         echo ""
-        echo "* = validation errors present (exit code 2). Metrics are still valid for profiling."
+        echo "* = validation warnings or errors (non-zero exit). Metrics are still valid for profiling."
     fi
 
     # Save JSON if requested
@@ -618,8 +621,8 @@ run_compare() {
     echo "Fixture: $old_fixture ($(awk "BEGIN { printf \"%.1f\", $old_size / 1048576.0 }") MiB)"
     echo ""
 
-    local -a configs=("min" "idx" "no-sem" "no-bin" "full")
-    local -a config_names=("XML+Struct" "+Index" "+Index+Binary" "+Index+Semantic" "Full")
+    local -a configs=("min" "idx" "bin" "sem" "full")
+    local -a config_names=("Struct" "Index" "Binary" "Semantic" "Full")
 
     # Calculate wall_time values
     local -a old_wall=()
