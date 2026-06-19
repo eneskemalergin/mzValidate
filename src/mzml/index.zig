@@ -430,6 +430,7 @@ fn recordContainerOffset(
 ) !void {
     const id = xml_events.attributeByLocalName(start.attributes, "id") orelse return;
     const owned = try validator.allocator.dupe(u8, id);
+    errdefer validator.allocator.free(owned);
     const result = try map.getOrPut(owned);
     if (result.found_existing) {
         validator.allocator.free(owned);

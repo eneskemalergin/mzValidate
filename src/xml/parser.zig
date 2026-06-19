@@ -953,7 +953,8 @@ fn parseCharacterReference(bytes: []const u8) ParseError!u21 {
             'A'...'F' => if (base == 16) byte - 'A' + 10 else return error.InvalidCharacterReference,
             else => return error.InvalidCharacterReference,
         };
-        value = value * base + digit;
+        value = std.math.mul(u32, value, @as(u32, base)) catch return error.InvalidCharacterReference;
+        value = std.math.add(u32, value, @as(u32, digit)) catch return error.InvalidCharacterReference;
         if (value > std.math.maxInt(u21)) return error.InvalidCharacterReference;
     }
 
@@ -961,6 +962,11 @@ fn parseCharacterReference(bytes: []const u8) ParseError!u21 {
 }
 
 // --- Tests: inline smoke ---
+
+test "parser character reference rejects overflow" {
+    // Regression: unchecked u32 arithmetic accepted this as codepoint 0.
+    try std.testing.expectError(error.InvalidCharacterReference, parseCharacterReference("x20000000"));
+}
 
 test "parser emits elements text attributes and namespaces" {
     const xml =

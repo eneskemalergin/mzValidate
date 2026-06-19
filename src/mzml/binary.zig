@@ -28,8 +28,10 @@ const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const base64_simd_chunk_len = 32;
 const base64_scalar_short_len = 64;
-const flate_buffer_len = 128 * 1024;
-const libdeflate_max_output_bytes = 8 * 1024 * 1024;
+const flate_buffer_len = 1024 * 1024;
+const libdeflate_default_output_limit = 256 * 1024 * 1024;
+const libdeflate_output_expansion_factor: usize = 16;
+const libdeflate_max_retained_output_bytes = 8 * 1024 * 1024;
 const LibdeflateDecompressor = if (build_options.enable_libdeflate) libdeflate.libdeflate_decompressor else opaque {};
 const OptionalLibdeflateDecompressor = if (build_options.enable_libdeflate) ?*LibdeflateDecompressor else void;
 
@@ -397,7 +399,7 @@ pub const BinaryValidator = struct {
     // Only kicks in when capacity > 1 MiB AND 4x the actual data.
     fn maybeShrinkScratch(validator: *BinaryValidator) void {
         validator.maybeShrinkPayload(&validator.compressed_payload, validator.compressed_payload.items.len);
-        validator.maybeShrinkPayload(&validator.libdeflate_output, validator.libdeflate_output.items.len);
+        validator.maybeShrinkLibdeflateOutput();
     }
 
     fn maybeShrinkPayload(validator: *BinaryValidator, payload: *std.ArrayList(u8), used: usize) void {
@@ -408,6 +410,12 @@ pub const BinaryValidator = struct {
             payload.capacity > used * max_headroom)
         {
             payload.shrinkAndFree(validator.allocator, used);
+        }
+    }
+
+    fn maybeShrinkLibdeflateOutput(validator: *BinaryValidator) void {
+        if (validator.libdeflate_output.capacity > libdeflate_max_retained_output_bytes) {
+            validator.libdeflate_output.shrinkAndFree(validator.allocator, 0);
         }
     }
 
@@ -842,9 +850,30 @@ pub const BinaryValidator = struct {
                 if (state.zlib_encoded_len == 0) break :blk 0;
 
                 const expected_decoded_bytes = if (state.default_array_length) |count|
-                    std.math.mul(usize, count, width) catch null
+                    std.math.mul(usize, count, width) catch {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_oversized,
+                            .location = location,
+                            .path = validator.path,
+                            .message = "binary payload decoded size exceeds decompressed output limit",
+                        });
+                        return;
+                    }
                 else
                     null;
+                if (expected_decoded_bytes) |expected| {
+                    if (expected > validator.libdeflateOutputLimit()) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_oversized,
+                            .location = location,
+                            .path = validator.path,
+                            .message = "binary payload decoded size exceeds decompressed output limit",
+                        });
+                        return;
+                    }
+                }
                 break :blk (validator.inflateDecodedZlib(validator.compressed_payload.items, expected_decoded_bytes) catch |err| switch (err) {
                     error.InvalidBase64 => {
                         try validator.appendDiagnostic(.{
@@ -944,7 +973,7 @@ pub const BinaryValidator = struct {
     fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory }!usize) {
         if (comptime build_options.enable_libdeflate) {
             if (expected_decoded_bytes) |expected| {
-                if (expected <= libdeflate_max_output_bytes) {
+                if (expected <= validator.libdeflateOutputLimit()) {
                     if (try validator.inflateWithLibdeflate(compressed, expected)) |decoded_bytes| {
                         return decoded_bytes;
                     }
@@ -986,6 +1015,12 @@ pub const BinaryValidator = struct {
         }
 
         unreachable;
+    }
+
+    fn libdeflateOutputLimit(validator: *const BinaryValidator) usize {
+        const max_encoded = validator.max_binary_size orelse return libdeflate_default_output_limit;
+        const expanded = std.math.mul(usize, max_encoded, libdeflate_output_expansion_factor) catch return libdeflate_default_output_limit;
+        return @min(expanded, libdeflate_default_output_limit);
     }
 
     fn ensureLibdeflateDecompressor(validator: *BinaryValidator) error{OutOfMemory}!*LibdeflateDecompressor {
@@ -1897,6 +1932,21 @@ test "binary validator unlimited default does not reject large payloads" {
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "binary validator rejects zlib decoded size above output cap" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const oversized_count = libdeflate_default_output_limit / 4 + 1;
+
+    var diagnostics = try runBinaryValidation(allocator, io, minimalSpectrumMzml("AAAA", oversized_count, "MS:1000574"));
+    defer diagnostics.deinit(allocator);
+
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_oversized,
+        "binary payload decoded size exceeds decompressed output limit",
+    );
 }
 
 test "binary validator scratch buffer shrink survives multi-array file" {

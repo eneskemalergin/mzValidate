@@ -189,13 +189,22 @@ run_profile() {
     )
 
     # Run zebrac for each configuration (30 minute timeout per run)
-    # First, capture exit codes by running mzValidate once per config
+    # First, capture exit codes by running mzValidate once per config.
+    # raw_exit_codes holds the CLI's 0/1/2 mapping (clean/warnings/errors).
+    # exit_codes holds the error-only gate (0 for clean or warnings, 2 for
+    # errors). Warnings are advisory and do not count as a gate event.
+    local -a raw_exit_codes=()
     local -a exit_codes=()
     for i in "${!configs[@]}"; do
         local flags="${skip_flags[$i]}"
         local rc=0
         "$MZVALIDATE" check "$fixture" -summary $flags >/dev/null 2>&1 || rc=$?
-        exit_codes+=($rc)
+        raw_exit_codes+=($rc)
+        if [[ $rc -eq 2 ]]; then
+            exit_codes+=(2)
+        else
+            exit_codes+=(0)
+        fi
     done
 
     # Remove old JSON files to avoid stale data
@@ -550,7 +559,7 @@ run_profile() {
     done
     if [[ $has_errors -eq 1 ]]; then
         echo ""
-        echo "* = validation warnings or errors (non-zero exit). Metrics are still valid for profiling."
+        echo "* = validation errors (non-zero exit). Warnings are advisory and do not mark this column. Metrics are still valid for profiling."
     fi
 
     # Save JSON if requested
@@ -573,6 +582,7 @@ EOF
     "${configs[$i]}": {
       "config_name": "${config_names[$i]}",
       "exit_code": ${exit_codes[$i]},
+      "severity_exit_code": ${raw_exit_codes[$i]},
       "wall_time_ns": $(extract_metric "${json_files[$i]}" "wall_time"),
       "wall_time_ms": $(calc "${wall_ms[$i]}"),
       "peak_rss_bytes": $(extract_metric "${json_files[$i]}" "peak_rss"),

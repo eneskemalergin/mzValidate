@@ -72,14 +72,19 @@ const RefTable = struct {
 
     fn declare(table: *RefTable, id: []const u8, element_name: []const u8, byte_offset: u64) !bool {
         const owned_id = try table.allocator.dupe(u8, id);
+        errdefer table.allocator.free(owned_id);
+        const owned_element_name = try table.allocator.dupe(u8, element_name);
+        errdefer table.allocator.free(owned_element_name);
+
         const result = try table.declarations.getOrPut(owned_id);
         if (result.found_existing) {
             table.allocator.free(owned_id);
+            table.allocator.free(owned_element_name);
             return false;
         }
         result.key_ptr.* = owned_id;
         result.value_ptr.* = .{
-            .element_name = try table.allocator.dupe(u8, element_name),
+            .element_name = owned_element_name,
             .byte_offset = byte_offset,
         };
         return true;
