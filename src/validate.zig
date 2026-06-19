@@ -181,6 +181,9 @@ fn runValidation(
 
     var index_validator = if (options.skip_index) null else mzml_index.IndexValidator.init(allocator, diagnostics, path);
     defer if (index_validator) |*validator| validator.deinit();
+    if (index_validator) |*validator| {
+        if (file_bytes) |bytes| validator.beginOnlineSha(bytes);
+    }
 
     // Load OBO and mapping rules. Embedded at build time, overridable at
     // runtime via -obo. If either fails we log an error and skip semantic
@@ -281,6 +284,9 @@ fn runValidation(
                     if (validator.wantsText()) try validator.consumeText(text);
                 }
             },
+        }
+        if (index_validator) |*validator| {
+            validator.feedShaExclusive(parser.byteOffset() + 1);
         }
     }
 

@@ -1221,9 +1221,12 @@ pub const StructuralValidator = struct {
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
         _ = element_label;
         const value = xml_events.attributeByLocalName(start.attributes, attribute_name) orelse return;
-        if (value.len > 0 and value[0] == '-') {
-            validator.attributeError(start.byte_offset, "attribute must not be negative") catch {};
-        }
+        if (std.fmt.parseUnsigned(usize, value, 10) catch null) |_| return;
+        const message = if (value.len > 0 and value[0] == '-')
+            "attribute must not be negative"
+        else
+            "attribute must be a non-negative integer";
+        validator.attributeError(start.byte_offset, message) catch {};
     }
 
     fn attributeError(validator: *StructuralValidator, byte_offset: u64, message: []const u8) !void {

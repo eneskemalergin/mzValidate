@@ -269,7 +269,11 @@ const StreamingBase64Decoder = struct {
         const decoded_len = (encoded.len / 4) * 3;
         const start = out.items.len;
         try out.resize(allocator, start + decoded_len);
-        std.base64.standard.Decoder.decode(out.items[start..][0..decoded_len], encoded) catch unreachable;
+        std.base64.standard.Decoder.decode(out.items[start..][0..decoded_len], encoded) catch {
+            try out.resize(allocator, start);
+            self.errored = true;
+            return;
+        };
         self.sig_len += encoded.len;
     }
 
@@ -1290,6 +1294,22 @@ test "streaming base64 counter C.1 SIMD rejects invalid byte after counted prefi
 
     try std.testing.expect(counter.errored);
     try std.testing.expectError(error.InvalidBase64, counter.result());
+}
+
+test "streaming base64 decoder decodes long clean bulk runs" {
+    const allocator = std.testing.allocator;
+
+    var payload: [128]u8 = undefined;
+    @memset(&payload, 'A');
+
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+
+    var stream: StreamingBase64Decoder = .{};
+    try stream.feed(allocator, &decoded, &payload);
+    try stream.finish();
+
+    try std.testing.expectEqual(@as(usize, 96), decoded.items.len);
 }
 
 test "streaming base64 decoder decodes split chunks and whitespace" {

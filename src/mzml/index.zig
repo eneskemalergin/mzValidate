@@ -1,9 +1,10 @@
 //! Index offset verification and SHA-1 checksum validation.
 //!
-//! Two-pass design: the forward pass records byte offsets of every spectrum
-//! and chromatogram, parses `<indexList>` entries, and captures the declared
-//! `<indexListOffset>` and `<fileChecksum>`. Then `finish()` cross-checks
-//! everything against the raw file bytes via mmap.
+//! Forward pass records byte offsets of every spectrum and chromatogram,
+//! parses `<indexList>` entries, and captures `<indexListOffset>` and
+//! `<fileChecksum>`. When `file_bytes` is available, SHA-1 is fed
+//! incrementally during parse; `finish()` cross-checks offsets and the
+//! digest without rescanning the mmap slice.
 //!
 //! Tolerates both pwiz offsets (pointing at `<`) and ThermoRawFileParser
 //! offsets (pointing at the line start before whitespace).
@@ -74,6 +75,13 @@ pub const IndexValidator = struct {
     // Set true when any index-related element is encountered.
     saw_index_elements: bool = false,
 
+    // Online SHA-1 over mmap bytes (D.1). Disabled when file_bytes is null.
+    sha_file_bytes: ?[]const u8 = null,
+    sha_ctx: std.crypto.hash.Sha1 = undefined,
+    sha_bytes_hashed: u64 = 0,
+    sha_complete: bool = false,
+    sha_computed: [20]u8 = undefined,
+
     /// True after we see any index-related elements.
     pub fn isIndexed(validator: *const IndexValidator) bool {
         return validator.saw_index_elements;
@@ -84,6 +92,39 @@ pub const IndexValidator = struct {
     pub fn declaredChecksum(validator: *const IndexValidator) ?[20]u8 {
         if (!validator.file_checksum_ok) return null;
         return validator.file_checksum_raw;
+    }
+
+    /// Start incremental SHA-1 over mmap bytes. Call once before the parse loop
+    /// when `file_bytes` is available (checkPath / checkSlice).
+    pub fn beginOnlineSha(validator: *IndexValidator, bytes: []const u8) void {
+        validator.sha_file_bytes = bytes;
+        validator.sha_ctx = std.crypto.hash.Sha1.init(.{});
+        validator.sha_bytes_hashed = 0;
+        validator.sha_complete = false;
+    }
+
+    /// Hash raw file bytes through `exclusive_end` (not hashed). Stops at the
+    /// `<fileChecksum>` hex boundary once `file_checksum_byte_offset` is set.
+    pub fn feedShaExclusive(validator: *IndexValidator, exclusive_end: u64) void {
+        if (validator.sha_file_bytes == null or validator.sha_complete) return;
+        const bytes = validator.sha_file_bytes.?;
+        const cap = validator.file_checksum_byte_offset orelse exclusive_end;
+        const end = @min(exclusive_end, cap, bytes.len);
+        if (end <= validator.sha_bytes_hashed) {
+            if (validator.file_checksum_byte_offset != null and
+                validator.sha_bytes_hashed >= cap)
+            {
+                validator.finalizeOnlineSha();
+            }
+            return;
+        }
+        validator.sha_ctx.update(bytes[validator.sha_bytes_hashed..end]);
+        validator.sha_bytes_hashed = end;
+        if (validator.file_checksum_byte_offset) |checksum_offset| {
+            if (validator.sha_bytes_hashed >= checksum_offset) {
+                validator.finalizeOnlineSha();
+            }
+        }
     }
 
     pub fn init(
@@ -180,7 +221,9 @@ pub const IndexValidator = struct {
             },
             .fileChecksum => {
                 validator.file_checksum_depth = element_depth;
-                validator.file_checksum_byte_offset = start.byte_offset + "<fileChecksum>".len;
+                const checksum_offset = start.byte_offset + "<fileChecksum>".len;
+                validator.file_checksum_byte_offset = checksum_offset;
+                validator.feedShaExclusive(checksum_offset);
                 validator.text_buf.clearRetainingCapacity();
             },
             else => {},
@@ -386,10 +429,13 @@ pub const IndexValidator = struct {
                         ) catch {};
                         return;
                     }
-                    var computed: [20]u8 = undefined;
-                    var ctx = std.crypto.hash.Sha1.init(.{});
-                    ctx.update(bytes[0..checksum_offset]);
-                    ctx.final(&computed);
+                    if (validator.sha_file_bytes != null and !validator.sha_complete) {
+                        validator.feedShaExclusive(checksum_offset);
+                    }
+                    const computed = if (validator.sha_complete)
+                        validator.sha_computed
+                    else
+                        computeChecksumBatch(bytes, checksum_offset);
 
                     if (!std.mem.eql(u8, &computed, &validator.file_checksum_raw)) {
                         validator.appendDiagnostic(
@@ -404,6 +450,14 @@ pub const IndexValidator = struct {
     }
 
     // --- Private helpers ---
+
+    fn finalizeOnlineSha(validator: *IndexValidator) void {
+        if (validator.sha_complete) return;
+        var out: [20]u8 = undefined;
+        validator.sha_ctx.final(&out);
+        validator.sha_computed = out;
+        validator.sha_complete = true;
+    }
 
     fn appendDiagnostic(
         validator: *IndexValidator,
@@ -486,6 +540,14 @@ fn freeIndexEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(IndexE
     for (entries.items) |entry| {
         allocator.free(entry.id_ref);
     }
+}
+
+fn computeChecksumBatch(bytes: []const u8, checksum_offset: u64) [20]u8 {
+    var computed: [20]u8 = undefined;
+    var ctx = std.crypto.hash.Sha1.init(.{});
+    ctx.update(bytes[0..checksum_offset]);
+    ctx.final(&computed);
+    return computed;
 }
 
 // ThermoRawFileParser writes line-start offsets instead of element-start
@@ -766,16 +828,15 @@ test "IndexValidator: valid SHA-1 checksum produces no diagnostic" {
     var v = IndexValidator.init(allocator, &diagnostics, null);
     defer v.deinit();
 
-    // Content before <fileChecksum>
     const prefix = "<?xml version=\"1.0\"?><mzML><run id=\"r\"></run>";
-    // Compute correct SHA-1
+    const checksum_offset = prefix.len + "<fileChecksum>".len;
     var expected_sha: [20]u8 = undefined;
     {
         var ctx = std.crypto.hash.Sha1.init(.{});
         ctx.update(prefix);
+        ctx.update("<fileChecksum>");
         ctx.final(&expected_sha);
     }
-    // Encode as hex
     var hex_buf: [40]u8 = undefined;
     for (0..20) |i| {
         const hi = expected_sha[i] >> 4;
@@ -787,17 +848,47 @@ test "IndexValidator: valid SHA-1 checksum produces no diagnostic" {
 
     const file_bytes = prefix ++ "<fileChecksum>" ++ hex_str ++ "</fileChecksum>";
 
+    v.beginOnlineSha(file_bytes);
+    v.feedShaExclusive(prefix.len);
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "r")}, 10), 1);
     v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
+    v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
     try v.consumeText(test_events.text(hex_str));
     v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
     v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    v.feedShaExclusive(checksum_offset);
 
     v.finish(file_bytes);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expect(v.sha_complete);
+}
+
+test "IndexValidator: online SHA matches batch hash at checksum boundary" {
+    const prefix = "<?xml version=\"1.0\"?><mzML><run id=\"r\"></run>";
+    const file_bytes = prefix ++ "<fileChecksum>deadbeef" ++ "</fileChecksum>";
+    const checksum_offset = prefix.len + "<fileChecksum>".len;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(testing.allocator);
+
+    var v = IndexValidator.init(testing.allocator, &diagnostics, null);
+    defer v.deinit();
+
+    v.beginOnlineSha(file_bytes);
+    v.feedShaExclusive(prefix.len / 2);
+    v.feedShaExclusive(prefix.len);
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 100), 1);
+    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
+
+    const batch = computeChecksumBatch(file_bytes, checksum_offset);
+    try expect(v.sha_complete);
+    try testing.expectEqualSlices(u8, &batch, &v.sha_computed);
 }
 
 test "IndexValidator: fileChecksum with surrounding whitespace passes validation" {
@@ -813,6 +904,7 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
     {
         var ctx = std.crypto.hash.Sha1.init(.{});
         ctx.update(prefix);
+        ctx.update("<fileChecksum>");
         ctx.final(&expected_sha);
     }
     var hex_buf: [40]u8 = undefined;
@@ -830,6 +922,8 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "r")}, 10), 1);
     v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
+    v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
     try v.consumeText(test_events.text("\n  "));
     try v.consumeText(test_events.text(hex_str));

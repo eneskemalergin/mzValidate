@@ -122,6 +122,11 @@ pub const Parser = struct {
     pending_self_closing_end: bool = false,
     // True once the UTF-8 BOM (if any) has been checked and skipped.
     bom_checked: bool = false,
+    // Bytes replayed after a partial UTF-8 BOM prefix (0xEF without 0xBB 0xBF).
+    pending: [2]u8 = undefined,
+    pending_offset: [2]u64 = undefined,
+    pending_len: u8 = 0,
+    pending_pos: u8 = 0,
 
     /// Constructs a parser from a reader and caller-supplied buffers.
     ///
@@ -807,10 +812,8 @@ pub const Parser = struct {
         return (try parser.peekOptionalByte()) orelse error.UnexpectedEof;
     }
 
-    // UTF-8 BOM: peek three bytes so a lone 0xEF at file start stays in lookahead.
-    // If it is not a BOM the first byte goes back into lookahead; bytes 1-2
-    // are lost but 0xEF at position 0 without the rest of the BOM is
-    // already invalid UTF-8 anyway.
+    // UTF-8 BOM: consume EF BB BF when present. A partial EF prefix is replayed
+    // through lookahead + pending so no input bytes are dropped.
     fn skipBom(parser: *Parser) ParseError!void {
         const b0 = try parser.peekOptionalByte() orelse return;
         if (b0 != 0xEF) return;
@@ -821,7 +824,12 @@ pub const Parser = struct {
         if (tmp[0] == 0xEF and tmp[1] == 0xBB and tmp[2] == 0xBF) return;
         parser.lookahead = tmp[0];
         parser.lookahead_offset = 0;
-        parser.absolute_offset = 1;
+        parser.pending[0] = tmp[1];
+        parser.pending_offset[0] = 1;
+        parser.pending[1] = tmp[2];
+        parser.pending_offset[1] = 2;
+        parser.pending_len = 2;
+        parser.pending_pos = 0;
     }
 
     fn takeRequiredByte(parser: *Parser) ParseError!u8 {
@@ -830,6 +838,7 @@ pub const Parser = struct {
 
     fn peekOptionalByte(parser: *Parser) ParseError!?u8 {
         if (parser.lookahead) |byte| return byte;
+        if (parser.pending_pos < parser.pending_len) return parser.pending[parser.pending_pos];
 
         const byte = switch (parser.input) {
             .reader => |reader| reader.takeByte() catch |err| switch (err) {
@@ -856,6 +865,17 @@ pub const Parser = struct {
         if (parser.lookahead) |byte| {
             parser.lookahead = null;
             parser.last_byte_offset = parser.lookahead_offset;
+            return byte;
+        }
+
+        if (parser.pending_pos < parser.pending_len) {
+            const byte = parser.pending[parser.pending_pos];
+            parser.last_byte_offset = parser.pending_offset[parser.pending_pos];
+            parser.pending_pos += 1;
+            if (parser.pending_pos >= parser.pending_len) {
+                parser.pending_len = 0;
+                parser.pending_pos = 0;
+            }
             return byte;
         }
 
@@ -966,6 +986,42 @@ fn parseCharacterReference(bytes: []const u8) ParseError!u21 {
 test "parser character reference rejects overflow" {
     // Regression: unchecked u32 arithmetic accepted this as codepoint 0.
     try std.testing.expectError(error.InvalidCharacterReference, parseCharacterReference("x20000000"));
+}
+
+test "parser skips utf8 bom and replays partial ef prefix" {
+    const plain = "<root></root>";
+    const with_bom = "\xEF\xBB\xBF" ++ plain;
+
+    var bom_harness: InlineParserHarness = undefined;
+    bom_harness.init(with_bom);
+    const bom_root = (try bom_harness.parser.next()).?.start_element;
+    try std.testing.expect(bom_root.name.matches(null, "root"));
+    const bom_end = (try bom_harness.parser.next()).?.end_element;
+    try std.testing.expect(bom_end.name.matches(null, "root"));
+    try std.testing.expectEqual(@as(?Event, null), try bom_harness.parser.next());
+
+    const partial = "\xEF\x41\x42<root></root>";
+    var token_buffer: [64]u8 = undefined;
+    var attrs: [4]Attribute = undefined;
+    var ns: [4]NamespaceBinding = undefined;
+    var ns_bytes: [64]u8 = undefined;
+    var stack: [4]ElementFrame = undefined;
+    var elem_bytes: [64]u8 = undefined;
+    var slice_parser = Parser.initSlice(partial, .{
+        .token = &token_buffer,
+        .attributes = &attrs,
+        .namespace_bindings = &ns,
+        .namespace_bytes = &ns_bytes,
+        .element_stack = &stack,
+        .element_bytes = &elem_bytes,
+    });
+    try slice_parser.skipBom();
+    try std.testing.expectEqual(@as(usize, 3), slice_parser.input.slice.pos);
+    try std.testing.expectEqual(@as(u64, 3), slice_parser.absolute_offset);
+    try std.testing.expectEqual(@as(u8, 0xEF), slice_parser.lookahead.?);
+    try std.testing.expectEqual(@as(u8, 2), slice_parser.pending_len);
+    try std.testing.expectEqual(@as(u8, 0x41), slice_parser.pending[0]);
+    try std.testing.expectEqual(@as(u8, 0x42), slice_parser.pending[1]);
 }
 
 test "parser emits elements text attributes and namespaces" {
