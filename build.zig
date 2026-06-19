@@ -11,7 +11,7 @@ const std = @import("std");
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Enable opt-in libdeflate zlib decode spike") orelse false;
+    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Enable libdeflate zlib decode acceleration (auto-detected if not set)") orelse detectLibdeflate(b);
 
     // --- Library and executable ---
 
@@ -119,6 +119,31 @@ fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
 fn linkLibdeflate(compile: *std.Build.Step.Compile) void {
     compile.root_module.linkSystemLibrary("c", .{});
     compile.root_module.linkSystemLibrary("deflate", .{});
+}
+
+/// Auto-detect libdeflate by checking for common library locations.
+/// Returns true if libdeflate is found, false otherwise.
+/// TODO: This is pretty stupid but for my own purposes will do.
+fn detectLibdeflate(b: *std.Build) bool {
+    const io = b.graph.io;
+    const search_paths = [_][]const u8{
+        "/usr/lib/x86_64-linux-gnu/libdeflate.so",
+        "/usr/lib/x86_64-linux-gnu/libdeflate.so.0",
+        "/usr/lib/x86_64-linux-gnu/libdeflate.a",
+        "/usr/lib/libdeflate.so",
+        "/usr/lib/libdeflate.so.0",
+        "/usr/lib/libdeflate.a",
+        "/usr/local/lib/libdeflate.so",
+        "/usr/local/lib/libdeflate.so.0",
+        "/usr/local/lib/libdeflate.a",
+    };
+
+    for (search_paths) |path| {
+        std.Io.Dir.accessAbsolute(io, path, .{}) catch continue;
+        return true;
+    }
+
+    return false;
 }
 
 /// Walks `root`, collects paths of all `.mzML` files, and returns them sorted.
