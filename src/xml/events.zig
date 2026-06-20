@@ -46,6 +46,43 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
+// Scans a raw tag byte slice for an attribute value by local name.
+// Used when eager attribute parsing was skipped (cvParam/userParam).
+fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const u8 {
+    var pos: usize = 0;
+    while (pos < tag_bytes.len) {
+        while (pos < tag_bytes.len and switch (tag_bytes[pos]) {
+            ' ', '\t', '\r', '\n' => true,
+            else => false,
+        }) : (pos += 1) {}
+        if (pos >= tag_bytes.len) return null;
+
+        const name_start = pos;
+        while (pos < tag_bytes.len and tag_bytes[pos] != '=' and !std.ascii.isWhitespace(tag_bytes[pos])) : (pos += 1) {}
+        if (pos >= tag_bytes.len or tag_bytes[pos] != '=') return null;
+        if (!std.mem.eql(u8, tag_bytes[name_start..pos], local_name)) {
+            pos += 1;
+            if (pos >= tag_bytes.len) return null;
+            const q = tag_bytes[pos];
+            if (q != '"' and q != '\'') return null;
+            pos += 1;
+            while (pos < tag_bytes.len and tag_bytes[pos] != q) : (pos += 1) {}
+            if (pos >= tag_bytes.len) return null;
+            pos += 1;
+            continue;
+        }
+        pos += 1;
+        if (pos >= tag_bytes.len) return null;
+        const q = tag_bytes[pos];
+        if (q != '"' and q != '\'') return null;
+        pos += 1;
+        const val_start = pos;
+        while (pos < tag_bytes.len and tag_bytes[pos] != q) : (pos += 1) {}
+        return tag_bytes[val_start..pos];
+    }
+    return null;
+}
+
 /// Looks up mzML attributes by local name, ignoring `xmlns*` declarations.
 pub fn attributeByLocalName(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
     for (attributes) |attr| {
@@ -62,6 +99,10 @@ pub const StartElement = struct {
     element_id: ElementId = .unknown,
     attributes: []const Attribute,
     self_closing: bool,
+    /// When eager attribute parsing was skipped, raw_tag holds the raw bytes
+    /// from the start of the tag name to `>` (exclusive), used by
+    /// `rawTagAttributeValue`. Borrows from the parser buffer.
+    raw_tag: []const u8 = "",
 
     /// Intern ID from the parser when set; otherwise derived from the QName.
     pub fn resolvedId(self: StartElement) ElementId {
@@ -70,6 +111,17 @@ pub const StartElement = struct {
             self.name.local_name,
             self.name.namespace_uri,
         );
+    }
+
+    /// Looks up an attribute by local name, checking eagerly-parsed attributes
+    /// first, then falling back to raw_tag scanning (cvParam/userParam path).
+    pub fn attr(self: StartElement, name: []const u8) ?[]const u8 {
+        for (self.attributes) |a| {
+            if (a.is_namespace_declaration) continue;
+            if (std.mem.eql(u8, a.name.local_name, name)) return a.value;
+        }
+        if (self.raw_tag.len > 0) return rawTagAttributeValue(self.raw_tag, name);
+        return null;
     }
 };
 

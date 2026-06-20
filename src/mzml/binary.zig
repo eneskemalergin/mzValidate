@@ -532,8 +532,8 @@ pub const BinaryValidator = struct {
         switch (tag) {
             .cv, .userParam => return,
             .spectrum => {
-                const index_attr = xml_events.attributeByLocalName(start.attributes, "index");
-                const dal_attr = xml_events.attributeByLocalName(start.attributes, "defaultArrayLength");
+                const index_attr = start.attr("index");
+                const dal_attr = start.attr("defaultArrayLength");
                 const index = parseOptionalUnsigned(index_attr);
                 const dal = parseOptionalUnsigned(dal_attr);
                 if (index_attr != null and index == null) {
@@ -561,7 +561,7 @@ pub const BinaryValidator = struct {
                 };
             },
             .chromatogram => {
-                const dal_attr = xml_events.attributeByLocalName(start.attributes, "defaultArrayLength");
+                const dal_attr = start.attr("defaultArrayLength");
                 const dal = parseOptionalUnsigned(dal_attr);
                 if (dal_attr != null and dal == null) {
                     try validator.appendDiagnostic(.{
@@ -580,7 +580,7 @@ pub const BinaryValidator = struct {
             },
             .binaryDataArray => {
                 if (validator.binary_array != null) return;
-                const enc_attr = xml_events.attributeByLocalName(start.attributes, "encodedLength");
+                const enc_attr = start.attr("encodedLength");
                 const encoded_length = parseOptionalUnsigned(enc_attr);
                 if (enc_attr != null and encoded_length == null) {
                     try validator.appendDiagnostic(.{
@@ -603,7 +603,7 @@ pub const BinaryValidator = struct {
             .cvParam => {
                 if (validator.binary_array) |*state| {
                     if (element_depth != state.depth + 1) return;
-                    const accession = xml_events.attributeByLocalName(start.attributes, "accession") orelse return;
+                    const accession = start.attr("accession") orelse return;
                     if (std.mem.eql(u8, accession, "MS:1000574")) {
                         state.saw_zlib_compression = true;
                         return;

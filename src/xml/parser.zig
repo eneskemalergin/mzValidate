@@ -257,6 +257,43 @@ pub const Parser = struct {
         const namespace_bytes_before = parser.namespace_bytes_len;
 
         const name_parts = try parser.parseName(first_name_byte);
+        const local_name = name_parts.local_name.slice(parser.token_buffer);
+        const lazy_attrs = (std.mem.eql(u8, local_name, "cvParam") or
+            std.mem.eql(u8, local_name, "userParam")) and parser.input == .slice;
+
+        if (lazy_attrs) {
+            // cvParam/userParam attributes are parsed lazily from raw_tag
+            // in the semantic validator. Skip eager parsing to save ~7M attribute scans.
+            const slice = &parser.input.slice;
+            const raw_start = slice.pos;
+            var self_closing = false;
+            while (slice.pos < slice.bytes.len) {
+                const b = slice.bytes[slice.pos];
+                slice.pos += 1;
+                if (b == '>') break;
+                if (b == '/') {
+                    if (slice.pos < slice.bytes.len and slice.bytes[slice.pos] == '>') {
+                        slice.pos += 1;
+                        self_closing = true;
+                        break;
+                    }
+                }
+            }
+            const raw_end = slice.pos - 1;
+            const raw_bytes = if (raw_end > raw_start) slice.bytes[raw_start..raw_end] else "";
+            parser.last_byte_offset = slice.pos;
+            parser.absolute_offset = slice.pos;
+
+            var event = try parser.finishStartElement(
+                byte_offset, name_parts,
+                namespace_count_before, namespace_bytes_before,
+                self_closing,
+                if (self_closing) parser.last_byte_offset - 1 else null,
+            );
+            if (self_closing) parser.pending_self_closing_end = true;
+            event.start_element.raw_tag = raw_bytes;
+            return event;
+        }
 
         while (true) {
             try parser.skipWhitespace();
@@ -306,8 +343,8 @@ pub const Parser = struct {
     ) ParseError!Event {
         const name = try parser.resolveQName(name_parts, true);
         try parser.resolveAttributeNamespaces();
-        try parser.pushElementFrame(name, namespace_count_before, namespace_bytes_before, synthetic_end_byte_offset);
         const element_id = elements.idFromParts(name.local_name, name.namespace_uri);
+        try parser.pushElementFrame(name, namespace_count_before, namespace_bytes_before, synthetic_end_byte_offset, element_id);
 
         return .{ .start_element = .{
             .byte_offset = byte_offset,
@@ -593,6 +630,7 @@ pub const Parser = struct {
         namespace_count_before: usize,
         namespace_bytes_before: usize,
         synthetic_end_byte_offset: ?u64,
+        element_id: elements.ElementId,
     ) ParseError!void {
         if (parser.element_count >= parser.element_storage.len) return error.ElementNestingTooDeep;
 
@@ -614,7 +652,7 @@ pub const Parser = struct {
             .prefix = prefix_range,
             .local_name = local_name_range,
             .namespace_uri = namespace_uri_range,
-            .element_id = elements.idFromParts(name.local_name, name.namespace_uri),
+            .element_id = element_id,
             .synthetic_end_byte_offset = synthetic_end_byte_offset,
         };
         parser.element_count += 1;
@@ -837,11 +875,11 @@ pub const Parser = struct {
         parser.pending_pos = 0;
     }
 
-    fn takeRequiredByte(parser: *Parser) ParseError!u8 {
+    inline fn takeRequiredByte(parser: *Parser) ParseError!u8 {
         return (try parser.takeOptionalByte()) orelse error.UnexpectedEof;
     }
 
-    fn peekOptionalByte(parser: *Parser) ParseError!?u8 {
+    inline fn peekOptionalByte(parser: *Parser) ParseError!?u8 {
         if (parser.lookahead) |byte| return byte;
         if (parser.pending_pos < parser.pending_len) return parser.pending[parser.pending_pos];
 
@@ -866,7 +904,7 @@ pub const Parser = struct {
         return byte;
     }
 
-    fn takeOptionalByte(parser: *Parser) ParseError!?u8 {
+    inline fn takeOptionalByte(parser: *Parser) ParseError!?u8 {
         if (parser.lookahead) |byte| {
             parser.lookahead = null;
             parser.last_byte_offset = parser.lookahead_offset;

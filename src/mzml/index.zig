@@ -181,7 +181,7 @@ pub const IndexValidator = struct {
                 validator.index_list_depth = element_depth;
                 validator.index_list_actual_offset = start.byte_offset;
                 validator.saw_index_elements = true;
-                const count_attr = xml_events.attributeByLocalName(start.attributes, "count");
+                const count_attr = start.attr("count");
                 validator.index_list_declared_count = if (count_attr) |c|
                     std.fmt.parseUnsigned(u64, c, 10) catch null
                 else
@@ -191,7 +191,7 @@ pub const IndexValidator = struct {
                 if (validator.index_list_depth == null) return;
                 if (element_depth != validator.index_list_depth.? + 1) return;
                 validator.index_list_actual_count += 1;
-                const name = xml_events.attributeByLocalName(start.attributes, "name") orelse {
+                const name = start.attr("name") orelse {
                     try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
                     return;
                 };
@@ -206,7 +206,7 @@ pub const IndexValidator = struct {
             },
             .offset => {
                 if (validator.current_index_kind == null) return;
-                const id_ref = xml_events.attributeByLocalName(start.attributes, "idRef") orelse {
+                const id_ref = start.attr("idRef") orelse {
                     try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
                     return;
                 };
@@ -482,7 +482,7 @@ fn recordContainerOffset(
     start: StartElement,
     map: *std.StringHashMap(u64),
 ) !void {
-    const id = xml_events.attributeByLocalName(start.attributes, "id") orelse return;
+    const id = start.attr("id") orelse return;
     const owned = try validator.allocator.dupe(u8, id);
     errdefer validator.allocator.free(owned);
     const result = try map.getOrPut(owned);

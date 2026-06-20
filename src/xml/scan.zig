@@ -6,41 +6,7 @@
 const std = @import("std");
 
 const chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
-const mask_t = std.meta.Int(.unsigned, chunk_len);
-
-fn loadChunk(bytes: []const u8, offset: usize) @Vector(chunk_len, u8) {
-    var buf: [chunk_len]u8 = undefined;
-    @memcpy(&buf, bytes[offset..][0..chunk_len]);
-    return buf;
-}
-
-fn eqMask(eq: @Vector(chunk_len, bool)) mask_t {
-    const lanes: [chunk_len]bool = eq;
-    var mask: mask_t = 0;
-    for (lanes, 0..) |lane, i| {
-        if (lane) mask |= @as(mask_t, 1) << @intCast(i);
-    }
-    return mask;
-}
-
-fn firstIndexOfAny(bytes: []const u8, needles: []const u8) ?usize {
-    var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk = loadChunk(bytes, offset);
-        var chunk_mask: mask_t = 0;
-        for (needles) |needle| {
-            chunk_mask |= eqMask(chunk == @as(@Vector(chunk_len, u8), @splat(needle)));
-        }
-        if (chunk_mask != 0) return offset + @ctz(chunk_mask);
-        offset += chunk_len;
-    }
-    while (offset < bytes.len) : (offset += 1) {
-        for (needles) |needle| {
-            if (bytes[offset] == needle) return offset;
-        }
-    }
-    return null;
-}
+const V = @Vector(chunk_len, u8);
 
 fn isWhitespaceByte(byte: u8) bool {
     return switch (byte) {
@@ -49,27 +15,43 @@ fn isWhitespaceByte(byte: u8) bool {
     };
 }
 
-/// Leading ASCII whitespace run length (SIMD on the slice path).
+// Returns the first occurrence of any needle byte in `bytes`, or null.
+// Uses direct vector loads + firstTrue (movemask + tzcnt equivalent).
+fn firstIndexOfAny(bytes: []const u8, needles: []const u8) ?usize {
+    var offset: usize = 0;
+    while (offset + chunk_len <= bytes.len) {
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        var combined: @Vector(chunk_len, bool) = @splat(false);
+        for (needles) |needle| {
+            combined = combined | (chunk == @as(V, @splat(needle)));
+        }
+        if (std.simd.firstTrue(combined)) |pos| return offset + pos;
+        offset += chunk_len;
+    }
+    for (bytes[offset..], 0..) |b, i| {
+        for (needles) |n| {
+            if (b == n) return offset + i;
+        }
+    }
+    return null;
+}
+
+/// Leading ASCII whitespace run length. Uses firstTrue (movemask + tzcnt equivalent).
 pub fn skipWhitespaceRun(bytes: []const u8) usize {
     var offset: usize = 0;
     while (offset + chunk_len <= bytes.len) {
-        const chunk = loadChunk(bytes, offset);
-        var all_whitespace = true;
-        const lanes: [chunk_len]u8 = @bitCast(chunk);
-        for (lanes) |byte| {
-            if (!isWhitespaceByte(byte)) {
-                all_whitespace = false;
-                break;
-            }
-        }
-        if (!all_whitespace) {
-            while (offset < bytes.len and isWhitespaceByte(bytes[offset])) : (offset += 1) {}
-            return offset;
-        }
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        const is_ws = (chunk == @as(V, @splat(' '))) |
+            (chunk == @as(V, @splat('\t'))) |
+            (chunk == @as(V, @splat('\r'))) |
+            (chunk == @as(V, @splat('\n')));
+        if (std.simd.firstTrue(!is_ws)) |pos| return offset + pos;
         offset += chunk_len;
     }
-    while (offset < bytes.len and isWhitespaceByte(bytes[offset])) : (offset += 1) {}
-    return offset;
+    for (bytes[offset..], 0..) |b, i| {
+        if (!isWhitespaceByte(b)) return offset + i;
+    }
+    return bytes.len;
 }
 
 const name_terminators = [_]u8{ ' ', '\t', '\r', '\n', '/', '>', '=', '?', '"', '\'' };

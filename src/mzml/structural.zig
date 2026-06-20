@@ -1086,7 +1086,7 @@ pub const StructuralValidator = struct {
     }
 
     fn parseCountAttribute(validator: *StructuralValidator, start: StartElement, label: []const u8) ?usize {
-        const value = xml_events.attributeByLocalName(start.attributes, "count") orelse return null;
+        const value = start.attr("count") orelse return null;
         return std.fmt.parseUnsigned(usize, value, 10) catch {
             validator.countError(start.byte_offset, invalidCountMessage(label)) catch {};
             return null;
@@ -1220,7 +1220,7 @@ pub const StructuralValidator = struct {
 
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
         _ = element_label;
-        const value = xml_events.attributeByLocalName(start.attributes, attribute_name) orelse return;
+        const value = start.attr(attribute_name) orelse return;
         if (std.fmt.parseUnsigned(usize, value, 10) catch null) |_| return;
         const message = if (value.len > 0 and value[0] == '-')
             "attribute must not be negative"

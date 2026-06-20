@@ -184,9 +184,58 @@ pub const SemanticValidator = struct {
     pub fn consumeStart(validator: *SemanticValidator, start: StartElement) !void {
         const tag = start.resolvedId();
 
+        var pa: ?[]const u8 = null;
+        var cvr: ?[]const u8 = null;
+        var ua: ?[]const u8 = null;
+        var ucr: ?[]const u8 = null;
+        var un: ?[]const u8 = null;
+        if (tag == .cvParam or tag == .userParam) {
+            if (start.raw_tag.len > 0) {
+                var pos: usize = 0;
+                const bytes = start.raw_tag;
+                while (pos < bytes.len) {
+                    while (pos < bytes.len and switch (bytes[pos]) {
+                        ' ', '\t', '\r', '\n' => true,
+                        else => false,
+                    }) : (pos += 1) {}
+                    if (pos >= bytes.len) break;
+                    const ns = pos;
+                    while (pos < bytes.len and bytes[pos] != '=' and !std.ascii.isWhitespace(bytes[pos])) : (pos += 1) {}
+                    if (pos >= bytes.len or bytes[pos] != '=') break;
+                    const attr_name = bytes[ns..pos];
+                    pos += 1;
+                    if (pos >= bytes.len) break;
+                    const q = bytes[pos];
+                    if (q != '"' and q != '\'') break;
+                    pos += 1;
+                    const vs = pos;
+                    while (pos < bytes.len and bytes[pos] != q) : (pos += 1) {}
+                    const attr_val = bytes[vs..pos];
+                    if (pos < bytes.len) pos += 1;
+                    if (std.mem.eql(u8, attr_name, "accession")) {
+                        pa = attr_val;
+                    } else if (std.mem.eql(u8, attr_name, "cvRef")) {
+                        cvr = attr_val;
+                    } else if (std.mem.eql(u8, attr_name, "unitAccession")) {
+                        ua = attr_val;
+                    } else if (std.mem.eql(u8, attr_name, "unitCvRef")) {
+                        ucr = attr_val;
+                    } else if (std.mem.eql(u8, attr_name, "unitName")) {
+                        un = attr_val;
+                    }
+                }
+            } else {
+                pa = start.attr("accession");
+                cvr = start.attr("cvRef");
+                ua = start.attr("unitAccession");
+                ucr = start.attr("unitCvRef");
+                un = start.attr("unitName");
+            }
+        }
+
         switch (tag) {
             .cv => {
-                if (xml_events.attributeByLocalName(start.attributes, "id")) |id| {
+                if (start.attr("id")) |id| {
                     const owned = try validator.allocator.dupe(u8, id);
                     validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
                 }
@@ -217,7 +266,7 @@ pub const SemanticValidator = struct {
                 pos += start.name.local_name.len;
                 const cur_path = path_buf[0..pos];
 
-                if (xml_events.attributeByLocalName(start.attributes, "id")) |id| {
+                if (start.attr("id")) |id| {
                     if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
                         try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
@@ -240,7 +289,7 @@ pub const SemanticValidator = struct {
 
         switch (tag) {
             .cvParam, .userParam => {
-                if (xml_events.attributeByLocalName(start.attributes, "accession")) |acc| {
+                if (pa) |acc| {
                     if (validator.scope_terms.items.len > 0) {
                         const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
                         const owned = try validator.allocator.dupe(u8, acc);
@@ -255,7 +304,7 @@ pub const SemanticValidator = struct {
 
                 switch (tag) {
                     .referenceableParamGroup => {
-                        const id_attr = xml_events.attributeByLocalName(start.attributes, "id");
+                        const id_attr = start.attr("id");
                         if (validator.current_group_id) |old_id| {
                             validator.allocator.free(old_id);
                         }
@@ -266,7 +315,7 @@ pub const SemanticValidator = struct {
                         }
                     },
                     .referenceableParamGroupRef => {
-                        if (xml_events.attributeByLocalName(start.attributes, "ref")) |ref_id| {
+                        if (start.attr("ref")) |ref_id| {
                             if (validator.param_groups.get(ref_id)) |group_terms| {
                                 if (validator.scope_terms.items.len >= 2) {
                                     const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
@@ -286,8 +335,8 @@ pub const SemanticValidator = struct {
             },
         }
 
-        const accession = xml_events.attributeByLocalName(start.attributes, "accession") orelse return;
-        const cv_ref = if (xml_events.attributeByLocalName(start.attributes, "cvRef")) |ref|
+        const accession = pa orelse return;
+        const cv_ref = if (cvr) |ref|
             ref
         else if (tag == .userParam) blk: {
             const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
@@ -346,9 +395,9 @@ pub const SemanticValidator = struct {
         }
 
         // Unit term validation.
-        if (xml_events.attributeByLocalName(start.attributes, "unitAccession")) |unit_acc| {
-            const unit_cv_ref = xml_events.attributeByLocalName(start.attributes, "unitCvRef");
-            const unit_name = xml_events.attributeByLocalName(start.attributes, "unitName");
+        if (ua) |unit_acc| {
+            const unit_cv_ref = ucr;
+            const unit_name = un;
 
             if (validator.cv_table.lookup(unit_acc)) |unit_term| {
                 if (unit_cv_ref) |ref| {
