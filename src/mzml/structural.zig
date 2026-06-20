@@ -1250,6 +1250,7 @@ pub const StructuralValidator = struct {
     }
 
     fn nestingError(validator: *StructuralValidator, byte_offset: u64, message: []const u8) !void {
+        @branchHint(.cold);
         try validator.appendDiagnostic(.{
             .severity = .@"error",
             .rule = RuleId.mzml_structure_nesting,
@@ -1260,6 +1261,7 @@ pub const StructuralValidator = struct {
     }
 
     fn appendDiagnostic(validator: *StructuralValidator, item: Diagnostic) !void {
+        @branchHint(.cold);
         try validator.diagnostics.append(validator.allocator, item);
     }
 };

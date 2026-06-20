@@ -26,7 +26,7 @@ const StartElement = xml_events.StartElement;
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
-const base64_simd_chunk_len = 32;
+const base64_simd_chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
 const base64_scalar_short_len = 64;
 const flate_buffer_len = 1024 * 1024;
 const libdeflate_default_output_limit = 256 * 1024 * 1024;
@@ -1039,6 +1039,7 @@ pub const BinaryValidator = struct {
     }
 
     fn appendDiagnostic(validator: *BinaryValidator, item: Diagnostic) !void {
+        @branchHint(.cold);
         try validator.diagnostics.append(validator.allocator, item);
     }
 };

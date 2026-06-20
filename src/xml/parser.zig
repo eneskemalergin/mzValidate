@@ -173,7 +173,10 @@ pub const Parser = struct {
             parser.resetEventStorage();
 
             const first_byte = (try parser.takeOptionalByte()) orelse {
-                if (parser.element_count != 0) return error.UnexpectedEof;
+                if (parser.element_count != 0) {
+                    @branchHint(.cold);
+                    return error.UnexpectedEof;
+                }
                 return null;
             };
             const start_offset = parser.last_byte_offset;
@@ -189,10 +192,12 @@ pub const Parser = struct {
             switch (markup) {
                 '/' => return try parser.parseEndElement(start_offset),
                 '?' => {
+                    @branchHint(.cold);
                     try parser.skipProcessingInstruction();
                     continue;
                 },
                 '!' => {
+                    @branchHint(.cold);
                     if (try parser.handleBangMarkup(start_offset)) |event| return event;
                     continue;
                 },

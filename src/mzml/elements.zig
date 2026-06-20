@@ -73,16 +73,21 @@ pub const ElementId = enum(u7) {
     userParam,
 };
 
+const element_map = blk: {
+    const fields = std.meta.fields(ElementId);
+    var kv: [fields.len]struct { []const u8, ElementId } = undefined;
+    var i: usize = 0;
+    for (fields) |f| {
+        if (std.mem.eql(u8, f.name, "unknown")) continue;
+        kv[i] = .{ f.name, @field(ElementId, f.name) };
+        i += 1;
+    }
+    break :blk std.StaticStringMap(ElementId).initComptime(kv[0..i]);
+};
+
 /// Maps a local name to an intern ID, or `.unknown` when unrecognized.
 pub fn idFromLocalName(local_name: []const u8) ElementId {
-    inline for (std.meta.fields(ElementId)) |field| {
-        if (!std.mem.eql(u8, field.name, "unknown") and
-            std.mem.eql(u8, local_name, field.name))
-        {
-            return @field(ElementId, field.name);
-        }
-    }
-    return .unknown;
+    return element_map.get(local_name) orelse .unknown;
 }
 
 /// Like `idFromLocalName`, but requires the mzML namespace URI.

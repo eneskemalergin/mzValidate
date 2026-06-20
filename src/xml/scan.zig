@@ -5,7 +5,8 @@
 
 const std = @import("std");
 
-const chunk_len = 32;
+const chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
+const mask_t = std.meta.Int(.unsigned, chunk_len);
 
 fn loadChunk(bytes: []const u8, offset: usize) @Vector(chunk_len, u8) {
     var buf: [chunk_len]u8 = undefined;
@@ -13,11 +14,11 @@ fn loadChunk(bytes: []const u8, offset: usize) @Vector(chunk_len, u8) {
     return buf;
 }
 
-fn eqMask(eq: @Vector(chunk_len, bool)) u32 {
+fn eqMask(eq: @Vector(chunk_len, bool)) mask_t {
     const lanes: [chunk_len]bool = eq;
-    var mask: u32 = 0;
+    var mask: mask_t = 0;
     for (lanes, 0..) |lane, i| {
-        if (lane) mask |= @as(u32, 1) << @intCast(i);
+        if (lane) mask |= @as(mask_t, 1) << @intCast(i);
     }
     return mask;
 }
@@ -26,7 +27,7 @@ fn firstIndexOfAny(bytes: []const u8, needles: []const u8) ?usize {
     var offset: usize = 0;
     while (offset + chunk_len <= bytes.len) {
         const chunk = loadChunk(bytes, offset);
-        var chunk_mask: u32 = 0;
+        var chunk_mask: mask_t = 0;
         for (needles) |needle| {
             chunk_mask |= eqMask(chunk == @as(@Vector(chunk_len, u8), @splat(needle)));
         }
