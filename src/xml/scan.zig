@@ -71,15 +71,73 @@ pub fn textPlainRunLen(bytes: []const u8) usize {
 /// CDATA payload length before `]]>`, or `null` if unterminated.
 pub fn cdataContentLen(bytes: []const u8) ?usize {
     var offset: usize = 0;
-    while (offset < bytes.len) {
-        if (bytes[offset] != ']') {
-            offset += 1;
-            continue;
+    while (offset + chunk_len <= bytes.len) {
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        const is_bracket = chunk == @as(V, @splat(']'));
+        if (std.simd.firstTrue(is_bracket)) |pos| {
+            const abs_pos = offset + pos;
+            if (abs_pos + 2 < bytes.len and bytes[abs_pos + 1] == ']' and bytes[abs_pos + 2] == '>') {
+                return abs_pos;
+            }
+            offset = abs_pos + 1;
+        } else {
+            offset += chunk_len;
         }
-        if (offset + 2 < bytes.len and bytes[offset + 1] == ']' and bytes[offset + 2] == '>') {
-            return offset;
+    }
+    for (bytes[offset..], 0..) |b, i| {
+        if (b == ']' and offset + i + 2 < bytes.len and bytes[offset + i + 1] == ']' and bytes[offset + i + 2] == '>') {
+            return offset + i;
         }
-        offset += 1;
+    }
+    return null;
+}
+
+/// Position of `-->` in bytes, or `null` if unterminated.
+/// Returns the index of the first `-` in the terminating `-->`.
+pub fn commentEndLen(bytes: []const u8) ?usize {
+    var offset: usize = 0;
+    while (offset + chunk_len <= bytes.len) {
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        const is_dash = chunk == @as(V, @splat('-'));
+        if (std.simd.firstTrue(is_dash)) |pos| {
+            const abs_pos = offset + pos;
+            if (abs_pos + 2 < bytes.len and bytes[abs_pos + 1] == '-' and bytes[abs_pos + 2] == '>') {
+                return abs_pos;
+            }
+            offset = abs_pos + 1;
+        } else {
+            offset += chunk_len;
+        }
+    }
+    for (bytes[offset..], 0..) |b, i| {
+        if (b == '-' and offset + i + 2 < bytes.len and bytes[offset + i + 1] == '-' and bytes[offset + i + 2] == '>') {
+            return offset + i;
+        }
+    }
+    return null;
+}
+
+/// Position of `?>` in bytes, or `null` if unterminated.
+/// Returns the index of `?` in the terminating `?>`.
+pub fn piEndLen(bytes: []const u8) ?usize {
+    var offset: usize = 0;
+    while (offset + chunk_len <= bytes.len) {
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        const is_qmark = chunk == @as(V, @splat('?'));
+        if (std.simd.firstTrue(is_qmark)) |pos| {
+            const abs_pos = offset + pos;
+            if (abs_pos + 1 < bytes.len and bytes[abs_pos + 1] == '>') {
+                return abs_pos;
+            }
+            offset = abs_pos + 1;
+        } else {
+            offset += chunk_len;
+        }
+    }
+    for (bytes[offset..], 0..) |b, i| {
+        if (b == '?' and offset + i + 1 < bytes.len and bytes[offset + i + 1] == '>') {
+            return offset + i;
+        }
     }
     return null;
 }
@@ -148,4 +206,47 @@ test "attrValuePlainRunLen stops at quote or entity" {
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+test "cdataContentLen uses SIMD for large content" {
+    const buf = "abcd]]>" ++ "x";
+    try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(buf));
+
+    const unterminated = "no end marker here";
+    try std.testing.expectEqual(@as(?usize, null), cdataContentLen(unterminated));
+
+    const empty_slice: []const u8 = "";
+    try std.testing.expectEqual(@as(?usize, null), cdataContentLen(empty_slice));
+}
+
+test "commentEndLen finds terminator" {
+    // "comment text " = 13 chars, then "-->"
+    const terminated = "comment text -->more";
+    try std.testing.expectEqual(@as(?usize, 13), commentEndLen(terminated));
+
+    // stray `--` before the real `-->`: "a - b -- c " = 11 chars, then "-->"
+    const with_stray = "a - b -- c -->end";
+    try std.testing.expectEqual(@as(?usize, 11), commentEndLen(with_stray));
+
+    const unterminated = "no end marker";
+    try std.testing.expectEqual(@as(?usize, null), commentEndLen(unterminated));
+
+    const empty_slice: []const u8 = "";
+    try std.testing.expectEqual(@as(?usize, null), commentEndLen(empty_slice));
+}
+
+test "piEndLen finds terminator" {
+    // "processing instruction" = 22 chars, then "?>"
+    const terminated = "processing instruction?>more";
+    try std.testing.expectEqual(@as(?usize, 22), piEndLen(terminated));
+
+    // "version=\"1.0\" encoding=\"UTF-8\"" = 30 chars, then "?>"
+    const with_stray = "version=\"1.0\" encoding=\"UTF-8\"?>";
+    try std.testing.expectEqual(@as(?usize, 30), piEndLen(with_stray));
+
+    const unterminated = "no end marker";
+    try std.testing.expectEqual(@as(?usize, null), piEndLen(unterminated));
+
+    const empty_slice: []const u8 = "";
+    try std.testing.expectEqual(@as(?usize, null), piEndLen(empty_slice));
 }

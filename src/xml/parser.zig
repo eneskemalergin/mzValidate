@@ -511,6 +511,13 @@ pub const Parser = struct {
     }
 
     fn skipProcessingInstruction(parser: *Parser) ParseError!void {
+        if (parser.lookahead == null and parser.input == .slice) {
+            const slice = &parser.input.slice;
+            const tail = slice.bytes[slice.pos..];
+            const end = scan.piEndLen(tail) orelse return error.UnexpectedEof;
+            parser.consumeSliceBytes(end + 2);
+            return;
+        }
         while (true) {
             const byte = try parser.takeRequiredByte();
             if (byte == '?') {
@@ -525,6 +532,13 @@ pub const Parser = struct {
     }
 
     fn skipComment(parser: *Parser) ParseError!void {
+        if (parser.lookahead == null and parser.input == .slice) {
+            const slice = &parser.input.slice;
+            const tail = slice.bytes[slice.pos..];
+            const end = scan.commentEndLen(tail) orelse return error.UnexpectedEof;
+            parser.consumeSliceBytes(end + 3);
+            return;
+        }
         while (true) {
             const byte = try parser.takeRequiredByte();
             if (byte == '-') {
