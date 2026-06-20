@@ -182,19 +182,6 @@ zig build cli-contract        # Valid and invalid fixture checks
 zig build ci                  # test + cli-contract
 ```
 
-## Daily gate
-
-The `tools/` directory holds a reference-and-gate workflow: write a golden reference once, then on every dev iteration run `tools/gate` to see whether truth drifted or performance regressed. See `tools/README.md` for the full pipeline.
-
-```sh
-./tools/establish-reference                      # one-time: write the golden
-./tools/establish-reference --profile data/Fusion.mzML -- -d 30000 -i 3 -a 10 -w 1
-./tools/dev gate                                  # daily: build, truth, profile, cli-contract
-./tools/dev gate --skip-profile                   # truth only, fast feedback
-./tools/dev gate --plan                           # print what would run, then exit
-./tools/dev status                                # show what's in ref/, last run
-```
-
 ## Build steps
 
 | Command                            | What it does               |
