@@ -10,6 +10,10 @@
 //!   const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
 
 const std = @import("std");
+const xml_events = @import("../xml/events.zig");
+const xml_parser = @import("../xml/parser.zig");
+
+const Attribute = xml_events.Attribute;
 
 pub const RequirementLevel = enum(u8) {
     must,
@@ -79,8 +83,12 @@ pub const RuleEngine = struct {
     }
 };
 
-// Minimal XML parser for ms-mapping.xml. Handles only the subset needed:
-// <CvMappingRule>, <CvTerm>, and their attributes.
+// --- Parser internals ---
+
+// Walk the mapping document with the project's streaming XML parser and
+// collect rules. Single pass; comments and PIs are skipped by the parser.
+// Attribute slices borrow the parser's token buffer and are only valid
+// until the next event, so we dupe the strings we need to keep.
 fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
     var rules: std.ArrayList(MappingRule) = .empty;
     errdefer {
@@ -93,106 +101,141 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         rules.deinit(allocator);
     }
 
-    var pos: usize = 0;
-    while (pos < xml.len) {
-        // Skip whitespace and XML comments before each rule.
-        // Comments in the mapping file contain disabled rules (e.g. sourcefile_must)
-        // that must not be parsed.
-        while (true) {
-            // Skip whitespace before checking for comment marker.
-            while (pos < xml.len and switch (xml[pos]) {
-                ' ', '\n', '\r', '\t' => true,
-                else => false,
-            }) pos += 1;
-            if (std.mem.startsWith(u8, xml[pos..], "<!--")) {
-                const comment_end = std.mem.indexOfPos(u8, xml, pos, "-->") orelse break;
-                pos = comment_end + 3;
-            } else {
-                break;
-            }
-        }
+    var current_terms: ?std.ArrayList(MappingTerm) = null;
+    errdefer if (current_terms) |*t| {
+        for (t.items) |term| allocator.free(term.accession);
+        t.deinit(allocator);
+    };
 
-        // Find the next <CvMappingRule> tag (note: trailing space avoids matching <CvMappingRuleList>)
-        const rule_start = std.mem.indexOfPos(u8, xml, pos, "<CvMappingRule ") orelse break;
-        const rule_end = std.mem.indexOfPos(u8, xml, rule_start, ">") orelse break;
-        const rule_tag = xml[rule_start..rule_end];
+    // Buffers sized for ms-mapping.xml: max nesting ~6 (CvMapping >
+    // CvReferenceList/CvMappingRuleList > CvMappingRule > CvTerm), max
+    // attributes per element ~7. Generous slack for future schema
+    // additions.
+    var token: [4096]u8 = undefined;
+    var attributes: [16]Attribute = undefined;
+    var namespace_bindings: [16]xml_parser.NamespaceBinding = undefined;
+    var namespace_bytes: [4096]u8 = undefined;
+    var element_stack: [16]xml_parser.ElementFrame = undefined;
+    var element_bytes: [4096]u8 = undefined;
 
-        // Find the closing </CvMappingRule>
-        const close_start = std.mem.indexOfPos(u8, xml, rule_end, "</CvMappingRule>") orelse break;
-        const inner_start = rule_end + 1;
-        const inner_end = close_start;
+    const buffers = xml_parser.Buffers{
+        .token = &token,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    };
 
-        // Parse rule attributes
-        const id = extractAttr(rule_tag, "id=\"") orelse "";
-        const element_path = extractAttr(rule_tag, "scopePath=\"") orelse "";
-        const req_str = extractAttr(rule_tag, "requirementLevel=\"") orelse "";
-        const logic_str = extractAttr(rule_tag, "cvTermsCombinationLogic=\"") orelse "AND";
+    var parser = xml_parser.Parser.initSlice(xml, buffers);
 
-        const requirement: RequirementLevel = if (std.mem.eql(u8, req_str, "MUST")) .must else if (std.mem.eql(u8, req_str, "SHOULD")) .should else .may;
-        const logic: CombinationLogic = if (std.mem.eql(u8, logic_str, "AND")) .@"and" else .@"or";
+    // Owned strings for the in-progress rule. Reset to null after the
+    // rule's closing tag is processed.
+    var current_id: ?[]u8 = null;
+    var current_path: ?[]u8 = null;
+    var current_requirement: RequirementLevel = .may;
+    var current_logic: CombinationLogic = .@"and";
+    errdefer {
+        if (current_id) |id| allocator.free(id);
+        if (current_path) |p| allocator.free(p);
+    }
 
-        // Parse <CvTerm> children
-        var terms: std.ArrayList(MappingTerm) = .empty;
-        errdefer {
-            for (terms.items) |t| allocator.free(t.accession);
-            terms.deinit(allocator);
-        }
+    while (true) {
+        const event = parser.next() catch |err| return err;
+        const ev = event orelse break;
 
-        var inner_pos = inner_start;
-        while (inner_pos < inner_end) {
-            const term_start = std.mem.indexOfPos(u8, xml, inner_pos, "<CvTerm") orelse break;
-            if (term_start >= inner_end) break;
-            const term_close = std.mem.indexOfPos(u8, xml, term_start, ">") orelse break;
-            const is_self_closing = term_close > 0 and xml[term_close - 1] == '/';
-            const term_tag = xml[term_start..term_close];
-            if (is_self_closing) {
-                inner_pos = term_close + 1;
-            } else {
-                const close_tag = std.mem.indexOfPos(u8, xml, term_close, "</CvTerm>") orelse break;
-                inner_pos = close_tag + "</CvTerm>".len;
-            }
-            // TODO: also parse useTerm, useTermName, cvIdentifierRef from CvTerm.
-            // Needed for value validation and multi-CV mapping.
-            if (extractAttr(term_tag, "termAccession=\"")) |acc| {
-                const owned = try allocator.dupe(u8, acc);
-                const allow_children_str = extractAttr(term_tag, "allowChildren=\"");
-                const allow_children = if (allow_children_str) |s| std.mem.eql(u8, s, "true") else false;
-                const repeatable_str = extractAttr(term_tag, "isRepeatable=\"");
-                const is_repeatable = if (repeatable_str) |s| std.mem.eql(u8, s, "true") else false;
-                try terms.append(allocator, .{
-                    .accession = owned,
-                    .allow_children = allow_children,
-                    .is_repeatable = is_repeatable,
+        switch (ev) {
+            .start_element => |start| {
+                if (std.mem.eql(u8, start.name.local_name, "CvMappingRule")) {
+                    current_id = try dupeAttr(allocator, start.attributes, "id");
+                    current_path = try dupeAttr(allocator, start.attributes, "scopePath");
+                    current_requirement = parseRequirement(findAttr(start.attributes, "requirementLevel") orelse "");
+                    current_logic = parseLogic(findAttr(start.attributes, "cvTermsCombinationLogic") orelse "AND");
+
+                    if (current_terms != null) {
+                        // Stray <CvMappingRule> inside another; ignore.
+                        continue;
+                    }
+                    var terms: std.ArrayList(MappingTerm) = .empty;
+                    errdefer {
+                        for (terms.items) |term| allocator.free(term.accession);
+                        terms.deinit(allocator);
+                    }
+                    current_terms = terms;
+                } else if (std.mem.eql(u8, start.name.local_name, "CvTerm")) {
+                    if (current_terms == null) continue;
+                    const acc = findAttr(start.attributes, "termAccession") orelse continue;
+                    const owned = try allocator.dupe(u8, acc);
+                    errdefer allocator.free(owned);
+                    const allow_children = eqTrue(findAttr(start.attributes, "allowChildren"));
+                    const is_repeatable = eqTrue(findAttr(start.attributes, "isRepeatable"));
+                    try current_terms.?.append(allocator, .{
+                        .accession = owned,
+                        .allow_children = allow_children,
+                        .is_repeatable = is_repeatable,
+                    });
+                }
+            },
+            .end_element => |end| {
+                if (!std.mem.eql(u8, end.name.local_name, "CvMappingRule")) continue;
+                if (current_terms == null) continue;
+
+                const owned_terms = try current_terms.?.toOwnedSlice(allocator);
+                errdefer {
+                    for (owned_terms) |term| allocator.free(term.accession);
+                    allocator.free(owned_terms);
+                }
+                try rules.append(allocator, .{
+                    .id = current_id.?,
+                    .element_path = current_path.?,
+                    .requirement = current_requirement,
+                    .logic = current_logic,
+                    .terms = owned_terms,
                 });
-            }
+
+                // Rule is now owned by `rules`; release the in-progress state.
+                current_terms = null;
+                current_id = null;
+                current_path = null;
+            },
+            .text => {},
         }
-
-        const owned_terms = try terms.toOwnedSlice(allocator);
-        rules.append(allocator, .{
-            .id = try allocator.dupe(u8, id),
-            .element_path = try allocator.dupe(u8, element_path),
-            .requirement = requirement,
-            .logic = logic,
-            .terms = owned_terms,
-        }) catch |err| {
-            for (owned_terms) |t| allocator.free(t.accession);
-            allocator.free(owned_terms);
-            return err;
-        };
-
-        pos = close_start + "</CvMappingRule>".len;
     }
 
     return try rules.toOwnedSlice(allocator);
 }
 
-// Extracts a quoted attribute value from an XML tag.
-// e.g. extractAttr(`id="foo"`, `id="`) returns "foo".
-fn extractAttr(tag: []const u8, prefix: []const u8) ?[]const u8 {
-    const start = std.mem.indexOfPos(u8, tag, 0, prefix) orelse return null;
-    const value_start = start + prefix.len;
-    const end = std.mem.indexOfScalarPos(u8, tag, value_start, '"') orelse return null;
-    return tag[value_start..end];
+// Looks up an attribute by local name on a parsed start element.
+// Skips namespace declarations (xmlns, xmlns:foo) so they never match
+// a real attribute.
+fn findAttr(attrs: []const Attribute, local_name: []const u8) ?[]const u8 {
+    for (attrs) |attr| {
+        if (attr.is_namespace_declaration) continue;
+        if (std.mem.eql(u8, attr.name.local_name, local_name)) return attr.value;
+    }
+    return null;
+}
+
+// Dupe the value of an attribute for storage; the parser's token buffer
+// is invalidated by the next event.
+fn dupeAttr(allocator: std.mem.Allocator, attrs: []const Attribute, local_name: []const u8) ![]u8 {
+    const value = findAttr(attrs, local_name) orelse "";
+    return allocator.dupe(u8, value);
+}
+
+fn eqTrue(s: ?[]const u8) bool {
+    return if (s) |v| std.mem.eql(u8, v, "true") else false;
+}
+
+fn parseRequirement(s: []const u8) RequirementLevel {
+    if (std.mem.eql(u8, s, "MUST")) return .must;
+    if (std.mem.eql(u8, s, "SHOULD")) return .should;
+    return .may;
+}
+
+fn parseLogic(s: []const u8) CombinationLogic {
+    if (std.mem.eql(u8, s, "AND")) return .@"and";
+    return .@"or";
 }
 
 test "RuleEngine parses ms-mapping.xml" {
