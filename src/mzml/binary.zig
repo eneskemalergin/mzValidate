@@ -173,12 +173,7 @@ const StreamingBase64Counter = struct {
     }
 
     fn countTrueLanes(lanes: @Vector(base64_simd_chunk_len, bool)) usize {
-        const values: [base64_simd_chunk_len]bool = lanes;
-        var count: usize = 0;
-        for (values) |value| {
-            count += @intFromBool(value);
-        }
-        return count;
+        return @popCount(@as(std.meta.Int(.unsigned, base64_simd_chunk_len), @bitCast(lanes)));
     }
 
     fn result(self: *const @This()) error{InvalidBase64}!usize {
