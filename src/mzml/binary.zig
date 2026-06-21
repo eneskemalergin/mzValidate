@@ -12,6 +12,10 @@ const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
 const xml_parse_errors = @import("../xml/parse_errors.zig");
+
+// Optional libdeflate binding. When -Denable-libdeflate=true at build time
+// the C header is imported and libdeflate_* symbols become available; when
+// false the binding is an empty struct so dependent code stays valid.
 const libdeflate = if (build_options.enable_libdeflate) @cImport({
     @cInclude("libdeflate.h");
 }) else struct {};
@@ -22,6 +26,8 @@ const EndElement = xml_events.EndElement;
 const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
+
+// --- Constants and types ---
 
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_binary_token_bytes = 1024 * 1024;
@@ -66,8 +72,9 @@ const ArrayKind = enum {
     time,
 };
 
+// --- Base64 streaming codec ---
+
 // Tracks the decoded byte count of a base64 payload across chunked text events.
-// No decoded bytes are materialized. Whitespace is ignored per the mzML spec.
 const StreamingBase64Counter = struct {
     sig_len: usize = 0,
     padding: usize = 0,
@@ -306,6 +313,8 @@ const StreamingBase64Decoder = struct {
     }
 };
 
+// --- mzML element state ---
+
 const OwnerState = struct {
     depth: usize,
     index: ?usize,
@@ -352,6 +361,8 @@ const BinaryArrayState = struct {
         };
     }
 };
+
+// --- Public validator ---
 
 /// Base64, zlib, and length/precision checks for `binaryDataArray` payloads.
 pub const BinaryValidator = struct {

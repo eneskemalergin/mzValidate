@@ -28,6 +28,8 @@ const Diagnostic = diagnostic.Diagnostic;
 const RuleId = diagnostic.RuleId;
 const max_validation_token_bytes = 1024 * 1024;
 
+// --- Public entry points ---
+
 /// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
@@ -97,6 +99,8 @@ fn checkPathMapped(
     const index_bytes = if (options.skip_index) null else mm.memory;
     try checkSlice(allocator, io, mm.memory, diagnostics, path, options, index_bytes);
 }
+
+// --- Validation core ---
 
 const ParserSource = union(enum) {
     reader: *std.Io.Reader,
@@ -293,6 +297,8 @@ fn runValidation(
     try structural_validator.finish();
     if (binary_validator) |*validator| try validator.finish();
 }
+
+// --- Unit tests ---
 
 // Tests: file and reader entry points.
 

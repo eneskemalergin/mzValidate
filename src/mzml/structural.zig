@@ -29,8 +29,12 @@ const RuleId = diagnostic.RuleId;
 const Severity = diagnostic.Severity;
 const StartElement = xml_events.StartElement;
 
+// --- Constants ---
+
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_structural_token_bytes = 1024 * 1024;
+
+// --- Element slot enums ---
 
 const TopLevelSlot = enum(u8) {
     cv_list = 1,
@@ -86,6 +90,8 @@ const ComponentChildSlot = enum(u8) {
     detector = 3,
 };
 
+// --- Per-element state structs ---
+
 const ContainerState = struct {
     byte_offset: u64,
     depth: usize,
@@ -135,6 +141,8 @@ const ComponentListState = struct {
     detector_count: usize = 0,
     last_child_slot: u8 = 0,
 };
+
+// --- Public validator ---
 
 /// mzML 1.1 structural schema validator (nesting, order, required attributes).
 pub const StructuralValidator = struct {

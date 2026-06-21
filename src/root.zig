@@ -34,7 +34,6 @@ pub const xml = struct {
     pub const parser = @import("xml/parser.zig");
     pub const scan = @import("xml/scan.zig");
 };
-pub const io = struct {};
 /// mzML validators for focused tooling.
 pub const mzml = struct {
     pub const elements = @import("mzml/elements.zig");
