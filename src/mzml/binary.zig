@@ -987,49 +987,39 @@ pub const BinaryValidator = struct {
 
     fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory }!usize) {
         if (comptime build_options.enable_libdeflate) {
-            if (expected_decoded_bytes) |expected| {
-                if (expected <= validator.libdeflateOutputLimit()) {
-                    if (try validator.inflateWithLibdeflate(compressed, expected)) |decoded_bytes| {
-                        return decoded_bytes;
-                    }
+            const limit = validator.libdeflateOutputLimit();
+            const output_limit = expected_decoded_bytes orelse brk: {
+                const estimated = std.math.mul(usize, compressed.len, libdeflate_output_expansion_factor) catch break :brk limit;
+                break :brk @min(estimated, limit);
+            };
+            if (output_limit > 0 and output_limit <= limit) {
+                const decompressor = try validator.ensureLibdeflateDecompressor();
+                try validator.libdeflate_output.resize(validator.allocator, output_limit);
+
+                const deflate_input = if (compressed.len >= 6) compressed[2..compressed.len - 4] else compressed[0..0];
+
+                var actual_in: usize = 0;
+                var actual_out: usize = 0;
+                const result = libdeflate.libdeflate_deflate_decompress_ex(
+                    decompressor,
+                    deflate_input.ptr,
+                    deflate_input.len,
+                    validator.libdeflate_output.items.ptr,
+                    output_limit,
+                    &actual_in,
+                    &actual_out,
+                );
+
+                switch (result) {
+                    libdeflate.LIBDEFLATE_SUCCESS => if (actual_in == deflate_input.len) return actual_out,
+                    libdeflate.LIBDEFLATE_BAD_DATA => return error.InvalidBinaryPayload,
+                    else => {},
                 }
             }
         }
 
         try validator.flate_buffer.resize(validator.allocator, flate_buffer_len);
         return inflateCountWithBuffer(compressed, validator.flate_buffer.items);
-    }
-
-    fn inflateWithLibdeflate(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: usize) (error{ InvalidBinaryPayload, OutOfMemory }!?usize) {
-        if (comptime build_options.enable_libdeflate) {
-            const decompressor = try validator.ensureLibdeflateDecompressor();
-            try validator.libdeflate_output.resize(validator.allocator, expected_decoded_bytes);
-
-            var actual_in: usize = 0;
-            var actual_out: usize = 0;
-            const output_ptr = if (expected_decoded_bytes == 0) null else validator.libdeflate_output.items.ptr;
-            const result = libdeflate.libdeflate_zlib_decompress_ex(
-                decompressor,
-                compressed.ptr,
-                compressed.len,
-                output_ptr,
-                expected_decoded_bytes,
-                &actual_in,
-                &actual_out,
-            );
-
-            return switch (result) {
-                libdeflate.LIBDEFLATE_SUCCESS => if (actual_in == compressed.len and actual_out == expected_decoded_bytes)
-                    expected_decoded_bytes
-                else
-                    null,
-                libdeflate.LIBDEFLATE_BAD_DATA => error.InvalidBinaryPayload,
-                libdeflate.LIBDEFLATE_SHORT_OUTPUT, libdeflate.LIBDEFLATE_INSUFFICIENT_SPACE => null,
-                else => error.InvalidBinaryPayload,
-            };
-        }
-
-        unreachable;
     }
 
     fn libdeflateOutputLimit(validator: *const BinaryValidator) usize {

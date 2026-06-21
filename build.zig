@@ -1,28 +1,23 @@
-//! Build script for mzValidate.
-//!
-//! Key steps:
-//!   test          - run all unit tests
-//!   cli-contract  - run the binary against valid and expected-invalid fixtures
-//!   ci            - test + cli-contract
-//!   run           - execute the binary directly
-
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
-    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Enable libdeflate zlib decode acceleration (auto-detected if not set)") orelse detectLibdeflate(b);
-
-    // --- Library and executable ---
+    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Use vendored libdeflate for zlib decompression (default: true)") orelse true;
 
     const mzvalidate_mod = b.addModule("mzvalidate", .{
         .root_source_file = b.path("src/root.zig"),
         .target = target,
         .optimize = optimize,
     });
+
     const mzvalidate_options = b.addOptions();
     mzvalidate_options.addOption(bool, "enable_libdeflate", enable_libdeflate);
     mzvalidate_mod.addOptions("build_options", mzvalidate_options);
+
+    if (enable_libdeflate) {
+        addVendoredLibdeflateToModule(mzvalidate_mod, b, optimize, target);
+    }
 
     const exe = b.addExecutable(.{
         .name = "mzValidate",
@@ -36,23 +31,8 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    if (enable_libdeflate) {
-        linkLibdeflate(exe);
-    }
-
+    exe.lto = .full;
     b.installArtifact(exe);
-
-    // --- Run step ---
-
-    const run_step = b.step("run", "Run mzValidate");
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_step.dependOn(&run_cmd.step);
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
-
-    // --- Unit tests ---
 
     const mod_tests = b.addTest(.{
         .root_module = mzvalidate_mod,
@@ -64,12 +44,17 @@ pub fn build(b: *std.Build) void {
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
-    if (enable_libdeflate) {
-        linkLibdeflate(mod_tests);
-        linkLibdeflate(exe_tests);
+    const run_step = b.step("run", "Run mzValidate");
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_step.dependOn(&run_cmd.step);
+    if (b.args) |args| {
+        run_cmd.addArgs(args);
     }
 
-    // --- CLI contract ---
+    const test_step = b.step("test", "Run unit tests (library, CLI; GPA leak detection)");
+    test_step.dependOn(&run_mod_tests.step);
+    test_step.dependOn(&run_exe_tests.step);
 
     const valid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/valid") catch @panic("failed to collect valid mzML fixtures");
     const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch @panic("failed to collect invalid mzML fixtures");
@@ -93,61 +78,58 @@ pub fn build(b: *std.Build) void {
     cli_invalid_cmd.expectExitCode(2);
     cli_invalid_cmd.expectStdOutMatch("status=errors-present info=0 warnings=0 errors=");
 
-    // --- Build steps ---
-
-    const test_step = b.step("test", "Run unit tests (library, CLI; GPA leak detection)");
-    test_step.dependOn(&run_mod_tests.step);
-    test_step.dependOn(&run_exe_tests.step);
-
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
     cli_contract_step.dependOn(&cli_invalid_cmd.step);
-
-    const legacy_cli_step = b.step("test-cli", "Alias for cli-contract");
-    legacy_cli_step.dependOn(cli_contract_step);
 
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
 }
 
-/// Appends each fixture path as a CLI argument to `run`.
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
     for (fixtures) |fixture| run.addArg(fixture);
 }
 
-fn linkLibdeflate(compile: *std.Build.Step.Compile) void {
-    compile.root_module.linkSystemLibrary("c", .{});
-    compile.root_module.linkSystemLibrary("deflate", .{});
-}
+fn addVendoredLibdeflateToModule(mod: *std.Build.Module, b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.Build.ResolvedTarget) void {
+    mod.linkSystemLibrary("c", .{});
+    mod.addIncludePath(b.path("vendor/libdeflate"));
+    mod.addIncludePath(b.path("vendor/libdeflate/lib"));
 
-/// Auto-detect libdeflate by checking for common library locations.
-/// Returns true if libdeflate is found, false otherwise.
-/// TODO: This is pretty stupid but for my own purposes will do.
-fn detectLibdeflate(b: *std.Build) bool {
-    const io = b.graph.io;
-    const search_paths = [_][]const u8{
-        "/usr/lib/x86_64-linux-gnu/libdeflate.so",
-        "/usr/lib/x86_64-linux-gnu/libdeflate.so.0",
-        "/usr/lib/x86_64-linux-gnu/libdeflate.a",
-        "/usr/lib/libdeflate.so",
-        "/usr/lib/libdeflate.so.0",
-        "/usr/lib/libdeflate.a",
-        "/usr/local/lib/libdeflate.so",
-        "/usr/local/lib/libdeflate.so.0",
-        "/usr/local/lib/libdeflate.a",
+    const opt = switch (optimize) {
+        .Debug => "-Og",
+        .ReleaseSafe => "-O2",
+        .ReleaseFast, .ReleaseSmall => "-O3",
     };
 
-    for (search_paths) |path| {
-        std.Io.Dir.accessAbsolute(io, path, .{}) catch continue;
-        return true;
-    }
+    const march: []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => "-march=x86-64-v2",
+        .aarch64 => "-march=armv8-a",
+        else => "",
+    };
 
-    return false;
+    const common_flags = &.{ opt, march };
+
+    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = common_flags });
+    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = common_flags });
+    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = common_flags });
+
+    switch (target.result.cpu.arch) {
+        .x86_64 => {
+            const adler32_flags = &.{ opt, march, "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI" };
+            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = adler32_flags });
+            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = common_flags });
+        },
+        .aarch64, .arm => {
+            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = common_flags });
+            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = common_flags });
+        },
+        else => {
+            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = common_flags });
+        },
+    }
 }
 
-/// Walks `root`, collects paths of all `.mzML` files, and returns them sorted.
-/// Build allocator owns all strings; no cleanup needed.
 fn collectMzmlFixturePaths(b: *std.Build, root: []const u8) ![]const []const u8 {
     const io = b.graph.io;
     var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
