@@ -184,14 +184,14 @@ zig build ci                  # test + cli-contract
 
 ## Build steps
 
-| Command                            | What it does               |
-| ---------------------------------- | -------------------------- |
-| `zig build`                        | Build debug binary         |
-| `zig build -Doptimize=ReleaseFast` | Build release binary       |
-| `zig build test`                   | Run all unit tests         |
-| `zig build cli-contract`           | Run CLI contract tests     |
-| `zig build ci`                     | test + cli-contract        |
-| `zig build run -- check file.mzML` | Build and run              |
+| Command                            | What it does           |
+| ---------------------------------- | ---------------------- |
+| `zig build`                        | Build debug binary     |
+| `zig build -Doptimize=ReleaseFast` | Build release binary   |
+| `zig build test`                   | Run all unit tests     |
+| `zig build cli-contract`           | Run CLI contract tests |
+| `zig build ci`                     | test + cli-contract    |
+| `zig build run -- check file.mzML` | Build and run          |
 
 ## Roadmap
 
