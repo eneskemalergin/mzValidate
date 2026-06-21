@@ -34,6 +34,12 @@ const Declaration = struct {
 };
 
 // A *Ref attribute encountered before its target id was declared.
+const ScopeItem = struct {
+    accession: []const u8,
+    /// Whether `accession` was heap-allocated and must be freed.
+    owned: bool,
+};
+
 const UnresolvedRef = struct {
     ref_attr: []const u8,
     ref_value: []const u8,
@@ -130,7 +136,7 @@ pub const SemanticValidator = struct {
     element_names: std.ArrayList([]const u8),
 
     // Per-scope term accessions collected for contradiction detection.
-    scope_terms: std.ArrayList(std.ArrayList([]const u8)),
+    scope_terms: std.ArrayList(std.ArrayList(ScopeItem)),
 
     // Reference resolution table.
     ref_table: RefTable,
@@ -149,7 +155,7 @@ pub const SemanticValidator = struct {
             .path = path,
             .cv_refs = std.StringHashMap(void).init(allocator),
             .element_names = std.ArrayList([]const u8).empty,
-            .scope_terms = std.ArrayList(std.ArrayList([]const u8)).empty,
+            .scope_terms = std.ArrayList(std.ArrayList(ScopeItem)).empty,
             .ref_table = RefTable.init(allocator),
             .param_groups = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
         };
@@ -162,7 +168,7 @@ pub const SemanticValidator = struct {
         for (validator.element_names.items) |name| validator.allocator.free(name);
         validator.element_names.deinit(validator.allocator);
         for (validator.scope_terms.items) |*list| {
-            for (list.items) |item| validator.allocator.free(item);
+            for (list.items) |item| if (item.owned) validator.allocator.free(item.accession);
             list.deinit(validator.allocator);
         }
         validator.scope_terms.deinit(validator.allocator);
@@ -292,15 +298,20 @@ pub const SemanticValidator = struct {
                 if (pa) |acc| {
                     if (validator.scope_terms.items.len > 0) {
                         const list = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
-                        const owned = try validator.allocator.dupe(u8, acc);
-                        list.append(validator.allocator, owned) catch validator.allocator.free(owned);
+                        const on_slice = start.raw_tag.len > 0;
+                        if (on_slice) {
+                            try list.append(validator.allocator, .{ .accession = acc, .owned = false });
+                        } else {
+                            const owned = try validator.allocator.dupe(u8, acc);
+                            list.append(validator.allocator, .{ .accession = owned, .owned = true }) catch validator.allocator.free(owned);
+                        }
                     }
                 }
             },
             else => {
                 const owned = try validator.allocator.dupe(u8, start.name.local_name);
                 try validator.element_names.append(validator.allocator, owned);
-                try validator.scope_terms.append(validator.allocator, std.ArrayList([]const u8).empty);
+                try validator.scope_terms.append(validator.allocator, std.ArrayList(ScopeItem).empty);
 
                 switch (tag) {
                     .referenceableParamGroup => {
@@ -317,15 +328,15 @@ pub const SemanticValidator = struct {
                     .referenceableParamGroupRef => {
                         if (start.attr("ref")) |ref_id| {
                             if (validator.param_groups.get(ref_id)) |group_terms| {
-                                if (validator.scope_terms.items.len >= 2) {
-                                    const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
-                                    for (group_terms.items) |acc| {
-                                        const owned_acc = try validator.allocator.dupe(u8, acc);
-                                        parent.append(validator.allocator, owned_acc) catch {
-                                            validator.allocator.free(owned_acc);
-                                            return;
-                                        };
-                                    }
+                            if (validator.scope_terms.items.len >= 2) {
+                                const parent = &validator.scope_terms.items[validator.scope_terms.items.len - 2];
+                                for (group_terms.items) |acc| {
+                                    const owned_acc = try validator.allocator.dupe(u8, acc);
+                                    parent.append(validator.allocator, .{ .accession = owned_acc, .owned = true }) catch {
+                                        validator.allocator.free(owned_acc);
+                                        return;
+                                    };
+                                }
                                 }
                             }
                         }
@@ -478,7 +489,7 @@ pub const SemanticValidator = struct {
         const scope = &validator.scope_terms.items[validator.scope_terms.items.len - 1];
         validator.scope_terms.items.len -= 1;
         defer {
-            for (scope.items) |item| validator.allocator.free(item);
+            for (scope.items) |item| if (item.owned) validator.allocator.free(item.accession);
             scope.deinit(validator.allocator);
         }
 
@@ -493,8 +504,8 @@ pub const SemanticValidator = struct {
                             for (term_list.items) |t| validator.allocator.free(t);
                             term_list.deinit(validator.allocator);
                         }
-                        for (scope.items) |acc| {
-                            const owned = try validator.allocator.dupe(u8, acc);
+                        for (scope.items) |item| {
+                            const owned = try validator.allocator.dupe(u8, item.accession);
                             try term_list.append(validator.allocator, owned);
                         }
                         validator.param_groups.put(owned_id, term_list) catch {
@@ -519,9 +530,9 @@ pub const SemanticValidator = struct {
             for (rule.terms) |rt| {
                 for (scope.items) |st| {
                     const is_match = if (rt.allow_children)
-                        validator.cv_table.isDescendantOf(st, rt.accession)
+                        validator.cv_table.isDescendantOf(st.accession, rt.accession)
                     else
-                        std.mem.eql(u8, st, rt.accession);
+                        std.mem.eql(u8, st.accession, rt.accession);
                     if (is_match) {
                         matched += 1;
                         break;
@@ -573,9 +584,9 @@ pub const SemanticValidator = struct {
                 for (scope.items) |st| {
                     for (r.terms) |rt| {
                         const is_match = if (rt.allow_children)
-                            validator.cv_table.isDescendantOf(st, rt.accession)
+                            validator.cv_table.isDescendantOf(st.accession, rt.accession)
                         else
-                            std.mem.eql(u8, st, rt.accession);
+                            std.mem.eql(u8, st.accession, rt.accession);
                         if (is_match) {
                             or_matched += 1;
                             break;
@@ -605,9 +616,16 @@ pub const SemanticValidator = struct {
 // Matching OpenMS behaviour: BTO, GO, PATO terms are not validated
 // because their ontologies are not embedded.
 fn isKnownExternalPrefix(prefix: []const u8) bool {
-    return std.mem.eql(u8, prefix, "BTO") or
-        std.mem.eql(u8, prefix, "GO") or
-        std.mem.eql(u8, prefix, "PATO");
+    if (prefix.len == 3) {
+        return prefix[0] == 'B' and prefix[1] == 'T' and prefix[2] == 'O';
+    }
+    if (prefix.len == 2) {
+        return prefix[0] == 'G' and prefix[1] == 'O';
+    }
+    if (prefix.len == 4) {
+        return prefix[0] == 'P' and prefix[1] == 'A' and prefix[2] == 'T' and prefix[3] == 'O';
+    }
+    return false;
 }
 
 // Extracts the namespace prefix from an accession string (e.g. "MS" from "MS:1000001").

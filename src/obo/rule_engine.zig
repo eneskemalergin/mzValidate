@@ -44,12 +44,25 @@ pub const MappingRule = struct {
 pub const RuleEngine = struct {
     allocator: std.mem.Allocator,
     rules: []MappingRule,
+    rule_map: std.StringHashMap([]const MappingRule),
 
     pub fn init(allocator: std.mem.Allocator, xml_text: []const u8) !RuleEngine {
-        return RuleEngine{
+        var engine = RuleEngine{
             .allocator = allocator,
             .rules = try parseRules(allocator, xml_text),
+            .rule_map = std.StringHashMap([]const MappingRule).init(allocator),
         };
+        errdefer engine.deinit();
+        // Build path-to-rules map. Rules are grouped by path in the XML.
+        var i: usize = 0;
+        while (i < engine.rules.len) {
+            const path = engine.rules[i].element_path;
+            const group_start = i;
+            i += 1;
+            while (i < engine.rules.len and std.mem.eql(u8, engine.rules[i].element_path, path)) : (i += 1) {}
+            try engine.rule_map.put(path, engine.rules[group_start..i]);
+        }
+        return engine;
     }
 
     pub fn deinit(engine: *RuleEngine) void {
@@ -60,26 +73,12 @@ pub const RuleEngine = struct {
             engine.allocator.free(rule.terms);
         }
         engine.allocator.free(engine.rules);
+        engine.rule_map.deinit();
     }
 
-    /// Linear scan to find rules for a given element path.
-    /// Returns a slice of the internal rules array that is invalidated
-    /// if the engine is mutated.
+    /// Look up rules for a given element path via hash map.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
-        var start: ?usize = null;
-        var end: usize = 0;
-        for (engine.rules, 0..) |rule, i| {
-            if (std.mem.eql(u8, rule.element_path, element_path)) {
-                if (start == null) start = i;
-                end = i + 1;
-            } else if (start != null) {
-                // Rules for the same path are grouped in the XML, so once
-                // we see a non-match after a match, we're done.
-                break;
-            }
-        }
-        if (start) |s| return engine.rules[s..end];
-        return &.{};
+        return engine.rule_map.get(element_path) orelse &.{};
     }
 };
 
