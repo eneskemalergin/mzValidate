@@ -1040,13 +1040,6 @@ pub const BinaryValidator = struct {
     }
 };
 
-// Streaming inflate: decompresses zlib data and returns the decoded byte count
-// without materializing the decompressed output. Uses a small stack buffer.
-fn inflateCount(compressed: []const u8) error{InvalidBinaryPayload}!usize {
-    var flate_buffer: [std.compress.flate.max_window_len]u8 = undefined;
-    return inflateCountWithBuffer(compressed, &flate_buffer);
-}
-
 fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{InvalidBinaryPayload}!usize {
     var input = std.Io.Reader.fixed(compressed);
     var decompress: std.compress.flate.Decompress = .init(&input, .zlib, flate_buffer);

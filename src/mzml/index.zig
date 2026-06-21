@@ -176,7 +176,23 @@ pub const IndexValidator = struct {
 
         switch (tag) {
             .spectrum => try recordContainerOffset(validator, start, &validator.spectrum_offsets),
+            .spectrumList => {
+                const count_attr = start.attr("count");
+                if (count_attr) |c| {
+                    if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
+                        try validator.spectrum_offsets.ensureTotalCapacity(@intCast(count));
+                    } else |_| {}
+                }
+            },
             .chromatogram => try recordContainerOffset(validator, start, &validator.chromatogram_offsets),
+            .chromatogramList => {
+                const count_attr = start.attr("count");
+                if (count_attr) |c| {
+                    if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
+                        try validator.chromatogram_offsets.ensureTotalCapacity(@intCast(count));
+                    } else |_| {}
+                }
+            },
             .indexList => {
                 validator.index_list_depth = element_depth;
                 validator.index_list_actual_offset = start.byte_offset;
