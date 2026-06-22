@@ -232,6 +232,7 @@ fn runCheck(
     check: CheckCommand,
 ) !u8 {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    try diagnostics.ensureTotalCapacity(allocator, 1024);
     defer diagnostics.deinit(allocator);
 
     for (check.inputs) |path| {

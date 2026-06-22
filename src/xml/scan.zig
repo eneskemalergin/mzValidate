@@ -54,11 +54,25 @@ pub fn skipWhitespaceRun(bytes: []const u8) usize {
     return bytes.len;
 }
 
-const name_terminators = [_]u8{ ' ', '\t', '\r', '\n', '/', '>', '=', '?', '"', '\'' };
-
 /// Run of XML name characters before a delimiter or end of slice.
 pub fn nameCharRunLen(bytes: []const u8) usize {
-    return firstIndexOfAny(bytes, &name_terminators) orelse bytes.len;
+    const spec = comptime [_]u8{ '/', '>', '=', '?', '"', '\'' };
+    var offset: usize = 0;
+    while (offset + chunk_len <= bytes.len) {
+        const chunk: V = bytes[offset..][0..chunk_len].*;
+        const is_whitespace_or_ctrl = chunk < @as(V, @splat('!'));
+        var combined = is_whitespace_or_ctrl;
+        inline for (spec) |c| {
+            combined = combined | (chunk == @as(V, @splat(c)));
+        }
+        if (std.simd.firstTrue(combined)) |pos| return offset + pos;
+        offset += chunk_len;
+    }
+    for (bytes[offset..], 0..) |b, i| {
+        if (b <= ' ' or b == '/' or b == '>' or b == '=' or b == '?' or b == '"' or b == '\'')
+            return offset + i;
+    }
+    return bytes.len;
 }
 
 const text_stops = [_]u8{ '<', '&' };
