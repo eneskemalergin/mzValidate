@@ -2,4 +2,4 @@
 //! Keep `semantic` in sync with `build.zig.zon` or the build breaks.
 
 /// Release version for `-version` and `build.zig` package metadata.
-pub const semantic = "0.1.3";
+pub const semantic = "0.1.4";
