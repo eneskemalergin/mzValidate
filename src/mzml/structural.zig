@@ -1405,7 +1405,7 @@ const test_events = @import("test_events.zig");
 test "structural validator accepts realistic one-spectrum mzML fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/clean-single-spectrum.mzML");
+    const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
@@ -1863,7 +1863,7 @@ test "structural validator repeated clean and broken runs do not accumulate diag
     const io = std.testing.io;
 
     // Arrange.
-    const clean_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/clean-single-spectrum.mzML");
+    const clean_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
     defer allocator.free(clean_fixture);
     const broken_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/wrong-namespace.mzML");
     defer allocator.free(broken_fixture);

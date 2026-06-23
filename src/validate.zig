@@ -324,7 +324,7 @@ test "checkPath_existingFile_runsStructuralValidationWhenSkippingBinary" {
     const io = std.testing.io;
 
     // Arrange.
-    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
     var temp_dir = std.testing.tmpDir(.{});
@@ -348,7 +348,7 @@ test "checkPath_existingFile_reportsCleanResultWhenStructureAndBinaryPass" {
     const io = std.testing.io;
 
     // Arrange.
-    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
     var temp_dir = std.testing.tmpDir(.{});
@@ -1483,7 +1483,7 @@ test "checkPath_repeated_clean_and_corrupt_runs_reset_diagnostics_between_invoca
     const io = std.testing.io;
 
     // Arrange.
-    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(clean_fixture);
     const corrupt_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(corrupt_fixture);

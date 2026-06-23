@@ -555,6 +555,29 @@ pub const SemanticValidator = struct {
             }
         }
 
+        // Non-repeatable term duplication (outside OR groups; OR-group
+        // duplicates are caught by contradiction detection above).
+        for (scope, 0..) |item, i| {
+            for (scope[0..i]) |earlier| {
+                if (std.mem.eql(u8, item.accession, earlier.accession)) {
+                    for (rules) |r| {
+                        for (r.terms) |rt| {
+                            if (!rt.is_repeatable and std.mem.eql(u8, rt.accession, item.accession)) {
+                                validator.diagnostics.append(validator.allocator, .{
+                                    .severity = .warning,
+                                    .rule = RuleId.mzml_cv_term_repeat,
+                                    .location = .{ .byte_offset = end.byte_offset },
+                                    .path = validator.path,
+                                    .message = "non-repeatable CV term appears more than once on the same element",
+                                }) catch {};
+                                return;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         // Contradiction: two alternatives from the same OR rule on one element.
         // A contradiction exists when:
         //   1. Two scope items match the same rule term which is

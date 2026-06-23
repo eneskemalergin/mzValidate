@@ -32,7 +32,9 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
-    exe.lto = .full;
+    if (optimize != .Debug) {
+        exe.lto = .full;
+    }
     b.installArtifact(exe);
 
     const mod_tests = b.addTest(.{
@@ -64,7 +66,7 @@ pub fn build(b: *std.Build) void {
     cli_valid_cmd.step.dependOn(b.getInstallStep());
     cli_valid_cmd.addArg("check");
     addFixtureArgs(cli_valid_cmd, valid_fixtures);
-    cli_valid_cmd.addArg("fixtures/examples/mzml/clean-single-spectrum.mzML");
+    cli_valid_cmd.addArg("fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
     cli_valid_cmd.addArg("-skip-semantic");
     cli_valid_cmd.addArg("-skip-index");
     cli_valid_cmd.addArg("-summary");

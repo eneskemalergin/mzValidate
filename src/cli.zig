@@ -698,7 +698,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_reports_aggregate_error_summary" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/examples/mzml/clean-single-spectrum.mzML",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "-summary",
     };
@@ -756,7 +756,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/examples/mzml/clean-single-spectrum.mzML",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
     };
 

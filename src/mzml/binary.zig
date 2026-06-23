@@ -374,6 +374,10 @@ pub const BinaryValidator = struct {
     chromatogram: ?OwnerState = null,
     binary_array: ?BinaryArrayState = null,
 
+    // Tracks which ArrayKinds have been seen within the current
+    // binaryDataArrayList. Bits: 0=mz, 1=intensity, 2=time.
+    seen_array_kinds: u3 = 0,
+
     /// Compressed zlib bytes decoded from base64 as text chunks arrive.
     /// Cleared with `clearRetainingCapacity` at the start of each binary element.
     compressed_payload: std.ArrayList(u8) = .empty,
@@ -702,6 +706,31 @@ pub const BinaryValidator = struct {
                 if (validator.binary_array) |*state| {
                     if (state.depth == element_depth) {
                         try validator.validateBinaryArray(state);
+
+                        // Check for duplicate array kind within this list.
+                        if (state.array_kind != .unknown) {
+                            const kind_bit: u3 = switch (state.array_kind) {
+                                .mz => 1 << 0,
+                                .intensity => 1 << 1,
+                                .time => 1 << 2,
+                                .unknown => unreachable,
+                            };
+                            if (validator.seen_array_kinds & kind_bit != 0) {
+                                try validator.appendDiagnostic(.{
+                                    .severity = .@"error",
+                                    .rule = RuleId.mzml_binary_type_mismatch,
+                                    .location = .{
+                                        .byte_offset = state.binary_byte_offset orelse state.byte_offset,
+                                        .spectrum_index = state.owner_spectrum_index,
+                                    },
+                                    .path = validator.path,
+                                    .message = "binaryDataArrayList contains duplicate array type",
+                                });
+                            } else {
+                                validator.seen_array_kinds |= kind_bit;
+                            }
+                        }
+
                         validator.maybeShrinkScratch();
                         validator.binary_array = null;
                     }
@@ -709,12 +738,18 @@ pub const BinaryValidator = struct {
             },
             .spectrum => {
                 if (validator.spectrum) |state| {
-                    if (state.depth == element_depth) validator.spectrum = null;
+                    if (state.depth == element_depth) {
+                        validator.spectrum = null;
+                        validator.seen_array_kinds = 0;
+                    }
                 }
             },
             .chromatogram => {
                 if (validator.chromatogram) |state| {
-                    if (state.depth == element_depth) validator.chromatogram = null;
+                    if (state.depth == element_depth) {
+                        validator.chromatogram = null;
+                        validator.seen_array_kinds = 0;
+                    }
                 }
             },
             .mzML => {
@@ -1105,7 +1140,7 @@ test "binary validator C.0 parity snapshots fixture diagnostics" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(clean_fixture);
     try expectBinaryDiagnosticsSnapshot(allocator, io, clean_fixture, &.{});
 
@@ -1335,7 +1370,7 @@ test "binary validator accepts clean single spectrum fixture" {
     const io = std.testing.io;
 
     // Arrange.
-    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
     // Act.
@@ -1747,7 +1782,7 @@ test "binary validator repeated clean and corrupt runs do not accumulate diagnos
     const io = std.testing.io;
 
     // Arrange.
-    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/clean-single-spectrum.mzML", allocator, .limited(64 * 1024));
+    const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(clean_fixture);
     const corrupt_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(corrupt_fixture);
