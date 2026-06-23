@@ -261,14 +261,21 @@ pub const SemanticValidator = struct {
             }
         } else {
             if (start.attr("id")) |id| {
-                if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
-                    try validator.diagnostics.append(validator.allocator, .{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_ref_duplicate_id,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "duplicate id",
-                    });
+                // Only register ids for elements that are xs:ID typed or
+                // xs:key constrained by the mzML schema.  <mzML> and <run>
+                // use plain xs:string with no key constraint and no *Ref
+                // attribute targets them, so skip them to avoid false
+                // duplicate-id errors when all three share the same value.
+                if (tag != .mzML and tag != .run) {
+                    if (!try validator.ref_table.declare(id, start.name.local_name, start.byte_offset)) {
+                        try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_ref_duplicate_id,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "duplicate id",
+                        });
+                    }
                 }
             }
 
@@ -549,31 +556,70 @@ pub const SemanticValidator = struct {
         }
 
         // Contradiction: two alternatives from the same OR rule on one element.
+        // A contradiction exists when:
+        //   1. Two scope items match the same rule term which is
+        //      is_repeatable=false (e.g., both positive and negative scan),
+        //   2. OR two scope items match different rule terms and at least
+        //      one has allow_children=false (specific alternatives).
+        // Terms with is_repeatable=true are broad categories that can
+        // legitimately have multiple children (e.g., "selection window
+        // attribute" with upper and lower limits).
         if (scope.len >= 2) {
             for (rules) |r| {
                 if (r.logic != .@"or") continue;
                 var or_matched: usize = 0;
+                var first_term: ?usize = null;
                 for (scope) |st| {
-                    for (r.terms) |rt| {
+                    for (r.terms, 0..) |rt, i| {
                         const is_match = if (rt.allow_children)
                             validator.cv_table.isDescendantOf(st.accession, rt.accession)
                         else
                             std.mem.eql(u8, st.accession, rt.accession);
                         if (is_match) {
                             or_matched += 1;
+                            if (first_term) |idx| {
+                                if (i == idx) {
+                                    // Same term matched twice.
+                                    if (!rt.is_repeatable) {
+                                        validator.diagnostics.append(validator.allocator, .{
+                                            .severity = .warning,
+                                            .rule = RuleId.mzml_cv_contradiction,
+                                            .location = .{ .byte_offset = end.byte_offset },
+                                            .path = validator.path,
+                                            .message = "element has contradictory CV terms",
+                                        }) catch {};
+                                        return;
+                                    }
+                                }
+                            } else {
+                                first_term = i;
+                            }
                             break;
                         }
                     }
                 }
                 if (or_matched > 1) {
-                    validator.diagnostics.append(validator.allocator, .{
-                        .severity = .warning,
-                        .rule = RuleId.mzml_cv_contradiction,
-                        .location = .{ .byte_offset = end.byte_offset },
-                        .path = validator.path,
-                        .message = "element has contradictory CV terms",
-                    }) catch {};
-                    return;
+                    // Multiple different terms matched. Only a contradiction if
+                    // any term uses allow_children=false (specific alternatives).
+                    // When all terms use allow_children=true, they represent
+                    // independent attribute categories that can coexist.
+                    var all_allow_children = true;
+                    for (r.terms) |rt| {
+                        if (!rt.allow_children) {
+                            all_allow_children = false;
+                            break;
+                        }
+                    }
+                    if (!all_allow_children) {
+                        validator.diagnostics.append(validator.allocator, .{
+                            .severity = .warning,
+                            .rule = RuleId.mzml_cv_contradiction,
+                            .location = .{ .byte_offset = end.byte_offset },
+                            .path = validator.path,
+                            .message = "element has contradictory CV terms",
+                        }) catch {};
+                        return;
+                    }
                 }
             }
         }
