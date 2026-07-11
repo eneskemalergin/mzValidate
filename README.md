@@ -19,12 +19,13 @@
 
 ---
 
-Validates mzML files in a single streaming pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree in memory, no full-file buffer, no external dependencies. Single binary, no runtime required.
+Validates mzML files in a single streaming pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree in memory, no external dependencies at runtime. Single binary, no JVM or Python stack required.
 
 - No JVM, no Python, no .NET, no libxml2
-- Streaming XML parser in one forward pass, predictable memory use
+- Streaming XML parser in one forward pass
+- Input is mmap'd today, so peak RSS tracks file size (see Performance). Next: stream by default, mmap when the file fits
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
-- Zlib arrays validated through streaming inflate, no output buffer needed
+- Zlib arrays validated through streaming inflate with bounded scratch buffers
 - Uses CPU vector instructions for faster base64 scanning
 - 205 unit tests, CLI contract tests, adversarial edge cases, and randomly generated inputs
 
@@ -42,19 +43,42 @@ Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
 
 ## Installation
 
-Build from source. Requires Zig 0.16.0 (bundled at `./zig-0.16.0/zig`).
+Build from source. You need **Zig 0.16.0** exactly. Other Zig versions will not work.
+
+1. Get Zig 0.16.0 from the [Zig download page](https://ziglang.org/download/#release-0.16.0) for your OS and CPU.
+2. Put the `zig` binary on your `PATH` (or call it by full path).
+3. Check the version:
+
+```sh
+zig version
+# 0.16.0
+```
+
+Then:
 
 ```sh
 git clone https://github.com/eneskemalergin/mzValidate.git
 cd mzValidate
-./zig-0.16.0/zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 ```
 
-The binary is at `zig-out/bin/mzValidate`. The default build bundles a fast zlib library called libdeflate via `-lc` (links the system C runtime, available on every OS). Use `-Denable-libdeflate=false` for a standalone binary with zero system dependencies.
+The binary is at `zig-out/bin/mzValidate`. The default build bundles libdeflate via `-lc` (system C runtime). Use `-Denable-libdeflate=false` for a standalone binary with no system C dependency.
+
+If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. (This is how I work with Zig on my projects. Keeps many copies but at least I know which one I am using and I can change it easily.)
+
+**Linux x86_64 local-copy example:**
+
+```sh
+curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
+tar xf zig-x86_64-linux-0.16.0.tar.xz
+mv zig-x86_64-linux-0.16.0 zig-0.16.0
+rm zig-x86_64-linux-0.16.0.tar.xz
+./zig-0.16.0/zig version
+```
 
 ## CLI reference
 
-```
+```bash
 mzValidate check [flags] <paths...>
 ```
 
@@ -82,17 +106,32 @@ Informational:
 
 ## Performance
 
-Benchmarked on a 642 MB Fusion file (172k spectra, all zlib) with `tools/bench`. ReleaseFast build, 5 runs, 10-second warmup. Stages are additive from the Struct baseline.
+ReleaseFast build, one Linux host, warm page cache, July 2026. Two real files. Not release gates.
 
-| Stage                     | Wall time  | vs Struct | Throughput    |
-| ------------------------- | ---------- | --------- | ------------- |
-| Struct (XML + schema)     | 1.08 s     | baseline  | 592 MiB/s     |
-| + Binary (base64 + zlib)  | 2.16 s     | +1.08 s   | 297 MiB/s     |
-| + Index (offsets + SHA-1) | 2.24 s     | +1.15 s   | 287 MiB/s     |
-| + Semantic (CV + refs)    | 1.91 s     | +0.82 s   | 337 MiB/s     |
-| **Full** (all stages)     | **4.23 s** | -         | **152 MiB/s** |
+| File                   |    Size | Spectra | Full validation | Peak RSS |
+| ---------------------- | ------: | ------: | --------------: | -------: |
+| Fusion (indexed, zlib) | 642 MiB |    ~86k |           4.1 s | ~720 MiB |
+| Astral (plain, zlib)   | 2.1 GiB |    ~44k |          10.3 s | ~2.2 GiB |
 
-RSS at full validation: 720 MiB (mostly the memory-mapped file at 642 MiB, plus the CV term table at ~9 MiB and per-spectrum ID tables).
+Fusion stage breakdown (separate runs on the same file):
+
+| Stage                     | Wall time |
+| ------------------------- | --------: |
+| Structural (XML + schema) |     1.1 s |
+| + Binary (base64 + zlib)  |     2.1 s |
+| + Index (offsets + SHA-1) |     2.2 s |
+| + Semantic (CV + refs)    |     1.8 s |
+| **Full** (all stages)     | **4.1 s** |
+
+On Fusion, most of the ~720 MiB RSS is the mmap'd file (~642 MiB). Validator state adds about 80 MiB. On Astral, full validation hits ~2.2 GiB RSS because the 2.1 GiB plain file stays resident. Binary work is most of the Astral runtime (~8 s of ~10 s).
+
+### Memory
+
+The default path mmap's the input, or reads the whole file into heap if mapping fails. The parser walks that slice. There is no bounded streaming mode yet.
+
+One 2 GiB file is fine if the machine has the RAM. Many large files in parallel is a different story. Each process can hold most of its input resident, and Linux does not always reclaim those pages quickly under load. Do not multiply single-file wall time by core count and assume a cohort will finish in that time.
+
+> Working toward: stream as the default input path, with mmap kept for files that fit in memory.
 
 ## Format support
 
@@ -105,7 +144,6 @@ Each format validated against its published specification. No XSD embedded or re
 | **SDRF-Proteomics** 1.1.0 | planned | planned    | -       | -       | planned  |
 | **imzML** 1.0             | planned | planned    | planned | -       | planned  |
 | **mzIdentML** 1.2         | planned | planned    | -       | planned | planned  |
-
 
 ## Validation
 
@@ -187,19 +225,21 @@ Four renderers from the same diagnostic list. Text mode for interactive use. JSO
 - Text token buffer is 1 MiB, reused across all events
 - Binary scratch buffers are cleared between arrays without reallocating
 - No per-spectrum accumulation: state is discarded after each element's end event
-- Semantic ID table grows with spectrum count (the only unbounded piece)
+- Semantic ID table grows with spectrum count
+- Input file is mmap'd or read whole today; stream-default with optional mmap is the next input work
 
 ## Build steps
 
-- `zig build`: build debug binary
-- `zig build -Doptimize=ReleaseFast`: build release binary
-- `zig build test`: run all unit tests with leak detection
-- `zig build cli-contract`: run tests that verify the CLI produces correct output and exit codes on known fixtures
+- `zig build`: debug binary
+- `zig build -Doptimize=ReleaseFast`: release binary
+- `zig build test`: unit tests with leak detection
+- `zig build cli-contract`: CLI output and exit-code tests on known fixtures
 - `zig build ci`: test + cli-contract
 - `zig build run -- check file.mzML`: build and run
 
 ## Roadmap
 
+- Stream as default input; mmap when the file fits
 - Conformance score for CI integration (`mzValidate score`)
 - Quick summary statistics (`mzValidate stats`)
 - Auto-repair common mzML issues (`mzValidate check --fix`)
