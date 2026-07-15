@@ -36,6 +36,7 @@ const libdeflate = if (build_options.enable_libdeflate) struct {
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
 const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
@@ -393,7 +394,7 @@ const BinaryArrayState = struct {
 /// Base64, zlib, and length/precision checks for `binaryDataArray` payloads.
 pub const BinaryValidator = struct {
     allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: ?[]const u8,
     limits: diagnostic.ResourceLimits = .{},
     max_binary_size: ?usize = null,
@@ -421,7 +422,7 @@ pub const BinaryValidator = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) BinaryValidator {
         return .{
@@ -501,7 +502,7 @@ pub const BinaryValidator = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         reader: *std.Io.Reader,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) !void {
         try validateReaderWithLimits(allocator, io, reader, diagnostics, path, .{});
@@ -511,7 +512,7 @@ pub const BinaryValidator = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         reader: *std.Io.Reader,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         limits: diagnostic.ResourceLimits,
     ) !void {
@@ -1281,7 +1282,7 @@ pub const BinaryValidator = struct {
 
     fn appendDiagnostic(validator: *BinaryValidator, item: Diagnostic) !void {
         @branchHint(.cold);
-        try validator.diagnostics.append(validator.allocator, item);
+        _ = try validator.diagnostics.append(validator.allocator, item);
     }
 };
 
@@ -1504,7 +1505,7 @@ test "binary validator C.0 parity snapshots decision order edge cases" {
         "<binary>eJxjYGBgAAAABAAB</binary>" ++
         "</binaryDataArray></binaryDataArrayList></spectrum>" ++
         "</spectrumList></run></mzML>";
-    var no_default_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var no_default_diagnostics: DiagnosticSink = .empty;
     defer no_default_diagnostics.deinit(allocator);
     try std.testing.expectError(
         error.ResourceLimitExceeded,
@@ -1531,7 +1532,7 @@ test "binary validator rejects non-empty chromatogram without array length" {
         "<binary>AAAAAA==</binary></binaryDataArray>" ++
         "</binaryDataArrayList></chromatogram></chromatogramList></run></mzML>";
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectError(
@@ -1749,7 +1750,7 @@ test "binary validator reports fallback decoded limit" {
     var limits = diagnostic.ResourceLimits{};
     limits.max_binary_decoded_bytes = 4;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectError(
@@ -1765,7 +1766,7 @@ test "binary validator reports fallback decoded limit" {
 
 test "binary scratch accounting enforces the configured capacity" {
     const allocator = std.testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = BinaryValidator.init(allocator, &diagnostics, "fixture");
@@ -1841,7 +1842,7 @@ test "binary validator reports invalid zlib payload" {
 test "binary validator cvParam with unknown intern id still records zlib compression" {
     const allocator = std.testing.allocator;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = BinaryValidator.init(allocator, &diagnostics, null);
@@ -2191,7 +2192,7 @@ test "binary validator repeated clean and corrupt runs do not accumulate diagnos
     const corrupt_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(corrupt_fixture);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2208,8 +2209,8 @@ test "binary validator repeated clean and corrupt runs do not accumulate diagnos
     }
 }
 
-fn runBinaryValidation(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) !std.ArrayList(Diagnostic) {
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+fn runBinaryValidation(allocator: std.mem.Allocator, io: std.Io, fixture: []const u8) !DiagnosticSink {
+    var diagnostics: DiagnosticSink = .empty;
     try runBinaryValidationInto(allocator, io, fixture, &diagnostics);
     return diagnostics;
 }
@@ -2218,7 +2219,7 @@ fn runBinaryValidationInto(
     allocator: std.mem.Allocator,
     io: std.Io,
     fixture: []const u8,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
 ) !void {
     diagnostics.clearRetainingCapacity();
     var reader = std.Io.Reader.fixed(fixture);
@@ -2229,7 +2230,7 @@ fn runBinaryValidationIntoWithLimits(
     allocator: std.mem.Allocator,
     io: std.Io,
     fixture: []const u8,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     limits: diagnostic.ResourceLimits,
 ) !void {
     diagnostics.clearRetainingCapacity();
@@ -2305,7 +2306,7 @@ test "binary validator oversized payload produces diagnostic" {
     // Fixture with encodedLength=8 but limit of 1.
     const xml = minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576");
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = BinaryValidator{
@@ -2348,7 +2349,7 @@ test "binary validator oversized limit is inclusive" {
     // encodedLength=8 exactly equals limit of 8 → should pass.
     const xml = minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576");
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = BinaryValidator{
@@ -2404,7 +2405,7 @@ test "binary validator rejects huge encodedLength before zlib reservation" {
         "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000574\"/>" ++
         "<binary/></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectError(error.ResourceLimitExceeded, runBinaryValidationInto(allocator, io, fixture, &diagnostics));
@@ -2416,7 +2417,7 @@ test "binary validator reports count-width multiplication overflow" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectError(
@@ -2446,7 +2447,7 @@ test "binary validator rejects zlib decoded size above output cap" {
     const io = std.testing.io;
     const oversized_count = (diagnostic.ResourceLimits{}).max_binary_decoded_bytes / 4 + 1;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectError(

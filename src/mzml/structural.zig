@@ -21,6 +21,7 @@ const xml_parse_errors = @import("../xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
 const Event = xml_events.Event;
 const ParseError = xml_parser.ParseError;
@@ -147,7 +148,7 @@ const ComponentListState = struct {
 /// mzML 1.1 structural schema validator (nesting, order, required attributes).
 pub const StructuralValidator = struct {
     allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: ?[]const u8,
 
     // Bounded: spectra/chromatograms are discarded after their end element.
@@ -213,7 +214,7 @@ pub const StructuralValidator = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) StructuralValidator {
         return .{
@@ -231,7 +232,7 @@ pub const StructuralValidator = struct {
         allocator: std.mem.Allocator,
         io: std.Io,
         reader: *std.Io.Reader,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) !void {
         const token_buffer = try allocator.alloc(u8, max_structural_token_bytes);
@@ -1287,7 +1288,7 @@ pub const StructuralValidator = struct {
 
     fn appendDiagnostic(validator: *StructuralValidator, item: Diagnostic) !void {
         @branchHint(.cold);
-        try validator.diagnostics.append(validator.allocator, item);
+        _ = try validator.diagnostics.append(validator.allocator, item);
     }
 };
 
@@ -1426,7 +1427,7 @@ test "structural validator accepts realistic one-spectrum mzML fixture" {
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1440,7 +1441,7 @@ test "structural validator accepts indexed mzML PSI tiny fixture" {
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1460,7 +1461,7 @@ test "structural validator accepts valid chromatogram fixture" {
     );
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1469,7 +1470,7 @@ test "structural validator accepts valid chromatogram fixture" {
 
 test "structural validator cvParam with unknown intern id does not report unrecognized element" {
     const allocator = std.testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = StructuralValidator.init(allocator, &diagnostics, null);
@@ -1499,7 +1500,7 @@ test "structural validator reports missing required top-level mzML children" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1534,7 +1535,7 @@ test "structural validator reports missing required run and spectrumList attribu
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1548,7 +1549,7 @@ test "structural validator reports missing required run and spectrumList attribu
 
 test "structural validator reports missing required reference element attributes" {
     const allocator = std.testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = StructuralValidator.init(allocator, &diagnostics, null);
@@ -1587,7 +1588,7 @@ test "structural validator reports out of order top-level child" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1613,7 +1614,7 @@ test "structural validator reports duplicate top-level child" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1645,7 +1646,7 @@ test "structural validator reports spectrumList count mismatch" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1670,7 +1671,7 @@ test "structural validator reports top-level list count mismatch" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1695,7 +1696,7 @@ test "structural validator reports malformed count attribute values" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1728,7 +1729,7 @@ test "structural validator reports scanList minimum child violation" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1759,7 +1760,7 @@ test "structural validator reports binaryDataArrayList minimum child violation" 
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1785,7 +1786,7 @@ test "structural validator reports optional top-level list minimum child violati
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1801,7 +1802,7 @@ test "structural validator reports wrong root namespace" {
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1816,7 +1817,7 @@ test "structural validator reports missing binaryDataArrayList" {
     defer allocator.free(fixture);
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1837,7 +1838,7 @@ test "structural validator reports mzml missing run child" {
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1865,7 +1866,7 @@ test "structural validator reports binaryDataArrayList nested directly under run
         "</mzML>";
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1889,7 +1890,7 @@ test "structural validator reports chromatogram child ordering violations" {
     );
 
     var reader = std.Io.Reader.fixed(fixture);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
@@ -1910,7 +1911,7 @@ test "structural validator repeated clean and broken runs do not accumulate diag
     const broken_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/wrong-namespace.mzML");
     defer allocator.free(broken_fixture);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1929,7 +1930,7 @@ test "structural validator repeated clean and broken runs do not accumulate diag
 
 test "structural validator propagates diagnostic allocation failure" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
 
     var validator = StructuralValidator.init(failing_allocator.allocator(), &diagnostics, "fixture");
@@ -1942,7 +1943,7 @@ fn runStructuralValidationInto(
     allocator: std.mem.Allocator,
     io: std.Io,
     fixture: []const u8,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
 ) !void {
     diagnostics.clearRetainingCapacity();
     var reader = std.Io.Reader.fixed(fixture);

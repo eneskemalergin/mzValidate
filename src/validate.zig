@@ -25,6 +25,7 @@ const xml_parse_errors = @import("xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 const FailureReason = diagnostic.FailureReason;
 const FileResult = diagnostic.FileResult;
 const RuleId = diagnostic.RuleId;
@@ -97,23 +98,24 @@ pub const InvocationContext = struct {
     /// Validates one path using this invocation's immutable resources.
     pub fn validateOne(
         context: *InvocationContext,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: []const u8,
     ) FileResult {
+        diagnostics.configureFromResourceLimits(context.options.resource_limits);
         if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
 
         var result = FileResult.init(enabledStages(context.options));
-        const diagnostic_start = diagnostics.items.len;
+        const diagnostic_mark = diagnostics.mark();
         checkPathInternal(context, diagnostics, path, &result) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
-        result.finalize(diagnostics.items[diagnostic_start..]);
+        result.finalizeSink(diagnostics, diagnostic_mark);
         return result;
     }
 
     pub fn checkPathResult(
         context: *InvocationContext,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: []const u8,
     ) FileResult {
         return context.validateOne(diagnostics, path);
@@ -122,38 +124,40 @@ pub const InvocationContext = struct {
     pub fn checkSliceResult(
         context: *InvocationContext,
         bytes: []const u8,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: []const u8,
         file_bytes: ?[]const u8,
     ) FileResult {
+        diagnostics.configureFromResourceLimits(context.options.resource_limits);
         if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
 
         var result = FileResult.init(enabledStages(context.options));
-        const diagnostic_start = diagnostics.items.len;
+        const diagnostic_mark = diagnostics.mark();
         result.completeStage(.input);
         runValidation(context, diagnostics, path, file_bytes, .{ .slice = bytes }, &result, null, null) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
-        result.finalize(diagnostics.items[diagnostic_start..]);
+        result.finalizeSink(diagnostics, diagnostic_mark);
         return result;
     }
 
     pub fn checkReaderResult(
         context: *InvocationContext,
         reader: *std.Io.Reader,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: []const u8,
         file_bytes: ?[]const u8,
     ) FileResult {
+        diagnostics.configureFromResourceLimits(context.options.resource_limits);
         if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
 
         var result = FileResult.init(enabledStages(context.options));
-        const diagnostic_start = diagnostics.items.len;
+        const diagnostic_mark = diagnostics.mark();
         result.completeStage(.input);
         runValidation(context, diagnostics, path, file_bytes, .{ .reader = reader }, &result, null, null) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
-        result.finalize(diagnostics.items[diagnostic_start..]);
+        result.finalizeSink(diagnostics, diagnostic_mark);
         return result;
     }
 
@@ -209,11 +213,11 @@ pub const InvocationContext = struct {
 
     fn catalogFailureResult(
         context: *InvocationContext,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: []const u8,
     ) FileResult {
         var result = FileResult.init(enabledStages(context.options));
-        const diagnostic_start = diagnostics.items.len;
+        const diagnostic_mark = diagnostics.mark();
         result.beginStage(.semantic);
         const failure = context.catalog_failure.?;
         appendFailureDiagnostic(
@@ -229,7 +233,7 @@ pub const InvocationContext = struct {
                 .message = failure.message,
             },
         ) catch |err| recordUnhandledFailure(&result, err, path);
-        result.finalize(diagnostics.items[diagnostic_start..]);
+        result.finalizeSink(diagnostics, diagnostic_mark);
         return result;
     }
 };
@@ -243,7 +247,7 @@ pub const ValidationError = error{
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
 ) ValidationError!void {
@@ -255,7 +259,7 @@ pub fn checkPath(
 pub fn checkPathResult(
     allocator: std.mem.Allocator,
     io: std.Io,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
 ) FileResult {
@@ -266,7 +270,7 @@ pub fn checkPathResult(
 
 fn checkPathInternal(
     context: *InvocationContext,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
 ) !void {
@@ -353,7 +357,7 @@ fn checkPathMapped(
     context: *InvocationContext,
     file: std.Io.File,
     initial_stat: std.Io.File.Stat,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
     comptime map_create: anytype,
@@ -404,7 +408,7 @@ fn checkPathStream(
     context: *InvocationContext,
     file: std.Io.File,
     initial_stat: std.Io.File.Stat,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
 ) !void {
@@ -428,7 +432,7 @@ fn checkFileStability(
     context: *InvocationContext,
     file: std.Io.File,
     initial_stat: std.Io.File.Stat,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
 ) !void {
@@ -447,7 +451,7 @@ fn checkFileStability(
 
 fn appendFileStabilityDiagnostic(
     context: *InvocationContext,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     result: *FileResult,
     path: []const u8,
     message: []const u8,
@@ -469,7 +473,7 @@ fn appendFileStabilityDiagnostic(
 
 fn appendModeFailureDiagnostic(
     context: *InvocationContext,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     result: *FileResult,
     path: []const u8,
     message: []const u8,
@@ -501,7 +505,7 @@ pub fn checkSlice(
     allocator: std.mem.Allocator,
     io: std.Io,
     bytes: []const u8,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
@@ -515,7 +519,7 @@ pub fn checkSliceResult(
     allocator: std.mem.Allocator,
     io: std.Io,
     bytes: []const u8,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
@@ -530,7 +534,7 @@ pub fn checkReader(
     allocator: std.mem.Allocator,
     io: std.Io,
     reader: *std.Io.Reader,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
@@ -544,7 +548,7 @@ pub fn checkReaderResult(
     allocator: std.mem.Allocator,
     io: std.Io,
     reader: *std.Io.Reader,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
@@ -556,7 +560,7 @@ pub fn checkReaderResult(
 
 fn runValidation(
     context: *InvocationContext,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: []const u8,
     file_bytes: ?[]const u8,
     source: ParserSource,
@@ -814,17 +818,18 @@ fn recordUnhandledFailure(result: *FileResult, err: anyerror, path: []const u8) 
 
 fn appendFailureDiagnostic(
     allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     result: *FileResult,
     stage: ValidationStage,
     reason: FailureReason,
     item: Diagnostic,
 ) !void {
-    diagnostics.append(allocator, item) catch |err| {
+    const emitted = diagnostics.append(allocator, item) catch |err| {
         result.recordEmergencyFailure(stage, .allocation, item.path);
         return err;
     };
-    result.recordFailure(stage, reason, item.rule, item.message, item.location, item.path, true);
+    result.recordFailure(stage, reason, item.rule, item.message, item.location, item.path, emitted);
+    if (!emitted) result.failure_diagnostic_counted = true;
 }
 
 fn expectAllocationFailuresIncomplete(
@@ -834,7 +839,7 @@ fn expectAllocationFailuresIncomplete(
     sampled: bool,
 ) !void {
     var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
-    var baseline_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var baseline_diagnostics: DiagnosticSink = .empty;
     const baseline = checkSliceResult(
         baseline_allocator.allocator(),
         std.testing.io,
@@ -852,7 +857,7 @@ fn expectAllocationFailuresIncomplete(
     for (0..allocation_count) |fail_index| {
         if (sampled and fail_index != 0 and fail_index != allocation_count / 2 and fail_index + 1 != allocation_count) continue;
         var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        var diagnostics: DiagnosticSink = .empty;
         const result = checkSliceResult(
             failing_allocator.allocator(),
             std.testing.io,
@@ -886,7 +891,7 @@ test "checkPath_missingFile_reportsOpenError" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -914,7 +919,7 @@ test "checkPath_streamMode_usesBoundedReaderPath" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "stream.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, path, .{
@@ -949,7 +954,7 @@ test "explicit mmap failure_reports_mode_error_without_fallback" {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const initial_stat = try file.stat(io);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var result = FileResult.init(enabledStages(context.options));
     result.beginStage(.input);
@@ -985,7 +990,7 @@ test "file stability check_rejects_changed_file" {
     const initial_stat = try file.stat(io);
     try temp_dir.dir.writeFile(io, .{ .sub_path = "changed.mzML", .data = "changed" });
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var context = InvocationContext.init(allocator, io, .{ .skip_semantic = true });
     defer context.deinit();
@@ -1018,7 +1023,7 @@ test "mapped validation_rejects_truncation_after_mapping" {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
     defer file.close(io);
     const initial_stat = try file.stat(io);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var result = FileResult.init(enabledStages(context.options));
     result.beginStage(.input);
@@ -1059,7 +1064,7 @@ test "checkPath_existingFile_runsStructuralValidationWhenSkippingBinary" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "sample.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1083,7 +1088,7 @@ test "checkPath_existingFile_reportsCleanResultWhenStructureAndBinaryPass" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "sample.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1109,7 +1114,7 @@ test "checkPath_indexedMzMLFixture_runsStructuralValidationWhenSkippingBinary" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "tiny-indexed.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1124,7 +1129,7 @@ test "checkPath_largeIndexedMzMLFixture_runsStructuralValidationWhenSkippingBina
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1139,7 +1144,7 @@ test "checkPath_indexedMzMLFixture_runsStructuralWhenSkippingIndex" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act. Skip index because the pwiz fixture has a bad checksum.
@@ -1154,7 +1159,7 @@ test "checkPath_semantic_end_to_end" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
@@ -1183,7 +1188,7 @@ test "checkSliceResult_semantic_limit_is_incomplete" {
         .resource_limits = .{ .max_semantic_bytes = 1 },
     });
     defer context.deinit();
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = context.checkSliceResult(xml, &diagnostics, "semantic-limit.mzML", null);
@@ -1197,7 +1202,7 @@ test "checkPath_indexed_fixture_runs_mapping_rules" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/indexed-mapping-missing.mzML", .{
@@ -1219,7 +1224,7 @@ test "checkPath_nonempty_binary_without_array_length_is_incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/adversarial/missing-default-array-length.mzML", .{
@@ -1247,7 +1252,7 @@ test "checkPath_missing_required_reference_emits_reference_rule" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/missing-required-reference.mzML", .{
@@ -1266,7 +1271,7 @@ test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1316,7 +1321,7 @@ test "checkPath_indexedSha_stream_noChecksumError" {
     defer allocator.free(path);
 
     // Act. Stream path: checksum is recomputed from the seekable source.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     const result = checkPathResult(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
@@ -1369,7 +1374,7 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
     defer allocator.free(path);
 
     // Act. Explicit mmap.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
@@ -1421,7 +1426,7 @@ test "checkPath_indexedSha_skipIndex_noShaCheck" {
     defer allocator.free(path);
 
     // Act. Skip-index: pure streaming, no SHA-1 at all.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
@@ -1449,7 +1454,7 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
     defer allocator.free(path);
 
     // Act.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
@@ -1494,7 +1499,7 @@ test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
     defer allocator.free(path);
 
     // Act.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
@@ -1510,7 +1515,7 @@ test "checkPath_indexed_skipIndex_noSha1Check" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act. Skip-index path: pure streaming, no SHA-1.
@@ -1553,7 +1558,7 @@ test "checkPath_indexed_missingChecksum_noError" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "no-checksum.mzML");
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1575,7 +1580,7 @@ test "checkPath_mmap_flag_onMissingFileReportsOpenError" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act. The open fails before input-mode selection starts.
@@ -1620,7 +1625,7 @@ test "checkPath_syntheticLargeMzMLFixture_runsCleanInOnePass" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "synthetic-large.mzML");
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -1633,7 +1638,7 @@ test "checkPath_syntheticLargeMzMLFixture_runsCleanInOnePass" {
 test "checkPath_stream_largeBinaryText_fixture_reportsLengthMismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/large-binary-text.mzML", .{
@@ -1684,7 +1689,7 @@ test "checkReader_truncated_xml_reports_exact_structure_xml_diagnostic" {
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -1706,7 +1711,7 @@ test "checkReader_truncated_xml_returns_incomplete_file_result" {
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run";
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -1727,7 +1732,7 @@ test "checkReader_clean_input_returns_complete_file_result" {
     const io = std.testing.io;
     const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -1748,7 +1753,7 @@ test "checkReader_out_of_memory_returns_incomplete_file_result" {
     const io = std.testing.io;
 
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
     var reader = std.Io.Reader.fixed("<mzML/>");
 
@@ -1793,7 +1798,7 @@ test "required-state allocation failures stay incomplete and leak-free" {
 test "failure diagnostic allocation uses the fixed emergency result" {
     const xml = "<?xml version=\"1.0\"?><mzML><run";
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
 
     const result = checkSliceResult(failing_allocator.allocator(), std.testing.io, xml, &diagnostics, "diagnostic-oom.mzML", .{
         .skip_binary = true,
@@ -1816,7 +1821,7 @@ test "checkPath_missing_catalog_returns_incomplete_file_result" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
@@ -1852,7 +1857,7 @@ test "InvocationContext_owns_catalog_across_multiple_paths" {
     try std.testing.expect(context.catalog != null);
     try temp_dir.dir.deleteFile(io, "psi-ms.obo");
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const first = context.validateOne(&diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
@@ -1868,7 +1873,7 @@ test "checkPath_incompatible_custom_vocabulary_is_non_clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
@@ -1887,7 +1892,7 @@ test "checkPath_invalid_zlib_returns_complete_result_with_error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/invalid/invalid-zlib.mzML", .{
@@ -1904,7 +1909,7 @@ test "checkPath_resource_limit_returns_incomplete_resource_result" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/adversarial/huge-count.mzML", .{
@@ -1935,7 +1940,7 @@ test "checkSlice_index_state_limit_returns_incomplete_resource_result" {
     );
     defer allocator.free(fixture);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const result = checkSliceResult(allocator, io, fixture, &diagnostics, "tiny-index-limit.mzML", .{
@@ -1953,7 +1958,7 @@ test "checkReader_legacy_wrapper_rejects_unreported_oom" {
     const io = std.testing.io;
 
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
     var reader = std.Io.Reader.fixed("<mzML/>");
 
@@ -1972,7 +1977,7 @@ test "checkReader_broken_attribute_quote_reports_malformed_xml_diagnostic" {
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run id=\"broken></run></mzML>";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -1999,7 +2004,7 @@ test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
     );
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2030,7 +2035,7 @@ test "checkReader_invalid_utf8_reports_exact_structure_xml_diagnostic" {
     );
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2057,7 +2062,7 @@ test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
         "</mzML>\n";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2084,7 +2089,7 @@ test "checkReader_text_before_root_reports_structure_xml_diagnostic" {
         "  </run>\n" ++
         "</mzML>\n";
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2119,7 +2124,7 @@ test "checkReader_prefixed_psi_namespace_root_runs_clean_when_skipping_binary" {
         "</ms:mzML>\n";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2142,7 +2147,7 @@ test "checkPath_chromatogram_binary_error_reports_exact_rule_without_spectrum_in
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "chromatogram-invalid-base64.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2196,7 +2201,7 @@ test "checkReader_repeated_clean_runs_do_not_accumulate_state" {
         "</mzML>\n";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2216,7 +2221,7 @@ test "checkReader_empty_spectrum_list_is_clean_when_skipping_binary" {
     const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2238,7 +2243,7 @@ test "checkReader_multiple_spectra_are_clean_when_structure_is_valid" {
     );
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2261,7 +2266,7 @@ test "checkReader_missing_binary_data_array_list_reports_exact_structure_rule" {
     );
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2291,7 +2296,7 @@ test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
         "</mzML>";
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2313,7 +2318,7 @@ test "checkReader_oversized_text_token_maps_parser_limit_to_structure_xml_diagno
     // Arrange.
     const xml = try oversizedAttributeValueMzml(allocator, max_validation_token_bytes + 1);
     defer allocator.free(xml);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2335,7 +2340,7 @@ test "checkReader_excessive_attribute_count_maps_parser_limit_to_structure_xml_d
     // Arrange.
     const xml = try tooManyAttributesXml(allocator, 65);
     defer allocator.free(xml);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2357,7 +2362,7 @@ test "checkReader_excessive_namespace_bindings_map_parser_limit_to_structure_xml
     // Arrange.
     const xml = try tooManyNamespacesXml(allocator, 33);
     defer allocator.free(xml);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2378,7 +2383,7 @@ test "checkReader_excessive_element_name_storage_maps_parser_limit_to_structure_
 
     const xml = try tooDeepXml(allocator, 129);
     defer allocator.free(xml);
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2405,7 +2410,7 @@ test "checkPath_existingFile_reportsStructuralErrorWithoutBinaryNoise" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "broken.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2431,7 +2436,7 @@ test "checkPath_existingFile_skips_binary_warning_when_structure_is_broken_and_s
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "broken.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2458,7 +2463,7 @@ test "checkPath_corruptBinary_reportsBinaryDiagnostic" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "corrupt-binary.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2482,7 +2487,7 @@ test "checkPath_corruptBinary_is_clean_when_skip_binary_is_enabled" {
     const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "corrupt-binary.mzML", fixture);
     defer allocator.free(path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2498,7 +2503,7 @@ test "checkReader_empty_binary_payload_reports_exact_length_mismatch" {
     const xml = binarySpectrumListMzml("", "AAAAAA==", 1, "MS:1000576");
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2519,7 +2524,7 @@ test "checkReader_valid_zlib_payload_with_wrong_declared_length_reports_exact_le
     const xml = binarySpectrumListMzml("eJxjYGBgAAAABAAB", "AAAAAAAAAAA=", 2, "MS:1000574");
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
@@ -2539,7 +2544,7 @@ test "checkPath_reports_conflictingCompression_fixture" {
     const io = std.testing.io;
 
     // Arrange.
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2551,7 +2556,7 @@ test "checkPath_reports_conflictingCompression_fixture" {
 test "checkPath_reports_unsupportedCompression_fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/unsupported-compression.mzML", .{ .skip_semantic = true });
 
@@ -2575,7 +2580,7 @@ test "checkPath_invalidMzMLBinaryCorpus_reportsExactRulePerFixture" {
 
     // Act.
     for (expectations) |expectation| {
-        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        var diagnostics: DiagnosticSink = .empty;
         defer diagnostics.deinit(allocator);
         try checkPath(allocator, io, &diagnostics, expectation.sub_path, .{ .skip_semantic = true });
 
@@ -2619,7 +2624,7 @@ test "checkPath_repeated_clean_and_corrupt_runs_reset_diagnostics_between_invoca
     const corrupt_path = try stageFixtureInTempDir(allocator, io, &temp_dir, "repeated-corrupt.mzML", corrupt_fixture);
     defer allocator.free(corrupt_path);
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Act.
@@ -2735,7 +2740,7 @@ fn expectCorpusDiagnostics(
     var walker = try corpus_dir.walk(allocator);
     defer walker.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var fixture_count: usize = 0;

@@ -30,6 +30,7 @@ pub const RuleId = struct {
     pub const runtime_file_stability = "runtime.file-stability";
     pub const runtime_catalog = "runtime.catalog";
     pub const runtime_semantic_limit = "runtime.semantic-limit";
+    pub const runtime_diagnostics_truncated = "runtime.diagnostics-truncated";
     pub const runtime_incomplete = "runtime.incomplete";
     pub const runtime_stub = "runtime.stub";
 
@@ -105,6 +106,8 @@ pub const ResourceLimits = struct {
     max_obo_line_bytes: usize = 1024 * 1024,
     max_obo_xref_accession_bytes: usize = 128,
     max_semantic_bytes: usize = 64 * 1024 * 1024,
+    max_diagnostics: usize = 4096,
+    max_rendered_bytes: usize = 4 * 1024 * 1024,
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.
@@ -136,6 +139,169 @@ pub const Diagnostic = struct {
     path: ?[]const u8 = null,
     message: []const u8,
 };
+
+/// Per-file borrowed diagnostic detail with fixed totals and explicit drops.
+pub const DiagnosticSink = struct {
+    items: []Diagnostic = &.{},
+    capacity: usize = 0,
+    totals: Totals = .{},
+    dropped: Totals = .{},
+    retained_bytes: usize = 0,
+    limits: Limits = .{},
+    configured: bool = false,
+
+    /// The byte limit uses a conservative escaped-output estimate.
+    pub const Limits = struct {
+        max_diagnostics: usize = 4096,
+        max_rendered_bytes: usize = 4 * 1024 * 1024,
+        retain_details: bool = true,
+    };
+
+    pub const Mark = struct {
+        item_len: usize,
+        totals: Totals,
+        dropped: Totals,
+    };
+
+    pub const empty: DiagnosticSink = .{
+        .limits = .{
+            .max_diagnostics = 4096,
+            .max_rendered_bytes = 4 * 1024 * 1024,
+            .retain_details = true,
+        },
+        .configured = false,
+    };
+
+    pub fn init(limits: Limits) DiagnosticSink {
+        return .{ .limits = limits, .configured = true };
+    }
+
+    pub fn configureFromResourceLimits(sink: *DiagnosticSink, resource_limits: ResourceLimits) void {
+        if (sink.configured) return;
+        sink.limits.max_diagnostics = resource_limits.max_diagnostics;
+        sink.limits.max_rendered_bytes = resource_limits.max_rendered_bytes;
+        sink.configured = true;
+    }
+
+    pub fn append(sink: *DiagnosticSink, allocator: std.mem.Allocator, item: Diagnostic) !bool {
+        if (!sink.limits.retain_details) {
+            sink.addTotal(item.severity);
+            return true;
+        }
+        const item_bytes = diagnosticBytes(item);
+        const count_limit = sink.items.len >= sink.limits.max_diagnostics;
+        const next_bytes = std.math.add(usize, sink.retained_bytes, item_bytes) catch {
+            sink.addDropped(item.severity);
+            return false;
+        };
+        if (count_limit or next_bytes > sink.limits.max_rendered_bytes) {
+            sink.addDropped(item.severity);
+            return false;
+        }
+
+        try sink.ensureTotalCapacity(allocator, sink.items.len + 1);
+        const index = sink.items.len;
+        sink.items.len += 1;
+        sink.items[index] = item;
+        sink.retained_bytes = next_bytes;
+        sink.addTotal(item.severity);
+        return true;
+    }
+
+    pub fn ensureTotalCapacity(sink: *DiagnosticSink, allocator: std.mem.Allocator, requested: usize) !void {
+        if (requested <= sink.capacity) return;
+        if (requested > sink.limits.max_diagnostics) return error.OutOfMemory;
+
+        const growth = std.math.add(usize, sink.capacity, sink.capacity / 2) catch std.math.maxInt(usize);
+        const grown = if (sink.capacity < 8) 8 else growth;
+        const new_capacity = @min(sink.limits.max_diagnostics, @max(requested, grown));
+        const old_memory = if (sink.capacity == 0) sink.items[0..0] else sink.items.ptr[0..sink.capacity];
+        const old_len = sink.items.len;
+        if (sink.capacity > 0) {
+            if (allocator.remap(old_memory, new_capacity)) |new_items| {
+                sink.items = new_items[0..old_len];
+                sink.capacity = new_items.len;
+                return;
+            }
+        }
+
+        const new_items = try allocator.alloc(Diagnostic, new_capacity);
+        @memcpy(new_items[0..sink.items.len], sink.items);
+        if (sink.capacity > 0) allocator.free(old_memory);
+        sink.items = new_items[0..old_len];
+        sink.capacity = new_capacity;
+    }
+
+    pub fn deinit(sink: *DiagnosticSink, allocator: std.mem.Allocator) void {
+        if (sink.capacity > 0) allocator.free(sink.items.ptr[0..sink.capacity]);
+        sink.* = .empty;
+    }
+
+    pub fn clearRetainingCapacity(sink: *DiagnosticSink) void {
+        sink.items.len = 0;
+        sink.totals = .{};
+        sink.dropped = .{};
+        sink.retained_bytes = 0;
+    }
+
+    pub fn mark(sink: *const DiagnosticSink) Mark {
+        return .{ .item_len = sink.items.len, .totals = sink.totals, .dropped = sink.dropped };
+    }
+
+    pub fn totalsSince(sink: *const DiagnosticSink, mark_value: Mark) Totals {
+        return subtractTotals(sink.totals, mark_value.totals);
+    }
+
+    pub fn droppedSince(sink: *const DiagnosticSink, mark_value: Mark) Totals {
+        return subtractTotals(sink.dropped, mark_value.dropped);
+    }
+
+    pub fn truncatedSince(sink: *const DiagnosticSink, mark_value: Mark) bool {
+        const dropped = sink.droppedSince(mark_value);
+        return dropped.info != 0 or dropped.warnings != 0 or dropped.errors != 0;
+    }
+
+    fn addTotal(sink: *DiagnosticSink, severity: Severity) void {
+        switch (severity) {
+            .info => sink.totals.info = saturatingAdd(sink.totals.info, 1),
+            .warning => sink.totals.warnings = saturatingAdd(sink.totals.warnings, 1),
+            .@"error" => sink.totals.errors = saturatingAdd(sink.totals.errors, 1),
+        }
+    }
+
+    fn addDropped(sink: *DiagnosticSink, severity: Severity) void {
+        switch (severity) {
+            .info => sink.dropped.info = saturatingAdd(sink.dropped.info, 1),
+            .warning => sink.dropped.warnings = saturatingAdd(sink.dropped.warnings, 1),
+            .@"error" => sink.dropped.errors = saturatingAdd(sink.dropped.errors, 1),
+        }
+        sink.addTotal(severity);
+    }
+};
+
+fn diagnosticBytes(item: Diagnostic) usize {
+    var bytes: usize = 192;
+    bytes = saturatingAdd(bytes, saturatingMul(item.rule.len, 6));
+    bytes = saturatingAdd(bytes, saturatingMul(item.message.len, 6));
+    if (item.path) |path| bytes = saturatingAdd(bytes, saturatingMul(path.len, 6));
+    return bytes;
+}
+
+fn saturatingAdd(left: usize, right: usize) usize {
+    return std.math.add(usize, left, right) catch std.math.maxInt(usize);
+}
+
+fn saturatingMul(left: usize, right: usize) usize {
+    return std.math.mul(usize, left, right) catch std.math.maxInt(usize);
+}
+
+fn subtractTotals(current: Totals, previous: Totals) Totals {
+    return .{
+        .info = current.info -| previous.info,
+        .warnings = current.warnings -| previous.warnings,
+        .errors = current.errors -| previous.errors,
+    };
+}
 
 pub const CompletionState = enum {
     complete,
@@ -248,9 +414,11 @@ pub const FileResult = struct {
     resource_usage: ResourceUsage = .{},
     first_failure: ?FirstFailure = null,
     diagnostics_truncated: bool = false,
+    dropped_diagnostics: Totals = .{},
 
     active_stage: ValidationStage = .input,
     failure_diagnostic_emitted: bool = false,
+    failure_diagnostic_counted: bool = false,
 
     pub fn init(enabled_stages: StageMask) FileResult {
         return .{ .enabled_stages = enabled_stages };
@@ -286,6 +454,7 @@ pub const FileResult = struct {
             .path = path,
         };
         result.failure_diagnostic_emitted = diagnostic_emitted;
+        result.failure_diagnostic_counted = diagnostic_emitted;
     }
 
     pub fn recordEmergencyFailure(
@@ -300,7 +469,22 @@ pub const FileResult = struct {
     pub fn finalize(result: *FileResult, diagnostics: []const Diagnostic) void {
         result.totals = count(diagnostics);
         if (result.first_failure != null) {
-            if (!result.failure_diagnostic_emitted) {
+            if (!result.failure_diagnostic_emitted and !result.failure_diagnostic_counted) {
+                result.totals.errors = std.math.add(usize, result.totals.errors, 1) catch std.math.maxInt(usize);
+            }
+        }
+        result.completion = if (result.first_failure == null and result.completed_stages == result.enabled_stages)
+            .complete
+        else
+            .incomplete;
+    }
+
+    pub fn finalizeSink(result: *FileResult, sink: *const DiagnosticSink, mark_value: DiagnosticSink.Mark) void {
+        result.totals = sink.totalsSince(mark_value);
+        result.dropped_diagnostics = sink.droppedSince(mark_value);
+        result.diagnostics_truncated = result.diagnostics_truncated or sink.truncatedSince(mark_value);
+        if (result.first_failure != null) {
+            if (!result.failure_diagnostic_emitted and !result.failure_diagnostic_counted) {
                 result.totals.errors = std.math.add(usize, result.totals.errors, 1) catch std.math.maxInt(usize);
             }
         }
@@ -469,4 +653,25 @@ test "file result marks the fixed emergency failure path" {
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expect(result.needsEmergencyDiagnostic());
     try std.testing.expectEqualStrings(emergency_failure_message, result.first_failure.?.message);
+}
+
+test "diagnostic sink bounds detail while retaining complete totals" {
+    var sink = DiagnosticSink.init(.{ .max_diagnostics = 2, .max_rendered_bytes = 4096 });
+    defer sink.deinit(std.testing.allocator);
+
+    const mark = sink.mark();
+    _ = try sink.append(std.testing.allocator, .{ .severity = .info, .rule = "test.info", .message = "one" });
+    _ = try sink.append(std.testing.allocator, .{ .severity = .warning, .rule = "test.warning", .message = "two" });
+    _ = try sink.append(std.testing.allocator, .{ .severity = .@"error", .rule = "test.error", .message = "three" });
+
+    try std.testing.expectEqual(@as(usize, 2), sink.items.len);
+    try std.testing.expectEqual(Totals{ .info = 1, .warnings = 1, .errors = 1 }, sink.totalsSince(mark));
+    try std.testing.expectEqual(Totals{ .info = 0, .warnings = 0, .errors = 1 }, sink.droppedSince(mark));
+
+    var result = FileResult.init(stageBit(.input));
+    result.completeStage(.input);
+    result.finalizeSink(&sink, mark);
+    try std.testing.expect(result.diagnostics_truncated);
+    try std.testing.expectEqual(@as(usize, 1), result.dropped_diagnostics.errors);
+    try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
 }

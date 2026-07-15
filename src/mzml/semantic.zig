@@ -20,6 +20,7 @@ const elements = @import("elements.zig");
 const Attribute = xml_events.Attribute;
 const CvTable = obo.CvTable;
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 const RuleEngine = rule_engine.RuleEngine;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
@@ -39,7 +40,7 @@ const SemanticOwner = enum {
 
 const SemanticBudget = struct {
     allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: ?[]const u8,
     limit: usize,
     current_bytes: usize = 0,
@@ -55,7 +56,7 @@ const SemanticBudget = struct {
 
     fn init(
         allocator: std.mem.Allocator,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         limits: diagnostic.ResourceLimits,
     ) SemanticBudget {
@@ -112,7 +113,7 @@ const SemanticBudget = struct {
     }
 
     fn limitDiagnostic(self: *SemanticBudget, byte_offset: u64) !void {
-        try self.diagnostics.append(self.allocator, .{
+        _ = try self.diagnostics.append(self.allocator, .{
             .severity = .@"error",
             .rule = RuleId.runtime_semantic_limit,
             .location = .{ .byte_offset = byte_offset },
@@ -206,7 +207,7 @@ const RefTable = struct {
     fn declare(
         table: *RefTable,
         budget: *SemanticBudget,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         id: []const u8,
         element_id: ElementId,
@@ -242,14 +243,14 @@ const RefTable = struct {
     fn addRef(
         table: *RefTable,
         budget: *SemanticBudget,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         ref_value: []const u8,
         expected_element: ?ElementId,
         byte_offset: u64,
     ) !void {
         if (ref_value.len == 0) {
-            try diagnostics.append(table.allocator, .{
+            _ = try diagnostics.append(table.allocator, .{
                 .severity = .@"error",
                 .rule = RuleId.mzml_ref_empty,
                 .location = .{ .byte_offset = byte_offset },
@@ -277,10 +278,10 @@ const RefTable = struct {
         });
     }
 
-    fn resolveAll(table: *RefTable, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) !void {
+    fn resolveAll(table: *RefTable, diagnostics: *DiagnosticSink, path: ?[]const u8) !void {
         for (table.unresolved.items) |r| {
             const declaration = table.declarations.get(r.ref_value) orelse {
-                try diagnostics.append(table.allocator, .{
+                _ = try diagnostics.append(table.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_unresolved,
                     .location = .{ .byte_offset = r.byte_offset },
@@ -296,7 +297,7 @@ const RefTable = struct {
     fn resolveDeclared(
         table: *RefTable,
         budget: *SemanticBudget,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         id: []const u8,
         element_id: ElementId,
@@ -324,7 +325,7 @@ const RefTable = struct {
 
     fn checkResolved(
         table: *RefTable,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         expected_element: ?ElementId,
         declaration: Declaration,
@@ -332,7 +333,7 @@ const RefTable = struct {
     ) !void {
         if (expected_element) |expected| {
             if (declaration.element_id != expected) {
-                try diagnostics.append(table.allocator, .{
+                _ = try diagnostics.append(table.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_wrong_target,
                     .location = .{ .byte_offset = byte_offset },
@@ -349,7 +350,7 @@ pub const SemanticValidator = struct {
     allocator: std.mem.Allocator,
     cv_table: *const CvTable,
     rule_engine: *const RuleEngine,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: ?[]const u8,
     budget: SemanticBudget,
 
@@ -368,7 +369,7 @@ pub const SemanticValidator = struct {
         allocator: std.mem.Allocator,
         cv_table: *const CvTable,
         engine: *const RuleEngine,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) SemanticValidator {
         return initWithLimits(allocator, cv_table, engine, diagnostics, path, .{});
@@ -378,7 +379,7 @@ pub const SemanticValidator = struct {
         allocator: std.mem.Allocator,
         cv_table: *const CvTable,
         engine: *const RuleEngine,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         limits: diagnostic.ResourceLimits,
     ) SemanticValidator {
@@ -546,7 +547,7 @@ pub const SemanticValidator = struct {
                         tag,
                         start.byte_offset,
                     )) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_ref_duplicate_id,
                             .location = .{ .byte_offset = start.byte_offset },
@@ -643,7 +644,7 @@ pub const SemanticValidator = struct {
 
         if (tag == .cvParam) {
             if (cvr == null) {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_missing,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -653,7 +654,7 @@ pub const SemanticValidator = struct {
                 return;
             }
             if (cvr.?.len == 0) {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_empty,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -676,7 +677,7 @@ pub const SemanticValidator = struct {
         if (!validator.cv_refs.contains(cv_ref)) {
             // BTO/GO/PATO may not be declared in cvList; skip cvRef check.
             if (!isKnownExternalPrefix(cv_ref)) {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_namespace,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -690,7 +691,7 @@ pub const SemanticValidator = struct {
         const term = validator.cv_table.lookup(accession);
         if (term) |t| {
             if (t.is_obsolete) {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .warning,
                     .rule = RuleId.mzml_cv_obsolete,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -705,7 +706,7 @@ pub const SemanticValidator = struct {
             if (!std.mem.eql(u8, t.namespace, cv_ref)) {
                 // Skip namespace check for BTO/GO/PATO (externally-managed CVs).
                 if (!isKnownExternalPrefix(cv_ref)) {
-                    try validator.diagnostics.append(validator.allocator, .{
+                    _ = try validator.diagnostics.append(validator.allocator, .{
                         .severity = .@"error",
                         .rule = RuleId.mzml_cv_namespace,
                         .location = .{ .byte_offset = start.byte_offset },
@@ -724,7 +725,7 @@ pub const SemanticValidator = struct {
                         }
                     }
                     if (!allowed) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_cv_unit,
                             .location = .{ .byte_offset = start.byte_offset },
@@ -737,7 +738,7 @@ pub const SemanticValidator = struct {
         } else {
             // BTO/GO/PATO terms may not be in our embedded psi-ms.obo.
             if (!isKnownExternalPrefix(extractAccessionPrefix(accession))) {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_accession,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -755,7 +756,7 @@ pub const SemanticValidator = struct {
             if (validator.cv_table.lookup(unit_acc)) |unit_term| {
                 if (unit_cv_ref) |ref| {
                     if (!std.mem.eql(u8, ref, unit_term.namespace)) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_cv_namespace,
                             .location = .{ .byte_offset = start.byte_offset },
@@ -778,7 +779,7 @@ pub const SemanticValidator = struct {
                         break :blk found;
                     } else false;
                     if (!exact_match and !case_insensitive_match and !synonym_match) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .info,
                             .rule = RuleId.mzml_cv_unit,
                             .location = .{ .byte_offset = start.byte_offset },
@@ -788,7 +789,7 @@ pub const SemanticValidator = struct {
                     }
                 }
             } else {
-                try validator.diagnostics.append(validator.allocator, .{
+                _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_unit,
                     .location = .{ .byte_offset = start.byte_offset },
@@ -893,7 +894,7 @@ pub const SemanticValidator = struct {
                         .@"or" => matched > 0,
                     };
                     if (!ok) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_cv_required,
                             .location = .{ .byte_offset = end.byte_offset },
@@ -909,7 +910,7 @@ pub const SemanticValidator = struct {
                         .@"or" => matched > 0,
                     };
                     if (!ok) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .warning,
                             .rule = RuleId.mzml_cv_recommended,
                             .location = .{ .byte_offset = end.byte_offset },
@@ -930,7 +931,7 @@ pub const SemanticValidator = struct {
                     for (rules) |r| {
                         for (r.terms) |rt| {
                             if (!rt.is_repeatable and std.mem.eql(u8, rt.accession, item.accession)) {
-                                try validator.diagnostics.append(validator.allocator, .{
+                                _ = try validator.diagnostics.append(validator.allocator, .{
                                     .severity = .warning,
                                     .rule = RuleId.mzml_cv_term_repeat,
                                     .location = .{ .byte_offset = end.byte_offset },
@@ -968,7 +969,7 @@ pub const SemanticValidator = struct {
                                 if (i == idx) {
                                     // Same term matched twice.
                                     if (!rt.is_repeatable) {
-                                        try validator.diagnostics.append(validator.allocator, .{
+                                        _ = try validator.diagnostics.append(validator.allocator, .{
                                             .severity = .warning,
                                             .rule = RuleId.mzml_cv_contradiction,
                                             .location = .{ .byte_offset = end.byte_offset },
@@ -998,7 +999,7 @@ pub const SemanticValidator = struct {
                         }
                     }
                     if (!all_allow_children) {
-                        try validator.diagnostics.append(validator.allocator, .{
+                        _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .warning,
                             .rule = RuleId.mzml_cv_contradiction,
                             .location = .{ .byte_offset = end.byte_offset },
@@ -1023,7 +1024,7 @@ pub const SemanticValidator = struct {
             .no => false,
             .limit_exceeded => limit: {
                 if (!validator.ancestry_limit_reported) {
-                    try validator.diagnostics.append(validator.allocator, .{
+                    _ = try validator.diagnostics.append(validator.allocator, .{
                         .severity = .@"error",
                         .rule = RuleId.mzml_cv_ancestry_limit,
                         .location = .{ .byte_offset = byte_offset },
@@ -1055,7 +1056,7 @@ pub const SemanticValidator = struct {
             }
         }
 
-        try validator.diagnostics.append(validator.allocator, .{
+        _ = try validator.diagnostics.append(validator.allocator, .{
             .severity = .@"error",
             .rule = RuleId.mzml_binary_type_mismatch,
             .location = .{ .byte_offset = byte_offset },
@@ -1238,7 +1239,7 @@ test "SemanticValidator: valid accession produces no diagnostic" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1256,7 +1257,7 @@ test "SemanticValidator: invalid accession produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1275,7 +1276,7 @@ test "SemanticValidator: cvParam with unknown intern id still validates accessio
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1295,7 +1296,7 @@ test "SemanticValidator: obsolete accession produces warning" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1327,7 +1328,7 @@ test "SemanticValidator: allowed unit restriction produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1361,7 +1362,7 @@ test "SemanticValidator: binary data type restriction produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1385,7 +1386,7 @@ test "SemanticValidator: mismatched cvRef/namespace produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1404,7 +1405,7 @@ test "SemanticValidator: cvRef not in cvList produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1422,7 +1423,7 @@ test "SemanticValidator: valid unit accession produces no diagnostic" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1441,7 +1442,7 @@ test "SemanticValidator: invalid unit accession produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1460,7 +1461,7 @@ test "SemanticValidator: unitCvRef mismatch produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1484,7 +1485,7 @@ test "SemanticValidator: unitName mismatch produces info" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1504,7 +1505,7 @@ test "SemanticValidator: userParam without accession is skipped" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1522,7 +1523,7 @@ test "SemanticValidator: cvRef after cvList declaration works" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1542,7 +1543,7 @@ test "SemanticValidator: multiple diagnostics on one cvParam" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1559,7 +1560,7 @@ test "SemanticValidator: no contradiction with single term" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // Create engine with an OR rule for spectrum: MS:1000130 or MS:1000129
@@ -1590,7 +1591,7 @@ test "SemanticValidator: must rule fires when term missing" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // MUST/AND rule: source must have MS:1000008
@@ -1629,7 +1630,7 @@ test "SemanticValidator: indexed wrapper preserves mapping paths" {
     defer engine.deinit();
 
     for ([_]bool{ false, true }) |indexed| {
-        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        var diagnostics: DiagnosticSink = .empty;
         defer diagnostics.deinit(allocator);
 
         var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
@@ -1654,7 +1655,7 @@ test "SemanticValidator: must rule passes when term present" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
@@ -1684,7 +1685,7 @@ test "SemanticValidator: must or rule fires when no term matches" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // MUST/OR rule: source must have MS:1000008 or MS:1000443
@@ -1716,7 +1717,7 @@ test "SemanticValidator: must or rule passes when one term present" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
@@ -1745,7 +1746,7 @@ test "SemanticValidator: declared id resolves in finish" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1773,7 +1774,7 @@ test "SemanticValidator: resolved forward references release their records" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1798,7 +1799,7 @@ test "SemanticValidator: semantic owner limit is a fatal resource error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1818,7 +1819,7 @@ test "SemanticValidator: unresolved ref produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1841,7 +1842,7 @@ test "SemanticValidator: missing cvRef produces reference diagnostic" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1861,7 +1862,7 @@ test "SemanticValidator: empty ref produces distinct diagnostic" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1884,7 +1885,7 @@ test "SemanticValidator: wrong ref target produces distinct diagnostic" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1906,7 +1907,7 @@ test "SemanticValidator: wrong ref target produces distinct diagnostic" {
 
 test "RefTable: unresolved diagnostic allocation failure propagates" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
 
     var table = RefTable.init(failing_allocator.allocator());
@@ -1924,7 +1925,7 @@ test "RefTable: addRef cleans each allocation failure" {
     for (0..2) |fail_index| {
         var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var table = RefTable.init(failing_allocator.allocator());
-        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        var diagnostics: DiagnosticSink = .empty;
         defer diagnostics.deinit(std.testing.allocator);
         var budget = SemanticBudget.init(failing_allocator.allocator(), &diagnostics, null, .{});
 
@@ -1941,7 +1942,7 @@ test "SemanticValidator: duplicate id produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1966,7 +1967,7 @@ test "SemanticValidator: forward reference resolves in finish" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -1991,7 +1992,7 @@ test "SemanticValidator: IM-MS and DIA CV terms are recognised" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -2018,7 +2019,7 @@ test "SemanticValidator: userParam with valid accession triggers CV validation" 
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -2037,7 +2038,7 @@ test "SemanticValidator: userParam with invalid accession produces error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -2059,7 +2060,7 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var engine = try testEngine(allocator);
@@ -2080,7 +2081,7 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     // OR rule: spectrum must have MS:1000130 or MS:1000129

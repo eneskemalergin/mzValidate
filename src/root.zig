@@ -53,6 +53,8 @@ pub const obo = struct {
 
 /// Shared diagnostic record. Avoid reaching through `diagnostic.Diagnostic`.
 pub const Diagnostic = diagnostic.Diagnostic;
+/// Bounded per-file diagnostic storage and severity totals.
+pub const DiagnosticSink = diagnostic.DiagnosticSink;
 /// Per-file completion and stage result.
 pub const FileResult = diagnostic.FileResult;
 /// Completion state independent of diagnostic severity.

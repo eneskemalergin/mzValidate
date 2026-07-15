@@ -14,6 +14,7 @@ const xml_events = @import("../xml/events.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
@@ -35,7 +36,7 @@ const IndexRecord = struct {
 /// then finish(file_bytes) after the document ends.
 pub const IndexValidator = struct {
     allocator: std.mem.Allocator,
-    diagnostics: *std.ArrayList(Diagnostic),
+    diagnostics: *DiagnosticSink,
     path: ?[]const u8,
     limits: diagnostic.ResourceLimits,
 
@@ -135,7 +136,7 @@ pub const IndexValidator = struct {
 
     pub fn init(
         allocator: std.mem.Allocator,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
     ) IndexValidator {
         return initWithLimits(allocator, diagnostics, path, .{});
@@ -143,7 +144,7 @@ pub const IndexValidator = struct {
 
     pub fn initWithLimits(
         allocator: std.mem.Allocator,
-        diagnostics: *std.ArrayList(Diagnostic),
+        diagnostics: *DiagnosticSink,
         path: ?[]const u8,
         limits: diagnostic.ResourceLimits,
     ) IndexValidator {
@@ -444,7 +445,7 @@ pub const IndexValidator = struct {
         if (!validator.saw_index_elements) return;
 
         if (file_bytes == null and validator.stream_file == null) {
-            try validator.diagnostics.append(validator.allocator, .{
+            _ = try validator.diagnostics.append(validator.allocator, .{
                 .severity = .info,
                 .rule = RuleId.mzml_index_checksum,
                 .location = .{ .byte_offset = 0 },
@@ -717,7 +718,7 @@ pub const IndexValidator = struct {
         rule: []const u8,
         message: []const u8,
     ) std.mem.Allocator.Error!void {
-        try validator.diagnostics.append(validator.allocator, .{
+        _ = try validator.diagnostics.append(validator.allocator, .{
             .severity = .@"error",
             .rule = rule,
             .location = .{ .byte_offset = byte_offset },
@@ -858,7 +859,7 @@ const expectError = testing.expectError;
 
 test "IndexValidator: non-indexed file produces no diagnostics" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -878,7 +879,7 @@ test "IndexValidator: non-indexed file produces no diagnostics" {
 
 test "IndexValidator: records spectrum and chromatogram offsets" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -899,7 +900,7 @@ test "IndexValidator: records spectrum and chromatogram offsets" {
 
 test "IndexValidator: index state tracks one key copy per record" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -914,7 +915,7 @@ test "IndexValidator: index state tracks one key copy per record" {
 
 test "IndexValidator: state byte limit rejects map growth" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_state_bytes = 1 });
@@ -932,7 +933,7 @@ test "IndexValidator: state byte limit rejects map growth" {
 
 test "IndexValidator: finish propagates diagnostic allocation failure" {
     var failing_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(testing.allocator);
 
     var v = IndexValidator.init(failing_allocator.allocator(), &diagnostics, null);
@@ -944,7 +945,7 @@ test "IndexValidator: finish propagates diagnostic allocation failure" {
 
 test "IndexValidator: spectrum with unknown intern id still records offsets" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -964,7 +965,7 @@ test "IndexValidator: spectrum with unknown intern id still records offsets" {
 
 test "IndexValidator: valid indexed mzML cross-checks correctly" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1000,7 +1001,7 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
 
 test "IndexValidator: bad offset value produces diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1030,7 +1031,7 @@ test "IndexValidator: bad offset value produces diagnostic" {
 
 test "IndexValidator: reference to non-existent element produces diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1058,7 +1059,7 @@ test "IndexValidator: reference to non-existent element produces diagnostic" {
 
 test "IndexValidator: indexListOffset mismatch produces diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1086,7 +1087,7 @@ test "IndexValidator: indexListOffset mismatch produces diagnostic" {
 
 test "IndexValidator: truncated offset produces diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1119,7 +1120,7 @@ test "IndexValidator: truncated offset produces diagnostic" {
 
 test "IndexValidator: SHA-1 checksum mismatch produces diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1150,7 +1151,7 @@ test "IndexValidator: SHA-1 checksum mismatch produces diagnostic" {
 
 test "IndexValidator: valid SHA-1 checksum produces no diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1200,7 +1201,7 @@ test "IndexValidator: online SHA matches batch hash at checksum boundary" {
     const file_bytes = prefix ++ "<fileChecksum>deadbeef" ++ "</fileChecksum>";
     const checksum_offset = prefix.len + "<fileChecksum>".len;
 
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(testing.allocator);
 
     var v = IndexValidator.init(testing.allocator, &diagnostics, null);
@@ -1221,7 +1222,7 @@ test "IndexValidator: online SHA matches batch hash at checksum boundary" {
 
 test "IndexValidator: fileChecksum with surrounding whitespace passes validation" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1266,7 +1267,7 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
 
 test "IndexValidator: duplicate index entries produce diagnostic" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.init(allocator, &diagnostics, null);
@@ -1300,7 +1301,7 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
 
 test "IndexValidator: count limit rejects before reservation" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_entries = 1 });
@@ -1318,7 +1319,7 @@ test "IndexValidator: count limit rejects before reservation" {
 
 test "IndexValidator: count boundaries stay within the configured limit" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_entries = 4 });
@@ -1335,7 +1336,7 @@ test "IndexValidator: count boundaries stay within the configured limit" {
 
 test "IndexValidator: scalar text limit rejects before buffer growth" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_offset_text_bytes = 4 });
@@ -1353,7 +1354,7 @@ test "IndexValidator: scalar text limit rejects before buffer growth" {
 
 test "IndexValidator: index scalar fields use separate limits" {
     const allocator = testing.allocator;
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     {

@@ -7,7 +7,7 @@
 //!   brief:   Result and optional config followed by grouped diagnostics.
 //!
 //! Every renderer writes directly to a `std.Io.Writer`. stdout, buffer,
-//! file, or network sink. Zero heap allocation outside the writer.
+//! file, or network sink.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -40,7 +40,17 @@ pub fn renderTextResult(
     memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     const emergency = hasEmergencyFailure(results);
-    if (diagnostics.len > 0 or !emergency) try renderTextDiagnostics(writer, diagnostics);
+    const truncated = hasDiagnosticTruncation(results);
+    if (diagnostics.len > 0) {
+        try renderTextDiagnostics(writer, diagnostics);
+    } else if (!emergency and !truncated) {
+        try renderTextDiagnostics(writer, diagnostics);
+    }
+    for (results) |result| {
+        if (hasDroppedDiagnostics(result)) {
+            try renderTruncationText(writer, result.dropped_diagnostics, null);
+        }
+    }
     var rendered_failure = false;
     for (results) |result| {
         if (result.first_failure) |failure| {
@@ -51,6 +61,45 @@ pub fn renderTextResult(
         }
     }
     if (rendered_failure) try writer.writeByte('\n');
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+}
+
+pub fn renderTextFile(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
+) std.Io.Writer.Error!void {
+    var rendered = false;
+    if (diagnostics.len > 0) {
+        try renderTextDiagnostics(writer, diagnostics);
+        rendered = true;
+    }
+    if (hasDroppedDiagnostics(result.*)) {
+        try renderTruncationText(writer, result.dropped_diagnostics, path);
+        rendered = true;
+    }
+    if (result.needsEmergencyDiagnostic()) {
+        if (rendered) try writer.writeByte('\n');
+        try renderFailureText(writer, result.first_failure.?);
+        try writer.writeByte('\n');
+    }
+}
+
+pub fn renderTextFinal(
+    writer: *std.Io.Writer,
+    results: []const diagnostic.FileResult,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
+) std.Io.Writer.Error!void {
+    var rendered = false;
+    for (results) |result| {
+        if (result.totals.info != 0 or result.totals.warnings != 0 or result.totals.errors != 0) {
+            rendered = true;
+            break;
+        }
+    }
+    if (!rendered) try writer.writeAll("OK: no diagnostics emitted\n\n");
     try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
 }
 
@@ -125,97 +174,90 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
     try renderBriefGroups(writer, diagnostics);
 }
 
-fn renderBriefGroups(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
+pub const BriefGroups = struct {
     const max_groups = 256;
-    var sev: [max_groups]Severity = undefined;
-    var rule: [max_groups][]const u8 = undefined;
-    var msg: [max_groups][]const u8 = undefined;
-    var cnt: [max_groups]usize = undefined;
-    var gcnt: usize = 0;
-    var dropped: usize = 0;
 
-    // Phase 1: group all diagnostics by (severity, rule, message).
-    for (diagnostics) |d| {
-        var found = false;
-        for (0..gcnt) |i| {
-            if (sev[i] == d.severity and
-                std.mem.eql(u8, rule[i], d.rule) and
-                std.mem.eql(u8, msg[i], d.message))
+    severity: [max_groups]Severity = undefined,
+    rule: [max_groups][]const u8 = undefined,
+    message: [max_groups][]const u8 = undefined,
+    count: [max_groups]usize = undefined,
+    length: usize = 0,
+    dropped: usize = 0,
+
+    pub fn add(groups: *BriefGroups, item: Diagnostic) void {
+        for (0..groups.length) |i| {
+            if (groups.severity[i] == item.severity and
+                std.mem.eql(u8, groups.rule[i], item.rule) and
+                std.mem.eql(u8, groups.message[i], item.message))
             {
-                cnt[i] += 1;
-                found = true;
-                break;
+                groups.count[i] = std.math.add(usize, groups.count[i], 1) catch std.math.maxInt(usize);
+                return;
             }
         }
-        if (!found and gcnt < max_groups) {
-            sev[gcnt] = d.severity;
-            rule[gcnt] = d.rule;
-            msg[gcnt] = d.message;
-            cnt[gcnt] = 1;
-            gcnt += 1;
-        } else if (!found) {
-            dropped += 1;
+        if (groups.length == max_groups) {
+            groups.dropped = std.math.add(usize, groups.dropped, 1) catch std.math.maxInt(usize);
+            return;
         }
+        groups.severity[groups.length] = item.severity;
+        groups.rule[groups.length] = item.rule;
+        groups.message[groups.length] = item.message;
+        groups.count[groups.length] = 1;
+        groups.length += 1;
     }
 
-    // Phase 2: sort by severity desc (error=2, warning=1, info=0),
-    // then by count desc within the same severity.
-    for (1..gcnt) |i| {
-        var j = i;
-        while (j > 0) : (j -= 1) {
-            const a = @intFromEnum(sev[j]);
-            const b = @intFromEnum(sev[j - 1]);
-            const swap = if (a != b) a > b else cnt[j] > cnt[j - 1];
-            if (!swap) break;
-            std.mem.swap(Severity, &sev[j], &sev[j - 1]);
-            std.mem.swap([]const u8, &rule[j], &rule[j - 1]);
-            std.mem.swap([]const u8, &msg[j], &msg[j - 1]);
-            std.mem.swap(usize, &cnt[j], &cnt[j - 1]);
+    pub fn render(groups: *BriefGroups, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+        for (1..groups.length) |i| {
+            var j = i;
+            while (j > 0) : (j -= 1) {
+                const a = @intFromEnum(groups.severity[j]);
+                const b = @intFromEnum(groups.severity[j - 1]);
+                const swap = if (a != b) a > b else groups.count[j] > groups.count[j - 1];
+                if (!swap) break;
+                std.mem.swap(Severity, &groups.severity[j], &groups.severity[j - 1]);
+                std.mem.swap([]const u8, &groups.rule[j], &groups.rule[j - 1]);
+                std.mem.swap([]const u8, &groups.message[j], &groups.message[j - 1]);
+                std.mem.swap(usize, &groups.count[j], &groups.count[j - 1]);
+            }
         }
-    }
 
-    // Phase 3: measure column widths for aligned output.
-    var count_w: usize = 1;
-    var sev_w: usize = 0;
-    var rule_w: usize = 0;
-    for (0..gcnt) |i| {
-        var n = cnt[i];
-        var cw: usize = 1;
-        while (n >= 10) : (n /= 10) cw += 1;
-        if (cw > count_w) count_w = cw;
+        var count_width: usize = 1;
+        var severity_width: usize = 0;
+        var rule_width: usize = 0;
+        for (0..groups.length) |i| {
+            var n = groups.count[i];
+            var width: usize = 1;
+            while (n >= 10) : (n /= 10) width += 1;
+            if (width > count_width) count_width = width;
+            severity_width = @max(severity_width, groups.severity[i].label().len);
+            rule_width = @max(rule_width, groups.rule[i].len);
+        }
 
-        const sl = sev[i].label().len;
-        if (sl > sev_w) sev_w = sl;
-
-        const rl = rule[i].len;
-        if (rl > rule_w) rule_w = rl;
-    }
-
-    // Phase 4: render aligned table.
-    // Layout: <count:count_w>  <severity:sev_w>  <rule:rule_w>  <message>
-    try writer.writeByte('\n');
-    for (0..gcnt) |i| {
-        var n = cnt[i];
-        var cw: usize = 1;
-        while (n >= 10) : (n /= 10) cw += 1;
-        for (0..count_w - cw) |_| try writer.writeByte(' ');
-        try writer.print("{d}  ", .{cnt[i]});
-
-        try writer.writeAll(sev[i].label());
-        for (0..sev_w - sev[i].label().len) |_| try writer.writeByte(' ');
-        try writer.writeAll("  ");
-
-        try writer.writeAll(rule[i]);
-        for (0..rule_w - rule[i].len) |_| try writer.writeByte(' ');
-        try writer.writeAll("  ");
-
-        // Message is last column, no padding needed.
-        try writer.writeAll(msg[i]);
         try writer.writeByte('\n');
+        for (0..groups.length) |i| {
+            var n = groups.count[i];
+            var width: usize = 1;
+            while (n >= 10) : (n /= 10) width += 1;
+            for (0..count_width - width) |_| try writer.writeByte(' ');
+            try writer.print("{d}  ", .{groups.count[i]});
+            try writer.writeAll(groups.severity[i].label());
+            for (0..severity_width - groups.severity[i].label().len) |_| try writer.writeByte(' ');
+            try writer.writeAll("  ");
+            try writer.writeAll(groups.rule[i]);
+            for (0..rule_width - groups.rule[i].len) |_| try writer.writeByte(' ');
+            try writer.writeAll("  ");
+            try writer.writeAll(groups.message[i]);
+            try writer.writeByte('\n');
+        }
+        if (groups.dropped > 0) {
+            try writer.print("... and {d} more unique diagnostic groups (brief limit)\n", .{groups.dropped});
+        }
     }
-    if (dropped > 0) {
-        try writer.print("... and {d} more unique diagnostic groups (brief limit)\n", .{dropped});
-    }
+};
+
+fn renderBriefGroups(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
+    var groups: BriefGroups = .{};
+    for (diagnostics) |item| groups.add(item);
+    try groups.render(writer);
 }
 
 pub fn renderBriefResult(
@@ -227,6 +269,25 @@ pub fn renderBriefResult(
 ) std.Io.Writer.Error!void {
     try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
     if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
+    for (results) |result| {
+        if (hasDroppedDiagnostics(result)) try renderTruncationText(writer, result.dropped_diagnostics, null);
+    }
+}
+
+pub fn renderBriefGroupsResult(
+    writer: *std.Io.Writer,
+    groups: *BriefGroups,
+    results: []const diagnostic.FileResult,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
+) std.Io.Writer.Error!void {
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    if (groups.length > 0) try groups.render(writer);
+    for (results) |result| {
+        if (hasDroppedDiagnostics(result)) {
+            try renderTruncationText(writer, result.dropped_diagnostics, null);
+        }
+    }
 }
 
 /// Renders diagnostics in a stable JSON shape for automation.
@@ -246,6 +307,53 @@ pub fn renderJsonResult(
     try writer.writeAll("\n]\n");
 }
 
+pub const JsonStream = struct {
+    writer: *std.Io.Writer,
+    first: bool = true,
+
+    pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
+        try writer.writeAll("[\n");
+        return .{ .writer = writer };
+    }
+
+    pub fn writeFile(
+        stream: *JsonStream,
+        diagnostics: []const Diagnostic,
+        result: *const diagnostic.FileResult,
+        path: []const u8,
+    ) std.Io.Writer.Error!void {
+        for (diagnostics) |item| try stream.writeDiagnostic(item);
+        if (result.needsEmergencyDiagnostic()) {
+            try stream.writeDiagnostic(.{
+                .severity = .@"error",
+                .rule = result.first_failure.?.rule,
+                .location = result.first_failure.?.location,
+                .path = result.first_failure.?.path,
+                .message = result.first_failure.?.message,
+            });
+        }
+        if (hasDroppedDiagnostics(result.*)) {
+            try stream.writeTruncation(result.dropped_diagnostics, path);
+        }
+    }
+
+    pub fn finish(stream: *JsonStream) std.Io.Writer.Error!void {
+        try stream.writer.writeAll("\n]\n");
+    }
+
+    fn writeDiagnostic(stream: *JsonStream, item: Diagnostic) std.Io.Writer.Error!void {
+        if (!stream.first) try stream.writer.writeAll(",\n");
+        try writeJsonDiagnostic(stream.writer, item);
+        stream.first = false;
+    }
+
+    fn writeTruncation(stream: *JsonStream, dropped: diagnostic.Totals, path: []const u8) std.Io.Writer.Error!void {
+        if (!stream.first) try stream.writer.writeAll(",\n");
+        try writeJsonTruncation(stream.writer, dropped, path);
+        stream.first = false;
+    }
+};
+
 fn renderJsonItems(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
@@ -260,15 +368,22 @@ fn renderJsonItems(
     if (results) |file_results| {
         for (file_results) |result| {
             if (result.first_failure) |failure| {
-                if (result.failure_diagnostic_emitted) continue;
+                if (!result.failure_diagnostic_emitted) {
+                    if (!first) try writer.writeAll(",\n");
+                    try writeJsonDiagnostic(writer, .{
+                        .severity = .@"error",
+                        .rule = failure.rule,
+                        .location = failure.location,
+                        .path = failure.path,
+                        .message = failure.message,
+                    });
+                    first = false;
+                }
+            }
+            if (hasDroppedDiagnostics(result)) {
                 if (!first) try writer.writeAll(",\n");
-                try writeJsonDiagnostic(writer, .{
-                    .severity = .@"error",
-                    .rule = failure.rule,
-                    .location = failure.location,
-                    .path = failure.path,
-                    .message = failure.message,
-                });
+                const path = if (result.first_failure) |failure| failure.path orelse "" else "";
+                try writeJsonTruncation(writer, result.dropped_diagnostics, path);
                 first = false;
             }
         }
@@ -301,6 +416,20 @@ fn writeJsonDiagnostic(writer: *std.Io.Writer, item: Diagnostic) std.Io.Writer.E
     try writer.writeAll("\n    },\n    \"message\": ");
     try writeJsonString(writer, item.message);
     try writer.writeAll("\n  }");
+}
+
+fn writeJsonTruncation(writer: *std.Io.Writer, dropped: diagnostic.Totals, path: []const u8) std.Io.Writer.Error!void {
+    try writer.writeAll("  {\n    \"severity\": \"warning\",\n    \"rule\": ");
+    try writeJsonString(writer, diagnostic.RuleId.runtime_diagnostics_truncated);
+    try writer.writeAll(",\n    \"path\": ");
+    try writeJsonString(writer, path);
+    try writer.writeAll(",\n    \"location\": {\n      \"byte_offset\": null,\n      \"spectrum_index\": null\n    },\n    \"message\": \"diagnostic detail truncated (dropped info=");
+    try writer.print("{d}", .{dropped.info});
+    try writer.writeAll(" warnings=");
+    try writer.print("{d}", .{dropped.warnings});
+    try writer.writeAll(" errors=");
+    try writer.print("{d}", .{dropped.errors});
+    try writer.writeAll(")\"\n  }");
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
@@ -410,6 +539,32 @@ fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) s
         "  error [{s}] {s} (stage={s} reason={s})\n",
         .{ failure.rule, failure.message, failure.stage.label(), failure.reason.label() },
     );
+}
+
+fn renderTruncationText(writer: *std.Io.Writer, dropped: diagnostic.Totals, path: ?[]const u8) std.Io.Writer.Error!void {
+    if (path) |input| try writer.print("input: {s}\n", .{input});
+    try writer.print(
+        "  warning [{s}] diagnostic detail truncated (dropped info={d} warnings={d} errors={d})\n",
+        .{
+            diagnostic.RuleId.runtime_diagnostics_truncated,
+            dropped.info,
+            dropped.warnings,
+            dropped.errors,
+        },
+    );
+}
+
+fn hasDroppedDiagnostics(result: diagnostic.FileResult) bool {
+    return result.dropped_diagnostics.info != 0 or
+        result.dropped_diagnostics.warnings != 0 or
+        result.dropped_diagnostics.errors != 0;
+}
+
+fn hasDiagnosticTruncation(results: []const diagnostic.FileResult) bool {
+    for (results) |result| {
+        if (hasDroppedDiagnostics(result)) return true;
+    }
+    return false;
 }
 
 fn hasEmergencyFailure(results: []const diagnostic.FileResult) bool {
@@ -664,4 +819,23 @@ test "renderJson escapes quotes backslashes and control characters" {
 
     // Assert.
     try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
+}
+
+test "bounded diagnostic output exposes dropped severity totals" {
+    var result = diagnostic.FileResult.init(0);
+    result.totals = .{ .info = 2, .warnings = 3, .errors = 4 };
+    result.dropped_diagnostics = .{ .info = 1, .warnings = 2, .errors = 3 };
+    result.diagnostics_truncated = true;
+
+    var text_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer text_writer.deinit();
+    try renderTextResult(&text_writer.writer, &.{}, &.{result}, "mmap", null);
+    try std.testing.expect(std.mem.indexOf(u8, text_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
+
+    var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer json_writer.deinit();
+    var stream = try JsonStream.init(&json_writer.writer);
+    try stream.writeFile(&.{}, &result, "sample.mzML");
+    try stream.finish();
+    try std.testing.expect(std.mem.indexOf(u8, json_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
 }

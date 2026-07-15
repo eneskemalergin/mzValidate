@@ -3,7 +3,7 @@
 //! Three layers:
 //!   `run`:      Juicy Main entry point, wires stdout/stderr writers.
 //!   `runArgs`:  Public test seam that accepts caller-provided writers.
-//!   `runCheck`: Iterates inputs, collects diagnostics, picks the renderer.
+//!   `runCheck`: Iterates inputs, bounds per-file detail, and picks the renderer.
 //!
 //! The rest is helpers: `parseArgs` converts argv into a `CheckCommand`,
 //! `writeUsage` and `writeParseError` format output, `findUnexpectedFlag`
@@ -16,6 +16,7 @@ const validate = @import("validate.zig");
 const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
+const DiagnosticSink = diagnostic.DiagnosticSink;
 
 /// Parsed `check` subcommand flags and input paths.
 pub const CheckCommand = struct {
@@ -269,13 +270,13 @@ fn runCheck(
     writer: *std.Io.Writer,
     check: CheckCommand,
 ) !u8 {
-    var diagnostics: std.ArrayList(Diagnostic) = .empty;
-    try diagnostics.ensureTotalCapacity(allocator, 1024);
-    defer diagnostics.deinit(allocator);
-
     var results: std.ArrayList(diagnostic.FileResult) = .empty;
     try results.ensureTotalCapacity(allocator, check.inputs.len);
     defer results.deinit(allocator);
+
+    const diagnostic_defaults = diagnostic.ResourceLimits{};
+    var brief_groups: output.BriefGroups = .{};
+    var json_stream: ?output.JsonStream = if (check.output_mode == .json) try output.JsonStream.init(writer) else null;
 
     const options = validate.CheckOptions{
         .skip_binary = check.skip_binary,
@@ -291,32 +292,28 @@ fn runCheck(
     defer context.deinit();
 
     for (check.inputs) |path| {
+        var diagnostics = DiagnosticSink.init(.{
+            .max_diagnostics = if (check.output_mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
+            .max_rendered_bytes = if (check.output_mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
+            .retain_details = check.output_mode != .summary,
+        });
+        defer diagnostics.deinit(allocator);
+
         const result = context.validateOne(&diagnostics, path);
         try results.append(allocator, result);
+        switch (check.output_mode) {
+            .text => try output.renderTextFile(writer, diagnostics.items, &results.items[results.items.len - 1], path),
+            .json => if (json_stream) |*stream| try stream.writeFile(diagnostics.items, &results.items[results.items.len - 1], path),
+            .summary => {},
+            .brief => for (diagnostics.items) |item| brief_groups.add(item),
+        }
     }
 
     switch (check.output_mode) {
-        .text => try output.renderTextResult(
-            writer,
-            diagnostics.items,
-            results.items,
-            @tagName(check.input_mode),
-            check.memory_limit,
-        ),
-        .json => try output.renderJsonResult(writer, diagnostics.items, results.items),
-        .summary => try output.renderSummaryResult(
-            writer,
-            results.items,
-            @tagName(check.input_mode),
-            check.memory_limit,
-        ),
-        .brief => try output.renderBriefResult(
-            writer,
-            diagnostics.items,
-            results.items,
-            @tagName(check.input_mode),
-            check.memory_limit,
-        ),
+        .text => try output.renderTextFinal(writer, results.items, @tagName(check.input_mode), check.memory_limit),
+        .json => if (json_stream) |*stream| try stream.finish(),
+        .summary => try output.renderSummaryResult(writer, results.items, @tagName(check.input_mode), check.memory_limit),
+        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items, @tagName(check.input_mode), check.memory_limit),
     }
 
     return diagnostic.exitCodeForResults(results.items);
