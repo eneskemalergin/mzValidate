@@ -140,12 +140,13 @@ pub const EndElement = struct {
     }
 };
 
-/// `from_cdata` distinguishes CDATA from normal text, so validators can
-/// warn about CDATA usage if the schema prohibits it.
+/// `from_cdata` distinguishes CDATA from normal text. Reader-backed text can
+/// span events; `is_final` marks the last chunk of that logical text node.
 pub const Text = struct {
     byte_offset: u64,
     value: []const u8,
     from_cdata: bool = false,
+    is_final: bool = true,
 };
 
 pub const EventKind = enum {

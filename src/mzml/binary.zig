@@ -365,6 +365,8 @@ const BinaryArrayState = struct {
     zlib_base64_stream: StreamingBase64Decoder = .{},
     zlib_encoded_len: usize = 0,
     encoded_text_len: usize = 0,
+    pending_text_whitespace: usize = 0,
+    text_node_has_non_whitespace: bool = false,
     skipped: bool = false,
 
     fn init(
@@ -550,7 +552,7 @@ pub const BinaryValidator = struct {
     }
 
     pub fn consumeText(validator: *BinaryValidator, text: xml_events.Text) !void {
-        try validator.handleText(text.value);
+        try validator.handleText(text);
     }
 
     /// Used by `runValidation` to avoid feeding text to binary unless a payload is open.
@@ -842,10 +844,31 @@ pub const BinaryValidator = struct {
         }
     }
 
-    fn handleText(validator: *BinaryValidator, value: []const u8) !void {
+    fn handleText(validator: *BinaryValidator, text: xml_events.Text) !void {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
-                const text_len = std.math.add(usize, state.encoded_text_len, value.len) catch {
+                const whitespace_only = isWhitespaceOnly(text.value);
+                if (whitespace_only and !state.text_node_has_non_whitespace) {
+                    state.pending_text_whitespace = std.math.add(usize, state.pending_text_whitespace, text.value.len) catch {
+                        try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
+                        state.skipped = true;
+                        state.binary_depth = null;
+                        return error.ResourceLimitExceeded;
+                    };
+                    if (text.is_final) state.pending_text_whitespace = 0;
+                    return;
+                }
+
+                const text_len = std.math.add(
+                    usize,
+                    state.encoded_text_len,
+                    std.math.add(usize, state.pending_text_whitespace, text.value.len) catch {
+                        try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
+                        state.skipped = true;
+                        state.binary_depth = null;
+                        return error.ResourceLimitExceeded;
+                    },
+                ) catch {
                     try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
                     state.skipped = true;
                     state.binary_depth = null;
@@ -858,6 +881,8 @@ pub const BinaryValidator = struct {
                     return error.ResourceLimitExceeded;
                 }
                 state.encoded_text_len = text_len;
+                state.pending_text_whitespace = 0;
+                if (!whitespace_only) state.text_node_has_non_whitespace = true;
                 if (state.saw_zlib_compression) {
                     const capacity = base64SizeUpperBound(text_len) catch {
                         try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
@@ -867,7 +892,7 @@ pub const BinaryValidator = struct {
                     };
                     try validator.ensureCompressedCapacity(state, capacity);
                     state.zlib_encoded_len = text_len;
-                    state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, value) catch |err| switch (err) {
+                    state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, text.value) catch |err| switch (err) {
                         error.ResourceLimitExceeded => {
                             try validator.appendBinaryLimitDiagnostic(state, "binary payload decoded-size arithmetic overflow");
                             state.skipped = true;
@@ -877,8 +902,10 @@ pub const BinaryValidator = struct {
                         else => return err,
                     };
                 } else {
-                    state.base64_stream.feed(value);
+                    state.base64_stream.feed(text.value);
                 }
+
+                if (text.is_final) state.text_node_has_non_whitespace = false;
             }
         }
     }
@@ -1292,6 +1319,16 @@ fn addDecodedChunk(count: *usize, adler: *std.hash.Adler32, chunk: []const u8, l
     if (next > limit) return error.DecodedLimitExceeded;
     adler.update(chunk);
     count.* = next;
+}
+
+fn isWhitespaceOnly(value: []const u8) bool {
+    for (value) |byte| {
+        switch (byte) {
+            ' ', '\t', '\n', '\r' => {},
+            else => return false,
+        }
+    }
+    return true;
 }
 
 fn zlibAdler32(compressed: []const u8) error{InvalidBinaryPayload}!u32 {
@@ -2067,6 +2104,24 @@ test "binary validator rejects short and mutated invalid base64 payload matrix" 
         defer diagnostics.deinit(allocator);
 
         // Assert.
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_base64,
+            "binary payload is not valid base64",
+        );
+    }
+}
+
+test "binary validator rejects non-XML whitespace payload" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const payloads = [_][]const u8{ "\x0b", "\x0c" };
+
+    inline for (payloads) |payload| {
+        const fixture = minimalSpectrumMzml(payload, 0, "MS:1000576");
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
         try expectSingleBinaryDiagnostic(
             diagnostics.items,
             RuleId.mzml_binary_base64,

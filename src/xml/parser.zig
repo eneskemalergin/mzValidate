@@ -58,6 +58,13 @@ const NameParts = struct {
     local_name: Range,
 };
 
+const TextState = struct {
+    byte_offset: u64,
+    from_cdata: bool,
+    cdata_brackets: u2 = 0,
+    saw_non_whitespace: bool = false,
+};
+
 pub const NamespaceBinding = struct {
     prefix: ?Range,
     namespace_uri: Range,
@@ -119,6 +126,7 @@ pub const Parser = struct {
     absolute_offset: u64 = 0,
     last_byte_offset: u64 = 0,
     pending_self_closing_end: bool = false,
+    text_state: ?TextState = null,
     // True once the UTF-8 BOM (if any) has been checked and skipped.
     bom_checked: bool = false,
     // Bytes replayed after a partial UTF-8 BOM prefix (0xEF without 0xBB 0xBF).
@@ -170,6 +178,11 @@ pub const Parser = struct {
 
         while (true) {
             parser.resetEventStorage();
+
+            if (parser.text_state != null) {
+                if (try parser.continueText()) |event| return event;
+                continue;
+            }
 
             const first_byte = (try parser.takeOptionalByte()) orelse {
                 if (parser.element_count != 0) {
@@ -230,6 +243,16 @@ pub const Parser = struct {
             }
         }
 
+        if (parser.input == .reader) {
+            if (parser.token_buffer.len <= 4) return error.TokenTooLong;
+            parser.text_state = .{
+                .byte_offset = byte_offset,
+                .from_cdata = from_cdata,
+            };
+            try parser.appendDecodedTextByte(first_byte);
+            return try parser.continueText();
+        }
+
         try parser.appendDecodedTextByte(first_byte);
 
         try parser.consumeSliceTextPlainRun();
@@ -250,6 +273,111 @@ pub const Parser = struct {
             .value = value,
             .from_cdata = from_cdata,
         } };
+    }
+
+    fn continueText(parser: *Parser) ParseError!?Event {
+        if (parser.text_state.?.from_cdata) return @as(?Event, try parser.continueCdata());
+
+        while (true) {
+            const state = &parser.text_state.?;
+            const next_byte = try parser.peekOptionalByte();
+            if (next_byte == null or next_byte.? == '<') {
+                if (!state.saw_non_whitespace and isWhitespaceOnly(parser.currentToken())) {
+                    parser.text_state = null;
+                    parser.token_len = 0;
+                    return null;
+                }
+                return try parser.emitTextChunk(true);
+            }
+
+            if (parser.token_len >= parser.textChunkCapacity()) {
+                if (std.unicode.utf8ValidateSlice(parser.currentToken())) {
+                    if (!state.saw_non_whitespace) {
+                        if (!isWhitespaceOnly(parser.currentToken())) state.saw_non_whitespace = true;
+                    }
+                    return try parser.emitTextChunk(false);
+                }
+                if (parser.token_len >= parser.token_buffer.len) return error.InvalidUtf8;
+            }
+
+            _ = try parser.takeRequiredByte();
+            try parser.appendDecodedTextByte(next_byte.?);
+        }
+    }
+
+    fn continueCdata(parser: *Parser) ParseError!Event {
+        while (true) {
+            const state = &parser.text_state.?;
+            const byte = try parser.peekOptionalByte() orelse return error.UnexpectedEof;
+            switch (state.cdata_brackets) {
+                0 => {
+                    if (parser.token_len >= parser.textChunkCapacity() and byte != ']') {
+                        if (!std.unicode.utf8ValidateSlice(parser.currentToken())) return error.InvalidUtf8;
+                        return try parser.emitTextChunk(false);
+                    }
+                    _ = try parser.takeRequiredByte();
+                    if (byte == ']') {
+                        state.cdata_brackets = 1;
+                    } else {
+                        try parser.appendTokenByte(byte);
+                    }
+                },
+                1 => {
+                    if (byte == ']') {
+                        _ = try parser.takeRequiredByte();
+                        state.cdata_brackets = 2;
+                    } else {
+                        if (parser.token_len > parser.token_buffer.len or 2 > parser.token_buffer.len - parser.token_len) {
+                            if (!std.unicode.utf8ValidateSlice(parser.currentToken())) return error.InvalidUtf8;
+                            return try parser.emitTextChunk(false);
+                        }
+                        _ = try parser.takeRequiredByte();
+                        try parser.appendTokenByte(']');
+                        state.cdata_brackets = 0;
+                        try parser.appendTokenByte(byte);
+                    }
+                },
+                2 => {
+                    if (byte == '>') {
+                        _ = try parser.takeRequiredByte();
+                        state.cdata_brackets = 0;
+                        return try parser.emitTextChunk(true);
+                    }
+                    const required = if (byte == ']') @as(usize, 2) else 3;
+                    if (parser.token_len > parser.token_buffer.len or required > parser.token_buffer.len - parser.token_len) {
+                        if (!std.unicode.utf8ValidateSlice(parser.currentToken())) return error.InvalidUtf8;
+                        return try parser.emitTextChunk(false);
+                    }
+                    _ = try parser.takeRequiredByte();
+                    try parser.appendTokenByte(']');
+                    try parser.appendTokenByte(']');
+                    if (byte == ']') {
+                        state.cdata_brackets = 1;
+                    } else {
+                        state.cdata_brackets = 0;
+                        try parser.appendTokenByte(byte);
+                    }
+                },
+                else => return error.MalformedXml,
+            }
+        }
+    }
+
+    fn emitTextChunk(parser: *Parser, is_final: bool) ParseError!Event {
+        const state = parser.text_state orelse return error.MalformedXml;
+        const value = parser.currentToken();
+        if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+        if (is_final) parser.text_state = null;
+        return .{ .text = .{
+            .byte_offset = state.byte_offset,
+            .value = value,
+            .from_cdata = state.from_cdata,
+            .is_final = is_final,
+        } };
+    }
+
+    fn textChunkCapacity(parser: *const Parser) usize {
+        return parser.token_buffer.len - 4;
     }
 
     fn parseStartElement(parser: *Parser, byte_offset: u64, first_name_byte: u8) ParseError!Event {
@@ -483,34 +611,12 @@ pub const Parser = struct {
             } };
         }
 
-        while (true) {
-            const byte = try parser.takeRequiredByte();
-            if (byte == ']') {
-                if (try parser.peekOptionalByte()) |second| {
-                    if (second == ']') {
-                        _ = try parser.takeRequiredByte();
-                        if (try parser.peekOptionalByte()) |third| {
-                            if (third == '>') {
-                                _ = try parser.takeRequiredByte();
-                                break;
-                            }
-                        } else return error.UnexpectedEof;
-                        try parser.appendTokenByte(']');
-                        try parser.appendTokenByte(']');
-                        continue;
-                    }
-                } else return error.UnexpectedEof;
-            }
-            try parser.appendTokenByte(byte);
-        }
-
-        const value = parser.currentToken();
-        if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
-        return .{ .text = .{
+        if (parser.token_buffer.len <= 4) return error.TokenTooLong;
+        parser.text_state = .{
             .byte_offset = byte_offset,
-            .value = value,
             .from_cdata = true,
-        } };
+        };
+        return try parser.continueCdata();
     }
 
     fn skipProcessingInstruction(parser: *Parser) ParseError!void {
@@ -1007,6 +1113,7 @@ fn eventsSemanticallyEqual(left: Event, right: Event) bool {
             const right_text = right.text;
             return left_text.byte_offset == right_text.byte_offset and
                 left_text.from_cdata == right_text.from_cdata and
+                left_text.is_final == right_text.is_final and
                 std.mem.eql(u8, left_text.value, right_text.value);
         },
     }
@@ -1352,8 +1459,8 @@ test "parser repeated clean inline parses keep event count stable" {
 
 // --- Tests: limit pressure ---
 
-test "parser accepts text token at exact buffer boundary" {
-    const xml = "<root>abcdefghijklmnop</root>";
+test "parser emits bounded text chunks" {
+    const xml = "<root>abcdefghijklmnopq</root>";
 
     // Arrange.
     var reader = std.Io.Reader.fixed(xml);
@@ -1374,16 +1481,19 @@ test "parser accepts text token at exact buffer boundary" {
 
     // Act and assert.
     _ = (try parser.next()).?.start_element;
-    const text = (try parser.next()).?.text;
-    try std.testing.expectEqualStrings("abcdefghijklmnop", text.value);
+    const first = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("abcdefghijkl", first.value);
+    try std.testing.expect(!first.is_final);
+    const second = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("mnopq", second.value);
+    try std.testing.expect(second.is_final);
     _ = (try parser.next()).?.end_element;
     try std.testing.expectEqual(@as(?Event, null), try parser.next());
 }
 
-test "parser rejects text token that exceeds buffer boundary by one byte" {
-    const xml = "<root>abcdefghijklmnopq</root>";
+test "parser preserves utf8 and cdata across text chunks" {
+    const xml = "<root>abcdefghijk\xF0\x9F\x98\x80xyz<![CDATA[abcdefghijklmnopq]]></root>";
 
-    // Arrange.
     var reader = std.Io.Reader.fixed(xml);
     var token_buffer: [16]u8 = undefined;
     var attributes: [4]Attribute = undefined;
@@ -1400,11 +1510,103 @@ test "parser rejects text token that exceeds buffer boundary by one byte" {
         .element_bytes = &element_bytes,
     });
 
-    // Act.
     _ = (try parser.next()).?.start_element;
+    const first = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("abcdefghijk\xF0\x9F\x98\x80", first.value);
+    try std.testing.expect(!first.is_final);
+    const second = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("xyz", second.value);
+    try std.testing.expect(second.is_final);
 
-    // Assert.
-    try std.testing.expectError(error.TokenTooLong, parser.next());
+    const cdata_first = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("abcdefghijkl", cdata_first.value);
+    try std.testing.expect(cdata_first.from_cdata);
+    try std.testing.expect(!cdata_first.is_final);
+    const cdata_second = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("mnopq", cdata_second.value);
+    try std.testing.expect(cdata_second.from_cdata);
+    try std.testing.expect(cdata_second.is_final);
+
+    _ = (try parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try parser.next());
+}
+
+test "parser preserves cdata bracket runs across text chunks" {
+    const xml = "<root><![CDATA[abcdefghijkl]]x]>]]></root>";
+
+    var reader = std.Io.Reader.fixed(xml);
+    var token_buffer: [16]u8 = undefined;
+    var attributes: [4]Attribute = undefined;
+    var namespace_bindings: [4]NamespaceBinding = undefined;
+    var namespace_bytes: [64]u8 = undefined;
+    var element_stack: [4]ElementFrame = undefined;
+    var element_bytes: [64]u8 = undefined;
+    var parser = Parser.init(&reader, .{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+
+    _ = (try parser.next()).?.start_element;
+    const first = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("abcdefghijkl]]x", first.value);
+    try std.testing.expect(!first.is_final);
+
+    const second = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings("]>", second.value);
+    try std.testing.expect(second.is_final);
+    _ = (try parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(?Event, null), try parser.next());
+}
+
+test "parser keeps slice and reader parity across refill boundaries" {
+    const xml = "<root a=\"value\"><child>hello &amp; goodbye</child><![CDATA[text]]></root>";
+
+    for (1..8) |chunk_size| {
+        var slice_token: [128]u8 = undefined;
+        var slice_attributes: [8]Attribute = undefined;
+        var slice_namespaces: [8]NamespaceBinding = undefined;
+        var slice_namespace_bytes: [256]u8 = undefined;
+        var slice_stack: [8]ElementFrame = undefined;
+        var slice_element_bytes: [256]u8 = undefined;
+        var slice_parser = Parser.initSlice(xml, .{
+            .token = &slice_token,
+            .attributes = &slice_attributes,
+            .namespace_bindings = &slice_namespaces,
+            .namespace_bytes = &slice_namespace_bytes,
+            .element_stack = &slice_stack,
+            .element_bytes = &slice_element_bytes,
+        });
+
+        var chunked_reader: ChunkedReader = undefined;
+        chunked_reader.init(xml, chunk_size);
+        var reader_token: [128]u8 = undefined;
+        var reader_attributes: [8]Attribute = undefined;
+        var reader_namespaces: [8]NamespaceBinding = undefined;
+        var reader_namespace_bytes: [256]u8 = undefined;
+        var reader_stack: [8]ElementFrame = undefined;
+        var reader_element_bytes: [256]u8 = undefined;
+        var reader_parser = Parser.init(chunked_reader.readerPtr(), .{
+            .token = &reader_token,
+            .attributes = &reader_attributes,
+            .namespace_bindings = &reader_namespaces,
+            .namespace_bytes = &reader_namespace_bytes,
+            .element_stack = &reader_stack,
+            .element_bytes = &reader_element_bytes,
+        });
+
+        while (true) {
+            const slice_event = try slice_parser.next();
+            const reader_event = try reader_parser.next();
+            if (slice_event == null and reader_event == null) break;
+            try std.testing.expect(slice_event != null);
+            try std.testing.expect(reader_event != null);
+            try std.testing.expect(eventsSemanticallyEqual(slice_event.?, reader_event.?));
+        }
+    }
 }
 
 test "parser accepts exact attribute count and rejects one more" {
@@ -1631,7 +1833,7 @@ test "parser accepts exact element name storage and rejects overflow" {
     try std.testing.expectError(error.ElementStorageExceeded, overflow_parser.next());
 }
 
-test "parser repeats boundary failures without changing error kind" {
+test "parser repeats bounded text chunks without changing event count" {
     const xml = "<root>abcdefghijklmnopq</root>";
 
     // Arrange.
@@ -1656,8 +1858,12 @@ test "parser repeats boundary failures without changing error kind" {
 
         _ = (try parser.next()).?.start_element;
 
-        // Assert.
-        try std.testing.expectError(error.TokenTooLong, parser.next());
+        const first = (try parser.next()).?.text;
+        const second = (try parser.next()).?.text;
+        try std.testing.expect(!first.is_final);
+        try std.testing.expect(second.is_final);
+        _ = (try parser.next()).?.end_element;
+        try std.testing.expectEqual(@as(?Event, null), try parser.next());
     }
 }
 
@@ -2051,6 +2257,45 @@ test "parser handles xml corpus fixtures" {
 }
 
 // --- Test helpers ---
+
+const ChunkedReader = struct {
+    reader: std.Io.Reader,
+    input: []const u8,
+    offset: usize,
+    chunk_size: usize,
+    buffer: [64]u8 = undefined,
+
+    fn init(self: *ChunkedReader, input: []const u8, chunk_size: usize) void {
+        self.* = .{
+            .reader = undefined,
+            .input = input,
+            .offset = 0,
+            .chunk_size = chunk_size,
+        };
+        self.reader = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = &self.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn readerPtr(self: *ChunkedReader) *std.Io.Reader {
+        return &self.reader;
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const self: *ChunkedReader = @alignCast(@fieldParentPtr("reader", reader));
+        if (self.offset == self.input.len) return error.EndOfStream;
+        const available = self.input.len - self.offset;
+        const allowed = limit.toInt() orelse available;
+        const count = @min(self.chunk_size, @min(available, allowed));
+        if (count == 0) return error.EndOfStream;
+        try writer.writeAll(self.input[self.offset..][0..count]);
+        self.offset += count;
+        return count;
+    }
+};
 
 const InlineParserHarness = struct {
     reader: std.Io.Reader,

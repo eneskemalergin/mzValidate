@@ -1580,6 +1580,24 @@ test "checkPath_syntheticLargeMzMLFixture_runsCleanInOnePass" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "checkPath_stream_largeBinaryText_fixture_reportsLengthMismatch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/large-binary-text.mzML", .{
+        .input_mode = .stream,
+        .skip_semantic = true,
+    });
+
+    try expectSingleDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "decoded array length does not match defaultArrayLength",
+    );
+}
+
 test "writeSyntheticLargeMzmlFixture_writes_expected_streamed_shape" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
