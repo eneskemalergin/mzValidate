@@ -79,6 +79,8 @@ pub const RuleId = struct {
     pub const mzml_ref_missing = "mzml.ref.missing";
 };
 
+const emergency_failure_message = "validation stopped before all enabled stages completed";
+
 /// Shared input-derived limits used by validators in one check.
 pub const ResourceLimits = struct {
     max_binary_encoded_bytes: usize = 256 * 1024 * 1024,
@@ -241,6 +243,7 @@ pub const FileResult = struct {
         path: ?[]const u8,
         diagnostic_emitted: bool,
     ) void {
+        if (!diagnostic_emitted) result.diagnostics_truncated = true;
         if (result.first_failure != null) return;
         result.first_failure = .{
             .stage = stage,
@@ -251,6 +254,15 @@ pub const FileResult = struct {
             .path = path,
         };
         result.failure_diagnostic_emitted = diagnostic_emitted;
+    }
+
+    pub fn recordEmergencyFailure(
+        result: *FileResult,
+        stage: ValidationStage,
+        reason: FailureReason,
+        path: ?[]const u8,
+    ) void {
+        result.recordFailure(stage, reason, RuleId.runtime_incomplete, emergency_failure_message, .{}, path, false);
     }
 
     pub fn finalize(result: *FileResult, diagnostics: []const Diagnostic) void {
@@ -409,8 +421,20 @@ test "file result records first failure without normal diagnostic storage" {
     result.recordFailure(.parser, .parser, RuleId.mzml_structure_xml, "parser stopped", .{}, "sample.mzML", false);
     result.finalize(&.{});
 
+    try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expectEqual(CompletionState.incomplete, result.completion);
     try std.testing.expect(result.needsEmergencyDiagnostic());
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
     try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+}
+
+test "file result marks the fixed emergency failure path" {
+    var result = FileResult.init(stageBit(.semantic));
+
+    result.recordEmergencyFailure(.semantic, .allocation, "sample.mzML");
+    result.finalize(&.{});
+
+    try std.testing.expect(result.diagnostics_truncated);
+    try std.testing.expect(result.needsEmergencyDiagnostic());
+    try std.testing.expectEqualStrings(emergency_failure_message, result.first_failure.?.message);
 }

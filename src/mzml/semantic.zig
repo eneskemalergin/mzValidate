@@ -103,9 +103,13 @@ const RefTable = struct {
     }
 
     fn addRef(table: *RefTable, ref_attr: []const u8, ref_value: []const u8, byte_offset: u64) !void {
+        const owned_attr = try table.allocator.dupe(u8, ref_attr);
+        errdefer table.allocator.free(owned_attr);
+        const owned_value = try table.allocator.dupe(u8, ref_value);
+        errdefer table.allocator.free(owned_value);
         try table.unresolved.append(table.allocator, .{
-            .ref_attr = try table.allocator.dupe(u8, ref_attr),
-            .ref_value = try table.allocator.dupe(u8, ref_value),
+            .ref_attr = owned_attr,
+            .ref_value = owned_value,
             .byte_offset = byte_offset,
         });
     }
@@ -1260,6 +1264,18 @@ test "RefTable: unresolved diagnostic allocation failure propagates" {
     }
 
     try expectError(error.OutOfMemory, table.resolveAll(&diagnostics, null));
+}
+
+test "RefTable: addRef cleans each allocation failure" {
+    for (0..3) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var table = RefTable.init(failing_allocator.allocator());
+
+        try std.testing.expectError(error.OutOfMemory, table.addRef("ref", "missing", 0));
+        table.deinit();
+
+        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    }
 }
 
 test "SemanticValidator: duplicate id produces error" {

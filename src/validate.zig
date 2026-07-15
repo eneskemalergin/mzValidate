@@ -91,13 +91,19 @@ fn checkPathInternal(
     result.beginStage(.input);
     const cwd = std.Io.Dir.cwd();
     var file = cwd.openFile(io, path, .{}) catch {
-        try diagnostics.append(allocator, .{
-            .severity = .@"error",
-            .rule = RuleId.runtime_file_open,
-            .path = path,
-            .message = "unable to open input file",
-        });
-        result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to open input file", .{}, path, true);
+        try appendFailureDiagnostic(
+            allocator,
+            diagnostics,
+            result,
+            .input,
+            .input,
+            .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "unable to open input file",
+            },
+        );
         return;
     };
     defer file.close(io);
@@ -117,23 +123,35 @@ fn checkPathMapped(
     result: *FileResult,
 ) !void {
     const stat = file.stat(io) catch {
-        try diagnostics.append(allocator, .{
-            .severity = .@"error",
-            .rule = RuleId.runtime_file_open,
-            .path = path,
-            .message = "unable to stat input file",
-        });
-        result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to stat input file", .{}, path, true);
+        try appendFailureDiagnostic(
+            allocator,
+            diagnostics,
+            result,
+            .input,
+            .input,
+            .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "unable to stat input file",
+            },
+        );
         return;
     };
     const len = std.math.cast(usize, stat.size) orelse {
-        try diagnostics.append(allocator, .{
-            .severity = .@"error",
-            .rule = RuleId.runtime_file_open,
-            .path = path,
-            .message = "input file is too large for this platform",
-        });
-        result.recordFailure(.input, .resource, RuleId.runtime_file_open, "input file is too large for this platform", .{}, path, true);
+        try appendFailureDiagnostic(
+            allocator,
+            diagnostics,
+            result,
+            .input,
+            .resource,
+            .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "input file is too large for this platform",
+            },
+        );
         return;
     };
 
@@ -145,13 +163,19 @@ fn checkPathMapped(
         const cwd = std.Io.Dir.cwd();
         const buf = cwd.readFileAlloc(io, path, allocator, .limited(len)) catch |err| {
             if (err == error.OutOfMemory) return err;
-            try diagnostics.append(allocator, .{
-                .severity = .@"error",
-                .rule = RuleId.runtime_file_open,
-                .path = path,
-                .message = "unable to read input after memory-map failure",
-            });
-            result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to read input after memory-map failure", .{}, path, true);
+            try appendFailureDiagnostic(
+                allocator,
+                diagnostics,
+                result,
+                .input,
+                .input,
+                .{
+                    .severity = .@"error",
+                    .rule = RuleId.runtime_file_open,
+                    .path = path,
+                    .message = "unable to read input after memory-map failure",
+                },
+            );
             return;
         };
         defer allocator.free(buf);
@@ -312,13 +336,19 @@ fn runValidation(
             // 50 MB limit: the embedded psi-ms.obo is 1.2 MB; the largest
             // OBO in common use (GO) fits well under this ceiling.
             break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(50 * 1024 * 1024)) catch |err| {
-                try diagnostics.append(allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.runtime_file_open,
-                    .path = path,
-                    .message = "unable to read OBO file",
-                });
-                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog, RuleId.runtime_file_open, "unable to read OBO file", .{}, path, true);
+                try appendFailureDiagnostic(
+                    allocator,
+                    diagnostics,
+                    result,
+                    .semantic,
+                    if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog,
+                    .{
+                        .severity = .@"error",
+                        .rule = RuleId.runtime_file_open,
+                        .path = path,
+                        .message = "unable to read OBO file",
+                    },
+                );
                 break :blk null;
             };
         } else @embedFile("data/psi-ms.obo");
@@ -327,26 +357,39 @@ fn runValidation(
             defer if (options.obo_path != null) allocator.free(text);
             cv_table = obo_parser.CvTable.init(allocator, text) catch |err| {
                 const message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err);
-                try diagnostics.append(allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.runtime_file_open,
-                    .path = path,
-                    .message = message,
-                });
-                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, message, .{}, path, true);
+                try appendFailureDiagnostic(
+                    allocator,
+                    diagnostics,
+                    result,
+                    .semantic,
+                    if (err == error.OutOfMemory) .allocation else .catalog,
+                    .{
+                        .severity = .@"error",
+                        .rule = RuleId.runtime_file_open,
+                        .path = path,
+                        .message = message,
+                    },
+                );
                 return;
             };
         }
         if (cv_table) |*table| {
             const rule_xml = @embedFile("data/ms-mapping.xml");
             rule_eng = rule_engine.RuleEngine.init(allocator, rule_xml) catch |err| {
-                try diagnostics.append(allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.runtime_file_open,
-                    .path = path,
-                    .message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules",
-                });
-                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, "unable to parse mapping rules", .{}, path, true);
+                const message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules";
+                try appendFailureDiagnostic(
+                    allocator,
+                    diagnostics,
+                    result,
+                    .semantic,
+                    if (err == error.OutOfMemory) .allocation else .catalog,
+                    .{
+                        .severity = .@"error",
+                        .rule = RuleId.runtime_file_open,
+                        .path = path,
+                        .message = message,
+                    },
+                );
                 return;
             };
             if (rule_eng) |*engine| {
@@ -366,14 +409,20 @@ fn runValidation(
         result.beginStage(.parser);
         const maybe_event = parser.next() catch |err| {
             const message = xml_parse_errors.parseErrorMessage(err);
-            try diagnostics.append(allocator, .{
-                .severity = .@"error",
-                .rule = RuleId.mzml_structure_xml,
-                .location = .{ .byte_offset = parser.byteOffset() },
-                .path = path,
-                .message = message,
-            });
-            result.recordFailure(.parser, .parser, RuleId.mzml_structure_xml, message, .{ .byte_offset = parser.byteOffset() }, path, true);
+            try appendFailureDiagnostic(
+                allocator,
+                diagnostics,
+                result,
+                .parser,
+                .parser,
+                .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_structure_xml,
+                    .location = .{ .byte_offset = parser.byteOffset() },
+                    .path = path,
+                    .message = message,
+                },
+            );
             return;
         };
         const event = maybe_event orelse {
@@ -491,15 +540,72 @@ fn recordUnhandledFailure(result: *FileResult, err: anyerror, path: []const u8) 
         .resource
     else
         .unknown;
-    result.recordFailure(
-        result.active_stage,
-        reason,
-        RuleId.runtime_incomplete,
-        "validation stopped before all enabled stages completed",
-        .{},
-        path,
-        false,
+    result.recordEmergencyFailure(result.active_stage, reason, path);
+}
+
+fn appendFailureDiagnostic(
+    allocator: std.mem.Allocator,
+    diagnostics: *std.ArrayList(Diagnostic),
+    result: *FileResult,
+    stage: ValidationStage,
+    reason: FailureReason,
+    item: Diagnostic,
+) !void {
+    diagnostics.append(allocator, item) catch |err| {
+        result.recordEmergencyFailure(stage, .allocation, item.path);
+        return err;
+    };
+    result.recordFailure(stage, reason, item.rule, item.message, item.location, item.path, true);
+}
+
+fn expectAllocationFailuresIncomplete(
+    bytes: []const u8,
+    options: CheckOptions,
+    file_bytes: ?[]const u8,
+    sampled: bool,
+) !void {
+    var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var baseline_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    const baseline = checkSliceResult(
+        baseline_allocator.allocator(),
+        std.testing.io,
+        bytes,
+        &baseline_diagnostics,
+        "allocation-failure.mzML",
+        options,
+        file_bytes,
     );
+    baseline_diagnostics.deinit(baseline_allocator.allocator());
+    try std.testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, baseline.completion);
+
+    const allocation_count = baseline_allocator.alloc_index;
+    for (0..allocation_count) |fail_index| {
+        if (sampled and fail_index != 0 and fail_index != allocation_count / 2 and fail_index + 1 != allocation_count) continue;
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        const result = checkSliceResult(
+            failing_allocator.allocator(),
+            std.testing.io,
+            bytes,
+            &diagnostics,
+            "allocation-failure.mzML",
+            options,
+            file_bytes,
+        );
+        const induced = failing_allocator.has_induced_failure;
+        diagnostics.deinit(failing_allocator.allocator());
+
+        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+        if (induced) {
+            const failure = result.first_failure orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+            try std.testing.expectEqual(diagnostic.FailureReason.allocation, failure.reason);
+            try std.testing.expect(result.status() != .clean);
+        } else {
+            try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+        }
+    }
 }
 
 // --- Unit tests ---
@@ -1129,6 +1235,54 @@ test "checkReader_out_of_memory_returns_incomplete_file_result" {
     try std.testing.expectEqual(diagnostic.FailureReason.allocation, result.first_failure.?.reason);
     try std.testing.expect(result.needsEmergencyDiagnostic());
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+}
+
+test "required-state allocation failures stay incomplete and leak-free" {
+    const semantic_xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
+    try expectAllocationFailuresIncomplete(semantic_xml, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    }, null, false);
+
+    const index_fixture = try std.Io.Dir.cwd().readFileAlloc(
+        std.testing.io,
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        std.testing.allocator,
+        .limited(256 * 1024),
+    );
+    defer std.testing.allocator.free(index_fixture);
+    try expectAllocationFailuresIncomplete(index_fixture, .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    }, index_fixture, false);
+
+    try expectAllocationFailuresIncomplete(semantic_xml, .{
+        .skip_binary = true,
+        .skip_index = true,
+    }, null, true);
+}
+
+test "failure diagnostic allocation uses the fixed emergency result" {
+    const xml = "<?xml version=\"1.0\"?><mzML><run";
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+
+    const result = checkSliceResult(failing_allocator.allocator(), std.testing.io, xml, &diagnostics, "diagnostic-oom.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    }, null);
+    diagnostics.deinit(failing_allocator.allocator());
+
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expect(result.first_failure.?.stage == .parser or result.first_failure.?.stage == .structural);
+    try std.testing.expectEqual(diagnostic.FailureReason.allocation, result.first_failure.?.reason);
+    try std.testing.expectEqualStrings(diagnostic.RuleId.runtime_incomplete, result.first_failure.?.rule);
+    try std.testing.expect(result.diagnostics_truncated);
+    try std.testing.expect(result.needsEmergencyDiagnostic());
 }
 
 test "checkPath_missing_catalog_returns_incomplete_file_result" {
