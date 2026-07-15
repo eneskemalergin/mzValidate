@@ -34,13 +34,19 @@ const max_validation_token_bytes = 1024 * 1024;
 
 // --- Public entry points ---
 
+/// Requested input source mode. Selection remains a P2.1 behavior.
+pub const InputMode = enum {
+    stream,
+    mmap,
+};
+
 /// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
-    /// Compatibility hint. The current regular-file path is mmap-first even
-    /// without this flag; explicit input-mode selection is planned.
+    input_mode: InputMode = .mmap,
+    memory_limit: ?usize = null,
     mmap: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,

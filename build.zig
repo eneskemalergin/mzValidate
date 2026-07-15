@@ -76,7 +76,7 @@ pub fn build(b: *std.Build) void {
     cli_valid_cmd.addArg("-skip-semantic");
     cli_valid_cmd.addArg("-skip-index");
     cli_valid_cmd.addArg("-summary");
-    cli_valid_cmd.expectStdOutEqual("status=clean completion=complete info=0 warnings=0 errors=0\n");
+    cli_valid_cmd.expectStdOutEqual("complete: clean (info=0 warnings=0 errors=0)\n");
 
     const cli_invalid_cmd = b.addRunArtifact(exe);
     cli_invalid_cmd.step.dependOn(b.getInstallStep());
@@ -85,7 +85,7 @@ pub fn build(b: *std.Build) void {
     cli_invalid_cmd.addArg("-skip-semantic");
     cli_invalid_cmd.addArg("-summary");
     cli_invalid_cmd.expectExitCode(2);
-    cli_invalid_cmd.expectStdOutMatch("status=errors-present completion=complete info=0 warnings=0 errors=");
+    cli_invalid_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
 
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);

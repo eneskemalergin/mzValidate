@@ -1,11 +1,10 @@
 //! Renders diagnostics for humans and machines.
 //!
 //! Four modes, one writer interface:
-//!   text:    Grouped by input path, one line per diagnostic, aggregate summary.
+//!   text:    Grouped diagnostics followed by a result and optional config.
 //!   json:    Stable JSON array for CI pipelines. Keys never reorder.
-//!   summary: One line with status and counts. Good for pass/fail gating.
-//!   brief:   Grouped by severity/rule/message with occurrence counts.
-//!            Errors first (most frequent), then warnings, then info.
+//!   summary: Result and optional config for pass/fail gating.
+//!   brief:   Result and optional config followed by grouped diagnostics.
 //!
 //! Every renderer writes directly to a `std.Io.Writer`. stdout, buffer,
 //! file, or network sink. Zero heap allocation outside the writer.
@@ -37,20 +36,27 @@ pub fn renderTextResult(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     const emergency = hasEmergencyFailure(results);
     if (diagnostics.len > 0 or !emergency) try renderTextDiagnostics(writer, diagnostics);
+    var rendered_failure = false;
     for (results) |result| {
         if (result.first_failure) |failure| {
-            if (!result.failure_diagnostic_emitted) try renderFailureText(writer, failure);
+            if (!result.failure_diagnostic_emitted) {
+                try renderFailureText(writer, failure);
+                rendered_failure = true;
+            }
         }
     }
-    try writeResultSummaryLine(writer, diagnostic.summarizeResults(results));
+    if (rendered_failure) try writer.writeByte('\n');
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
 }
 
 fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     if (diagnostics.len == 0) {
-        try writer.writeAll("OK: no diagnostics emitted\n");
+        try writer.writeAll("OK: no diagnostics emitted\n\n");
         return;
     }
 
@@ -95,8 +101,13 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
     );
 }
 
-pub fn renderSummaryResult(writer: *std.Io.Writer, results: []const diagnostic.FileResult) std.Io.Writer.Error!void {
-    try writeResultStatusLine(writer, diagnostic.summarizeResults(results));
+pub fn renderSummaryResult(
+    writer: *std.Io.Writer,
+    results: []const diagnostic.FileResult,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
+) std.Io.Writer.Error!void {
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
 }
 
 /// Groups diagnostics by severity+rule+message and prints compact counts.
@@ -211,8 +222,10 @@ pub fn renderBriefResult(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
-    try writeResultStatusLine(writer, diagnostic.summarizeResults(results));
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
     if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
 }
 
@@ -323,35 +336,72 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     );
 }
 
-fn writeResultStatusLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
-    try writer.print("status={s} completion={s} info={d} warnings={d} errors={d}", .{
-        summary.status().label(),
+fn writeResultBlock(
+    writer: *std.Io.Writer,
+    summary: diagnostic.Summary,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
+) std.Io.Writer.Error!void {
+    try writer.print("{s}: {s} (info={d} warnings={d} errors={d})\n", .{
         summary.completion.label(),
+        humanStatusLabel(summary.status()),
         summary.totals.info,
         summary.totals.warnings,
         summary.totals.errors,
     });
     if (summary.first_failure) |failure| {
-        try writer.print(" failure_stage={s} failure_reason={s}", .{ failure.stage.label(), failure.reason.label() });
+        try writer.print("failure: stage={s} reason={s}", .{ failure.stage.label(), failure.reason.label() });
+        if (failure.path) |path| try writer.print(" input={s}", .{path});
+        try writer.writeByte('\n');
+    }
+    try writeConfigLine(writer, requested_input_mode, memory_limit);
+}
+
+fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
+    return switch (status) {
+        .clean => "clean",
+        .warnings_only => "warnings",
+        .errors_present => "errors",
+    };
+}
+
+fn writeConfigLine(
+    writer: *std.Io.Writer,
+    requested_input_mode: []const u8,
+    memory_limit: ?usize,
+) std.Io.Writer.Error!void {
+    const mode_changed = !std.mem.eql(u8, requested_input_mode, "mmap");
+    if (!mode_changed and memory_limit == null) return;
+
+    try writer.writeAll("config:");
+    var has_field = false;
+    if (mode_changed) {
+        try writer.print(" input={s} behavior=mmap-first", .{requested_input_mode});
+        has_field = true;
+    }
+    if (memory_limit) |limit| {
+        if (has_field) try writer.writeAll(";");
+        try writer.writeAll(" limit=");
+        try writeHumanSize(writer, limit);
+        try writer.writeAll("; ledger=not-enforced");
     }
     try writer.writeByte('\n');
 }
 
-fn writeResultSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
-    try writer.print(
-        "summary: {s} (completion={s} info={d} warnings={d} errors={d}",
-        .{
-            summary.status().label(),
-            summary.completion.label(),
-            summary.totals.info,
-            summary.totals.warnings,
-            summary.totals.errors,
-        },
-    );
-    if (summary.first_failure) |failure| {
-        try writer.print(" failure_stage={s} failure_reason={s}", .{ failure.stage.label(), failure.reason.label() });
+fn writeHumanSize(writer: *std.Io.Writer, bytes: usize) std.Io.Writer.Error!void {
+    const units = [_]struct { size: usize, label: []const u8 }{
+        .{ .size = 1024 * 1024 * 1024 * 1024, .label = "TiB" },
+        .{ .size = 1024 * 1024 * 1024, .label = "GiB" },
+        .{ .size = 1024 * 1024, .label = "MiB" },
+        .{ .size = 1024, .label = "KiB" },
+    };
+    for (units) |unit| {
+        if (bytes >= unit.size and bytes % unit.size == 0) {
+            try writer.print("{d} {s}", .{ bytes / unit.size, unit.label });
+            return;
+        }
     }
-    try writer.writeAll(")\n");
+    try writer.print("{d} bytes", .{bytes});
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
@@ -399,10 +449,80 @@ test "renderSummaryResult reports incomplete completion and first failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result});
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap", null);
 
     try std.testing.expectEqualStrings(
-        "status=errors-present completion=incomplete info=0 warnings=0 errors=1 failure_stage=parser failure_reason=parser\n",
+        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "failure: stage=parser reason=parser input=sample.mzML\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderSummaryResult_separates_nondefault_config" {
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "stream", 500 * 1024 * 1024);
+
+    try std.testing.expectEqualStrings(
+        "complete: clean (info=0 warnings=0 errors=0)\n" ++
+            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderSummaryResult_uses_friendly_warning_status" {
+    var result = diagnostic.FileResult.init(0);
+    const diagnostics = [_]Diagnostic{
+        .{ .severity = .info, .rule = "test.info", .message = "note" },
+        .{ .severity = .info, .rule = "test.info", .message = "note" },
+        .{ .severity = .warning, .rule = "test.warning", .message = "warning" },
+    };
+    result.finalize(&diagnostics);
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap", null);
+
+    try std.testing.expectEqualStrings(
+        "complete: warnings (info=2 warnings=1 errors=0)\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderTextResult_separates_result_and_config" {
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "stream", 500 * 1024 * 1024);
+
+    try std.testing.expectEqualStrings(
+        "OK: no diagnostics emitted\n\n" ++
+            "complete: clean (info=0 warnings=0 errors=0)\n" ++
+            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderBriefResult_uses_the_same_result_block" {
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result}, "stream", 500 * 1024 * 1024);
+
+    try std.testing.expectEqualStrings(
+        "complete: clean (info=0 warnings=0 errors=0)\n" ++
+            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
         allocating_writer.written(),
     );
 }
