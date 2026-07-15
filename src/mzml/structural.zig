@@ -491,7 +491,7 @@ pub const StructuralValidator = struct {
                 validator.run_has_chromatogram_list = false;
                 validator.run_last_child_slot = 0;
                 try validator.requireAttribute(start, "id", "run is missing required attribute id");
-                try validator.requireAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
+                try validator.requireReferenceAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
             },
             // Post-run: indexList > indexListOffset > fileChecksum.
             // Content validation delegated to IndexValidator.
@@ -566,7 +566,7 @@ pub const StructuralValidator = struct {
                 }
                 validator.spectrum_list_depth = element_depth;
                 try validator.requireAttribute(start, "count", "spectrumList is missing required attribute count");
-                try validator.requireAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
+                try validator.requireReferenceAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
                 validator.spectrum_list = try validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
             },
             .chromatogramList => {
@@ -578,7 +578,7 @@ pub const StructuralValidator = struct {
                 }
                 validator.chromatogram_list_depth = element_depth;
                 try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
-                try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
+                try validator.requireReferenceAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
                 validator.chromatogram_list = try validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
             },
             .spectrum => {
@@ -606,6 +606,9 @@ pub const StructuralValidator = struct {
             .referenceableParamGroup => {
                 validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
                 try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
+            },
+            .referenceableParamGroupRef => {
+                try validator.requireReferenceAttribute(start, "ref", "referenceableParamGroupRef is missing required attribute ref");
             },
             .sample => {
                 validator.bumpListItemCount(&validator.sample_list, element_depth);
@@ -658,7 +661,10 @@ pub const StructuralValidator = struct {
                         state.software_ref_seen = true;
                     }
                 }
-                try validator.requireAttribute(start, "ref", "softwareRef is missing required attribute ref");
+                try validator.requireReferenceAttribute(start, "ref", "softwareRef is missing required attribute ref");
+            },
+            .sourceFileRef => {
+                try validator.requireReferenceAttribute(start, "ref", "sourceFileRef is missing required attribute ref");
             },
             .source => {
                 try validator.noteComponentChild(start.byte_offset, .source);
@@ -690,7 +696,7 @@ pub const StructuralValidator = struct {
                 }
                 try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
                 try validator.requireNonNegativeAttribute(start, "order", "processingMethod");
-                try validator.requireAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
+                try validator.requireReferenceAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
             },
             .scanList => {
                 if (validator.spectrum == null) {
@@ -1226,6 +1232,17 @@ pub const StructuralValidator = struct {
         try validator.attributeError(start.byte_offset, message);
     }
 
+    fn requireReferenceAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, message: []const u8) !void {
+        if (hasAttribute(start.attributes, attribute_name)) return;
+        try validator.appendDiagnostic(.{
+            .severity = .@"error",
+            .rule = RuleId.mzml_ref_missing,
+            .location = .{ .byte_offset = start.byte_offset },
+            .path = validator.path,
+            .message = message,
+        });
+    }
+
     fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) !void {
         _ = element_label;
         const value = start.attr(attribute_name) orelse return;
@@ -1523,8 +1540,33 @@ test "structural validator reports missing required run and spectrumList attribu
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
     try std.testing.expectEqual(@as(usize, 3), diagnostics.items.len);
     try std.testing.expectEqualStrings("run is missing required attribute id", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_ref_missing, diagnostics.items[1].rule);
     try std.testing.expectEqualStrings("run is missing required attribute defaultInstrumentConfigurationRef", diagnostics.items[1].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_ref_missing, diagnostics.items[2].rule);
     try std.testing.expectEqualStrings("spectrumList is missing required attribute defaultDataProcessingRef", diagnostics.items[2].message);
+}
+
+test "structural validator reports missing required reference element attributes" {
+    const allocator = std.testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
+    try validator.consumeStart(test_events.startUnknown("sourceFileRef", &.{}, 10));
+    try validator.consumeStart(test_events.startUnknown("referenceableParamGroupRef", &.{}, 20));
+
+    var source_file_missing = false;
+    var param_group_missing = false;
+    for (diagnostics.items) |item| {
+        if (!std.mem.eql(u8, item.rule, RuleId.mzml_ref_missing)) continue;
+        if (std.mem.eql(u8, item.message, "sourceFileRef is missing required attribute ref")) source_file_missing = true;
+        if (std.mem.eql(u8, item.message, "referenceableParamGroupRef is missing required attribute ref")) param_group_missing = true;
+    }
+    try std.testing.expect(source_file_missing);
+    try std.testing.expect(param_group_missing);
 }
 
 // Tests: ordering and nesting rules.

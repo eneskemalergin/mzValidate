@@ -1,0 +1,10 @@
+<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">
+  <cvList count="1"><cv id="MS" fullName="PSI-MS" URI="https://example.invalid/psi-ms.obo"/></cvList>
+  <fileDescription><fileContent/></fileDescription>
+  <softwareList count="1"><software id="SW1" version="1.0"/></softwareList>
+  <instrumentConfigurationList count="1"><instrumentConfiguration id="IC1"/></instrumentConfigurationList>
+  <dataProcessingList count="1"><dataProcessing id="DP1"><processingMethod order="0" softwareRef="SW1"/></dataProcessing></dataProcessingList>
+  <run id="run-1">
+    <spectrumList count="0" defaultDataProcessingRef="DP1"/>
+  </run>
+</mzML>

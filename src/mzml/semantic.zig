@@ -51,6 +51,7 @@ const ScopeFrame = struct {
 const UnresolvedRef = struct {
     ref_attr: []const u8,
     ref_value: []const u8,
+    expected_element: ?[]const u8 = null,
     byte_offset: u64,
 };
 
@@ -102,7 +103,13 @@ const RefTable = struct {
         return true;
     }
 
-    fn addRef(table: *RefTable, ref_attr: []const u8, ref_value: []const u8, byte_offset: u64) !void {
+    fn addRef(
+        table: *RefTable,
+        ref_attr: []const u8,
+        ref_value: []const u8,
+        expected_element: ?[]const u8,
+        byte_offset: u64,
+    ) !void {
         const owned_attr = try table.allocator.dupe(u8, ref_attr);
         errdefer table.allocator.free(owned_attr);
         const owned_value = try table.allocator.dupe(u8, ref_value);
@@ -110,15 +117,25 @@ const RefTable = struct {
         try table.unresolved.append(table.allocator, .{
             .ref_attr = owned_attr,
             .ref_value = owned_value,
+            .expected_element = expected_element,
             .byte_offset = byte_offset,
         });
     }
 
     fn resolveAll(table: *RefTable, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) !void {
         for (table.unresolved.items) |r| {
-            if (table.declarations.get(r.ref_value)) |_| {
-                // resolved OK
-            } else {
+            if (r.ref_value.len == 0) {
+                try diagnostics.append(table.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_ref_empty,
+                    .location = .{ .byte_offset = r.byte_offset },
+                    .path = path,
+                    .message = "reference value is empty",
+                });
+                continue;
+            }
+
+            const declaration = table.declarations.get(r.ref_value) orelse {
                 try diagnostics.append(table.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_unresolved,
@@ -126,6 +143,19 @@ const RefTable = struct {
                     .path = path,
                     .message = "unresolved reference",
                 });
+                continue;
+            };
+
+            if (r.expected_element) |expected| {
+                if (!std.mem.eql(u8, declaration.element_name, expected)) {
+                    try diagnostics.append(table.allocator, .{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_ref_wrong_target,
+                        .location = .{ .byte_offset = r.byte_offset },
+                        .path = path,
+                        .message = "reference target has the wrong element type",
+                    });
+                }
             }
         }
     }
@@ -288,7 +318,12 @@ pub const SemanticValidator = struct {
             for (start.attributes) |attr| {
                 const name_attr = attr.name.local_name;
                 if (isRefAttr(name_attr)) {
-                    try validator.ref_table.addRef(name_attr, attr.value, start.byte_offset);
+                    try validator.ref_table.addRef(
+                        name_attr,
+                        attr.value,
+                        expectedReferenceTarget(tag, name_attr),
+                        start.byte_offset,
+                    );
                 }
             }
 
@@ -349,7 +384,31 @@ pub const SemanticValidator = struct {
             }
         }
 
+        if (tag == .cvParam) {
+            if (cvr == null) {
+                try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_ref_missing,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "cvParam is missing required attribute cvRef",
+                });
+                return;
+            }
+            if (cvr.?.len == 0) {
+                try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_ref_empty,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "reference value is empty",
+                });
+                return;
+            }
+        }
+
         const accession = pa orelse return;
+
         const cv_ref = if (cvr) |ref|
             ref
         else if (tag == .userParam) blk: {
@@ -681,6 +740,26 @@ fn isRefAttr(name: []const u8) bool {
     // paramGroupRef uses attribute name "ref" instead of *Ref suffix.
     if (std.mem.eql(u8, name, "ref")) return true;
     return name.len >= 3 and std.mem.eql(u8, name[name.len - 3 ..], "Ref");
+}
+
+fn expectedReferenceTarget(tag: ElementId, ref_attr: []const u8) ?[]const u8 {
+    if (std.mem.eql(u8, ref_attr, "cvRef") or std.mem.eql(u8, ref_attr, "unitCvRef")) return "cv";
+    if (std.mem.eql(u8, ref_attr, "dataProcessingRef") or std.mem.eql(u8, ref_attr, "defaultDataProcessingRef")) return "dataProcessing";
+    if (std.mem.eql(u8, ref_attr, "defaultInstrumentConfigurationRef") or std.mem.eql(u8, ref_attr, "instrumentConfigurationRef")) return "instrumentConfiguration";
+    if (std.mem.eql(u8, ref_attr, "defaultSourceFileRef") or std.mem.eql(u8, ref_attr, "sourceFileRef")) return "sourceFile";
+    if (std.mem.eql(u8, ref_attr, "sampleRef")) return "sample";
+    if (std.mem.eql(u8, ref_attr, "scanSettingsRef")) return "scanSettings";
+    if (std.mem.eql(u8, ref_attr, "spectrumRef")) return "spectrum";
+    if (std.mem.eql(u8, ref_attr, "softwareRef")) return "software";
+    if (std.mem.eql(u8, ref_attr, "ref")) {
+        return switch (tag) {
+            .referenceableParamGroupRef, .paramGroupRef => "referenceableParamGroup",
+            .softwareRef => "software",
+            .sourceFileRef => "sourceFile",
+            else => null,
+        };
+    }
+    return null;
 }
 
 // --- Unit tests ---
@@ -1285,6 +1364,75 @@ test "SemanticValidator: unresolved ref produces error" {
     try expectEqualStrings(RuleId.mzml_ref_unresolved, diagnostics.items[0].rule);
 }
 
+test "SemanticValidator: missing cvRef produces reference diagnostic" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try sv.consumeStart(test_events.startInterned("cvParam", &.{}, 10));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_ref_missing, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: empty ref produces distinct diagnostic" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try sv.consumeStart(test_events.startInterned("instrumentConfiguration", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "" },
+    }, 10));
+
+    try sv.finish();
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_ref_empty, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: wrong ref target produces distinct diagnostic" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try sv.consumeStart(test_events.startInterned("instrumentConfiguration", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "IC1" },
+    }, 0));
+    try sv.consumeStart(test_events.startInterned("processingMethod", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "IC1" },
+    }, 10));
+
+    try sv.finish();
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_ref_wrong_target, diagnostics.items[0].rule);
+}
+
 test "RefTable: unresolved diagnostic allocation failure propagates" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
@@ -1306,7 +1454,7 @@ test "RefTable: addRef cleans each allocation failure" {
         var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var table = RefTable.init(failing_allocator.allocator());
 
-        try std.testing.expectError(error.OutOfMemory, table.addRef("ref", "missing", 0));
+        try std.testing.expectError(error.OutOfMemory, table.addRef("ref", "missing", null, 0));
         table.deinit();
 
         try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);

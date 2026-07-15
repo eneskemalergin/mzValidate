@@ -73,6 +73,10 @@ pub const RuleId = struct {
     pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";
     /// A *Ref attribute does not resolve to any declared id.
     pub const mzml_ref_unresolved = "mzml.ref.unresolved";
+    /// A reference attribute is present but has an empty value.
+    pub const mzml_ref_empty = "mzml.ref.empty";
+    /// A reference resolves to an id declared by the wrong mzML element type.
+    pub const mzml_ref_wrong_target = "mzml.ref.wrong-target";
     /// Two or more elements share the same id.
     pub const mzml_ref_duplicate_id = "mzml.ref.duplicate-id";
     /// A required *Ref attribute is missing on an element.

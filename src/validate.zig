@@ -785,6 +785,24 @@ test "checkPath_indexed_fixture_runs_mapping_rules" {
     try std.testing.expect(found_required_mapping_error);
 }
 
+test "checkPath_missing_required_reference_emits_reference_rule" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/missing-required-reference.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_ref_missing, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("run is missing required attribute defaultInstrumentConfigurationRef", diagnostics.items[0].message);
+}
+
 test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
