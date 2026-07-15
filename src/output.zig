@@ -350,7 +350,7 @@ fn writeResultBlock(
         summary.totals.errors,
     });
     if (summary.first_failure) |failure| {
-        try writer.print("failure: stage={s} reason={s}", .{ failure.stage.label(), failure.reason.label() });
+        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule });
         if (failure.path) |path| try writer.print(" input={s}", .{path});
         try writer.writeByte('\n');
     }
@@ -376,7 +376,7 @@ fn writeConfigLine(
     try writer.writeAll("config:");
     var has_field = false;
     if (mode_changed) {
-        try writer.print(" input={s} behavior=mmap-first", .{requested_input_mode});
+        try writer.print(" input={s} behavior=explicit", .{requested_input_mode});
         has_field = true;
     }
     if (memory_limit) |limit| {
@@ -453,7 +453,7 @@ test "renderSummaryResult reports incomplete completion and first failure" {
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=parser reason=parser input=sample.mzML\n",
+            "failure: stage=parser reason=parser rule=runtime.incomplete input=sample.mzML\n",
         allocating_writer.written(),
     );
 }
@@ -469,7 +469,7 @@ test "renderSummaryResult_separates_nondefault_config" {
 
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
         allocating_writer.written(),
     );
 }
@@ -506,7 +506,7 @@ test "renderTextResult_separates_result_and_config" {
     try std.testing.expectEqualStrings(
         "OK: no diagnostics emitted\n\n" ++
             "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
         allocating_writer.written(),
     );
 }
@@ -522,7 +522,7 @@ test "renderBriefResult_uses_the_same_result_block" {
 
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=mmap-first; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
         allocating_writer.written(),
     );
 }

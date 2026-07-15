@@ -341,10 +341,10 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
             "  -input-mode stream|mmap\n" ++
-            "               Record the requested mode; behavior remains mmap-first until P2.1.\n" ++
+            "               Use bounded stream input or explicit read-only mmap.\n" ++
             "  -mmap        Compatibility alias for -input-mode mmap.\n" ++
             "  -memory-limit N\n" ++
-            "               Record the validator-state limit; enforcement lands in P2.1.\n" ++
+            "               Record the validator-state limit; ledger enforcement is pending.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
@@ -840,7 +840,7 @@ test "runArgs_summary_records_requested_mode_and_memory_limit" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=mmap-first; limit=2 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit; limit=2 MiB; ledger=not-enforced\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());

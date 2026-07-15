@@ -1,15 +1,14 @@
 //! Entry points for running validation against files or streams.
 //!
 //! Three I/O paths:
-//!   checkPath                  -> mmap (preferred) or read-into-heap, slice parser.
+//!   checkPath                  -> explicit mmap or bounded stream, selected by options.
 //!   checkSlice                 -> caller provides contiguous bytes, slice parser.
 //!   checkReader                -> caller provides a stream, reader parser.
 //!
 //! All validators (structural, binary, index, semantic) run in one
 //! forward pass over the event stream. Validator-owned state is bounded per
 //! phase: parser buffers, one active binary workspace, index tables, and the
-//! semantic CV/ref tracker. The current path input itself may be file-sized;
-//! the bounded stream input path is planned separately.
+//! semantic CV/ref tracker. A path never falls back to a file-sized heap buffer.
 
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
@@ -31,10 +30,11 @@ const FileResult = diagnostic.FileResult;
 const RuleId = diagnostic.RuleId;
 const ValidationStage = diagnostic.ValidationStage;
 const max_validation_token_bytes = 1024 * 1024;
+const stream_input_buffer_bytes = 64 * 1024;
 
 // --- Public entry points ---
 
-/// Requested input source mode. Selection remains a P2.1 behavior.
+/// Requested input source mode. Mmap requires a stable regular file.
 pub const InputMode = enum {
     stream,
     mmap,
@@ -239,7 +239,7 @@ pub const ValidationError = error{
     ValidationIncomplete,
 };
 
-/// Validates an mzML file on disk (mmap when possible).
+/// Validates an mzML file on disk using the requested input mode.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -272,6 +272,38 @@ fn checkPathInternal(
 ) !void {
     result.beginStage(.input);
     const cwd = std.Io.Dir.cwd();
+    const path_stat = cwd.statFile(context.io, path, .{}) catch {
+        try appendFailureDiagnostic(
+            context.allocator,
+            diagnostics,
+            result,
+            .input,
+            .input,
+            .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "unable to stat input file",
+            },
+        );
+        return;
+    };
+    if (path_stat.kind != .file) {
+        try appendFailureDiagnostic(
+            context.allocator,
+            diagnostics,
+            result,
+            .input,
+            .input,
+            .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "input path is not a regular file",
+            },
+        );
+        return;
+    }
     var file = cwd.openFile(context.io, path, .{}) catch {
         try appendFailureDiagnostic(
             context.allocator,
@@ -290,19 +322,7 @@ fn checkPathInternal(
     };
     defer file.close(context.io);
 
-    try checkPathMapped(context, file, diagnostics, path, result);
-}
-
-// mmap for random-access index checks; fall back to a stat-limited whole-file
-// read until the stream path is available.
-fn checkPathMapped(
-    context: *InvocationContext,
-    file: std.Io.File,
-    diagnostics: *std.ArrayList(Diagnostic),
-    path: []const u8,
-    result: *FileResult,
-) !void {
-    const stat = file.stat(context.io) catch {
+    const opened_stat = file.stat(context.io) catch {
         try appendFailureDiagnostic(
             context.allocator,
             diagnostics,
@@ -313,12 +333,32 @@ fn checkPathMapped(
                 .severity = .@"error",
                 .rule = RuleId.runtime_file_open,
                 .path = path,
-                .message = "unable to stat input file",
+                .message = "unable to stat opened input file",
             },
         );
         return;
     };
-    const len = std.math.cast(usize, stat.size) orelse {
+    if (!sameFileStat(path_stat, opened_stat)) {
+        try appendFileStabilityDiagnostic(context, diagnostics, result, path, "input changed before validation started");
+        return;
+    }
+
+    switch (context.options.input_mode) {
+        .mmap => try checkPathMapped(context, file, opened_stat, diagnostics, path, result, std.Io.File.MemoryMap.create),
+        .stream => try checkPathStream(context, file, opened_stat, diagnostics, path, result),
+    }
+}
+
+fn checkPathMapped(
+    context: *InvocationContext,
+    file: std.Io.File,
+    initial_stat: std.Io.File.Stat,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    result: *FileResult,
+    comptime map_create: anytype,
+) !void {
+    const len = std.math.cast(usize, initial_stat.size) orelse {
         try appendFailureDiagnostic(
             context.allocator,
             diagnostics,
@@ -335,40 +375,118 @@ fn checkPathMapped(
         return;
     };
 
-    var mm = std.Io.File.MemoryMap.create(context.io, file, .{
+    var mm = map_create(context.io, file, .{
         .len = len,
         .protection = .{ .read = true },
         .populate = false,
     }) catch {
-        const cwd = std.Io.Dir.cwd();
-        const buf = cwd.readFileAlloc(context.io, path, context.allocator, .limited(len)) catch |err| {
-            if (err == error.OutOfMemory) return err;
-            try appendFailureDiagnostic(
-                context.allocator,
-                diagnostics,
-                result,
-                .input,
-                .input,
-                .{
-                    .severity = .@"error",
-                    .rule = RuleId.runtime_file_open,
-                    .path = path,
-                    .message = "unable to read input after memory-map failure",
-                },
-            );
-            return;
-        };
-        defer context.allocator.free(buf);
-        const index_bytes = if (context.options.skip_index) null else buf;
-        result.completeStage(.input);
-        try runValidation(context, diagnostics, path, index_bytes, .{ .slice = buf }, result);
+        try appendModeFailureDiagnostic(context, diagnostics, result, path, "requested mmap input mode is unavailable");
         return;
     };
-    defer mm.destroy(context.io);
+    if (mm.section == null) {
+        mm.destroy(context.io);
+        try appendModeFailureDiagnostic(context, diagnostics, result, path, "requested mmap input mode is unavailable");
+        return;
+    }
+
+    var map_destroyed = false;
+    defer if (!map_destroyed) mm.destroy(context.io);
 
     const index_bytes = if (context.options.skip_index) null else mm.memory;
     result.completeStage(.input);
     try runValidation(context, diagnostics, path, index_bytes, .{ .slice = mm.memory }, result);
+    mm.destroy(context.io);
+    map_destroyed = true;
+    try checkFileStability(context, file, initial_stat, diagnostics, path, result);
+}
+
+fn checkPathStream(
+    context: *InvocationContext,
+    file: std.Io.File,
+    initial_stat: std.Io.File.Stat,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    result: *FileResult,
+) !void {
+    var input_buffer: [stream_input_buffer_bytes]u8 = undefined;
+    var file_reader = file.readerStreaming(context.io, &input_buffer);
+
+    result.completeStage(.input);
+    try runValidation(context, diagnostics, path, null, .{ .reader = &file_reader.interface }, result);
+    try checkFileStability(context, file, initial_stat, diagnostics, path, result);
+}
+
+fn sameFileStat(first: std.Io.File.Stat, second: std.Io.File.Stat) bool {
+    return first.kind == second.kind and
+        first.inode == second.inode and
+        first.size == second.size and
+        std.meta.eql(first.mtime, second.mtime) and
+        std.meta.eql(first.ctime, second.ctime);
+}
+
+fn checkFileStability(
+    context: *InvocationContext,
+    file: std.Io.File,
+    initial_stat: std.Io.File.Stat,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    result: *FileResult,
+) !void {
+    const final_file_stat = file.stat(context.io) catch {
+        try appendFileStabilityDiagnostic(context, diagnostics, result, path, "unable to stat input after validation");
+        return;
+    };
+    const final_path_stat = std.Io.Dir.cwd().statFile(context.io, path, .{}) catch {
+        try appendFileStabilityDiagnostic(context, diagnostics, result, path, "unable to stat input path after validation");
+        return;
+    };
+    if (!sameFileStat(initial_stat, final_file_stat) or !sameFileStat(initial_stat, final_path_stat)) {
+        try appendFileStabilityDiagnostic(context, diagnostics, result, path, "input file changed during validation");
+    }
+}
+
+fn appendFileStabilityDiagnostic(
+    context: *InvocationContext,
+    diagnostics: *std.ArrayList(Diagnostic),
+    result: *FileResult,
+    path: []const u8,
+    message: []const u8,
+) !void {
+    try appendFailureDiagnostic(
+        context.allocator,
+        diagnostics,
+        result,
+        .input,
+        .file_stability,
+        .{
+            .severity = .@"error",
+            .rule = RuleId.runtime_file_stability,
+            .path = path,
+            .message = message,
+        },
+    );
+}
+
+fn appendModeFailureDiagnostic(
+    context: *InvocationContext,
+    diagnostics: *std.ArrayList(Diagnostic),
+    result: *FileResult,
+    path: []const u8,
+    message: []const u8,
+) !void {
+    try appendFailureDiagnostic(
+        context.allocator,
+        diagnostics,
+        result,
+        .input,
+        .input,
+        .{
+            .severity = .@"error",
+            .rule = RuleId.runtime_input_mode,
+            .path = path,
+            .message = message,
+        },
+    );
 }
 
 // --- Validation core ---
@@ -378,7 +496,7 @@ const ParserSource = union(enum) {
     slice: []const u8,
 };
 
-/// Validates mzML from a contiguous byte slice (mmap or heap buffer).
+/// Validates mzML from a caller-owned contiguous byte slice.
 pub fn checkSlice(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -751,6 +869,153 @@ test "checkPath_missingFile_reportsOpenError" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.@"error", diagnostics.items[0].severity);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
+}
+
+test "checkPath_streamMode_usesBoundedReaderPath" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(fixture);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    const path = try stageFixtureInTempDir(allocator, io, &temp_dir, "stream.mzML", fixture);
+    defer allocator.free(path);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, path, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+        .input_mode = .stream,
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "explicit mmap failure_reports_mode_error_without_fallback" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "mmap-failure.mzML", .data = "<mzML/>" });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "mmap-failure.mzML");
+    defer allocator.free(path);
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+        .input_mode = .mmap,
+    });
+    defer context.deinit();
+
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const initial_stat = try file.stat(io);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var result = FileResult.init(enabledStages(context.options));
+    result.beginStage(.input);
+
+    try checkPathMapped(
+        &context,
+        file,
+        initial_stat,
+        &diagnostics,
+        path,
+        &result,
+        forcedMemoryMapFailure,
+    );
+    result.finalize(diagnostics.items);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.runtime_input_mode, diagnostics.items[0].rule);
+}
+
+test "file stability check_rejects_changed_file" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "changed.mzML", .data = "x" });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "changed.mzML");
+    defer allocator.free(path);
+
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    const initial_stat = try file.stat(io);
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "changed.mzML", .data = "changed" });
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var context = InvocationContext.init(allocator, io, .{ .skip_semantic = true });
+    defer context.deinit();
+    var result = FileResult.init(enabledStages(context.options));
+
+    try checkFileStability(&context, file, initial_stat, &diagnostics, path, &result);
+    result.finalize(diagnostics.items);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqualStrings(RuleId.runtime_file_stability, diagnostics.items[0].rule);
+}
+
+test "mapped validation_rejects_truncation_after_mapping" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml = "<?xml version=\"1.0\"?><mzML xmlns=\"http://psi.hupo.org/ms/mzml\"/>";
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "mapped-truncated.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "mapped-truncated.mzML");
+    defer allocator.free(path);
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    });
+    defer context.deinit();
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    const initial_stat = try file.stat(io);
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var result = FileResult.init(enabledStages(context.options));
+    result.beginStage(.input);
+
+    try checkPathMapped(
+        &context,
+        file,
+        initial_stat,
+        &diagnostics,
+        path,
+        &result,
+        mapThenTruncate,
+    );
+    result.finalize(diagnostics.items);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    var found_stability_failure = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.runtime_file_stability)) {
+            found_stability_failure = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_stability_failure);
 }
 
 test "checkPath_existingFile_runsStructuralValidationWhenSkippingBinary" {
@@ -1797,6 +2062,30 @@ test "checkPath_chromatogram_binary_error_reports_exact_rule_without_spectrum_in
         "binary payload is not valid base64",
     );
     try std.testing.expectEqual(@as(?usize, null), diagnostics.items[0].location.spectrum_index);
+}
+
+fn forcedMemoryMapFailure(
+    io: std.Io,
+    file: std.Io.File,
+    options: std.Io.File.MemoryMap.CreateOptions,
+) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
+    _ = io;
+    _ = file;
+    _ = options;
+    return error.AccessDenied;
+}
+
+fn mapThenTruncate(
+    io: std.Io,
+    file: std.Io.File,
+    options: std.Io.File.MemoryMap.CreateOptions,
+) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
+    var mm = try std.Io.File.MemoryMap.create(io, file, options);
+    file.setLength(io, 1) catch {
+        mm.destroy(io);
+        return error.AccessDenied;
+    };
+    return mm;
 }
 
 test "checkReader_repeated_clean_runs_do_not_accumulate_state" {
