@@ -38,6 +38,7 @@ pub const IndexValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
+    limits: diagnostic.ResourceLimits,
 
     depth: usize = 0,
     mzml_depth: ?usize = null,
@@ -132,10 +133,20 @@ pub const IndexValidator = struct {
         diagnostics: *std.ArrayList(Diagnostic),
         path: ?[]const u8,
     ) IndexValidator {
+        return initWithLimits(allocator, diagnostics, path, .{});
+    }
+
+    pub fn initWithLimits(
+        allocator: std.mem.Allocator,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: ?[]const u8,
+        limits: diagnostic.ResourceLimits,
+    ) IndexValidator {
         return .{
             .allocator = allocator,
             .diagnostics = diagnostics,
             .path = path,
+            .limits = limits,
             .spectrum_offsets = std.StringHashMap(u64).init(allocator),
             .chromatogram_offsets = std.StringHashMap(u64).init(allocator),
             .index_entries = std.ArrayList(IndexEntry).empty,
@@ -180,7 +191,8 @@ pub const IndexValidator = struct {
                 const count_attr = start.attr("count");
                 if (count_attr) |c| {
                     if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
-                        try validator.spectrum_offsets.ensureTotalCapacity(@intCast(count));
+                        const bounded = try validator.boundedCount(count, start.byte_offset, "spectrumList count exceeds the configured index-entry limit");
+                        try validator.spectrum_offsets.ensureTotalCapacity(bounded);
                     } else |_| {}
                 }
             },
@@ -189,7 +201,8 @@ pub const IndexValidator = struct {
                 const count_attr = start.attr("count");
                 if (count_attr) |c| {
                     if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
-                        try validator.chromatogram_offsets.ensureTotalCapacity(@intCast(count));
+                        const bounded = try validator.boundedCount(count, start.byte_offset, "chromatogramList count exceeds the configured index-entry limit");
+                        try validator.chromatogram_offsets.ensureTotalCapacity(bounded);
                     } else |_| {}
                 }
             },
@@ -199,14 +212,26 @@ pub const IndexValidator = struct {
                 validator.saw_index_elements = true;
                 const count_attr = start.attr("count");
                 validator.index_list_declared_count = if (count_attr) |c|
-                    std.fmt.parseUnsigned(u64, c, 10) catch null
+                    if (std.fmt.parseUnsigned(u64, c, 10)) |count| blk: {
+                        _ = try validator.boundedCount(count, start.byte_offset, "indexList count exceeds the configured index-entry limit");
+                        break :blk count;
+                    } else |_| null
                 else
                     null;
             },
             .index => {
                 if (validator.index_list_depth == null) return;
-                if (element_depth != validator.index_list_depth.? + 1) return;
-                validator.index_list_actual_count += 1;
+                const child_depth = std.math.add(usize, validator.index_list_depth.?, 1) catch {
+                    try validator.limitDiagnostic(start.byte_offset, "index nesting depth arithmetic overflow");
+                    return error.ResourceLimitExceeded;
+                };
+                if (element_depth != child_depth) return;
+                const next_count = std.math.add(u64, validator.index_list_actual_count, 1) catch {
+                    try validator.limitDiagnostic(start.byte_offset, "index element count arithmetic overflow");
+                    return error.ResourceLimitExceeded;
+                };
+                _ = try validator.boundedCount(next_count, start.byte_offset, "index element count exceeds the configured index-entry limit");
+                validator.index_list_actual_count = next_count;
                 const name = start.attr("name") orelse {
                     try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
                     return;
@@ -227,6 +252,10 @@ pub const IndexValidator = struct {
                     return;
                 };
                 if (validator.offset_id_ref_owned) |owned| validator.allocator.free(owned);
+                if (id_ref.len > validator.limits.max_index_id_ref_bytes) {
+                    try validator.limitDiagnostic(start.byte_offset, "index idRef exceeds the configured field limit");
+                    return error.ResourceLimitExceeded;
+                }
                 validator.offset_id_ref_owned = try validator.allocator.dupe(u8, id_ref);
                 validator.text_buf.clearRetainingCapacity();
             },
@@ -237,7 +266,10 @@ pub const IndexValidator = struct {
             },
             .fileChecksum => {
                 validator.file_checksum_depth = element_depth;
-                const checksum_offset = start.byte_offset + "<fileChecksum>".len;
+                const checksum_offset = std.math.add(u64, start.byte_offset, "<fileChecksum>".len) catch {
+                    try validator.limitDiagnostic(start.byte_offset, "fileChecksum offset arithmetic overflow");
+                    return error.ResourceLimitExceeded;
+                };
                 validator.file_checksum_byte_offset = checksum_offset;
                 validator.feedShaExclusive(checksum_offset);
                 validator.text_buf.clearRetainingCapacity();
@@ -265,6 +297,11 @@ pub const IndexValidator = struct {
                     validator.allocator.free(id_ref_owned);
                     return;
                 };
+                if (validator.index_entries.items.len >= validator.maxIndexEntries()) {
+                    validator.allocator.free(id_ref_owned);
+                    try validator.limitDiagnostic(end.byte_offset, "index entry count exceeds the configured index-entry limit");
+                    return error.ResourceLimitExceeded;
+                }
                 errdefer validator.allocator.free(id_ref_owned);
                 try validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset });
             },
@@ -308,6 +345,22 @@ pub const IndexValidator = struct {
 
     pub fn consumeText(validator: *IndexValidator, text: Text) !void {
         if (!validator.wantsText()) return;
+        const limit = if (validator.offset_id_ref_owned != null)
+            validator.limits.max_index_offset_text_bytes
+        else if (validator.index_list_offset_depth != null)
+            validator.limits.max_index_list_offset_text_bytes
+        else
+            validator.limits.max_file_checksum_text_bytes;
+        if (validator.text_buf.items.len > limit or text.value.len > limit - validator.text_buf.items.len) {
+            const message = if (validator.offset_id_ref_owned != null)
+                "index offset text exceeds the configured field limit"
+            else if (validator.index_list_offset_depth != null)
+                "indexListOffset text exceeds the configured field limit"
+            else
+                "fileChecksum text exceeds the configured field limit";
+            try validator.limitDiagnostic(text.byte_offset, message);
+            return error.ResourceLimitExceeded;
+        }
         try validator.text_buf.appendSlice(validator.allocator, text.value);
     }
 
@@ -465,6 +518,30 @@ pub const IndexValidator = struct {
 
     // --- Private helpers ---
 
+    fn maxIndexEntries(validator: *const IndexValidator) usize {
+        if (validator.sha_file_bytes) |bytes| return @min(validator.limits.max_index_entries, bytes.len);
+        return validator.limits.max_index_entries;
+    }
+
+    fn boundedCount(validator: *IndexValidator, count: u64, byte_offset: u64, message: []const u8) !u32 {
+        const bounded = std.math.cast(usize, count) orelse {
+            try validator.limitDiagnostic(byte_offset, message);
+            return error.ResourceLimitExceeded;
+        };
+        if (bounded > validator.maxIndexEntries()) {
+            try validator.limitDiagnostic(byte_offset, message);
+            return error.ResourceLimitExceeded;
+        }
+        return std.math.cast(u32, bounded) orelse {
+            try validator.limitDiagnostic(byte_offset, message);
+            return error.ResourceLimitExceeded;
+        };
+    }
+
+    fn limitDiagnostic(validator: *IndexValidator, byte_offset: u64, message: []const u8) !void {
+        try validator.appendDiagnostic(byte_offset, RuleId.mzml_index_offset_list, message);
+    }
+
     fn finalizeOnlineSha(validator: *IndexValidator) void {
         if (validator.sha_complete) return;
         var out: [20]u8 = undefined;
@@ -497,6 +574,15 @@ fn recordContainerOffset(
     map: *std.StringHashMap(u64),
 ) !void {
     const id = start.attr("id") orelse return;
+    if (map.contains(id)) return;
+    if (id.len > validator.limits.max_index_id_ref_bytes) {
+        try validator.limitDiagnostic(start.byte_offset, "indexable element id exceeds the configured field limit");
+        return error.ResourceLimitExceeded;
+    }
+    if (map.count() >= validator.maxIndexEntries()) {
+        try validator.limitDiagnostic(start.byte_offset, "indexable element count exceeds the configured index-entry limit");
+        return error.ResourceLimitExceeded;
+    }
     const owned = try validator.allocator.dupe(u8, id);
     errdefer validator.allocator.free(owned);
     const result = try map.getOrPut(owned);
@@ -995,6 +1081,83 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
     try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
+}
+
+test "IndexValidator: count limit rejects before reservation" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_entries = 1 });
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try expectError(
+        error.ResourceLimitExceeded,
+        v.consumeStart(test_events.startUnknown("spectrumList", &.{test_events.attr("count", "18446744073709551615")}, 10), 1),
+    );
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+}
+
+test "IndexValidator: count boundaries stay within the configured limit" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_entries = 4 });
+    defer v.deinit();
+
+    try expectEqual(@as(u32, 0), try v.boundedCount(0, 0, "count exceeds limit"));
+    try expectEqual(@as(u32, 1), try v.boundedCount(1, 0, "count exceeds limit"));
+    try expectEqual(@as(u32, 4), try v.boundedCount(4, 0, "count exceeds limit"));
+    try expectError(error.ResourceLimitExceeded, v.boundedCount(5, 0, "count exceeds limit"));
+    try expectError(error.ResourceLimitExceeded, v.boundedCount(std.math.maxInt(u64), 0, "count exceeds limit"));
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+}
+
+test "IndexValidator: scalar text limit rejects before buffer growth" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_offset_text_bytes = 4 });
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 1), 1);
+    try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 2), 2);
+    try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 3), 3);
+    try expectError(error.ResourceLimitExceeded, v.consumeText(test_events.text("12345")));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+}
+
+test "IndexValidator: index scalar fields use separate limits" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    {
+        var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_list_offset_text_bytes = 2 });
+        defer v.deinit();
+        try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+        try v.consumeStart(test_events.startUnknown("indexListOffset", &.{}, 1), 1);
+        try expectError(error.ResourceLimitExceeded, v.consumeText(test_events.text("123")));
+    }
+
+    {
+        var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_file_checksum_text_bytes = 4 });
+        defer v.deinit();
+        try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+        try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, 1), 1);
+        try expectError(error.ResourceLimitExceeded, v.consumeText(test_events.text("12345")));
+    }
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
 }
 
 fn hexChar(nibble: u4) u8 {

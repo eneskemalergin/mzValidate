@@ -79,6 +79,18 @@ pub const RuleId = struct {
     pub const mzml_ref_missing = "mzml.ref.missing";
 };
 
+/// Shared input-derived limits used by validators in one check.
+pub const ResourceLimits = struct {
+    max_binary_encoded_bytes: usize = 256 * 1024 * 1024,
+    max_index_entries: usize = 1_000_000,
+    max_index_id_ref_bytes: usize = 4096,
+    max_index_offset_text_bytes: usize = 64,
+    max_index_list_offset_text_bytes: usize = 64,
+    max_file_checksum_text_bytes: usize = 64,
+    max_obo_line_bytes: usize = 1024 * 1024,
+    max_obo_xref_accession_bytes: usize = 128,
+};
+
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.
 pub const Severity = enum {
     info,

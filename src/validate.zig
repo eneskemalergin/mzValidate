@@ -485,7 +485,12 @@ fn enabledStages(options: CheckOptions) diagnostic.StageMask {
 }
 
 fn recordUnhandledFailure(result: *FileResult, err: anyerror, path: []const u8) void {
-    const reason: FailureReason = if (err == error.OutOfMemory) .allocation else .unknown;
+    const reason: FailureReason = if (err == error.OutOfMemory)
+        .allocation
+    else if (err == error.ResourceLimitExceeded)
+        .resource
+    else
+        .unknown;
     result.recordFailure(
         result.active_stage,
         reason,
@@ -1158,6 +1163,30 @@ test "checkPath_invalid_zlib_returns_complete_result_with_error" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(diagnostic.ResultStatus.errors_present, result.status());
     try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
+}
+
+test "checkPath_resource_limit_returns_incomplete_resource_result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/adversarial/huge-count.mzML", .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    var found_limit = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.mzml_index_offset_list)) {
+            found_limit = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_limit);
 }
 
 test "checkReader_legacy_wrapper_rejects_unreported_oom" {

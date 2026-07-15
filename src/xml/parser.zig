@@ -218,7 +218,8 @@ pub const Parser = struct {
             const tail = slice.bytes[slice.pos..];
             const plain_len = scan.textPlainRunLen(tail);
             if (plain_len == tail.len or tail[plain_len] != '&') {
-                const value = slice.bytes[start .. start + 1 + plain_len];
+                const value_len = std.math.add(usize, plain_len, 1) catch return error.TokenTooLong;
+                const value = slice.bytes[start..][0..value_len];
                 parser.consumeSliceBytes(plain_len);
                 if (!from_cdata and isWhitespaceOnly(value)) return null;
                 if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
@@ -473,7 +474,8 @@ pub const Parser = struct {
             const tail = slice.bytes[start..];
             const content_len = scan.cdataContentLen(tail) orelse return error.UnexpectedEof;
             const value = slice.bytes[start..][0..content_len];
-            parser.consumeSliceBytes(content_len + 3);
+            const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
+            parser.consumeSliceBytes(consumed_len);
             if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
             return .{ .text = .{
                 .byte_offset = byte_offset,
@@ -517,7 +519,8 @@ pub const Parser = struct {
             const slice = &parser.input.slice;
             const tail = slice.bytes[slice.pos..];
             const end = scan.piEndLen(tail) orelse return error.UnexpectedEof;
-            parser.consumeSliceBytes(end + 2);
+            const consumed_len = std.math.add(usize, end, 2) catch return error.UnexpectedEof;
+            parser.consumeSliceBytes(consumed_len);
             return;
         }
         while (true) {
@@ -538,7 +541,8 @@ pub const Parser = struct {
             const slice = &parser.input.slice;
             const tail = slice.bytes[slice.pos..];
             const end = scan.commentEndLen(tail) orelse return error.UnexpectedEof;
-            parser.consumeSliceBytes(end + 3);
+            const consumed_len = std.math.add(usize, end, 3) catch return error.UnexpectedEof;
+            parser.consumeSliceBytes(consumed_len);
             return;
         }
         while (true) {
@@ -582,7 +586,10 @@ pub const Parser = struct {
         return if (colon_index) |index|
             .{
                 .prefix = .{ .start = start, .len = index },
-                .local_name = .{ .start = start + index + 1, .len = bytes.len - index - 1 },
+                .local_name = .{
+                    .start = std.math.add(usize, start, std.math.add(usize, index, 1) catch return error.MalformedXml) catch return error.MalformedXml,
+                    .len = bytes.len - index - 1,
+                },
             }
         else
             .{
@@ -758,7 +765,7 @@ pub const Parser = struct {
     }
 
     fn appendTokenSlice(parser: *Parser, bytes: []const u8) ParseError!void {
-        if (parser.token_len + bytes.len > parser.token_buffer.len) return error.TokenTooLong;
+        if (parser.token_len > parser.token_buffer.len or bytes.len > parser.token_buffer.len - parser.token_len) return error.TokenTooLong;
         @memcpy(parser.token_buffer[parser.token_len..][0..bytes.len], bytes);
         parser.token_len += bytes.len;
     }
@@ -770,7 +777,7 @@ pub const Parser = struct {
     }
 
     fn appendNamespaceBytes(parser: *Parser, bytes: []const u8) ParseError!Range {
-        if (parser.namespace_bytes_len + bytes.len > parser.namespace_bytes.len) return error.NamespaceStorageExceeded;
+        if (parser.namespace_bytes_len > parser.namespace_bytes.len or bytes.len > parser.namespace_bytes.len - parser.namespace_bytes_len) return error.NamespaceStorageExceeded;
         const start = parser.namespace_bytes_len;
         @memcpy(parser.namespace_bytes[start..][0..bytes.len], bytes);
         parser.namespace_bytes_len += bytes.len;
@@ -778,7 +785,7 @@ pub const Parser = struct {
     }
 
     fn appendElementBytes(parser: *Parser, bytes: []const u8) ParseError!Range {
-        if (parser.element_bytes_len + bytes.len > parser.element_bytes.len) return error.ElementStorageExceeded;
+        if (parser.element_bytes_len > parser.element_bytes.len or bytes.len > parser.element_bytes.len - parser.element_bytes_len) return error.ElementStorageExceeded;
         const start = parser.element_bytes_len;
         @memcpy(parser.element_bytes[start..][0..bytes.len], bytes);
         parser.element_bytes_len += bytes.len;
@@ -2160,14 +2167,18 @@ const FixtureParser = struct {
 
     fn deinit(fixture_parser: *FixtureParser, allocator: std.mem.Allocator) void {
         allocator.free(fixture_parser.token_buffer);
+        allocator.destroy(fixture_parser);
     }
 };
 
-fn initFixtureParser(allocator: std.mem.Allocator, fixture: []const u8) !FixtureParser {
-    var fixture_parser: FixtureParser = .{
+fn initFixtureParser(allocator: std.mem.Allocator, fixture: []const u8) !*FixtureParser {
+    const fixture_parser = try allocator.create(FixtureParser);
+    errdefer allocator.destroy(fixture_parser);
+    fixture_parser.* = .{
         .reader = std.Io.Reader.fixed(fixture),
         .token_buffer = try allocator.alloc(u8, @max(@as(usize, 1024), fixture.len)),
     };
+    errdefer allocator.free(fixture_parser.token_buffer);
     fixture_parser.parser = Parser.init(&fixture_parser.reader, .{
         .token = fixture_parser.token_buffer,
         .attributes = &fixture_parser.attributes,

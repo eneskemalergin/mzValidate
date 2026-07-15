@@ -140,7 +140,7 @@ fn startMaskFor(comptime tag: ElementId) IndexSemanticMask {
         .unknown => .none,
         .activation, .contact, .isolationWindow, .paramGroupRef, .sourceFileRef, .sourceFileRefList, .target, .targetList => comptimeMask(false, true),
         .cvParam, .userParam, .binary => comptimeMask(false, true),
-        .indexedmzML, .mzML, .spectrum, .chromatogram => comptimeMask(true, true),
+        .indexedmzML, .mzML, .spectrumList, .chromatogramList, .spectrum, .chromatogram => comptimeMask(true, true),
         .indexList, .indexListOffset, .fileChecksum, .index, .offset => comptimeMask(true, true),
         .binaryDataArray => comptimeMask(false, true),
         else => comptimeMask(false, true),
@@ -236,6 +236,8 @@ test "dispatch masks hand-traced spot checks" {
 
     try std.testing.expectEqual(all, startMask(.spectrum));
     try std.testing.expectEqual(all, startMask(.chromatogram));
+    try std.testing.expectEqual(idx_sem, startMask(.spectrumList));
+    try std.testing.expectEqual(idx_sem, startMask(.chromatogramList));
     try std.testing.expectEqual(sem_only, startMask(.cvParam));
     try std.testing.expectEqual(sem_only, startMask(.activation));
     try std.testing.expectEqual(IndexSemanticMask.none, startMask(.unknown));

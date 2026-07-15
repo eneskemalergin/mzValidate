@@ -13,8 +13,9 @@
 //!   const term = table.lookup("MS:1000001");
 
 const std = @import("std");
+const diagnostic = @import("../diagnostic.zig");
 
-const max_xref_accession_bytes = 128;
+const max_xref_accession_bytes = (diagnostic.ResourceLimits{}).max_obo_xref_accession_bytes;
 
 pub const Relationship = struct {
     name: []const u8,
@@ -44,12 +45,22 @@ pub const CvTable = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap(CvTerm),
     ns_prefix: std.StringHashMap(void),
+    limits: diagnostic.ResourceLimits,
 
     pub fn init(allocator: std.mem.Allocator, obo_text: []const u8) !CvTable {
+        return initWithLimits(allocator, obo_text, .{});
+    }
+
+    pub fn initWithLimits(
+        allocator: std.mem.Allocator,
+        obo_text: []const u8,
+        limits: diagnostic.ResourceLimits,
+    ) !CvTable {
         var table = CvTable{
             .allocator = allocator,
             .map = std.StringHashMap(CvTerm).init(allocator),
             .ns_prefix = std.StringHashMap(void).init(allocator),
+            .limits = limits,
         };
         errdefer table.deinit();
         try table.parse(obo_text);
@@ -140,6 +151,8 @@ pub const CvTable = struct {
         while (lines.next()) |raw_line| {
             const line = raw_line;
 
+            if (line.len > table.limits.max_obo_line_bytes) return error.LineTooLong;
+
             if (line.len == 0 or line[0] == '!') continue;
 
             if (line[0] == '[') {
@@ -203,7 +216,7 @@ pub const CvTable = struct {
                         if (rest[i] == '\\' and i + 1 < space_pos) {
                             i += 1;
                         }
-                        if (acc_len == acc_buf.len) return error.XrefTooLong;
+                        if (acc_len == @min(table.limits.max_obo_xref_accession_bytes, acc_buf.len)) return error.XrefTooLong;
                         acc_buf[acc_len] = rest[i];
                         acc_len += 1;
                     }
@@ -303,6 +316,7 @@ pub const CvTable = struct {
 pub fn parseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
         error.XrefTooLong => "OBO binary-data-type xref accession exceeds its configured limit",
+        error.LineTooLong => "OBO line exceeds its configured limit",
         error.DuplicateId => "OBO contains a duplicate term ID",
         else => "unable to parse OBO file",
     };
@@ -501,6 +515,16 @@ test "CvTable rejects an overlong binary-data xref" {
     defer allocator.free(obo);
 
     try std.testing.expectError(error.XrefTooLong, CvTable.init(allocator, obo));
+}
+
+test "CvTable rejects an overlong line before field allocation" {
+    const allocator = std.testing.allocator;
+    const obo = "[Term]\nname: " ++ "abcdefghijklmnop";
+
+    try std.testing.expectError(
+        error.LineTooLong,
+        CvTable.initWithLimits(allocator, obo, .{ .max_obo_line_bytes = 8 }),
+    );
 }
 
 test "CvTable rejects duplicate IDs without replacing the first term" {

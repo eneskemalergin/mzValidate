@@ -103,20 +103,26 @@ const StreamingBase64Counter = struct {
         }
 
         var offset: usize = 0;
-        while (offset + base64_simd_chunk_len <= chunk.len) {
+        while (chunk.len - offset >= base64_simd_chunk_len) {
             const bytes = loadBase64Chunk(chunk, offset);
             const base64_chars = base64CharLanes(bytes);
             const whitespace = whitespaceLanes(bytes);
             const pre_pad_allowed = base64_chars | whitespace;
 
             if (@reduce(.And, base64_chars)) {
-                self.sig_len += base64_simd_chunk_len;
+                self.sig_len = std.math.add(usize, self.sig_len, base64_simd_chunk_len) catch {
+                    self.errored = true;
+                    return;
+                };
                 offset += base64_simd_chunk_len;
                 continue;
             }
 
             if (@reduce(.And, pre_pad_allowed)) {
-                self.sig_len += countTrueLanes(base64_chars);
+                self.sig_len = std.math.add(usize, self.sig_len, countTrueLanes(base64_chars)) catch {
+                    self.errored = true;
+                    return;
+                };
                 offset += base64_simd_chunk_len;
                 continue;
             }
@@ -143,12 +149,21 @@ const StreamingBase64Counter = struct {
                     self.errored = true;
                     return;
                 }
-                self.sig_len += 1;
+                self.sig_len = std.math.add(usize, self.sig_len, 1) catch {
+                    self.errored = true;
+                    return;
+                };
             },
             '=' => {
-                self.padding += 1;
+                self.padding = std.math.add(usize, self.padding, 1) catch {
+                    self.errored = true;
+                    return;
+                };
                 self.saw_pad = true;
-                self.sig_len += 1;
+                self.sig_len = std.math.add(usize, self.sig_len, 1) catch {
+                    self.errored = true;
+                    return;
+                };
                 if (self.padding > 2) {
                     self.errored = true;
                     return;
@@ -194,7 +209,8 @@ const StreamingBase64Counter = struct {
         if (self.errored) return error.InvalidBase64;
         if (self.sig_len % 4 != 0) return error.InvalidBase64;
         if (self.sig_len == 0) return 0;
-        return (self.sig_len / 4) * 3 - self.padding;
+        const decoded = std.math.mul(usize, self.sig_len / 4, 3) catch return error.InvalidBase64;
+        return std.math.sub(usize, decoded, self.padding) catch error.InvalidBase64;
     }
 };
 
@@ -237,13 +253,13 @@ const StreamingBase64Decoder = struct {
                     self.errored = true;
                     return;
                 }
-                self.sig_len += 1;
+                self.sig_len = std.math.add(usize, self.sig_len, 1) catch return error.ResourceLimitExceeded;
                 try self.pushSextet(allocator, out, base64Value(c));
             },
             '=' => {
-                self.padding += 1;
+                self.padding = std.math.add(usize, self.padding, 1) catch return error.ResourceLimitExceeded;
                 self.saw_pad = true;
-                self.sig_len += 1;
+                self.sig_len = std.math.add(usize, self.sig_len, 1) catch return error.ResourceLimitExceeded;
                 if (self.padding > 2) {
                     self.errored = true;
                     return;
@@ -282,20 +298,21 @@ const StreamingBase64Decoder = struct {
     fn decodeCleanRun(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), encoded: []const u8) !void {
         std.debug.assert(encoded.len % 4 == 0);
 
-        const decoded_len = (encoded.len / 4) * 3;
+        const decoded_len = std.math.mul(usize, encoded.len / 4, 3) catch return error.ResourceLimitExceeded;
         const start = out.items.len;
-        try out.resize(allocator, start + decoded_len);
+        const end = std.math.add(usize, start, decoded_len) catch return error.ResourceLimitExceeded;
+        try out.resize(allocator, end);
         std.base64.standard.Decoder.decode(out.items[start..][0..decoded_len], encoded) catch {
             try out.resize(allocator, start);
             self.errored = true;
             return;
         };
-        self.sig_len += encoded.len;
+        self.sig_len = std.math.add(usize, self.sig_len, encoded.len) catch return error.ResourceLimitExceeded;
     }
 
     fn cleanBase64DataPrefixLen(bytes: []const u8) usize {
         var offset: usize = 0;
-        while (offset + base64_simd_chunk_len <= bytes.len) {
+        while (bytes.len - offset >= base64_simd_chunk_len) {
             const chunk = StreamingBase64Counter.loadBase64Chunk(bytes, offset);
             if (!@reduce(.And, StreamingBase64Counter.base64CharLanes(chunk))) break;
             offset += base64_simd_chunk_len;
@@ -350,6 +367,7 @@ const BinaryArrayState = struct {
     base64_stream: StreamingBase64Counter = .{},
     zlib_base64_stream: StreamingBase64Decoder = .{},
     zlib_encoded_len: usize = 0,
+    encoded_text_len: usize = 0,
     skipped: bool = false,
 
     fn init(
@@ -378,6 +396,7 @@ pub const BinaryValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *std.ArrayList(Diagnostic),
     path: ?[]const u8,
+    limits: diagnostic.ResourceLimits = .{},
     max_binary_size: ?usize = null,
 
     // Only one active binary array at a time. No accumulation across spectra.
@@ -434,8 +453,9 @@ pub const BinaryValidator = struct {
         if (used == 0) return;
         const min_threshold: usize = 1024 * 1024; // 1 MiB
         const max_headroom: usize = 4;
+        const retained_limit = std.math.mul(usize, used, max_headroom) catch return;
         if (payload.capacity > min_threshold and
-            payload.capacity > used * max_headroom)
+            payload.capacity > retained_limit)
         {
             payload.shrinkAndFree(validator.allocator, used);
         }
@@ -673,24 +693,34 @@ pub const BinaryValidator = struct {
                                 // encodedLength=0 is suspicious; allow it but flag
                                 // if the actual payload is non-empty (caught below).
                             }
-                            if (validator.max_binary_size) |max_size| {
-                                if (encoded_length > max_size) {
+                            if (encoded_length > validator.maxEncodedBytes()) {
+                                try validator.appendDiagnostic(.{
+                                    .severity = .@"error",
+                                    .rule = RuleId.mzml_binary_oversized,
+                                    .location = .{ .byte_offset = start.byte_offset },
+                                    .path = validator.path,
+                                    .message = "binary payload exceeds the configured encoded-size limit",
+                                });
+                                state.skipped = true;
+                                state.binary_depth = null;
+                                return error.ResourceLimitExceeded;
+                            }
+                            if (state.saw_zlib_compression) {
+                                const capacity = base64SizeUpperBound(encoded_length) catch {
                                     try validator.appendDiagnostic(.{
                                         .severity = .@"error",
                                         .rule = RuleId.mzml_binary_oversized,
                                         .location = .{ .byte_offset = start.byte_offset },
                                         .path = validator.path,
-                                        .message = "binary payload exceeds -max-binary-size limit",
+                                        .message = "binary payload encoded-size arithmetic overflow",
                                     });
                                     state.skipped = true;
                                     state.binary_depth = null;
-                                    return;
-                                }
-                            }
-                            if (state.saw_zlib_compression) {
+                                    return error.ResourceLimitExceeded;
+                                };
                                 try validator.compressed_payload.ensureTotalCapacity(
                                     validator.allocator,
-                                    base64_decoder.calcSizeUpperBound(encoded_length),
+                                    capacity,
                                 );
                                 state.encoded_length = null;
                             }
@@ -778,9 +808,30 @@ pub const BinaryValidator = struct {
     fn handleText(validator: *BinaryValidator, value: []const u8) !void {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
+                const text_len = std.math.add(usize, state.encoded_text_len, value.len) catch {
+                    try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
+                    state.skipped = true;
+                    state.binary_depth = null;
+                    return error.ResourceLimitExceeded;
+                };
+                if (text_len > validator.maxEncodedBytes()) {
+                    try validator.appendBinaryLimitDiagnostic(state, "binary payload exceeds the configured encoded-size limit");
+                    state.skipped = true;
+                    state.binary_depth = null;
+                    return error.ResourceLimitExceeded;
+                }
+                state.encoded_text_len = text_len;
                 if (state.saw_zlib_compression) {
-                    state.zlib_encoded_len += value.len;
-                    try state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, value);
+                    state.zlib_encoded_len = text_len;
+                    state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, value) catch |err| switch (err) {
+                        error.ResourceLimitExceeded => {
+                            try validator.appendBinaryLimitDiagnostic(state, "binary payload decoded-size arithmetic overflow");
+                            state.skipped = true;
+                            state.binary_depth = null;
+                            return error.ResourceLimitExceeded;
+                        },
+                        else => return err,
+                    };
                 } else {
                     state.base64_stream.feed(value);
                 }
@@ -851,21 +902,19 @@ pub const BinaryValidator = struct {
         // If encodedLength was omitted, the early oversized check in
         // handleStart was skipped. Check actual payload size here.
         if (state.encoded_length_declared == null) {
-            if (validator.max_binary_size) |max_size| {
-                const actual = if (state.saw_zlib_compression)
-                    state.zlib_encoded_len
-                else
-                    state.base64_stream.sig_len;
-                if (actual > max_size) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_oversized,
-                        .location = location,
-                        .path = validator.path,
-                        .message = "binary payload exceeds -max-binary-size limit",
-                    });
-                    return;
-                }
+            const actual = if (state.saw_zlib_compression)
+                state.zlib_encoded_len
+            else
+                state.base64_stream.sig_len;
+            if (actual > validator.maxEncodedBytes()) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_oversized,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "binary payload exceeds the configured encoded-size limit",
+                });
+                return error.ResourceLimitExceeded;
             }
         }
 
@@ -917,7 +966,7 @@ pub const BinaryValidator = struct {
                             .path = validator.path,
                             .message = "binary payload decoded size exceeds decompressed output limit",
                         });
-                        return;
+                        return error.ResourceLimitExceeded;
                     }
                 else
                     null;
@@ -930,7 +979,7 @@ pub const BinaryValidator = struct {
                             .path = validator.path,
                             .message = "binary payload decoded size exceeds decompressed output limit",
                         });
-                        return;
+                        return error.ResourceLimitExceeded;
                     }
                 }
                 break :blk (validator.inflateDecodedZlib(validator.compressed_payload.items, expected_decoded_bytes) catch |err| switch (err) {
@@ -953,6 +1002,16 @@ pub const BinaryValidator = struct {
                             .message = "binary payload is not valid zlib data",
                         });
                         return;
+                    },
+                    error.ResourceLimitExceeded => {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_oversized,
+                            .location = location,
+                            .path = validator.path,
+                            .message = "binary payload decoded size arithmetic overflow",
+                        });
+                        return error.ResourceLimitExceeded;
                     },
                     error.OutOfMemory => |oom| return oom,
                 });
@@ -1004,7 +1063,11 @@ pub const BinaryValidator = struct {
         if (element_count == declared_count) return;
 
         const alternate_width: usize = if (width == 4) 8 else 4;
-        if (declared_count != 0 and decoded_bytes == declared_count * alternate_width) {
+        const alternate_bytes = std.math.mul(usize, declared_count, alternate_width) catch {
+            try validator.appendBinaryLimitDiagnostic(state, "binary array count-width arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        if (declared_count != 0 and decoded_bytes == alternate_bytes) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
                 .rule = RuleId.mzml_binary_precision_mismatch,
@@ -1029,7 +1092,7 @@ pub const BinaryValidator = struct {
         return element_depth >= validator.mzml_depth.?;
     }
 
-    fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory }!usize) {
+    fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory, ResourceLimitExceeded }!usize) {
         if (comptime build_options.enable_libdeflate) {
             const limit = validator.libdeflateOutputLimit();
             const output_limit = expected_decoded_bytes orelse brk: {
@@ -1083,13 +1146,30 @@ pub const BinaryValidator = struct {
         unreachable;
     }
 
+    fn maxEncodedBytes(validator: *const BinaryValidator) usize {
+        return @min(validator.limits.max_binary_encoded_bytes, validator.max_binary_size orelse validator.limits.max_binary_encoded_bytes);
+    }
+
+    fn appendBinaryLimitDiagnostic(validator: *BinaryValidator, state: *const BinaryArrayState, message: []const u8) !void {
+        try validator.appendDiagnostic(.{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_oversized,
+            .location = .{
+                .byte_offset = state.binary_byte_offset orelse state.byte_offset,
+                .spectrum_index = state.owner_spectrum_index,
+            },
+            .path = validator.path,
+            .message = message,
+        });
+    }
+
     fn appendDiagnostic(validator: *BinaryValidator, item: Diagnostic) !void {
         @branchHint(.cold);
         try validator.diagnostics.append(validator.allocator, item);
     }
 };
 
-fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{InvalidBinaryPayload}!usize {
+fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{ InvalidBinaryPayload, ResourceLimitExceeded }!usize {
     var input = std.Io.Reader.fixed(compressed);
     var decompress: std.compress.flate.Decompress = .init(&input, .zlib, flate_buffer);
 
@@ -1098,13 +1178,13 @@ fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{Inva
     while (true) {
         const slice = decompress.reader.peekGreedy(max_peek) catch |err| switch (err) {
             error.EndOfStream => {
-                count += decompress.reader.buffered().len;
+                count = std.math.add(usize, count, decompress.reader.buffered().len) catch return error.ResourceLimitExceeded;
                 break;
             },
             else => return error.InvalidBinaryPayload,
         };
         if (slice.len == 0) break;
-        count += slice.len;
+        count = std.math.add(usize, count, slice.len) catch return error.ResourceLimitExceeded;
         decompress.reader.toss(slice.len);
     }
     return count;
@@ -1112,7 +1192,14 @@ fn inflateCountWithBuffer(compressed: []const u8, flate_buffer: []u8) error{Inva
 
 fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
     const slice = value orelse return null;
-    return std.fmt.parseUnsigned(usize, slice, 10) catch null;
+    const parsed = std.fmt.parseUnsigned(u64, slice, 10) catch return null;
+    return std.math.cast(usize, parsed);
+}
+
+fn base64SizeUpperBound(encoded_len: usize) error{Overflow}!usize {
+    if (encoded_len == 0) return 0;
+    const rounded = std.math.add(usize, encoded_len, 3) catch return error.Overflow;
+    return std.math.mul(usize, rounded / 4, 3) catch error.Overflow;
 }
 
 // Recognise unsupported compression types so we can report them instead
@@ -1933,7 +2020,7 @@ test "binary validator oversized payload produces diagnostic" {
         .element_bytes = &element_bytes,
     });
 
-    try validator.run(io, &parser);
+    try std.testing.expectError(error.ResourceLimitExceeded, validator.run(io, &parser));
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_oversized, diagnostics.items[0].rule);
@@ -1982,15 +2069,61 @@ test "binary validator oversized limit is inclusive" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "binary validator unlimited default does not reject large payloads" {
+test "binary validator default policy accepts small payloads" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Default max_binary_size=null → no limit.
     var diagnostics = try runBinaryValidation(allocator, io, minimalSpectrumMzml("AAAAAA==", 1, "MS:1000576"));
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "binary validator rejects huge encodedLength before zlib reservation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\"><spectrumList count=\"1\"><spectrum index=\"0\" defaultArrayLength=\"0\">" ++
+        "<binaryDataArrayList count=\"1\"><binaryDataArray encodedLength=\"18446744073709551615\">" ++
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000574\"/>" ++
+        "<binary/></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectError(error.ResourceLimitExceeded, runBinaryValidationInto(allocator, io, fixture, &diagnostics));
+
+    try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
+}
+
+test "binary validator reports count-width multiplication overflow" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        runBinaryValidationInto(
+            allocator,
+            io,
+            minimalSpectrumMzml("AAAAAA==", std.math.maxInt(usize), "MS:1000576"),
+            &diagnostics,
+        ),
+    );
+
+    try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
+}
+
+test "binary base64 size upper bound checks arithmetic boundaries" {
+    try std.testing.expectEqual(@as(usize, 0), try base64SizeUpperBound(0));
+    try std.testing.expectEqual(@as(usize, 3), try base64SizeUpperBound(1));
+
+    const max_valid = (std.math.maxInt(usize) - 3) / 4 * 4;
+    try std.testing.expectEqual(max_valid / 4 * 3, try base64SizeUpperBound(max_valid));
+    try std.testing.expectError(error.Overflow, base64SizeUpperBound(std.math.maxInt(usize) - 2));
 }
 
 test "binary validator rejects zlib decoded size above output cap" {
@@ -1998,8 +2131,13 @@ test "binary validator rejects zlib decoded size above output cap" {
     const io = std.testing.io;
     const oversized_count = libdeflate_default_output_limit / 4 + 1;
 
-    var diagnostics = try runBinaryValidation(allocator, io, minimalSpectrumMzml("AAAA", oversized_count, "MS:1000574"));
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        runBinaryValidationInto(allocator, io, minimalSpectrumMzml("AAAA", oversized_count, "MS:1000574"), &diagnostics),
+    );
 
     try expectSingleBinaryDiagnostic(
         diagnostics.items,
