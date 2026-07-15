@@ -49,7 +49,189 @@ pub const CheckOptions = struct {
     memory_limit: ?usize = null,
     mmap: bool = false,
     max_binary_size: ?usize = null,
+    resource_limits: diagnostic.ResourceLimits = .{},
     obo_path: ?[]const u8 = null,
+};
+
+const CatalogFailure = struct {
+    reason: FailureReason,
+    rule: []const u8,
+    message: []const u8,
+};
+
+const SemanticCatalog = struct {
+    cv_table: obo_parser.CvTable,
+    rule_engine: rule_engine.RuleEngine,
+
+    fn deinit(catalog: *SemanticCatalog) void {
+        catalog.rule_engine.deinit();
+        catalog.cv_table.deinit();
+    }
+};
+
+/// Invocation-owned immutable options and semantic resources.
+pub const InvocationContext = struct {
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    options: CheckOptions,
+    catalog: ?SemanticCatalog = null,
+    catalog_failure: ?CatalogFailure = null,
+
+    /// Builds the semantic catalog once. A catalog failure is retained as fixed
+    /// metadata so file validation can stop before opening an input.
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, options: CheckOptions) InvocationContext {
+        var context = InvocationContext{
+            .allocator = allocator,
+            .io = io,
+            .options = options,
+        };
+        if (!options.skip_semantic) context.buildCatalog();
+        return context;
+    }
+
+    pub fn deinit(context: *InvocationContext) void {
+        if (context.catalog) |*catalog| catalog.deinit();
+        context.* = undefined;
+    }
+
+    /// Validates one path using this invocation's immutable resources.
+    pub fn validateOne(
+        context: *InvocationContext,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: []const u8,
+    ) FileResult {
+        if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
+
+        var result = FileResult.init(enabledStages(context.options));
+        const diagnostic_start = diagnostics.items.len;
+        checkPathInternal(context, diagnostics, path, &result) catch |err| {
+            recordUnhandledFailure(&result, err, path);
+        };
+        result.finalize(diagnostics.items[diagnostic_start..]);
+        return result;
+    }
+
+    pub fn checkPathResult(
+        context: *InvocationContext,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: []const u8,
+    ) FileResult {
+        return context.validateOne(diagnostics, path);
+    }
+
+    pub fn checkSliceResult(
+        context: *InvocationContext,
+        bytes: []const u8,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: []const u8,
+        file_bytes: ?[]const u8,
+    ) FileResult {
+        if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
+
+        var result = FileResult.init(enabledStages(context.options));
+        const diagnostic_start = diagnostics.items.len;
+        result.completeStage(.input);
+        runValidation(context, diagnostics, path, file_bytes, .{ .slice = bytes }, &result) catch |err| {
+            recordUnhandledFailure(&result, err, path);
+        };
+        result.finalize(diagnostics.items[diagnostic_start..]);
+        return result;
+    }
+
+    pub fn checkReaderResult(
+        context: *InvocationContext,
+        reader: *std.Io.Reader,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: []const u8,
+        file_bytes: ?[]const u8,
+    ) FileResult {
+        if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
+
+        var result = FileResult.init(enabledStages(context.options));
+        const diagnostic_start = diagnostics.items.len;
+        result.completeStage(.input);
+        runValidation(context, diagnostics, path, file_bytes, .{ .reader = reader }, &result) catch |err| {
+            recordUnhandledFailure(&result, err, path);
+        };
+        result.finalize(diagnostics.items[diagnostic_start..]);
+        return result;
+    }
+
+    fn buildCatalog(context: *InvocationContext) void {
+        const options = context.options;
+        const obo_text: ?[]const u8 = if (options.obo_path) |obo_path| blk: {
+            const cwd = std.Io.Dir.cwd();
+            const text = cwd.readFileAlloc(context.io, obo_path, context.allocator, .limited(50 * 1024 * 1024)) catch |err| {
+                context.catalog_failure = .{
+                    .reason = if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog,
+                    .rule = RuleId.runtime_file_open,
+                    .message = "unable to read OBO file",
+                };
+                break :blk null;
+            };
+            break :blk text;
+        } else @embedFile("data/psi-ms.obo");
+        const text = obo_text orelse return;
+        defer if (options.obo_path != null) context.allocator.free(text);
+
+        var table = obo_parser.CvTable.initWithLimits(context.allocator, text, options.resource_limits) catch |err| {
+            context.catalog_failure = .{
+                .reason = if (err == error.OutOfMemory) .allocation else .catalog,
+                .rule = RuleId.runtime_file_open,
+                .message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err),
+            };
+            return;
+        };
+
+        var engine = rule_engine.RuleEngine.init(context.allocator, @embedFile("data/ms-mapping.xml")) catch |err| {
+            table.deinit();
+            context.catalog_failure = .{
+                .reason = if (err == error.OutOfMemory) .allocation else .catalog,
+                .rule = RuleId.runtime_file_open,
+                .message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules",
+            };
+            return;
+        };
+
+        if (engine.firstMissingVocabularyTerm(&table) != null) {
+            engine.deinit();
+            table.deinit();
+            context.catalog_failure = .{
+                .reason = .catalog,
+                .rule = RuleId.runtime_catalog,
+                .message = "embedded mapping policy is incompatible with the selected OBO vocabulary",
+            };
+            return;
+        }
+
+        context.catalog = .{ .cv_table = table, .rule_engine = engine };
+    }
+
+    fn catalogFailureResult(
+        context: *InvocationContext,
+        diagnostics: *std.ArrayList(Diagnostic),
+        path: []const u8,
+    ) FileResult {
+        var result = FileResult.init(enabledStages(context.options));
+        const diagnostic_start = diagnostics.items.len;
+        result.beginStage(.semantic);
+        const failure = context.catalog_failure.?;
+        appendFailureDiagnostic(
+            context.allocator,
+            diagnostics,
+            &result,
+            .semantic,
+            failure.reason,
+            .{
+                .severity = .@"error",
+                .rule = failure.rule,
+                .path = path,
+                .message = failure.message,
+            },
+        ) catch |err| recordUnhandledFailure(&result, err, path);
+        result.finalize(diagnostics.items[diagnostic_start..]);
+        return result;
+    }
 };
 
 /// Returned by legacy `check*` wrappers when no normal diagnostic could be stored.
@@ -77,28 +259,22 @@ pub fn checkPathResult(
     path: []const u8,
     options: CheckOptions,
 ) FileResult {
-    var result = FileResult.init(enabledStages(options));
-    const diagnostic_start = diagnostics.items.len;
-    checkPathInternal(allocator, io, diagnostics, path, options, &result) catch |err| {
-        recordUnhandledFailure(&result, err, path);
-    };
-    result.finalize(diagnostics.items[diagnostic_start..]);
-    return result;
+    var context = InvocationContext.init(allocator, io, options);
+    defer context.deinit();
+    return context.validateOne(diagnostics, path);
 }
 
 fn checkPathInternal(
-    allocator: std.mem.Allocator,
-    io: std.Io,
+    context: *InvocationContext,
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
-    options: CheckOptions,
     result: *FileResult,
 ) !void {
     result.beginStage(.input);
     const cwd = std.Io.Dir.cwd();
-    var file = cwd.openFile(io, path, .{}) catch {
+    var file = cwd.openFile(context.io, path, .{}) catch {
         try appendFailureDiagnostic(
-            allocator,
+            context.allocator,
             diagnostics,
             result,
             .input,
@@ -112,25 +288,23 @@ fn checkPathInternal(
         );
         return;
     };
-    defer file.close(io);
+    defer file.close(context.io);
 
-    try checkPathMapped(allocator, io, file, diagnostics, path, options, result);
+    try checkPathMapped(context, file, diagnostics, path, result);
 }
 
 // mmap for random-access index checks; fall back to a stat-limited whole-file
 // read until the stream path is available.
 fn checkPathMapped(
-    allocator: std.mem.Allocator,
-    io: std.Io,
+    context: *InvocationContext,
     file: std.Io.File,
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
-    options: CheckOptions,
     result: *FileResult,
 ) !void {
-    const stat = file.stat(io) catch {
+    const stat = file.stat(context.io) catch {
         try appendFailureDiagnostic(
-            allocator,
+            context.allocator,
             diagnostics,
             result,
             .input,
@@ -146,7 +320,7 @@ fn checkPathMapped(
     };
     const len = std.math.cast(usize, stat.size) orelse {
         try appendFailureDiagnostic(
-            allocator,
+            context.allocator,
             diagnostics,
             result,
             .input,
@@ -161,16 +335,16 @@ fn checkPathMapped(
         return;
     };
 
-    var mm = std.Io.File.MemoryMap.create(io, file, .{
+    var mm = std.Io.File.MemoryMap.create(context.io, file, .{
         .len = len,
         .protection = .{ .read = true },
         .populate = false,
     }) catch {
         const cwd = std.Io.Dir.cwd();
-        const buf = cwd.readFileAlloc(io, path, allocator, .limited(len)) catch |err| {
+        const buf = cwd.readFileAlloc(context.io, path, context.allocator, .limited(len)) catch |err| {
             if (err == error.OutOfMemory) return err;
             try appendFailureDiagnostic(
-                allocator,
+                context.allocator,
                 diagnostics,
                 result,
                 .input,
@@ -184,17 +358,17 @@ fn checkPathMapped(
             );
             return;
         };
-        defer allocator.free(buf);
-        const index_bytes = if (options.skip_index) null else buf;
+        defer context.allocator.free(buf);
+        const index_bytes = if (context.options.skip_index) null else buf;
         result.completeStage(.input);
-        try runValidation(allocator, io, diagnostics, path, options, index_bytes, .{ .slice = buf }, result);
+        try runValidation(context, diagnostics, path, index_bytes, .{ .slice = buf }, result);
         return;
     };
-    defer mm.destroy(io);
+    defer mm.destroy(context.io);
 
-    const index_bytes = if (options.skip_index) null else mm.memory;
+    const index_bytes = if (context.options.skip_index) null else mm.memory;
     result.completeStage(.input);
-    try runValidation(allocator, io, diagnostics, path, options, index_bytes, .{ .slice = mm.memory }, result);
+    try runValidation(context, diagnostics, path, index_bytes, .{ .slice = mm.memory }, result);
 }
 
 // --- Validation core ---
@@ -228,16 +402,9 @@ pub fn checkSliceResult(
     options: CheckOptions,
     file_bytes: ?[]const u8,
 ) FileResult {
-    var result = FileResult.init(enabledStages(options));
-    const diagnostic_start = diagnostics.items.len;
-    result.completeStage(.input);
-    runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
-        .slice = bytes,
-    }, &result) catch |err| {
-        recordUnhandledFailure(&result, err, path);
-    };
-    result.finalize(diagnostics.items[diagnostic_start..]);
-    return result;
+    var context = InvocationContext.init(allocator, io, options);
+    defer context.deinit();
+    return context.checkSliceResult(bytes, diagnostics, path, file_bytes);
 }
 
 /// Validates mzML from a streaming `std.Io.Reader` (stdin, pipes).
@@ -264,24 +431,15 @@ pub fn checkReaderResult(
     options: CheckOptions,
     file_bytes: ?[]const u8,
 ) FileResult {
-    var result = FileResult.init(enabledStages(options));
-    const diagnostic_start = diagnostics.items.len;
-    result.completeStage(.input);
-    runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
-        .reader = reader,
-    }, &result) catch |err| {
-        recordUnhandledFailure(&result, err, path);
-    };
-    result.finalize(diagnostics.items[diagnostic_start..]);
-    return result;
+    var context = InvocationContext.init(allocator, io, options);
+    defer context.deinit();
+    return context.checkReaderResult(reader, diagnostics, path, file_bytes);
 }
 
 fn runValidation(
-    allocator: std.mem.Allocator,
-    io: std.Io,
+    context: *InvocationContext,
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
-    options: CheckOptions,
     file_bytes: ?[]const u8,
     source: ParserSource,
     result: *FileResult,
@@ -290,8 +448,12 @@ fn runValidation(
     // Bounded validator state: parser stacks, structural state, and one
     // binary workspace. The slice source itself may be file-sized.
     result.beginStage(.parser);
-    const token_buffer = try allocator.alloc(u8, max_validation_token_bytes);
-    defer allocator.free(token_buffer);
+    const token_buffer = try context.allocator.alloc(u8, max_validation_token_bytes);
+    defer {
+        result.resource_usage.parser_current_bytes = token_buffer.len;
+        result.resource_usage.parser_peak_bytes = token_buffer.len;
+        context.allocator.free(token_buffer);
+    }
 
     var attributes: [64]Attribute = undefined;
     var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
@@ -313,117 +475,59 @@ fn runValidation(
         .slice => |bytes| xml_parser.Parser.initSlice(bytes, parser_buffers),
     };
 
-    var structural_validator = structural.StructuralValidator.init(allocator, diagnostics, path);
+    var structural_validator = structural.StructuralValidator.init(context.allocator, diagnostics, path);
     defer structural_validator.deinit();
 
-    var binary_validator = if (options.skip_binary) null else binary.BinaryValidator{
-        .allocator = allocator,
+    var binary_validator = if (context.options.skip_binary) null else binary.BinaryValidator{
+        .allocator = context.allocator,
         .diagnostics = diagnostics,
         .path = path,
-        .max_binary_size = options.max_binary_size,
+        .limits = context.options.resource_limits,
+        .max_binary_size = context.options.max_binary_size,
     };
-    defer if (binary_validator) |*validator| validator.deinit();
+    defer if (binary_validator) |*validator| {
+        result.resource_usage.binary_scratch_current_bytes = validator.scratch_current_bytes;
+        result.resource_usage.binary_scratch_peak_bytes = validator.scratch_peak_bytes;
+        validator.deinit();
+    };
 
-    var index_validator = if (options.skip_index) null else mzml_index.IndexValidator.init(allocator, diagnostics, path);
+    var index_validator = if (context.options.skip_index) null else mzml_index.IndexValidator.initWithLimits(context.allocator, diagnostics, path, context.options.resource_limits);
     defer if (index_validator) |*validator| validator.deinit();
     if (index_validator) |*validator| {
         if (file_bytes) |bytes| validator.beginOnlineSha(bytes);
     }
 
-    // Load OBO and mapping rules. Embedded at build time, overridable at
-    // runtime via -obo. A catalog failure stops the current file.
-    var cv_table: ?obo_parser.CvTable = null;
-    var rule_eng: ?rule_engine.RuleEngine = null;
     var semantic_validator: ?semantic.SemanticValidator = null;
     defer if (semantic_validator) |*v| v.deinit();
-    defer if (rule_eng) |*e| e.deinit();
-    defer if (cv_table) |*t| t.deinit();
-    if (!options.skip_semantic) {
+    if (!context.options.skip_semantic) {
         result.beginStage(.semantic);
-        const obo_text = if (options.obo_path) |obo_path| blk: {
-            const cwd = std.Io.Dir.cwd();
-            // 50 MB limit: the embedded psi-ms.obo is 1.2 MB; the largest
-            // OBO in common use (GO) fits well under this ceiling.
-            break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(50 * 1024 * 1024)) catch |err| {
-                try appendFailureDiagnostic(
-                    allocator,
-                    diagnostics,
-                    result,
-                    .semantic,
-                    if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog,
-                    .{
-                        .severity = .@"error",
-                        .rule = RuleId.runtime_file_open,
-                        .path = path,
-                        .message = "unable to read OBO file",
-                    },
-                );
-                break :blk null;
-            };
-        } else @embedFile("data/psi-ms.obo");
-        if (obo_text == null) return;
-        if (obo_text) |text| {
-            defer if (options.obo_path != null) allocator.free(text);
-            cv_table = obo_parser.CvTable.init(allocator, text) catch |err| {
-                const message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err);
-                try appendFailureDiagnostic(
-                    allocator,
-                    diagnostics,
-                    result,
-                    .semantic,
-                    if (err == error.OutOfMemory) .allocation else .catalog,
-                    .{
-                        .severity = .@"error",
-                        .rule = RuleId.runtime_file_open,
-                        .path = path,
-                        .message = message,
-                    },
-                );
-                return;
-            };
-        }
-        if (cv_table) |*table| {
-            const rule_xml = @embedFile("data/ms-mapping.xml");
-            rule_eng = rule_engine.RuleEngine.init(allocator, rule_xml) catch |err| {
-                const message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules";
-                try appendFailureDiagnostic(
-                    allocator,
-                    diagnostics,
-                    result,
-                    .semantic,
-                    if (err == error.OutOfMemory) .allocation else .catalog,
-                    .{
-                        .severity = .@"error",
-                        .rule = RuleId.runtime_file_open,
-                        .path = path,
-                        .message = message,
-                    },
-                );
-                return;
-            };
-            if (rule_eng) |*engine| {
-                if (engine.firstMissingVocabularyTerm(table) != null) {
-                    try appendFailureDiagnostic(
-                        allocator,
-                        diagnostics,
-                        result,
-                        .semantic,
-                        .catalog,
-                        .{
-                            .severity = .@"error",
-                            .rule = RuleId.runtime_catalog,
-                            .path = path,
-                            .message = "embedded mapping policy is incompatible with the selected OBO vocabulary",
-                        },
-                    );
-                    return;
-                }
-                semantic_validator = semantic.SemanticValidator.init(allocator, table, engine, diagnostics, path);
-            }
+        if (context.catalog) |*catalog| {
+            semantic_validator = semantic.SemanticValidator.init(
+                context.allocator,
+                &catalog.cv_table,
+                &catalog.rule_engine,
+                diagnostics,
+                path,
+            );
+        } else {
+            try appendFailureDiagnostic(
+                context.allocator,
+                diagnostics,
+                result,
+                .semantic,
+                .catalog,
+                .{
+                    .severity = .@"error",
+                    .rule = RuleId.runtime_catalog,
+                    .path = path,
+                    .message = "semantic catalog is unavailable",
+                },
+            );
+            return;
         }
     }
     var element_depth: usize = 0;
-    const active = elements.activeMask(options.skip_binary, options.skip_index, options.skip_semantic);
+    const active = elements.activeMask(context.options.skip_binary, context.options.skip_index, context.options.skip_semantic);
     const fuse_index_semantic = index_validator != null or semantic_validator != null;
 
     while (true) {
@@ -431,7 +535,7 @@ fn runValidation(
         const maybe_event = parser.next() catch |err| {
             const message = xml_parse_errors.parseErrorMessage(err);
             try appendFailureDiagnostic(
-                allocator,
+                context.allocator,
                 diagnostics,
                 result,
                 .parser,
@@ -511,7 +615,6 @@ fn runValidation(
                 element_depth -= 1;
             },
             .text => |text| {
-                // Text outside the root element is only visible when depth is still zero.
                 result.beginStage(.structural);
                 if (structural_validator.depth == 0) {
                     try structural_validator.consumeText(text);
@@ -1304,6 +1407,8 @@ test "checkReader_clean_input_returns_complete_file_result" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(result.enabled_stages, result.completed_stages);
     try std.testing.expectEqual(diagnostic.ResultStatus.clean, result.status());
+    try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_current_bytes);
+    try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_peak_bytes);
 }
 
 test "checkReader_out_of_memory_returns_incomplete_file_result" {
@@ -1392,6 +1497,40 @@ test "checkPath_missing_catalog_returns_incomplete_file_result" {
     try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
 }
 
+test "InvocationContext_owns_catalog_across_multiple_paths" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{
+        .sub_path = "psi-ms.obo",
+        .data = @embedFile("data/psi-ms.obo"),
+    });
+    const obo_path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "psi-ms.obo");
+    defer allocator.free(obo_path);
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .obo_path = obo_path,
+    });
+    defer context.deinit();
+    try std.testing.expect(context.catalog != null);
+    try temp_dir.dir.deleteFile(io, "psi-ms.obo");
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const first = context.validateOne(&diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
+    diagnostics.clearRetainingCapacity();
+    const second = context.validateOne(&diagnostics, "fixtures/mzml/valid/small.pwiz.1.1.mzML");
+
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, first.completion);
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, second.completion);
+    try std.testing.expect(context.catalog != null);
+}
+
 test "checkPath_incompatible_custom_vocabulary_is_non_clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1425,6 +1564,7 @@ test "checkPath_invalid_zlib_returns_complete_result_with_error" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(diagnostic.ResultStatus.errors_present, result.status());
     try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
+    try std.testing.expect(result.resource_usage.binary_scratch_peak_bytes > 0);
 }
 
 test "checkPath_resource_limit_returns_incomplete_resource_result" {

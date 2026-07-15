@@ -203,6 +203,14 @@ pub const Totals = struct {
     errors: usize = 0,
 };
 
+/// Per-file owner measurements captured before validation state is released.
+pub const ResourceUsage = struct {
+    parser_current_bytes: usize = 0,
+    parser_peak_bytes: usize = 0,
+    binary_scratch_current_bytes: usize = 0,
+    binary_scratch_peak_bytes: usize = 0,
+};
+
 /// Fixed, allocation-free metadata for the first failure that stopped a file.
 pub const FirstFailure = struct {
     stage: ValidationStage,
@@ -220,6 +228,7 @@ pub const FileResult = struct {
     enabled_stages: StageMask = 0,
     completed_stages: StageMask = 0,
     totals: Totals = .{},
+    resource_usage: ResourceUsage = .{},
     first_failure: ?FirstFailure = null,
     diagnostics_truncated: bool = false,
 

@@ -277,17 +277,21 @@ fn runCheck(
     try results.ensureTotalCapacity(allocator, check.inputs.len);
     defer results.deinit(allocator);
 
+    const options = validate.CheckOptions{
+        .skip_binary = check.skip_binary,
+        .skip_index = check.skip_index,
+        .skip_semantic = check.skip_semantic,
+        .input_mode = check.input_mode,
+        .memory_limit = check.memory_limit,
+        .mmap = check.mmap,
+        .max_binary_size = check.max_binary_size,
+        .obo_path = check.obo_path,
+    };
+    var context = validate.InvocationContext.init(allocator, io, options);
+    defer context.deinit();
+
     for (check.inputs) |path| {
-        const result = validate.checkPathResult(allocator, io, &diagnostics, path, .{
-            .skip_binary = check.skip_binary,
-            .skip_index = check.skip_index,
-            .skip_semantic = check.skip_semantic,
-            .input_mode = check.input_mode,
-            .memory_limit = check.memory_limit,
-            .mmap = check.mmap,
-            .max_binary_size = check.max_binary_size,
-            .obo_path = check.obo_path,
-        });
+        const result = context.validateOne(&diagnostics, path);
         try results.append(allocator, result);
     }
 
