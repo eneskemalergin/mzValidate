@@ -26,7 +26,7 @@ These were kept: `deflate_decompress.c` (core engine), `zlib_decompress.c` (zlib
 
 ## How it is used
 
-`binary.zig` calls `libdeflate_deflate_decompress_ex()` with the zlib header (2 bytes) and adler32 footer (4 bytes) stripped from each compressed payload. This skips checksum verification for roughly 5-7% more throughput than the full `libdeflate_zlib_decompress_ex()` path.
+`binary.zig` calls `libdeflate_zlib_decompress_ex()` with the complete zlib payload. This validates the zlib header and Adler-32 checksum; the consumed-input result is also checked so trailing bytes are rejected.
 
 The decompressor handle is allocated once and reused across all binary arrays in a file.
 

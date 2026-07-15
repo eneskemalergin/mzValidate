@@ -82,6 +82,9 @@ pub const RuleId = struct {
 /// Shared input-derived limits used by validators in one check.
 pub const ResourceLimits = struct {
     max_binary_encoded_bytes: usize = 256 * 1024 * 1024,
+    max_binary_decoded_bytes: usize = 256 * 1024 * 1024,
+    max_binary_scratch_bytes: usize = 256 * 1024 * 1024,
+    max_binary_materialized_bytes: usize = 8 * 1024 * 1024,
     max_index_entries: usize = 1_000_000,
     max_index_id_ref_bytes: usize = 4096,
     max_index_offset_text_bytes: usize = 64,
