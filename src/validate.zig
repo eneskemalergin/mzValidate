@@ -785,6 +785,34 @@ test "checkPath_indexed_fixture_runs_mapping_rules" {
     try std.testing.expect(found_required_mapping_error);
 }
 
+test "checkPath_nonempty_binary_without_array_length_is_incomplete" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/adversarial/missing-default-array-length.mzML", .{
+        .skip_index = true,
+        .skip_semantic = true,
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.binary, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+
+    var found_binary_diagnostic = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.mzml_binary_length_mismatch) and
+            std.mem.eql(u8, item.message, "non-empty binary payload is missing required defaultArrayLength"))
+        {
+            found_binary_diagnostic = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_binary_diagnostic);
+}
+
 test "checkPath_missing_required_reference_emits_reference_rule" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

@@ -1122,7 +1122,16 @@ pub const BinaryValidator = struct {
         }
 
         const element_count = decoded_bytes / width;
-        // TODO: missing defaultArrayLength lets non-empty payloads slip through unchecked.
+        if (state.default_array_length == null and decoded_bytes > 0) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_length_mismatch,
+                .location = location,
+                .path = validator.path,
+                .message = "non-empty binary payload is missing required defaultArrayLength",
+            });
+            return error.ResourceLimitExceeded;
+        }
         const declared_count = state.default_array_length orelse return;
         if (element_count == declared_count) return;
 
@@ -1453,12 +1462,50 @@ test "binary validator C.0 parity snapshots decision order edge cases" {
         "<binaryDataArrayList count=\"1\">" ++
         "<binaryDataArray encodedLength=\"8\">" ++
         "<cvParam accession=\"MS:1000521\"/>" ++
-        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000574\"/>" ++
         "<cvParam accession=\"MS:1000515\"/>" ++
-        "<binary>AACAPw==</binary>" ++
+        "<binary>eJxjYGBgAAAABAAB</binary>" ++
         "</binaryDataArray></binaryDataArrayList></spectrum>" ++
         "</spectrumList></run></mzML>";
-    try expectBinaryDiagnosticsSnapshot(allocator, io, no_default_array_length, &.{});
+    var no_default_diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer no_default_diagnostics.deinit(allocator);
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        runBinaryValidationInto(allocator, io, no_default_array_length, &no_default_diagnostics),
+    );
+    try expectSingleBinaryDiagnostic(
+        no_default_diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "non-empty binary payload is missing required defaultArrayLength",
+    );
+}
+
+test "binary validator rejects non-empty chromatogram without array length" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<run id=\"run-1\"><chromatogramList count=\"1\">" ++
+        "<chromatogram index=\"0\" id=\"tic=1\"><binaryDataArrayList count=\"1\">" ++
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000595\"/>" ++
+        "<binary>AAAAAA==</binary></binaryDataArray>" ++
+        "</binaryDataArrayList></chromatogram></chromatogramList></run></mzML>";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        runBinaryValidationInto(allocator, io, fixture, &diagnostics),
+    );
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "non-empty binary payload is missing required defaultArrayLength",
+    );
 }
 
 test "streaming base64 counter C.2 scalar short path stays exact" {
