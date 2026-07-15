@@ -131,7 +131,7 @@ pub const InvocationContext = struct {
         var result = FileResult.init(enabledStages(context.options));
         const diagnostic_start = diagnostics.items.len;
         result.completeStage(.input);
-        runValidation(context, diagnostics, path, file_bytes, .{ .slice = bytes }, &result) catch |err| {
+        runValidation(context, diagnostics, path, file_bytes, .{ .slice = bytes }, &result, null, null) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
         result.finalize(diagnostics.items[diagnostic_start..]);
@@ -150,7 +150,7 @@ pub const InvocationContext = struct {
         var result = FileResult.init(enabledStages(context.options));
         const diagnostic_start = diagnostics.items.len;
         result.completeStage(.input);
-        runValidation(context, diagnostics, path, file_bytes, .{ .reader = reader }, &result) catch |err| {
+        runValidation(context, diagnostics, path, file_bytes, .{ .reader = reader }, &result, null, null) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
         result.finalize(diagnostics.items[diagnostic_start..]);
@@ -394,7 +394,7 @@ fn checkPathMapped(
 
     const index_bytes = if (context.options.skip_index) null else mm.memory;
     result.completeStage(.input);
-    try runValidation(context, diagnostics, path, index_bytes, .{ .slice = mm.memory }, result);
+    try runValidation(context, diagnostics, path, index_bytes, .{ .slice = mm.memory }, result, null, null);
     mm.destroy(context.io);
     map_destroyed = true;
     try checkFileStability(context, file, initial_stat, diagnostics, path, result);
@@ -412,7 +412,7 @@ fn checkPathStream(
     var file_reader = file.readerStreaming(context.io, &input_buffer);
 
     result.completeStage(.input);
-    try runValidation(context, diagnostics, path, null, .{ .reader = &file_reader.interface }, result);
+    try runValidation(context, diagnostics, path, null, .{ .reader = &file_reader.interface }, result, file, initial_stat.size);
     try checkFileStability(context, file, initial_stat, diagnostics, path, result);
 }
 
@@ -561,6 +561,8 @@ fn runValidation(
     file_bytes: ?[]const u8,
     source: ParserSource,
     result: *FileResult,
+    stream_file: ?std.Io.File,
+    stream_size: ?u64,
 ) !void {
 
     // Bounded validator state: parser stacks, structural state, and one
@@ -610,8 +612,19 @@ fn runValidation(
     };
 
     var index_validator = if (context.options.skip_index) null else mzml_index.IndexValidator.initWithLimits(context.allocator, diagnostics, path, context.options.resource_limits);
-    defer if (index_validator) |*validator| validator.deinit();
+    defer if (index_validator) |*validator| {
+        result.resource_usage.index_current_bytes = validator.index_state_current_bytes;
+        result.resource_usage.index_peak_bytes = validator.index_state_peak_bytes;
+        validator.deinit();
+    };
     if (index_validator) |*validator| {
+        switch (source) {
+            .slice => |bytes| {
+                validator.input_size = bytes.len;
+            },
+            .reader => {},
+        }
+        if (stream_file) |file| validator.setStreamSource(context.io, file, stream_size orelse return error.InputOutput);
         if (file_bytes) |bytes| validator.beginOnlineSha(bytes);
     }
 
@@ -1263,7 +1276,7 @@ test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexedSha_valid_noChecksumError" {
+test "checkPath_indexedSha_stream_noChecksumError" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1302,12 +1315,13 @@ test "checkPath_indexedSha_valid_noChecksumError" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha.mzML");
     defer allocator.free(path);
 
-    // Act. Default path: mmap.
+    // Act. Stream path: checksum is recomputed from the seekable source.
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
-    try checkPath(allocator, io, &diagnostics, path, .{
+    const result = checkPathResult(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
+        .input_mode = .stream,
     });
 
     // Assert. No checksum error.
@@ -1316,6 +1330,7 @@ test "checkPath_indexedSha_valid_noChecksumError" {
             return error.TestUnexpectedChecksumError;
         }
     }
+    try std.testing.expect(result.resource_usage.index_peak_bytes > 0);
 }
 
 test "checkPath_indexedSha_mmap_noChecksumError" {
@@ -1439,6 +1454,7 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
+        .input_mode = .stream,
     });
 
     // Assert. The wrong checksum must produce a mismatch diagnostic.
@@ -1906,6 +1922,31 @@ test "checkPath_resource_limit_returns_incomplete_resource_result" {
         }
     }
     try std.testing.expect(found_limit);
+}
+
+test "checkSlice_index_state_limit_returns_incomplete_resource_result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        allocator,
+        .limited(64 * 1024),
+    );
+    defer allocator.free(fixture);
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkSliceResult(allocator, io, fixture, &diagnostics, "tiny-index-limit.mzML", .{
+        .skip_binary = true,
+        .skip_semantic = true,
+        .resource_limits = .{ .max_index_state_bytes = 1 },
+    }, fixture);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.index, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
 }
 
 test "checkReader_legacy_wrapper_rejects_unreported_oom" {

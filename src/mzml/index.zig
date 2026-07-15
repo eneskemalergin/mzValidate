@@ -2,9 +2,8 @@
 //!
 //! Forward pass records byte offsets of every spectrum and chromatogram,
 //! parses `<indexList>` entries, and captures `<indexListOffset>` and
-//! `<fileChecksum>`. When `file_bytes` is available, SHA-1 is fed
-//! incrementally during parse; `finish()` cross-checks offsets and the
-//! digest without rescanning the mmap slice.
+//! `<fileChecksum>`. SHA-1 and offset checks work for both contiguous and
+//! seekable stream sources without retaining the input.
 //!
 //! Tolerates both pwiz offsets (pointing at `<`) and ThermoRawFileParser
 //! offsets (pointing at the line start before whitespace).
@@ -25,9 +24,9 @@ const mzml_namespace = diagnostic.mzml_namespace;
 
 const IndexKind = enum { spectrum, chromatogram };
 
-const IndexEntry = struct {
-    id_ref: []const u8,
+const IndexRecord = struct {
     offset: u64,
+    index_seen: bool = false,
 };
 
 /// Validates index offsets, indexListOffset, fileChecksum SHA-1, and truncation.
@@ -43,9 +42,9 @@ pub const IndexValidator = struct {
     depth: usize = 0,
     mzml_depth: ?usize = null,
 
-    // Forward-pass: id → byte_offset for every spectrum/chromatogram.
-    spectrum_offsets: std.StringHashMap(u64),
-    chromatogram_offsets: std.StringHashMap(u64),
+    // One key and record for every spectrum or chromatogram.
+    spectrum_offsets: std.StringHashMap(IndexRecord),
+    chromatogram_offsets: std.StringHashMap(IndexRecord),
 
     // --- Index list parsing state ---
     index_list_depth: ?usize = null,
@@ -54,10 +53,9 @@ pub const IndexValidator = struct {
     index_list_actual_count: u64 = 0,
 
     current_index_kind: ?IndexKind = null,
-    offset_id_ref_owned: ?[]const u8 = null,
-
-    // Accumulated entries parsed from <indexList>.
-    index_entries: std.ArrayList(IndexEntry),
+    offset_id_ref: ?[]const u8 = null,
+    index_entry_count: usize = 0,
+    previous_index_offset: ?u64 = null,
 
     // --- indexListOffset ---
     index_list_offset_depth: ?usize = null,
@@ -76,7 +74,13 @@ pub const IndexValidator = struct {
     // Set true when any index-related element is encountered.
     saw_index_elements: bool = false,
 
-    // Online SHA-1 over mmap bytes (D.1). Disabled when file_bytes is null.
+    index_state_current_bytes: usize = 0,
+    index_state_peak_bytes: usize = 0,
+    input_size: ?u64 = null,
+    stream_io: ?std.Io = null,
+    stream_file: ?std.Io.File = null,
+
+    // Online SHA-1 over contiguous input bytes.
     sha_file_bytes: ?[]const u8 = null,
     sha_ctx: std.crypto.hash.Sha1 = undefined,
     sha_bytes_hashed: u64 = 0,
@@ -99,6 +103,7 @@ pub const IndexValidator = struct {
     /// when `file_bytes` is available (checkPath / checkSlice).
     pub fn beginOnlineSha(validator: *IndexValidator, bytes: []const u8) void {
         validator.sha_file_bytes = bytes;
+        validator.input_size = bytes.len;
         validator.sha_ctx = std.crypto.hash.Sha1.init(.{});
         validator.sha_bytes_hashed = 0;
         validator.sha_complete = false;
@@ -147,9 +152,8 @@ pub const IndexValidator = struct {
             .diagnostics = diagnostics,
             .path = path,
             .limits = limits,
-            .spectrum_offsets = std.StringHashMap(u64).init(allocator),
-            .chromatogram_offsets = std.StringHashMap(u64).init(allocator),
-            .index_entries = std.ArrayList(IndexEntry).empty,
+            .spectrum_offsets = std.StringHashMap(IndexRecord).init(allocator),
+            .chromatogram_offsets = std.StringHashMap(IndexRecord).init(allocator),
             .text_buf = std.ArrayList(u8).empty,
         };
     }
@@ -157,11 +161,16 @@ pub const IndexValidator = struct {
     pub fn deinit(validator: *IndexValidator) void {
         freeHashMap(validator.allocator, &validator.spectrum_offsets);
         freeHashMap(validator.allocator, &validator.chromatogram_offsets);
-        freeIndexEntries(validator.allocator, &validator.index_entries);
-        if (validator.offset_id_ref_owned) |owned| validator.allocator.free(owned);
-        validator.index_entries.deinit(validator.allocator);
+        if (validator.offset_id_ref) |ref| validator.allocator.free(ref);
         validator.text_buf.deinit(validator.allocator);
         validator.* = undefined;
+    }
+
+    /// Set the seekable source and size before parsing stream events.
+    pub fn setStreamSource(validator: *IndexValidator, io: std.Io, file: std.Io.File, size: u64) void {
+        validator.stream_io = io;
+        validator.stream_file = file;
+        validator.input_size = size;
     }
 
     pub fn consumeStart(
@@ -192,7 +201,7 @@ pub const IndexValidator = struct {
                 if (count_attr) |c| {
                     if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
                         const bounded = try validator.boundedCount(count, start.byte_offset, "spectrumList count exceeds the configured index-entry limit");
-                        try validator.spectrum_offsets.ensureTotalCapacity(bounded);
+                        try validator.ensureMapCapacity(&validator.spectrum_offsets, bounded, start.byte_offset);
                     } else |_| {}
                 }
             },
@@ -202,7 +211,7 @@ pub const IndexValidator = struct {
                 if (count_attr) |c| {
                     if (std.fmt.parseUnsigned(u64, c, 10)) |count| {
                         const bounded = try validator.boundedCount(count, start.byte_offset, "chromatogramList count exceeds the configured index-entry limit");
-                        try validator.chromatogram_offsets.ensureTotalCapacity(bounded);
+                        try validator.ensureMapCapacity(&validator.chromatogram_offsets, bounded, start.byte_offset);
                     } else |_| {}
                 }
             },
@@ -251,12 +260,19 @@ pub const IndexValidator = struct {
                     try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
                     return;
                 };
-                if (validator.offset_id_ref_owned) |owned| validator.allocator.free(owned);
+                if (validator.offset_id_ref) |old_ref| {
+                    validator.releaseIndexBytes(old_ref.len);
+                    validator.allocator.free(old_ref);
+                }
+                validator.offset_id_ref = null;
                 if (id_ref.len > validator.limits.max_index_id_ref_bytes) {
                     try validator.limitDiagnostic(start.byte_offset, "index idRef exceeds the configured field limit");
                     return error.ResourceLimitExceeded;
                 }
-                validator.offset_id_ref_owned = try validator.allocator.dupe(u8, id_ref);
+                try validator.reserveIndexBytes(id_ref.len, start.byte_offset);
+                errdefer validator.releaseIndexBytes(id_ref.len);
+                const retained = try validator.allocator.dupe(u8, id_ref);
+                validator.offset_id_ref = retained;
                 validator.text_buf.clearRetainingCapacity();
             },
             .indexListOffset => {
@@ -290,20 +306,17 @@ pub const IndexValidator = struct {
 
         switch (tag) {
             .offset => {
-                if (validator.current_index_kind == null or validator.offset_id_ref_owned == null) return;
-                const id_ref_owned = validator.offset_id_ref_owned.?;
-                validator.offset_id_ref_owned = null;
+                if (validator.current_index_kind == null or validator.offset_id_ref == null) return;
+                const id_ref = validator.offset_id_ref.?;
+                validator.offset_id_ref = null;
+                defer {
+                    validator.releaseIndexBytes(id_ref.len);
+                    validator.allocator.free(id_ref);
+                }
                 const offset = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
-                    validator.allocator.free(id_ref_owned);
                     return;
                 };
-                if (validator.index_entries.items.len >= validator.maxIndexEntries()) {
-                    validator.allocator.free(id_ref_owned);
-                    try validator.limitDiagnostic(end.byte_offset, "index entry count exceeds the configured index-entry limit");
-                    return error.ResourceLimitExceeded;
-                }
-                errdefer validator.allocator.free(id_ref_owned);
-                try validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset });
+                try validator.checkIndexEntry(id_ref, offset, end.byte_offset);
             },
             .index => validator.current_index_kind = null,
             .indexList => {
@@ -345,14 +358,14 @@ pub const IndexValidator = struct {
 
     pub fn consumeText(validator: *IndexValidator, text: Text) !void {
         if (!validator.wantsText()) return;
-        const limit = if (validator.offset_id_ref_owned != null)
+        const limit = if (validator.offset_id_ref != null)
             validator.limits.max_index_offset_text_bytes
         else if (validator.index_list_offset_depth != null)
             validator.limits.max_index_list_offset_text_bytes
         else
             validator.limits.max_file_checksum_text_bytes;
         if (validator.text_buf.items.len > limit or text.value.len > limit - validator.text_buf.items.len) {
-            const message = if (validator.offset_id_ref_owned != null)
+            const message = if (validator.offset_id_ref != null)
                 "index offset text exceeds the configured field limit"
             else if (validator.index_list_offset_depth != null)
                 "indexListOffset text exceeds the configured field limit"
@@ -361,27 +374,76 @@ pub const IndexValidator = struct {
             try validator.limitDiagnostic(text.byte_offset, message);
             return error.ResourceLimitExceeded;
         }
+        const required = std.math.add(usize, validator.text_buf.items.len, text.value.len) catch {
+            try validator.limitDiagnostic(text.byte_offset, "index text size arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        if (required > validator.text_buf.capacity) {
+            const extra = required - validator.text_buf.capacity;
+            try validator.reserveIndexBytes(extra, text.byte_offset);
+            errdefer validator.releaseIndexBytes(extra);
+            try validator.text_buf.ensureTotalCapacityPrecise(validator.allocator, required);
+        }
         try validator.text_buf.appendSlice(validator.allocator, text.value);
     }
 
     /// True when accumulating offset, indexListOffset, or fileChecksum text.
     pub fn wantsText(validator: *const IndexValidator) bool {
         if (validator.mzml_depth == null) return false;
-        return validator.offset_id_ref_owned != null or
+        return validator.offset_id_ref != null or
             validator.index_list_offset_depth != null or
             validator.file_checksum_depth != null;
     }
 
+    /// Recomputes fileChecksum from the seekable stream source without retaining input bytes.
+    pub fn completeStreamChecksum(validator: *IndexValidator) !void {
+        if (!validator.file_checksum_ok or validator.sha_complete) return;
+        const checksum_offset = validator.file_checksum_byte_offset orelse return;
+        const size = validator.input_size orelse return;
+        if (checksum_offset > size) return;
+
+        const file = validator.stream_file orelse return;
+        const io = validator.stream_io orelse {
+            try validator.appendDiagnostic(
+                checksum_offset,
+                RuleId.mzml_index_checksum,
+                "stream I/O unavailable while verifying fileChecksum",
+            );
+            return error.InputOutput;
+        };
+        var buffer: [64 * 1024]u8 = undefined;
+        var hashed: u64 = 0;
+        var ctx = std.crypto.hash.Sha1.init(.{});
+        while (hashed < checksum_offset) {
+            const remaining = checksum_offset - hashed;
+            const want: usize = @intCast(@min(remaining, @as(u64, buffer.len)));
+            const n = try std.Io.File.readPositionalAll(file, io, buffer[0..want], hashed);
+            if (n != want) {
+                try validator.appendDiagnostic(
+                    checksum_offset,
+                    RuleId.mzml_index_checksum,
+                    "unable to read input while verifying fileChecksum",
+                );
+                return error.InputOutput;
+            }
+            ctx.update(buffer[0..n]);
+            hashed = std.math.add(u64, hashed, n) catch return error.InputOutput;
+        }
+        ctx.final(&validator.sha_computed);
+        validator.sha_complete = true;
+    }
+
     /// After the document is fully parsed, cross-check all collected data.
-    /// `file_bytes` is the complete mmap'd file content (or null if unavailable).
-    /// When null, SHA-1 verification and truncation checks are skipped.
+    /// `file_bytes` is the complete contiguous input when available.
+    /// Call beginOnlineSha or setStreamSource before parsing when input-size
+    /// and truncation checks are required.
     pub fn finish(
         validator: *IndexValidator,
         file_bytes: ?[]const u8,
     ) !void {
         if (!validator.saw_index_elements) return;
 
-        if (file_bytes == null) {
+        if (file_bytes == null and validator.stream_file == null) {
             try validator.diagnostics.append(validator.allocator, .{
                 .severity = .info,
                 .rule = RuleId.mzml_index_checksum,
@@ -406,9 +468,7 @@ pub const IndexValidator = struct {
         if (validator.index_list_offset_value) |declared| {
             if (validator.index_list_actual_offset) |actual| {
                 if (declared != actual) {
-                    // Accept offset pointing to whitespace before element
-                    // (e.g. ThermoRawFileParser writes line-start offsets).
-                    if (!offsetsMatchWithWhitespace(file_bytes, declared, actual)) {
+                    if (!try validator.offsetsMatchWithWhitespace(declared, actual)) {
                         try validator.appendDiagnostic(
                             validator.index_list_offset_byte_offset orelse validator.index_list_actual_offset orelse 0,
                             RuleId.mzml_index_offset_list,
@@ -419,72 +479,8 @@ pub const IndexValidator = struct {
             }
         }
 
-        // --- Cross-check each index entry ---
-        var prev_offset: ?u64 = null;
-        var seen_ids = std.StringHashMap(void).init(validator.allocator);
-        defer seen_ids.deinit();
-        for (validator.index_entries.items) |entry| {
-            // Check for duplicate idRef in index.
-            if (seen_ids.contains(entry.id_ref)) {
-                try validator.appendDiagnostic(
-                    entry.offset,
-                    RuleId.mzml_index_offset,
-                    "duplicate idRef in index",
-                );
-            } else {
-                try seen_ids.put(entry.id_ref, {});
-            }
-
-            // Check monotonic ordering.
-            if (prev_offset) |prev| {
-                if (entry.offset < prev) {
-                    try validator.appendDiagnostic(
-                        entry.offset,
-                        RuleId.mzml_index_offset,
-                        "index offsets are not monotonically increasing",
-                    );
-                }
-            }
-            prev_offset = entry.offset;
-
-            // Check truncation (offset past EOF).
-            if (file_bytes) |bytes| {
-                if (entry.offset >= bytes.len) {
-                    try validator.appendDiagnostic(
-                        entry.offset,
-                        RuleId.mzml_index_truncated,
-                        "index offset points past end of file",
-                    );
-                    continue;
-                }
-            }
-
-            // Look up the idRef in both maps.
-            const recorded_offset = validator.spectrum_offsets.get(entry.id_ref) orelse
-                validator.chromatogram_offsets.get(entry.id_ref) orelse
-                {
-                    try validator.appendDiagnostic(
-                        entry.offset,
-                        RuleId.mzml_index_offset,
-                        "index references non-existent spectrum or chromatogram",
-                    );
-                    continue;
-                };
-
-            if (entry.offset != recorded_offset) {
-                // Accept offset pointing to whitespace before the element
-                // (ThermoRawFileParser convention: line-start offset).
-                if (!offsetsMatchWithWhitespace(file_bytes, entry.offset, recorded_offset)) {
-                    try validator.appendDiagnostic(
-                        entry.offset,
-                        RuleId.mzml_index_offset,
-                        "index offset does not match actual byte position",
-                    );
-                }
-            }
-        }
-
         // --- SHA-1 checksum verification ---
+        if (file_bytes == null) try validator.completeStreamChecksum();
         if (file_bytes) |bytes| {
             if (validator.file_checksum_ok) {
                 if (validator.file_checksum_byte_offset) |checksum_offset| {
@@ -513,14 +509,179 @@ pub const IndexValidator = struct {
                     }
                 }
             }
+        } else if (validator.stream_file != null and validator.file_checksum_ok) {
+            if (validator.file_checksum_byte_offset) |checksum_offset| {
+                const size = validator.input_size orelse {
+                    try validator.appendDiagnostic(
+                        checksum_offset,
+                        RuleId.mzml_index_checksum,
+                        "input size unavailable while verifying fileChecksum",
+                    );
+                    return error.InputOutput;
+                };
+                if (checksum_offset > size) {
+                    try validator.appendDiagnostic(
+                        checksum_offset,
+                        RuleId.mzml_index_checksum,
+                        "fileChecksum offset exceeds file size",
+                    );
+                } else if (!std.mem.eql(u8, &validator.sha_computed, &validator.file_checksum_raw)) {
+                    try validator.appendDiagnostic(
+                        checksum_offset,
+                        RuleId.mzml_index_checksum,
+                        "fileChecksum SHA-1 does not match recomputed value",
+                    );
+                }
+            }
         }
     }
 
     // --- Private helpers ---
 
     fn maxIndexEntries(validator: *const IndexValidator) usize {
-        if (validator.sha_file_bytes) |bytes| return @min(validator.limits.max_index_entries, bytes.len);
+        if (validator.input_size) |size| {
+            if (std.math.cast(usize, size)) |length| return @min(validator.limits.max_index_entries, length);
+        }
         return validator.limits.max_index_entries;
+    }
+
+    fn reserveIndexBytes(validator: *IndexValidator, bytes: usize, byte_offset: u64) !void {
+        const next = std.math.add(usize, validator.index_state_current_bytes, bytes) catch {
+            try validator.limitDiagnostic(byte_offset, "index state size arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        if (next > validator.limits.max_index_state_bytes) {
+            try validator.limitDiagnostic(byte_offset, "index state exceeds the configured byte limit");
+            return error.ResourceLimitExceeded;
+        }
+        validator.index_state_current_bytes = next;
+        validator.index_state_peak_bytes = @max(validator.index_state_peak_bytes, next);
+    }
+
+    fn releaseIndexBytes(validator: *IndexValidator, bytes: usize) void {
+        std.debug.assert(bytes <= validator.index_state_current_bytes);
+        validator.index_state_current_bytes -= bytes;
+    }
+
+    fn ensureMapCapacity(
+        validator: *IndexValidator,
+        map: *std.StringHashMap(IndexRecord),
+        required: u32,
+        byte_offset: u64,
+    ) !void {
+        const old_capacity = map.capacity();
+        if (old_capacity != 0) {
+            const load_limit = std.math.mul(u64, old_capacity, 80) catch unreachable;
+            if (@as(u64, required) <= load_limit / 100) return;
+        }
+        const target_without_minimum = mapCapacityForCount(required) catch {
+            try validator.limitDiagnostic(byte_offset, "index map capacity arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        const target = @max(target_without_minimum, @as(u32, 8));
+        if (target <= old_capacity) return;
+        const old_bytes = mapStorageBytes(map.capacity()) catch {
+            try validator.limitDiagnostic(byte_offset, "index map size arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        const new_bytes = mapStorageBytes(target) catch {
+            try validator.limitDiagnostic(byte_offset, "index map size arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+        try validator.reserveIndexBytes(new_bytes, byte_offset);
+        errdefer validator.releaseIndexBytes(new_bytes);
+        try map.ensureTotalCapacity(required);
+        validator.releaseIndexBytes(old_bytes);
+    }
+
+    fn checkIndexEntry(validator: *IndexValidator, id_ref: []const u8, offset: u64, byte_offset: u64) !void {
+        if (validator.index_entry_count >= validator.maxIndexEntries()) {
+            try validator.limitDiagnostic(byte_offset, "index entry count exceeds the configured index-entry limit");
+            return error.ResourceLimitExceeded;
+        }
+        validator.index_entry_count = std.math.add(usize, validator.index_entry_count, 1) catch {
+            try validator.limitDiagnostic(byte_offset, "index entry count arithmetic overflow");
+            return error.ResourceLimitExceeded;
+        };
+
+        var found = false;
+        var duplicate = false;
+        var recorded_offset: ?u64 = null;
+        if (validator.spectrum_offsets.getPtr(id_ref)) |record| {
+            found = true;
+            duplicate = record.index_seen;
+            record.index_seen = true;
+            recorded_offset = record.offset;
+        }
+        if (validator.chromatogram_offsets.getPtr(id_ref)) |record| {
+            found = true;
+            duplicate = duplicate or record.index_seen;
+            record.index_seen = true;
+            if (recorded_offset == null) recorded_offset = record.offset;
+        }
+        if (duplicate) {
+            try validator.appendDiagnostic(byte_offset, RuleId.mzml_index_offset, "duplicate idRef in index");
+        }
+        if (validator.previous_index_offset) |previous| {
+            if (offset < previous) {
+                try validator.appendDiagnostic(
+                    byte_offset,
+                    RuleId.mzml_index_offset,
+                    "index offsets are not monotonically increasing",
+                );
+            }
+        }
+        validator.previous_index_offset = offset;
+        if (validator.input_size) |size| {
+            if (offset >= size) {
+                try validator.appendDiagnostic(
+                    offset,
+                    RuleId.mzml_index_truncated,
+                    "index offset points past end of file",
+                );
+                return;
+            }
+        }
+        if (!found) {
+            try validator.appendDiagnostic(
+                offset,
+                RuleId.mzml_index_offset,
+                "index references non-existent spectrum or chromatogram",
+            );
+            return;
+        }
+        if (offset != recorded_offset.? and !try validator.offsetsMatchWithWhitespace(offset, recorded_offset.?)) {
+            try validator.appendDiagnostic(
+                offset,
+                RuleId.mzml_index_offset,
+                "index offset does not match actual byte position",
+            );
+        }
+    }
+
+    fn offsetsMatchWithWhitespace(validator: *IndexValidator, declared: u64, actual: u64) !bool {
+        if (declared == actual) return true;
+        if (declared > actual) return false;
+        if (validator.sha_file_bytes) |bytes| return offsetsMatchWithBytes(bytes, declared, actual);
+        const io = validator.stream_io orelse return false;
+        const file = validator.stream_file orelse return false;
+        if (validator.input_size) |size| if (actual > size) return false;
+
+        var buffer: [4096]u8 = undefined;
+        var offset = declared;
+        while (offset < actual) {
+            const want: usize = @intCast(@min(actual - offset, @as(u64, buffer.len)));
+            const n = try std.Io.File.readPositionalAll(file, io, buffer[0..want], offset);
+            if (n != want) return false;
+            for (buffer[0..n]) |byte| {
+                switch (byte) {
+                    ' ', '\t', '\n', '\r' => {},
+                    else => return false,
+                }
+            }
+            offset = std.math.add(u64, offset, n) catch return false;
+        }
+        return true;
     }
 
     fn boundedCount(validator: *IndexValidator, count: u64, byte_offset: u64, message: []const u8) !u32 {
@@ -571,7 +732,7 @@ pub const IndexValidator = struct {
 fn recordContainerOffset(
     validator: *IndexValidator,
     start: StartElement,
-    map: *std.StringHashMap(u64),
+    map: *std.StringHashMap(IndexRecord),
 ) !void {
     const id = start.attr("id") orelse return;
     if (map.contains(id)) return;
@@ -583,15 +744,25 @@ fn recordContainerOffset(
         try validator.limitDiagnostic(start.byte_offset, "indexable element count exceeds the configured index-entry limit");
         return error.ResourceLimitExceeded;
     }
-    const owned = try validator.allocator.dupe(u8, id);
-    errdefer validator.allocator.free(owned);
-    const result = try map.getOrPut(owned);
+    const count = std.math.add(u32, map.count(), 1) catch {
+        try validator.limitDiagnostic(start.byte_offset, "index map count arithmetic overflow");
+        return error.ResourceLimitExceeded;
+    };
+    try validator.ensureMapCapacity(map, count, start.byte_offset);
+    try validator.reserveIndexBytes(id.len, start.byte_offset);
+    errdefer validator.releaseIndexBytes(id.len);
+    const key = try validator.allocator.dupe(u8, id);
+    errdefer {
+        validator.allocator.free(key);
+    }
+    const result = try map.getOrPut(key);
     if (result.found_existing) {
-        validator.allocator.free(owned);
+        validator.releaseIndexBytes(key.len);
+        validator.allocator.free(key);
         return;
     }
-    result.key_ptr.* = owned;
-    result.value_ptr.* = start.byte_offset;
+    result.key_ptr.* = key;
+    result.value_ptr.* = .{ .offset = start.byte_offset };
 }
 
 fn decodeHex(hex: []const u8, out: *[20]u8) void {
@@ -628,7 +799,7 @@ fn isHexString(s: []const u8) bool {
     return true;
 }
 
-fn freeHashMap(allocator: std.mem.Allocator, map: *std.StringHashMap(u64)) void {
+fn freeHashMap(allocator: std.mem.Allocator, map: *std.StringHashMap(IndexRecord)) void {
     var it = map.iterator();
     while (it.next()) |entry| {
         allocator.free(entry.key_ptr.*);
@@ -636,10 +807,19 @@ fn freeHashMap(allocator: std.mem.Allocator, map: *std.StringHashMap(u64)) void 
     map.deinit();
 }
 
-fn freeIndexEntries(allocator: std.mem.Allocator, entries: *std.ArrayList(IndexEntry)) void {
-    for (entries.items) |entry| {
-        allocator.free(entry.id_ref);
-    }
+fn mapCapacityForCount(required: u32) !u32 {
+    const scaled = try std.math.mul(u64, required, 100);
+    const needed = try std.math.add(u64, scaled / 80, 1);
+    const bounded = std.math.cast(u32, needed) orelse return error.Overflow;
+    return std.math.ceilPowerOfTwo(u32, bounded) catch return error.Overflow;
+}
+
+fn mapStorageBytes(capacity: u32) !usize {
+    if (capacity == 0) return 0;
+    const per_slot = @sizeOf([]const u8) + @sizeOf(IndexRecord) +
+        @alignOf([]const u8) + @alignOf(IndexRecord) + @sizeOf(u8);
+    const slots = try std.math.mul(usize, @intCast(capacity), per_slot);
+    return std.math.add(usize, slots, 128);
 }
 
 fn computeChecksumBatch(bytes: []const u8, checksum_offset: u64) [20]u8 {
@@ -652,8 +832,8 @@ fn computeChecksumBatch(bytes: []const u8, checksum_offset: u64) [20]u8 {
 
 // ThermoRawFileParser writes line-start offsets instead of element-start
 // offsets. Accept `declared` before `actual` when the gap is all whitespace.
-// Falls back to exact match when file_bytes is unavailable.
-fn offsetsMatchWithWhitespace(file_bytes: ?[]const u8, declared: u64, actual: u64) bool {
+// Used for contiguous input; stream input uses positional reads in the validator.
+fn offsetsMatchWithBytes(file_bytes: ?[]const u8, declared: u64, actual: u64) bool {
     if (declared == actual) return true;
     if (declared > actual) return false;
     const bytes = file_bytes orelse return false;
@@ -713,8 +893,41 @@ test "IndexValidator: records spectrum and chromatogram offsets" {
     try v.consumeEnd(test_events.endUnknown("run"), 1);
     try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?);
-    try expectEqual(@as(u64, 200), v.chromatogram_offsets.get("c1").?);
+    try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?.offset);
+    try expectEqual(@as(u64, 200), v.chromatogram_offsets.get("c1").?.offset);
+}
+
+test "IndexValidator: index state tracks one key copy per record" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 1);
+
+    try expectEqualStrings("s1", v.spectrum_offsets.getKey("s1").?);
+    try expect(v.index_state_current_bytes > 0);
+}
+
+test "IndexValidator: state byte limit rejects map growth" {
+    const allocator = testing.allocator;
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.initWithLimits(allocator, &diagnostics, null, .{ .max_index_state_bytes = 1 });
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try expectError(
+        error.ResourceLimitExceeded,
+        v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 1),
+    );
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(@as(usize, 0), v.index_state_current_bytes);
 }
 
 test "IndexValidator: finish propagates diagnostic allocation failure" {
@@ -746,7 +959,7 @@ test "IndexValidator: spectrum with unknown intern id still records offsets" {
     try v.consumeEnd(test_events.endUnknown("run"), 1);
     try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?);
+    try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?.offset);
 }
 
 test "IndexValidator: valid indexed mzML cross-checks correctly" {
@@ -811,8 +1024,8 @@ test "IndexValidator: bad offset value produces diagnostic" {
     try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: reference to non-existent element produces diagnostic" {
@@ -839,8 +1052,8 @@ test "IndexValidator: reference to non-existent element produces diagnostic" {
     try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: indexListOffset mismatch produces diagnostic" {
@@ -879,6 +1092,9 @@ test "IndexValidator: truncated offset produces diagnostic" {
     var v = IndexValidator.init(allocator, &diagnostics, null);
     defer v.deinit();
 
+    const file_bytes = "<?xml version=\"1.0\"?><mzML>...</mzML>" ++ [_]u8{0} ** 100;
+    v.beginOnlineSha(file_bytes);
+
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
@@ -895,7 +1111,6 @@ test "IndexValidator: truncated offset produces diagnostic" {
     try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
     // file_bytes shorter than 999999
-    const file_bytes = "<?xml version=\"1.0\"?><mzML>...</mzML>" ++ [_]u8{0} ** 100;
     try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
@@ -1079,8 +1294,8 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
     try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
-    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[1].rule);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
 }
 
 test "IndexValidator: count limit rejects before reservation" {
