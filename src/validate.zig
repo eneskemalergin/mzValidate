@@ -757,6 +757,28 @@ test "checkPath_semantic_end_to_end" {
     try std.testing.expect(has_cv_diag);
 }
 
+test "checkPath_indexed_fixture_runs_mapping_rules" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/indexed-mapping-missing.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+    });
+
+    var found_required_mapping_error = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.mzml_cv_required)) {
+            found_required_mapping_error = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_required_mapping_error);
+}
+
 test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

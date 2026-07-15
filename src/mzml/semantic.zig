@@ -313,6 +313,7 @@ pub const SemanticValidator = struct {
             path_buf[pos] = '/';
             pos += 1;
             for (validator.scope_frames.items) |frame| {
+                if (frame.element_id == .indexedmzML) continue;
                 const fname = @tagName(frame.element_id);
                 if (pos + fname.len + 1 > path_buf.len) return;
                 @memcpy(path_buf[pos..][0..fname.len], fname);
@@ -1106,6 +1107,40 @@ test "SemanticValidator: must rule fires when term missing" {
     try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: indexed wrapper preserves mapping paths" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000008\n" ++ "name: ionization type\n" ++ "namespace: MS\n" ++
+        "[Term]\n" ++ "id: MS:1000482\n" ++ "name: source attribute\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/mzML/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+
+    for ([_]bool{ false, true }) |indexed| {
+        var diagnostics: std.ArrayList(Diagnostic) = .empty;
+        defer diagnostics.deinit(allocator);
+
+        var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+        defer sv.deinit();
+        try consumeCv(&sv, "MS");
+        if (indexed) try sv.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+        try sv.consumeStart(test_events.startInterned("mzML", &.{}, 1));
+        try sv.consumeStart(test_events.startInterned("source", &.{}, 2));
+        try consumeCvParam(&sv, "MS:1000482", "MS", 3);
+        try sv.consumeEnd(test_events.endInterned("source", 4));
+        try sv.consumeEnd(test_events.endInterned("mzML", 5));
+        if (indexed) try sv.consumeEnd(test_events.endInterned("indexedmzML", 6));
+
+        try expectEqual(@as(usize, 1), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+    }
 }
 
 test "SemanticValidator: must rule passes when term present" {
