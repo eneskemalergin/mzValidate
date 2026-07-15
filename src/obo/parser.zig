@@ -22,6 +22,14 @@ pub const Relationship = struct {
     target: []const u8,
 };
 
+pub const DescendantResult = enum {
+    yes,
+    no,
+    limit_exceeded,
+};
+
+pub const max_descendant_nodes: usize = 256;
+
 pub const CvTerm = struct {
     accession: []const u8,
     name: []const u8,
@@ -95,34 +103,32 @@ pub const CvTable = struct {
         return null;
     }
 
-    /// Returns true if `term_acc` equals `ancestor_acc` or any of its
-    /// `is_a` ancestors in the CV hierarchy.
-    pub fn isDescendantOf(table: *const CvTable, term_acc: []const u8, ancestor_acc: []const u8) bool {
-        if (std.mem.eql(u8, term_acc, ancestor_acc)) return true;
-        var stack: [256][]const u8 = undefined;
+    /// Returns whether `term_acc` equals `ancestor_acc` or reaches it through
+    /// `is_a`; reports `limit_exceeded` when the bounded traversal is full.
+    pub fn isDescendantOf(table: *const CvTable, term_acc: []const u8, ancestor_acc: []const u8) DescendantResult {
+        if (std.mem.eql(u8, term_acc, ancestor_acc)) return .yes;
+        var stack: [max_descendant_nodes][]const u8 = undefined;
         var count: usize = 0;
         if (table.lookup(term_acc)) |t| {
             for (t.is_a) |parent| {
-                if (count < stack.len) {
-                    stack[count] = parent;
-                    count += 1;
-                }
+                if (count == stack.len) return .limit_exceeded;
+                stack[count] = parent;
+                count += 1;
             }
         }
         var visited: usize = 0;
         while (visited < count) : (visited += 1) {
             const current = stack[visited];
-            if (std.mem.eql(u8, current, ancestor_acc)) return true;
+            if (std.mem.eql(u8, current, ancestor_acc)) return .yes;
             if (table.lookup(current)) |t| {
                 for (t.is_a) |parent| {
-                    if (count < stack.len) {
-                        stack[count] = parent;
-                        count += 1;
-                    }
+                    if (count == stack.len) return .limit_exceeded;
+                    stack[count] = parent;
+                    count += 1;
                 }
             }
         }
-        return false;
+        return .no;
     }
 
     fn parse(table: *CvTable, text: []const u8) !void {
@@ -502,11 +508,37 @@ test "isDescendantOf traverses hierarchy in real OBO" {
     defer table.deinit();
 
     // MS:1003378 (Orbitrap Astral) -> MS:1000494 -> MS:1000483 -> MS:1000031 (instrument model)
-    try std.testing.expect(table.isDescendantOf("MS:1003378", "MS:1000031"));
+    try std.testing.expectEqual(DescendantResult.yes, table.isDescendantOf("MS:1003378", "MS:1000031"));
     // MS:1003378 is not a descendant of itself via is_a (identity check)
-    try std.testing.expect(table.isDescendantOf("MS:1003378", "MS:1003378"));
+    try std.testing.expectEqual(DescendantResult.yes, table.isDescendantOf("MS:1003378", "MS:1003378"));
     // MS:1000031 is not a descendant of MS:1003378
-    try std.testing.expect(!table.isDescendantOf("MS:1000031", "MS:1003378"));
+    try std.testing.expectEqual(DescendantResult.no, table.isDescendantOf("MS:1000031", "MS:1003378"));
+}
+
+test "isDescendantOf reports its bounded traversal limit" {
+    const allocator = std.testing.allocator;
+    var obo = std.ArrayList(u8).empty;
+    defer obo.deinit(allocator);
+
+    for (0..max_descendant_nodes + 2) |i| {
+        try obo.appendSlice(allocator, "[Term]\nid: MS:");
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "{d}\nname: term\n", .{i});
+        try obo.appendSlice(allocator, id);
+        if (i > 0) {
+            try obo.appendSlice(allocator, "is_a: MS:");
+            const parent = try std.fmt.bufPrint(&id_buf, "{d} ! parent\n", .{i - 1});
+            try obo.appendSlice(allocator, parent);
+        }
+    }
+
+    var table = try CvTable.init(allocator, obo.items);
+    defer table.deinit();
+
+    try std.testing.expectEqual(
+        DescendantResult.limit_exceeded,
+        table.isDescendantOf("MS:257", "MS:0"),
+    );
 }
 
 test "CvTable rejects an overlong binary-data xref" {

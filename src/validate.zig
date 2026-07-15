@@ -335,6 +335,9 @@ fn runValidation(
     var cv_table: ?obo_parser.CvTable = null;
     var rule_eng: ?rule_engine.RuleEngine = null;
     var semantic_validator: ?semantic.SemanticValidator = null;
+    defer if (semantic_validator) |*v| v.deinit();
+    defer if (rule_eng) |*e| e.deinit();
+    defer if (cv_table) |*t| t.deinit();
     if (!options.skip_semantic) {
         result.beginStage(.semantic);
         const obo_text = if (options.obo_path) |obo_path| blk: {
@@ -399,14 +402,26 @@ fn runValidation(
                 return;
             };
             if (rule_eng) |*engine| {
+                if (engine.firstMissingVocabularyTerm(table) != null) {
+                    try appendFailureDiagnostic(
+                        allocator,
+                        diagnostics,
+                        result,
+                        .semantic,
+                        .catalog,
+                        .{
+                            .severity = .@"error",
+                            .rule = RuleId.runtime_catalog,
+                            .path = path,
+                            .message = "embedded mapping policy is incompatible with the selected OBO vocabulary",
+                        },
+                    );
+                    return;
+                }
                 semantic_validator = semantic.SemanticValidator.init(allocator, table, engine, diagnostics, path);
             }
         }
     }
-    defer if (semantic_validator) |*v| v.deinit();
-    defer if (rule_eng) |*e| e.deinit();
-    defer if (cv_table) |*t| t.deinit();
-
     var element_depth: usize = 0;
     const active = elements.activeMask(options.skip_binary, options.skip_index, options.skip_semantic);
     const fuse_index_semantic = index_validator != null or semantic_validator != null;
@@ -1375,6 +1390,25 @@ test "checkPath_missing_catalog_returns_incomplete_file_result" {
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
     try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+}
+
+test "checkPath_incompatible_custom_vocabulary_is_non_clean" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .obo_path = "fixtures/obo/adversarial/custom-namespace.obo",
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.semantic, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog, result.first_failure.?.rule);
 }
 
 test "checkPath_invalid_zlib_returns_complete_result_with_error" {

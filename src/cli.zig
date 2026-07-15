@@ -13,6 +13,7 @@ const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
 const output = @import("output.zig");
 const validate = @import("validate.zig");
+const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 
@@ -98,7 +99,11 @@ pub fn runArgs(
     }
 
     if (wantsVersion(args)) {
-        try stdout.print("mzValidate v{s}\n", .{@import("version.zig").semantic});
+        try stdout.print("mzValidate v{s} mapping={s}@{s}\n", .{
+            version.semantic,
+            version.mapping_model,
+            version.mapping_model_version,
+        });
         return 0;
     }
 
@@ -341,6 +346,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
             "  -obo <path>  Override the embedded psi-ms.obo with a custom file.\n" ++
+            "               Mapping policy remains the embedded mzML.xsd contract; see -version for its version.\n" ++
             "  -version, --version\n" ++
             "               Print the mzValidate version number and exit.\n" ++
             "  -h, --help   Show this help text.\n\n" ++
@@ -762,6 +768,23 @@ test "runArgs_help_flag_writes_usage_to_stdout_and_returns_zero" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-input-mode stream|mmap") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit N") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
+test "runArgs_version_reports_mapping_policy" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "mzValidate", "-version" };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings("mzValidate v0.1.4 mapping=mzML.xsd@1.0.0\n", stdout_writer.written());
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 

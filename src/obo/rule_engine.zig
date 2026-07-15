@@ -10,8 +10,10 @@
 //!   const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
 
 const std = @import("std");
+const obo = @import("parser.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
+const version = @import("../version.zig");
 
 const Attribute = xml_events.Attribute;
 
@@ -79,6 +81,17 @@ pub const RuleEngine = struct {
     /// Look up rules for a given element path via hash map.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
         return engine.rule_map.get(element_path) orelse &.{};
+    }
+
+    /// Returns the first mapping accession absent from `table`.
+    pub fn firstMissingVocabularyTerm(engine: *const RuleEngine, table: *const obo.CvTable) ?[]const u8 {
+        for (engine.rules) |rule| {
+            for (rule.terms) |term| {
+                if (isExternalPrefix(term.accession)) continue;
+                if (table.lookup(term.accession) == null) return term.accession;
+            }
+        }
+        return null;
     }
 };
 
@@ -237,9 +250,19 @@ fn parseLogic(s: []const u8) CombinationLogic {
     return .@"or";
 }
 
+fn isExternalPrefix(accession: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return false;
+    const prefix = accession[0..colon];
+    return std.mem.eql(u8, prefix, "BTO") or
+        std.mem.eql(u8, prefix, "GO") or
+        std.mem.eql(u8, prefix, "PATO");
+}
+
 test "RuleEngine parses ms-mapping.xml" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
+    try std.testing.expect(std.mem.indexOf(u8, xml, "modelName=\"" ++ version.mapping_model ++ "\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, xml, "modelVersion=\"" ++ version.mapping_model_version ++ "\"") != null);
     var engine = try RuleEngine.init(allocator, xml);
     defer engine.deinit();
 
@@ -286,4 +309,23 @@ test "RuleEngine does not parse commented-out rules" {
     // sourcefile_must is inside <!-- --> and must not be parsed.
     const src_rules = engine.rulesFor("/mzML/fileDescription/sourceFileList/sourceFile");
     try std.testing.expectEqual(@as(usize, 0), src_rules.len);
+}
+
+test "RuleEngine accepts the embedded vocabulary and rejects incompatible custom vocabulary" {
+    const allocator = std.testing.allocator;
+    const mapping_xml = @embedFile("../data/ms-mapping.xml");
+    var engine = try RuleEngine.init(allocator, mapping_xml);
+    defer engine.deinit();
+
+    const embedded_obo = @embedFile("../data/psi-ms.obo");
+    var embedded_table = try obo.CvTable.init(allocator, embedded_obo);
+    defer embedded_table.deinit();
+    try std.testing.expect(engine.firstMissingVocabularyTerm(&embedded_table) == null);
+
+    var custom_table = try obo.CvTable.init(allocator, "[Term]\nid: MS:9999999\nname: custom\nnamespace: MS\n");
+    defer custom_table.deinit();
+    try std.testing.expectEqualStrings(
+        "MS:1000857",
+        engine.firstMissingVocabularyTerm(&custom_table).?,
+    );
 }

@@ -26,6 +26,7 @@ const StartElement = xml_events.StartElement;
 const EndElement = xml_events.EndElement;
 const ElementId = elements.ElementId;
 const MappingRule = rule_engine.MappingRule;
+const MappingTerm = rule_engine.MappingTerm;
 
 const mzml_namespace = diagnostic.mzml_namespace;
 
@@ -178,6 +179,7 @@ pub const SemanticValidator = struct {
 
     param_groups: std.StringHashMap(std.ArrayList([]const u8)),
     current_group_id: ?[]const u8 = null,
+    ancestry_limit_reported: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, cv_table: *const CvTable, engine: *const RuleEngine, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) SemanticValidator {
         return .{
@@ -438,7 +440,10 @@ pub const SemanticValidator = struct {
                     .rule = RuleId.mzml_cv_obsolete,
                     .location = .{ .byte_offset = start.byte_offset },
                     .path = validator.path,
-                    .message = "CV term is obsolete; check replaced_by for alternatives",
+                    .message = if (t.replaced_by != null)
+                        "CV term is obsolete; use its replacement term"
+                    else
+                        "CV term is obsolete and has no replacement term",
                 });
                 return;
             }
@@ -452,6 +457,26 @@ pub const SemanticValidator = struct {
                         .path = validator.path,
                         .message = "cvRef does not match term namespace",
                     });
+                }
+            }
+            if (ua) |unit_acc| {
+                if (t.allowed_units.len > 0 and validator.cv_table.lookup(unit_acc) != null) {
+                    var allowed = false;
+                    for (t.allowed_units) |allowed_acc| {
+                        if (try validator.matchesDescendant(unit_acc, allowed_acc, start.byte_offset)) {
+                            allowed = true;
+                            break;
+                        }
+                    }
+                    if (!allowed) {
+                        try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_cv_unit,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "unit accession is not allowed for CV term",
+                        });
+                    }
                 }
             }
         } else {
@@ -536,6 +561,10 @@ pub const SemanticValidator = struct {
             for (scope) |item| if (item.owned) validator.allocator.free(item.accession);
         }
 
+        if (tag == .binaryDataArray) {
+            try validator.validateBinaryDataType(scope, end.byte_offset);
+        }
+
         // Capture referenceableParamGroup cvParams for later ref resolution.
         switch (tag) {
             .referenceableParamGroup => {
@@ -569,10 +598,7 @@ pub const SemanticValidator = struct {
             var matched: usize = 0;
             for (rule.terms) |rt| {
                 for (scope) |st| {
-                    const is_match = if (rt.allow_children)
-                        validator.cv_table.isDescendantOf(st.accession, rt.accession)
-                    else
-                        std.mem.eql(u8, st.accession, rt.accession);
+                    const is_match = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
                     if (is_match) {
                         matched += 1;
                         break;
@@ -655,10 +681,7 @@ pub const SemanticValidator = struct {
                 var first_term: ?usize = null;
                 for (scope) |st| {
                     for (r.terms, 0..) |rt, i| {
-                        const is_match = if (rt.allow_children)
-                            validator.cv_table.isDescendantOf(st.accession, rt.accession)
-                        else
-                            std.mem.eql(u8, st.accession, rt.accession);
+                        const is_match = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
                         if (is_match) {
                             or_matched += 1;
                             if (first_term) |idx| {
@@ -707,6 +730,58 @@ pub const SemanticValidator = struct {
                 }
             }
         }
+    }
+
+    fn matchesMappingTerm(validator: *SemanticValidator, accession: []const u8, term: MappingTerm, byte_offset: u64) !bool {
+        if (!term.allow_children) return std.mem.eql(u8, accession, term.accession);
+        return validator.matchesDescendant(accession, term.accession, byte_offset);
+    }
+
+    fn matchesDescendant(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8, byte_offset: u64) !bool {
+        return switch (validator.cv_table.isDescendantOf(accession, ancestor)) {
+            .yes => true,
+            .no => false,
+            .limit_exceeded => limit: {
+                if (!validator.ancestry_limit_reported) {
+                    try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_cv_ancestry_limit,
+                        .location = .{ .byte_offset = byte_offset },
+                        .path = validator.path,
+                        .message = "CV ancestry traversal exceeded its configured limit",
+                    });
+                    validator.ancestry_limit_reported = true;
+                }
+                break :limit false;
+            },
+        };
+    }
+
+    fn validateBinaryDataType(validator: *SemanticValidator, scope: []const ScopeItem, byte_offset: u64) !void {
+        var allowed_types: ?[][]const u8 = null;
+        for (scope) |item| {
+            if (validator.cv_table.lookup(item.accession)) |term| {
+                if (term.binary_data_types.len > 0) {
+                    allowed_types = term.binary_data_types;
+                    break;
+                }
+            }
+        }
+        const allowed = allowed_types orelse return;
+
+        for (scope) |item| {
+            for (allowed) |allowed_type| {
+                if (std.mem.eql(u8, item.accession, allowed_type)) return;
+            }
+        }
+
+        try validator.diagnostics.append(validator.allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_binary_type_mismatch,
+            .location = .{ .byte_offset = byte_offset },
+            .path = validator.path,
+            .message = "binary array type is incompatible with its declared precision",
+        });
     }
 
     pub fn finish(validator: *SemanticValidator) !void {
@@ -951,6 +1026,77 @@ test "SemanticValidator: obsolete accession produces warning" {
     try consumeCvParam(&sv, "MS:1000001", "MS", 100);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_obsolete, diagnostics.items[0].rule);
+    try expectEqualStrings("CV term is obsolete; use its replacement term", diagnostics.items[0].message);
+}
+
+test "SemanticValidator: allowed unit restriction produces error" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: sample value\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_units UO:0000001\n" ++
+        "\n[Term]\n" ++
+        "id: UO:0000001\n" ++
+        "name: allowed unit\n" ++
+        "namespace: UO\n" ++
+        "\n[Term]\n" ++
+        "id: UO:0000002\n" ++
+        "name: other unit\n" ++
+        "namespace: UO\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    try consumeCv(&sv, "UO");
+    try consumeUnitParam(&sv, "MS:1000001", "MS", "UO:0000002", 100);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_unit, diagnostics.items[0].rule);
+    try expectEqualStrings("unit accession is not allowed for CV term", diagnostics.items[0].message);
+}
+
+test "SemanticValidator: binary data type restriction produces error" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000514\n" ++
+        "name: m/z array\n" ++
+        "namespace: MS\n" ++
+        "xref: binary-data-type:MS\\:1000521\n" ++
+        "\n[Term]\n" ++
+        "id: MS:1000519\n" ++
+        "name: 32-bit integer\n" ++
+        "namespace: MS\n" ++
+        "\n[Term]\n" ++
+        "id: MS:1000521\n" ++
+        "name: 32-bit float\n" ++
+        "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    try sv.consumeStart(test_events.startInterned("binaryDataArray", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000514", "MS", 10);
+    try consumeCvParam(&sv, "MS:1000519", "MS", 20);
+    try sv.consumeEnd(test_events.endInterned("binaryDataArray", 30));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_binary_type_mismatch, diagnostics.items[0].rule);
+    try expectEqualStrings("binary array type is incompatible with its declared precision", diagnostics.items[0].message);
 }
 
 test "SemanticValidator: mismatched cvRef/namespace produces error" {

@@ -26,6 +26,7 @@ const std = @import("std");
 /// so it is a breaking change to rename or remove an existing entry.
 pub const RuleId = struct {
     pub const runtime_file_open = "runtime.file-open";
+    pub const runtime_catalog = "runtime.catalog";
     pub const runtime_incomplete = "runtime.incomplete";
     pub const runtime_stub = "runtime.stub";
 
@@ -41,7 +42,6 @@ pub const RuleId = struct {
     pub const mzml_binary_length_mismatch = "mzml.binary.length-mismatch";
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
     pub const mzml_binary_oversized = "mzml.binary.oversized";
-    // TODO: Need to either wire this into a validator or remove it.
     pub const mzml_binary_type_mismatch = "mzml.binary.type-mismatch";
 
     /// Declared indexListOffset does not match the actual byte offset of indexList.
@@ -68,6 +68,8 @@ pub const RuleId = struct {
     pub const mzml_cv_recommended = "mzml.cv.recommended";
     /// Mutually exclusive CV terms appear on the same element.
     pub const mzml_cv_contradiction = "mzml.cv.contradiction";
+    /// CV ancestry traversal reached its configured bound.
+    pub const mzml_cv_ancestry_limit = "mzml.cv.ancestry-limit";
     // TODO: Need to either wire this into a validator or remove it.
     /// Non-repeatable CV term appears more than once on the same element.
     pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";

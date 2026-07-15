@@ -3,3 +3,6 @@
 
 /// Release version for `-version` and `build.zig` package metadata.
 pub const semantic = "0.1.4";
+
+pub const mapping_model = "mzML.xsd";
+pub const mapping_model_version = "1.0.0";
