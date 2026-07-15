@@ -26,6 +26,7 @@ const std = @import("std");
 /// so it is a breaking change to rename or remove an existing entry.
 pub const RuleId = struct {
     pub const runtime_file_open = "runtime.file-open";
+    pub const runtime_incomplete = "runtime.incomplete";
     pub const runtime_stub = "runtime.stub";
 
     pub const mzml_structure_root = "mzml.structure.root";
@@ -108,11 +109,158 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
+pub const CompletionState = enum {
+    complete,
+    incomplete,
+
+    pub fn label(state: CompletionState) []const u8 {
+        return switch (state) {
+            .complete => "complete",
+            .incomplete => "incomplete",
+        };
+    }
+};
+
+pub const ValidationStage = enum(u3) {
+    input,
+    parser,
+    structural,
+    binary,
+    index,
+    semantic,
+
+    pub fn label(stage: ValidationStage) []const u8 {
+        return switch (stage) {
+            .input => "input",
+            .parser => "parser",
+            .structural => "structural",
+            .binary => "binary",
+            .index => "index",
+            .semantic => "semantic",
+        };
+    }
+};
+
+pub const StageMask = u8;
+
+pub fn stageBit(stage: ValidationStage) StageMask {
+    return @as(StageMask, 1) << @intFromEnum(stage);
+}
+
+pub const FailureReason = enum {
+    input,
+    parser,
+    allocation,
+    resource,
+    catalog,
+    decompression,
+    file_stability,
+    output,
+    unknown,
+
+    pub fn label(reason: FailureReason) []const u8 {
+        return switch (reason) {
+            .input => "input",
+            .parser => "parser",
+            .allocation => "allocation",
+            .resource => "resource",
+            .catalog => "catalog",
+            .decompression => "decompression",
+            .file_stability => "file-stability",
+            .output => "output",
+            .unknown => "unknown",
+        };
+    }
+};
+
 /// Tracks aggregate counts so renderers and exit-code mapping share one source of truth.
 pub const Totals = struct {
     info: usize = 0,
     warnings: usize = 0,
     errors: usize = 0,
+};
+
+/// Fixed, allocation-free metadata for the first failure that stopped a file.
+pub const FirstFailure = struct {
+    stage: ValidationStage,
+    reason: FailureReason,
+    rule: []const u8,
+    message: []const u8,
+    location: Location = .{},
+    /// Borrowed input path, valid for the caller's path lifetime.
+    path: ?[]const u8 = null,
+};
+
+/// Per-file result independent of the normal diagnostic-list allocator.
+pub const FileResult = struct {
+    completion: CompletionState = .incomplete,
+    enabled_stages: StageMask = 0,
+    completed_stages: StageMask = 0,
+    totals: Totals = .{},
+    first_failure: ?FirstFailure = null,
+    diagnostics_truncated: bool = false,
+
+    active_stage: ValidationStage = .input,
+    failure_diagnostic_emitted: bool = false,
+
+    pub fn init(enabled_stages: StageMask) FileResult {
+        return .{ .enabled_stages = enabled_stages };
+    }
+
+    pub fn beginStage(result: *FileResult, stage: ValidationStage) void {
+        result.active_stage = stage;
+    }
+
+    pub fn completeStage(result: *FileResult, stage: ValidationStage) void {
+        result.completed_stages |= stageBit(stage);
+    }
+
+    /// Stores the first failure without allocating or replacing an earlier failure.
+    pub fn recordFailure(
+        result: *FileResult,
+        stage: ValidationStage,
+        reason: FailureReason,
+        rule: []const u8,
+        message: []const u8,
+        location: Location,
+        path: ?[]const u8,
+        diagnostic_emitted: bool,
+    ) void {
+        if (result.first_failure != null) return;
+        result.first_failure = .{
+            .stage = stage,
+            .reason = reason,
+            .rule = rule,
+            .message = message,
+            .location = location,
+            .path = path,
+        };
+        result.failure_diagnostic_emitted = diagnostic_emitted;
+    }
+
+    pub fn finalize(result: *FileResult, diagnostics: []const Diagnostic) void {
+        result.totals = count(diagnostics);
+        if (result.first_failure != null) {
+            if (!result.failure_diagnostic_emitted) {
+                result.totals.errors = std.math.add(usize, result.totals.errors, 1) catch std.math.maxInt(usize);
+            }
+        }
+        result.completion = if (result.first_failure == null and result.completed_stages == result.enabled_stages)
+            .complete
+        else
+            .incomplete;
+    }
+
+    pub fn status(result: FileResult) ResultStatus {
+        if (result.completion == .incomplete) return .errors_present;
+        if (result.totals.errors > 0) return .errors_present;
+        if (result.totals.warnings > 0) return .warnings_only;
+        return .clean;
+    }
+
+    pub fn needsEmergencyDiagnostic(result: FileResult) bool {
+        return result.first_failure != null and !result.failure_diagnostic_emitted;
+    }
 };
 
 /// Distills a run into the three states the CLI cares about.
@@ -133,8 +281,12 @@ pub const ResultStatus = enum {
 /// Bundles severity totals with the derived result status.
 pub const Summary = struct {
     totals: Totals,
+    completion: CompletionState = .complete,
+    incomplete_files: usize = 0,
+    first_failure: ?FirstFailure = null,
 
     pub fn status(summary: Summary) ResultStatus {
+        if (summary.completion == .incomplete) return .errors_present;
         if (summary.totals.errors > 0) return .errors_present;
         if (summary.totals.warnings > 0) return .warnings_only;
         return .clean;
@@ -159,11 +311,34 @@ pub fn summarize(diagnostics: []const Diagnostic) Summary {
     return .{ .totals = count(diagnostics) };
 }
 
+pub fn summarizeResults(results: []const FileResult) Summary {
+    var summary: Summary = .{ .totals = .{} };
+    for (results) |result| {
+        summary.totals.info = std.math.add(usize, summary.totals.info, result.totals.info) catch std.math.maxInt(usize);
+        summary.totals.warnings = std.math.add(usize, summary.totals.warnings, result.totals.warnings) catch std.math.maxInt(usize);
+        summary.totals.errors = std.math.add(usize, summary.totals.errors, result.totals.errors) catch std.math.maxInt(usize);
+        if (result.completion == .incomplete) {
+            summary.completion = .incomplete;
+            summary.incomplete_files = std.math.add(usize, summary.incomplete_files, 1) catch std.math.maxInt(usize);
+            if (summary.first_failure == null) summary.first_failure = result.first_failure;
+        }
+    }
+    return summary;
+}
+
 /// Maps diagnostics to the process exit code contract.
 ///
 /// 0 = clean, 1 = warnings only, 2 = any errors present.
 pub fn exitCode(diagnostics: []const Diagnostic) u8 {
     return switch (summarize(diagnostics).status()) {
+        .clean => 0,
+        .warnings_only => 1,
+        .errors_present => 2,
+    };
+}
+
+pub fn exitCodeForResults(results: []const FileResult) u8 {
+    return switch (summarizeResults(results).status()) {
         .clean => 0,
         .warnings_only => 1,
         .errors_present => 2,
@@ -201,4 +376,26 @@ test "summarize distinguishes clean warnings and errors" {
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
     try std.testing.expectEqual(ResultStatus.errors_present, summarize(&error_diagnostics).status());
+}
+
+test "file result stays incomplete until every enabled stage completes" {
+    var result = FileResult.init(stageBit(.input) | stageBit(.parser));
+
+    result.completeStage(.input);
+    result.finalize(&.{});
+
+    try std.testing.expectEqual(CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+}
+
+test "file result records first failure without normal diagnostic storage" {
+    var result = FileResult.init(stageBit(.parser));
+
+    result.recordFailure(.parser, .parser, RuleId.mzml_structure_xml, "parser stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+
+    try std.testing.expectEqual(CompletionState.incomplete, result.completion);
+    try std.testing.expect(result.needsEmergencyDiagnostic());
+    try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
 }

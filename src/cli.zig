@@ -235,8 +235,12 @@ fn runCheck(
     try diagnostics.ensureTotalCapacity(allocator, 1024);
     defer diagnostics.deinit(allocator);
 
+    var results: std.ArrayList(diagnostic.FileResult) = .empty;
+    try results.ensureTotalCapacity(allocator, check.inputs.len);
+    defer results.deinit(allocator);
+
     for (check.inputs) |path| {
-        try validate.checkPath(allocator, io, &diagnostics, path, .{
+        const result = validate.checkPathResult(allocator, io, &diagnostics, path, .{
             .skip_binary = check.skip_binary,
             .skip_index = check.skip_index,
             .skip_semantic = check.skip_semantic,
@@ -244,16 +248,17 @@ fn runCheck(
             .max_binary_size = check.max_binary_size,
             .obo_path = check.obo_path,
         });
+        try results.append(allocator, result);
     }
 
     switch (check.output_mode) {
-        .text => try output.renderText(writer, diagnostics.items),
-        .json => try output.renderJson(writer, diagnostics.items),
-        .summary => try output.renderSummary(writer, diagnostics.items),
-        .brief => try output.renderBrief(writer, diagnostics.items),
+        .text => try output.renderTextResult(writer, diagnostics.items, results.items),
+        .json => try output.renderJsonResult(writer, diagnostics.items, results.items),
+        .summary => try output.renderSummaryResult(writer, results.items),
+        .brief => try output.renderBriefResult(writer, diagnostics.items, results.items),
     }
 
-    return diagnostic.exitCode(diagnostics.items);
+    return diagnostic.exitCodeForResults(results.items);
 }
 
 // Usage and parse helpers.
@@ -715,7 +720,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_reports_aggregate_error_summary" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "status=errors-present info=0 warnings=0 errors=1\n",
+        "status=errors-present completion=complete info=0 warnings=0 errors=1\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -774,7 +779,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "input: fixtures/mzml/invalid/invalid-base64.mzML") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.binary.base64] binary payload is not valid base64") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "location: byte=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "summary: errors-present (info=0 warnings=0 errors=1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "summary: errors-present (completion=complete info=0 warnings=0 errors=1)") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -801,7 +806,7 @@ test "runArgs_skip_binary_keeps_corrupt_payload_clean_when_structure_is_valid" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
-        "status=clean info=0 warnings=0 errors=0\n",
+        "status=clean completion=complete info=0 warnings=0 errors=0\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -830,7 +835,7 @@ test "runArgs_multiple_missing_inputs_report_each_open_failure" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "status=errors-present info=0 warnings=0 errors=2\n",
+        "status=errors-present completion=complete info=0 warnings=0 errors=2\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());

@@ -110,18 +110,18 @@ const RefTable = struct {
         });
     }
 
-    fn resolveAll(table: *RefTable, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) void {
+    fn resolveAll(table: *RefTable, diagnostics: *std.ArrayList(Diagnostic), path: ?[]const u8) !void {
         for (table.unresolved.items) |r| {
             if (table.declarations.get(r.ref_value)) |_| {
                 // resolved OK
             } else {
-                diagnostics.append(table.allocator, .{
+                try diagnostics.append(table.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_ref_unresolved,
                     .location = .{ .byte_offset = r.byte_offset },
                     .path = path,
                     .message = "unresolved reference",
-                }) catch {};
+                });
             }
         }
     }
@@ -240,7 +240,8 @@ pub const SemanticValidator = struct {
             .cv => {
                 if (start.attr("id")) |id| {
                     const owned = try validator.allocator.dupe(u8, id);
-                    validator.cv_refs.put(owned, {}) catch validator.allocator.free(owned);
+                    errdefer validator.allocator.free(owned);
+                    try validator.cv_refs.put(owned, {});
                 }
                 return;
             },
@@ -255,7 +256,8 @@ pub const SemanticValidator = struct {
                         try validator.scope_items.append(validator.allocator, .{ .accession = acc, .owned = false });
                     } else {
                         const owned = try validator.allocator.dupe(u8, acc);
-                        validator.scope_items.append(validator.allocator, .{ .accession = owned, .owned = true }) catch validator.allocator.free(owned);
+                        errdefer validator.allocator.free(owned);
+                        try validator.scope_items.append(validator.allocator, .{ .accession = owned, .owned = true });
                     }
                 }
             }
@@ -292,10 +294,8 @@ pub const SemanticValidator = struct {
                         if (validator.scope_frames.items.len >= 1) {
                             for (group_terms.items) |acc| {
                                 const owned_acc = try validator.allocator.dupe(u8, acc);
-                                validator.scope_items.append(validator.allocator, .{ .accession = owned_acc, .owned = true }) catch {
-                                    validator.allocator.free(owned_acc);
-                                    return;
-                                };
+                                errdefer validator.allocator.free(owned_acc);
+                                try validator.scope_items.append(validator.allocator, .{ .accession = owned_acc, .owned = true });
                             }
                         }
                     }
@@ -487,11 +487,8 @@ pub const SemanticValidator = struct {
                             const owned = try validator.allocator.dupe(u8, item.accession);
                             try term_list.append(validator.allocator, owned);
                         }
-                        validator.param_groups.put(owned_id, term_list) catch {
-                            validator.allocator.free(owned_id);
-                            for (term_list.items) |t| validator.allocator.free(t);
-                            term_list.deinit(validator.allocator);
-                        };
+                        errdefer validator.allocator.free(owned_id);
+                        try validator.param_groups.put(owned_id, term_list);
                     }
                     if (validator.current_group_id) |id| {
                         validator.allocator.free(id);
@@ -526,13 +523,13 @@ pub const SemanticValidator = struct {
                         .@"or" => matched > 0,
                     };
                     if (!ok) {
-                        validator.diagnostics.append(validator.allocator, .{
+                        try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_cv_required,
                             .location = .{ .byte_offset = end.byte_offset },
                             .path = validator.path,
                             .message = "missing required CV term for element",
-                        }) catch {};
+                        });
                         return;
                     }
                 },
@@ -542,13 +539,13 @@ pub const SemanticValidator = struct {
                         .@"or" => matched > 0,
                     };
                     if (!ok) {
-                        validator.diagnostics.append(validator.allocator, .{
+                        try validator.diagnostics.append(validator.allocator, .{
                             .severity = .warning,
                             .rule = RuleId.mzml_cv_recommended,
                             .location = .{ .byte_offset = end.byte_offset },
                             .path = validator.path,
                             .message = "missing recommended CV term for element",
-                        }) catch {};
+                        });
                     }
                 },
                 .may => {},
@@ -563,13 +560,13 @@ pub const SemanticValidator = struct {
                     for (rules) |r| {
                         for (r.terms) |rt| {
                             if (!rt.is_repeatable and std.mem.eql(u8, rt.accession, item.accession)) {
-                                validator.diagnostics.append(validator.allocator, .{
+                                try validator.diagnostics.append(validator.allocator, .{
                                     .severity = .warning,
                                     .rule = RuleId.mzml_cv_term_repeat,
                                     .location = .{ .byte_offset = end.byte_offset },
                                     .path = validator.path,
                                     .message = "non-repeatable CV term appears more than once on the same element",
-                                }) catch {};
+                                });
                                 return;
                             }
                         }
@@ -604,13 +601,13 @@ pub const SemanticValidator = struct {
                                 if (i == idx) {
                                     // Same term matched twice.
                                     if (!rt.is_repeatable) {
-                                        validator.diagnostics.append(validator.allocator, .{
+                                        try validator.diagnostics.append(validator.allocator, .{
                                             .severity = .warning,
                                             .rule = RuleId.mzml_cv_contradiction,
                                             .location = .{ .byte_offset = end.byte_offset },
                                             .path = validator.path,
                                             .message = "element has contradictory CV terms",
-                                        }) catch {};
+                                        });
                                         return;
                                     }
                                 }
@@ -634,13 +631,13 @@ pub const SemanticValidator = struct {
                         }
                     }
                     if (!all_allow_children) {
-                        validator.diagnostics.append(validator.allocator, .{
+                        try validator.diagnostics.append(validator.allocator, .{
                             .severity = .warning,
                             .rule = RuleId.mzml_cv_contradiction,
                             .location = .{ .byte_offset = end.byte_offset },
                             .path = validator.path,
                             .message = "element has contradictory CV terms",
-                        }) catch {};
+                        });
                         return;
                     }
                 }
@@ -648,8 +645,8 @@ pub const SemanticValidator = struct {
         }
     }
 
-    pub fn finish(validator: *SemanticValidator) void {
-        validator.ref_table.resolveAll(validator.diagnostics, validator.path);
+    pub fn finish(validator: *SemanticValidator) !void {
+        try validator.ref_table.resolveAll(validator.diagnostics, validator.path);
     }
 };
 
@@ -687,6 +684,7 @@ const test_events = @import("test_events.zig");
 const testing = std.testing;
 const expectEqual = testing.expectEqual;
 const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
 const Severity = diagnostic.Severity;
 
 fn makeCvParam(accession: []const u8, cv_ref: []const u8, byte_offset: u64) StartElement {
@@ -1204,7 +1202,7 @@ test "SemanticValidator: declared id resolves in finish" {
         .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "SW1" },
     }, 10));
 
-    sv.finish();
+    try sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
@@ -1226,9 +1224,25 @@ test "SemanticValidator: unresolved ref produces error" {
         .{ .byte_offset = 0, .name = .{ .local_name = "softwareRef" }, .value = "NONEXISTENT" },
     }, 10));
 
-    sv.finish();
+    try sv.finish();
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_ref_unresolved, diagnostics.items[0].rule);
+}
+
+test "RefTable: unresolved diagnostic allocation failure propagates" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    var table = RefTable.init(failing_allocator.allocator());
+    var unresolved = [_]UnresolvedRef{.{ .ref_attr = "ref", .ref_value = "missing", .byte_offset = 0 }};
+    table.unresolved = .{ .items = &unresolved, .capacity = unresolved.len };
+    defer {
+        table.unresolved = .empty;
+        table.deinit();
+    }
+
+    try expectError(error.OutOfMemory, table.resolveAll(&diagnostics, null));
 }
 
 test "SemanticValidator: duplicate id produces error" {
@@ -1277,7 +1291,7 @@ test "SemanticValidator: forward reference resolves in finish" {
         .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "SW1" },
     }, 10));
 
-    sv.finish();
+    try sv.finish();
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 

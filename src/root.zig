@@ -53,6 +53,10 @@ pub const obo = struct {
 
 /// Shared diagnostic record. Avoid reaching through `diagnostic.Diagnostic`.
 pub const Diagnostic = diagnostic.Diagnostic;
+/// Per-file completion and stage result.
+pub const FileResult = diagnostic.FileResult;
+/// Completion state independent of diagnostic severity.
+pub const CompletionState = diagnostic.CompletionState;
 /// Severity levels. Avoid reaching through `diagnostic.Severity`.
 pub const Severity = diagnostic.Severity;
 /// Output mode selector. Avoid reaching through `output.OutputMode`.

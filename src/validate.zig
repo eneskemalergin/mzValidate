@@ -26,7 +26,10 @@ const xml_parse_errors = @import("xml/parse_errors.zig");
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
+const FailureReason = diagnostic.FailureReason;
+const FileResult = diagnostic.FileResult;
 const RuleId = diagnostic.RuleId;
+const ValidationStage = diagnostic.ValidationStage;
 const max_validation_token_bytes = 1024 * 1024;
 
 // --- Public entry points ---
@@ -43,6 +46,11 @@ pub const CheckOptions = struct {
     obo_path: ?[]const u8 = null,
 };
 
+/// Returned by legacy `check*` wrappers when no normal diagnostic could be stored.
+pub const ValidationError = error{
+    ValidationIncomplete,
+};
+
 /// Validates an mzML file on disk (mmap when possible).
 pub fn checkPath(
     allocator: std.mem.Allocator,
@@ -50,7 +58,37 @@ pub fn checkPath(
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
     options: CheckOptions,
+) ValidationError!void {
+    const result = checkPathResult(allocator, io, diagnostics, path, options);
+    if (result.needsEmergencyDiagnostic()) return error.ValidationIncomplete;
+}
+
+/// Validates one path and returns completion metadata independent of diagnostics storage.
+pub fn checkPathResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+) FileResult {
+    var result = FileResult.init(enabledStages(options));
+    const diagnostic_start = diagnostics.items.len;
+    checkPathInternal(allocator, io, diagnostics, path, options, &result) catch |err| {
+        recordUnhandledFailure(&result, err, path);
+    };
+    result.finalize(diagnostics.items[diagnostic_start..]);
+    return result;
+}
+
+fn checkPathInternal(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+    result: *FileResult,
 ) !void {
+    result.beginStage(.input);
     const cwd = std.Io.Dir.cwd();
     var file = cwd.openFile(io, path, .{}) catch {
         try diagnostics.append(allocator, .{
@@ -59,11 +97,12 @@ pub fn checkPath(
             .path = path,
             .message = "unable to open input file",
         });
+        result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to open input file", .{}, path, true);
         return;
     };
     defer file.close(io);
 
-    try checkPathMapped(allocator, io, file, diagnostics, path, options);
+    try checkPathMapped(allocator, io, file, diagnostics, path, options, result);
 }
 
 // mmap for random-access index checks; fall back to a stat-limited whole-file
@@ -75,6 +114,7 @@ fn checkPathMapped(
     diagnostics: *std.ArrayList(Diagnostic),
     path: []const u8,
     options: CheckOptions,
+    result: *FileResult,
 ) !void {
     const stat = file.stat(io) catch {
         try diagnostics.append(allocator, .{
@@ -83,6 +123,7 @@ fn checkPathMapped(
             .path = path,
             .message = "unable to stat input file",
         });
+        result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to stat input file", .{}, path, true);
         return;
     };
     const len = std.math.cast(usize, stat.size) orelse {
@@ -92,6 +133,7 @@ fn checkPathMapped(
             .path = path,
             .message = "input file is too large for this platform",
         });
+        result.recordFailure(.input, .resource, RuleId.runtime_file_open, "input file is too large for this platform", .{}, path, true);
         return;
     };
 
@@ -109,17 +151,20 @@ fn checkPathMapped(
                 .path = path,
                 .message = "unable to read input after memory-map failure",
             });
+            result.recordFailure(.input, .input, RuleId.runtime_file_open, "unable to read input after memory-map failure", .{}, path, true);
             return;
         };
         defer allocator.free(buf);
         const index_bytes = if (options.skip_index) null else buf;
-        try checkSlice(allocator, io, buf, diagnostics, path, options, index_bytes);
+        result.completeStage(.input);
+        try runValidation(allocator, io, diagnostics, path, options, index_bytes, .{ .slice = buf }, result);
         return;
     };
     defer mm.destroy(io);
 
     const index_bytes = if (options.skip_index) null else mm.memory;
-    try checkSlice(allocator, io, mm.memory, diagnostics, path, options, index_bytes);
+    result.completeStage(.input);
+    try runValidation(allocator, io, diagnostics, path, options, index_bytes, .{ .slice = mm.memory }, result);
 }
 
 // --- Validation core ---
@@ -138,10 +183,31 @@ pub fn checkSlice(
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
-) !void {
-    try runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
+) ValidationError!void {
+    const result = checkSliceResult(allocator, io, bytes, diagnostics, path, options, file_bytes);
+    if (result.needsEmergencyDiagnostic()) return error.ValidationIncomplete;
+}
+
+/// Validates a contiguous input and returns completion metadata.
+pub fn checkSliceResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    bytes: []const u8,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+    file_bytes: ?[]const u8,
+) FileResult {
+    var result = FileResult.init(enabledStages(options));
+    const diagnostic_start = diagnostics.items.len;
+    result.completeStage(.input);
+    runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
         .slice = bytes,
-    });
+    }, &result) catch |err| {
+        recordUnhandledFailure(&result, err, path);
+    };
+    result.finalize(diagnostics.items[diagnostic_start..]);
+    return result;
 }
 
 /// Validates mzML from a streaming `std.Io.Reader` (stdin, pipes).
@@ -153,10 +219,31 @@ pub fn checkReader(
     path: []const u8,
     options: CheckOptions,
     file_bytes: ?[]const u8,
-) !void {
-    try runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
+) ValidationError!void {
+    const result = checkReaderResult(allocator, io, reader, diagnostics, path, options, file_bytes);
+    if (result.needsEmergencyDiagnostic()) return error.ValidationIncomplete;
+}
+
+/// Validates a reader input and returns completion metadata.
+pub fn checkReaderResult(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    reader: *std.Io.Reader,
+    diagnostics: *std.ArrayList(Diagnostic),
+    path: []const u8,
+    options: CheckOptions,
+    file_bytes: ?[]const u8,
+) FileResult {
+    var result = FileResult.init(enabledStages(options));
+    const diagnostic_start = diagnostics.items.len;
+    result.completeStage(.input);
+    runValidation(allocator, io, diagnostics, path, options, file_bytes, .{
         .reader = reader,
-    });
+    }, &result) catch |err| {
+        recordUnhandledFailure(&result, err, path);
+    };
+    result.finalize(diagnostics.items[diagnostic_start..]);
+    return result;
 }
 
 fn runValidation(
@@ -167,10 +254,12 @@ fn runValidation(
     options: CheckOptions,
     file_bytes: ?[]const u8,
     source: ParserSource,
+    result: *FileResult,
 ) !void {
 
     // Bounded validator state: parser stacks, structural state, and one
     // binary workspace. The slice source itself may be file-sized.
+    result.beginStage(.parser);
     const token_buffer = try allocator.alloc(u8, max_validation_token_bytes);
     defer allocator.free(token_buffer);
 
@@ -212,41 +301,53 @@ fn runValidation(
     }
 
     // Load OBO and mapping rules. Embedded at build time, overridable at
-    // runtime via -obo. If either fails we log an error and skip semantic
-    // checks instead of crashing.
+    // runtime via -obo. A catalog failure stops the current file.
     var cv_table: ?obo_parser.CvTable = null;
     var rule_eng: ?rule_engine.RuleEngine = null;
     var semantic_validator: ?semantic.SemanticValidator = null;
     if (!options.skip_semantic) {
+        result.beginStage(.semantic);
         const obo_text = if (options.obo_path) |obo_path| blk: {
             const cwd = std.Io.Dir.cwd();
             // 50 MB limit: the embedded psi-ms.obo is 1.2 MB; the largest
             // OBO in common use (GO) fits well under this ceiling.
-            break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(50 * 1024 * 1024)) catch {
+            break :blk cwd.readFileAlloc(io, obo_path, allocator, .limited(50 * 1024 * 1024)) catch |err| {
                 try diagnostics.append(allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.runtime_file_open,
                     .path = path,
                     .message = "unable to read OBO file",
                 });
+                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog, RuleId.runtime_file_open, "unable to read OBO file", .{}, path, true);
                 break :blk null;
             };
         } else @embedFile("data/psi-ms.obo");
+        if (obo_text == null) return;
         if (obo_text) |text| {
-            cv_table = obo_parser.CvTable.init(allocator, text) catch null;
-            if (cv_table == null) {
+            defer if (options.obo_path != null) allocator.free(text);
+            cv_table = obo_parser.CvTable.init(allocator, text) catch |err| {
                 try diagnostics.append(allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.runtime_file_open,
                     .path = path,
-                    .message = "unable to parse OBO file",
+                    .message = if (err == error.OutOfMemory) "unable to allocate OBO state" else "unable to parse OBO file",
                 });
-            }
-            if (options.obo_path != null) allocator.free(text);
+                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, "unable to parse OBO file", .{}, path, true);
+                return;
+            };
         }
         if (cv_table) |*table| {
             const rule_xml = @embedFile("data/ms-mapping.xml");
-            rule_eng = rule_engine.RuleEngine.init(allocator, rule_xml) catch null;
+            rule_eng = rule_engine.RuleEngine.init(allocator, rule_xml) catch |err| {
+                try diagnostics.append(allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.runtime_file_open,
+                    .path = path,
+                    .message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules",
+                });
+                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, "unable to parse mapping rules", .{}, path, true);
+                return;
+            };
             if (rule_eng) |*engine| {
                 semantic_validator = semantic.SemanticValidator.init(allocator, table, engine, diagnostics, path);
             }
@@ -261,63 +362,138 @@ fn runValidation(
     const fuse_index_semantic = index_validator != null or semantic_validator != null;
 
     while (true) {
+        result.beginStage(.parser);
         const maybe_event = parser.next() catch |err| {
+            const message = xml_parse_errors.parseErrorMessage(err);
             try diagnostics.append(allocator, .{
                 .severity = .@"error",
                 .rule = RuleId.mzml_structure_xml,
                 .location = .{ .byte_offset = parser.byteOffset() },
                 .path = path,
-                .message = xml_parse_errors.parseErrorMessage(err),
+                .message = message,
             });
+            result.recordFailure(.parser, .parser, RuleId.mzml_structure_xml, message, .{ .byte_offset = parser.byteOffset() }, path, true);
             return;
         };
         const event = maybe_event orelse {
-            if (semantic_validator) |*sv| sv.finish();
-            if (index_validator) |*iv| iv.finish(file_bytes);
+            result.completeStage(.parser);
+            if (semantic_validator) |*sv| {
+                result.beginStage(.semantic);
+                try sv.finish();
+                result.completeStage(.semantic);
+            }
+            if (index_validator) |*iv| {
+                result.beginStage(.index);
+                try iv.finish(file_bytes);
+                result.completeStage(.index);
+            }
             break;
         };
 
         switch (event) {
             .start_element => |start| {
                 element_depth += 1;
+                result.beginStage(.structural);
                 try structural_validator.consumeStart(start);
-                if (binary_validator) |*validator| try validator.consumeStart(start);
+                if (binary_validator) |*validator| {
+                    result.beginStage(.binary);
+                    try validator.consumeStart(start);
+                }
                 if (fuse_index_semantic) {
                     const needed = elements.startMask(start.resolvedId()).intersect(active);
-                    if (needed.index) if (index_validator) |*validator| try validator.consumeStart(start, element_depth);
-                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeStart(start);
+                    if (needed.index) {
+                        if (index_validator) |*validator| {
+                            result.beginStage(.index);
+                            try validator.consumeStart(start, element_depth);
+                        }
+                    }
+                    if (needed.semantic) {
+                        if (semantic_validator) |*validator| {
+                            result.beginStage(.semantic);
+                            try validator.consumeStart(start);
+                        }
+                    }
                 }
             },
             .end_element => |end| {
+                result.beginStage(.structural);
                 try structural_validator.consumeEnd(end);
-                if (binary_validator) |*validator| try validator.consumeEnd(end);
+                if (binary_validator) |*validator| {
+                    result.beginStage(.binary);
+                    try validator.consumeEnd(end);
+                }
                 if (fuse_index_semantic) {
                     const needed = elements.endMask(end.resolvedId()).intersect(active);
-                    if (needed.index) if (index_validator) |*validator| validator.consumeEnd(end, element_depth);
-                    if (needed.semantic) if (semantic_validator) |*validator| try validator.consumeEnd(end);
+                    if (needed.index) {
+                        if (index_validator) |*validator| {
+                            result.beginStage(.index);
+                            try validator.consumeEnd(end, element_depth);
+                        }
+                    }
+                    if (needed.semantic) {
+                        if (semantic_validator) |*validator| {
+                            result.beginStage(.semantic);
+                            try validator.consumeEnd(end);
+                        }
+                    }
                 }
                 element_depth -= 1;
             },
             .text => |text| {
                 // Text outside the root element is only visible when depth is still zero.
+                result.beginStage(.structural);
                 if (structural_validator.depth == 0) {
                     try structural_validator.consumeText(text);
                 }
                 if (binary_validator) |*validator| {
-                    if (validator.wantsText()) try validator.consumeText(text);
+                    if (validator.wantsText()) {
+                        result.beginStage(.binary);
+                        try validator.consumeText(text);
+                    }
                 }
                 if (index_validator) |*validator| {
-                    if (validator.wantsText()) try validator.consumeText(text);
+                    if (validator.wantsText()) {
+                        result.beginStage(.index);
+                        try validator.consumeText(text);
+                    }
                 }
             },
         }
         if (index_validator) |*validator| {
+            result.beginStage(.index);
             validator.feedShaExclusive(parser.byteOffset() + 1);
         }
     }
 
+    result.beginStage(.structural);
     try structural_validator.finish();
-    if (binary_validator) |*validator| try validator.finish();
+    result.completeStage(.structural);
+    if (binary_validator) |*validator| {
+        result.beginStage(.binary);
+        try validator.finish();
+        result.completeStage(.binary);
+    }
+}
+
+fn enabledStages(options: CheckOptions) diagnostic.StageMask {
+    var stages = diagnostic.stageBit(.input) | diagnostic.stageBit(.parser) | diagnostic.stageBit(.structural);
+    if (!options.skip_binary) stages |= diagnostic.stageBit(.binary);
+    if (!options.skip_index) stages |= diagnostic.stageBit(.index);
+    if (!options.skip_semantic) stages |= diagnostic.stageBit(.semantic);
+    return stages;
+}
+
+fn recordUnhandledFailure(result: *FileResult, err: anyerror, path: []const u8) void {
+    const reason: FailureReason = if (err == error.OutOfMemory) .allocation else .unknown;
+    result.recordFailure(
+        result.active_stage,
+        reason,
+        RuleId.runtime_incomplete,
+        "validation stopped before all enabled stages completed",
+        .{},
+        path,
+        false,
+    );
 }
 
 // --- Unit tests ---
@@ -884,6 +1060,118 @@ test "checkReader_truncated_xml_reports_exact_structure_xml_diagnostic" {
         RuleId.mzml_structure_xml,
         "unexpected end of XML input",
     );
+}
+
+test "checkReader_truncated_xml_returns_incomplete_file_result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run";
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    const result = checkReaderResult(allocator, io, &reader, &diagnostics, "inline-truncated.mzML", .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    }, null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.parser, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.parser, result.first_failure.?.reason);
+    try std.testing.expectEqual(diagnostic.stageBit(.input), result.completed_stages);
+    try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+}
+
+test "checkReader_clean_input_returns_complete_file_result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    const result = checkReaderResult(allocator, io, &reader, &diagnostics, "inline-clean.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    }, null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+    try std.testing.expectEqual(result.enabled_stages, result.completed_stages);
+    try std.testing.expectEqual(diagnostic.ResultStatus.clean, result.status());
+}
+
+test "checkReader_out_of_memory_returns_incomplete_file_result" {
+    const io = std.testing.io;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    var reader = std.Io.Reader.fixed("<mzML/>");
+
+    const result = checkReaderResult(failing_allocator.allocator(), io, &reader, &diagnostics, "inline-oom.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    }, null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.allocation, result.first_failure.?.reason);
+    try std.testing.expect(result.needsEmergencyDiagnostic());
+    try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+}
+
+test "checkPath_missing_catalog_returns_incomplete_file_result" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .obo_path = "definitely-missing.obo",
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
+    try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+}
+
+test "checkPath_invalid_zlib_returns_complete_result_with_error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/invalid/invalid-zlib.mzML", .{
+        .skip_semantic = true,
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+    try std.testing.expectEqual(diagnostic.ResultStatus.errors_present, result.status());
+    try std.testing.expectEqualStrings(RuleId.mzml_binary_decompress, diagnostics.items[0].rule);
+}
+
+test "checkReader_legacy_wrapper_rejects_unreported_oom" {
+    const io = std.testing.io;
+
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    var reader = std.Io.Reader.fixed("<mzML/>");
+
+    try std.testing.expectError(error.ValidationIncomplete, checkReader(failing_allocator.allocator(), io, &reader, &diagnostics, "inline-oom.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .skip_semantic = true,
+    }, null));
 }
 
 test "checkReader_broken_attribute_quote_reports_malformed_xml_diagnostic" {

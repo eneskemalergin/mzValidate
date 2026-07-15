@@ -442,7 +442,7 @@ pub const StructuralValidator = struct {
             .cvList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
                 try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
-                validator.cv_list = validator.initListCountState(start, element_depth, "cvList", "cv", 1);
+                validator.cv_list = try validator.initListCountState(start, element_depth, "cvList", "cv", 1);
             },
             .fileDescription => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_description_seen, "fileDescription", .file_description);
@@ -451,32 +451,32 @@ pub const StructuralValidator = struct {
             .referenceableParamGroupList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
                 try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
-                validator.referenceable_param_group_list = validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
+                validator.referenceable_param_group_list = try validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
             },
             .sampleList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
                 try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
-                validator.sample_list = validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
+                validator.sample_list = try validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
             },
             .softwareList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
                 try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
-                validator.software_list = validator.initListCountState(start, element_depth, "softwareList", "software", 1);
+                validator.software_list = try validator.initListCountState(start, element_depth, "softwareList", "software", 1);
             },
             .scanSettingsList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
                 try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
-                validator.scan_settings_list = validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
+                validator.scan_settings_list = try validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
             },
             .instrumentConfigurationList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
                 try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
-                validator.instrument_configuration_list = validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
+                validator.instrument_configuration_list = try validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
             },
             .dataProcessingList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
                 try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
-                validator.data_processing_list = validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
+                validator.data_processing_list = try validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
             },
             .run => {
                 if (element_depth != validator.topLevelChildDepth()) {
@@ -549,7 +549,7 @@ pub const StructuralValidator = struct {
                     }
                 }
                 try validator.requireAttribute(start, "count", "sourceFileList is missing required attribute count");
-                validator.source_file_list = validator.initListCountState(start, element_depth, "sourceFileList", "sourceFile", 1);
+                validator.source_file_list = try validator.initListCountState(start, element_depth, "sourceFileList", "sourceFile", 1);
             },
             .sourceFile => {
                 validator.bumpListItemCount(&validator.source_file_list, element_depth);
@@ -567,7 +567,7 @@ pub const StructuralValidator = struct {
                 validator.spectrum_list_depth = element_depth;
                 try validator.requireAttribute(start, "count", "spectrumList is missing required attribute count");
                 try validator.requireAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
-                validator.spectrum_list = validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
+                validator.spectrum_list = try validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
             },
             .chromatogramList => {
                 try validator.noteRunChild(start.byte_offset, .chromatogram_list);
@@ -579,7 +579,7 @@ pub const StructuralValidator = struct {
                 validator.chromatogram_list_depth = element_depth;
                 try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
                 try validator.requireAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
-                validator.chromatogram_list = validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
+                validator.chromatogram_list = try validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
             },
             .spectrum => {
                 validator.bumpListItemCount(&validator.spectrum_list, element_depth);
@@ -640,7 +640,7 @@ pub const StructuralValidator = struct {
                     }
                 }
                 try validator.requireAttribute(start, "count", "componentList is missing required attribute count");
-                const count_state = validator.initListCountState(start, element_depth, "componentList", "component", 3);
+                const count_state = try validator.initListCountState(start, element_depth, "componentList", "component", 3);
                 if (count_state) |active| {
                     validator.component_list = .{ .count_state = active };
                 } else {
@@ -663,17 +663,17 @@ pub const StructuralValidator = struct {
             .source => {
                 try validator.noteComponentChild(start.byte_offset, .source);
                 try validator.requireAttribute(start, "order", "source is missing required attribute order");
-                validator.requireNonNegativeAttribute(start, "order", "source");
+                try validator.requireNonNegativeAttribute(start, "order", "source");
             },
             .analyzer => {
                 try validator.noteComponentChild(start.byte_offset, .analyzer);
                 try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
-                validator.requireNonNegativeAttribute(start, "order", "analyzer");
+                try validator.requireNonNegativeAttribute(start, "order", "analyzer");
             },
             .detector => {
                 try validator.noteComponentChild(start.byte_offset, .detector);
                 try validator.requireAttribute(start, "order", "detector is missing required attribute order");
-                validator.requireNonNegativeAttribute(start, "order", "detector");
+                try validator.requireNonNegativeAttribute(start, "order", "detector");
             },
             .dataProcessing => {
                 validator.bumpListItemCount(&validator.data_processing_list, element_depth);
@@ -689,7 +689,7 @@ pub const StructuralValidator = struct {
                     }
                 }
                 try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
-                validator.requireNonNegativeAttribute(start, "order", "processingMethod");
+                try validator.requireNonNegativeAttribute(start, "order", "processingMethod");
                 try validator.requireAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
             },
             .scanList => {
@@ -698,7 +698,7 @@ pub const StructuralValidator = struct {
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .scan_list);
                 try validator.requireAttribute(start, "count", "scanList is missing required attribute count");
-                validator.scan_list = validator.initListCountState(start, element_depth, "scanList", "scan", 1);
+                validator.scan_list = try validator.initListCountState(start, element_depth, "scanList", "scan", 1);
             },
             .precursorList => {
                 if (validator.spectrum == null) {
@@ -706,7 +706,7 @@ pub const StructuralValidator = struct {
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
                 try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
-                validator.precursor_list = validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
+                validator.precursor_list = try validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
             },
             .productList => {
                 if (validator.spectrum == null) {
@@ -714,7 +714,7 @@ pub const StructuralValidator = struct {
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .product_list);
                 try validator.requireAttribute(start, "count", "productList is missing required attribute count");
-                validator.product_list = validator.initListCountState(start, element_depth, "productList", "product", 0);
+                validator.product_list = try validator.initListCountState(start, element_depth, "productList", "product", 0);
             },
             .precursor => {
                 if (validator.chromatogram) |state| {
@@ -747,14 +747,14 @@ pub const StructuralValidator = struct {
             },
             .scanWindowList => {
                 try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
-                validator.scan_window_list = validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
+                validator.scan_window_list = try validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
             },
             .scanWindow => {
                 validator.bumpListItemCount(&validator.scan_window_list, element_depth);
             },
             .selectedIonList => {
                 try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
-                validator.selected_ion_list = validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
+                validator.selected_ion_list = try validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
             },
             .selectedIon => {
                 validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
@@ -762,7 +762,7 @@ pub const StructuralValidator = struct {
             .binaryDataArrayList => {
                 try validator.noteBinaryDataArrayListChild(start.byte_offset);
                 try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
-                validator.binary_data_array_list = validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
+                validator.binary_data_array_list = try validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
 
                 if (validator.spectrum != null and validator.spectrum_list_depth != null and validator.spectrum_list_depth.? < element_depth) {
                     validator.spectrum.?.has_binary_data_array_list = true;
@@ -1081,8 +1081,8 @@ pub const StructuralValidator = struct {
         label: []const u8,
         child_label: []const u8,
         min_count: usize,
-    ) ?ListCountState {
-        const declared_count = validator.parseCountAttribute(start, label) orelse return null;
+    ) !?ListCountState {
+        const declared_count = try validator.parseCountAttribute(start, label) orelse return null;
         return .{
             .byte_offset = start.byte_offset,
             .depth = element_depth,
@@ -1093,10 +1093,10 @@ pub const StructuralValidator = struct {
         };
     }
 
-    fn parseCountAttribute(validator: *StructuralValidator, start: StartElement, label: []const u8) ?usize {
+    fn parseCountAttribute(validator: *StructuralValidator, start: StartElement, label: []const u8) !?usize {
         const value = start.attr("count") orelse return null;
         return std.fmt.parseUnsigned(usize, value, 10) catch {
-            validator.countError(start.byte_offset, invalidCountMessage(label)) catch {};
+            try validator.countError(start.byte_offset, invalidCountMessage(label));
             return null;
         };
     }
@@ -1208,7 +1208,7 @@ pub const StructuralValidator = struct {
                 "chromatogram is missing required attribute index");
         } else {
             const label = if (kind == .spectrum) "spectrum" else "chromatogram";
-            validator.requireNonNegativeAttribute(start, "index", label);
+            try validator.requireNonNegativeAttribute(start, "index", label);
         }
         if (!hasAttribute(start.attributes, "defaultArrayLength")) {
             try validator.attributeError(start.byte_offset, if (kind == .spectrum)
@@ -1217,7 +1217,7 @@ pub const StructuralValidator = struct {
                 "chromatogram is missing required attribute defaultArrayLength");
         } else {
             const label = if (kind == .spectrum) "spectrum" else "chromatogram";
-            validator.requireNonNegativeAttribute(start, "defaultArrayLength", label);
+            try validator.requireNonNegativeAttribute(start, "defaultArrayLength", label);
         }
     }
 
@@ -1226,7 +1226,7 @@ pub const StructuralValidator = struct {
         try validator.attributeError(start.byte_offset, message);
     }
 
-    fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) void {
+    fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) !void {
         _ = element_label;
         const value = start.attr(attribute_name) orelse return;
         if (std.fmt.parseUnsigned(usize, value, 10) catch null) |_| return;
@@ -1234,7 +1234,7 @@ pub const StructuralValidator = struct {
             "attribute must not be negative"
         else
             "attribute must be a non-negative integer";
-        validator.attributeError(start.byte_offset, message) catch {};
+        try validator.attributeError(start.byte_offset, message);
     }
 
     fn attributeError(validator: *StructuralValidator, byte_offset: u64, message: []const u8) !void {
@@ -1883,6 +1883,17 @@ test "structural validator repeated clean and broken runs do not accumulate diag
             try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_root, null);
         }
     }
+}
+
+test "structural validator propagates diagnostic allocation failure" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    var validator = StructuralValidator.init(failing_allocator.allocator(), &diagnostics, "fixture");
+    defer validator.deinit();
+
+    try std.testing.expectError(error.OutOfMemory, validator.countError(0, "count mismatch"));
 }
 
 fn runStructuralValidationInto(

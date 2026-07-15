@@ -250,7 +250,7 @@ pub const IndexValidator = struct {
         validator: *IndexValidator,
         end: EndElement,
         element_depth: usize,
-    ) void {
+    ) !void {
         if (validator.mzml_depth == null) return;
         if (element_depth < validator.mzml_depth.?) return;
 
@@ -265,10 +265,8 @@ pub const IndexValidator = struct {
                     validator.allocator.free(id_ref_owned);
                     return;
                 };
-                validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset }) catch {
-                    validator.allocator.free(id_ref_owned);
-                    return;
-                };
+                errdefer validator.allocator.free(id_ref_owned);
+                try validator.index_entries.append(validator.allocator, .{ .id_ref = id_ref_owned, .offset = offset });
             },
             .index => validator.current_index_kind = null,
             .indexList => {
@@ -283,7 +281,7 @@ pub const IndexValidator = struct {
                             validator.index_list_offset_byte_offset orelse 0,
                             RuleId.mzml_index_offset_list,
                             "indexListOffset value is not a valid integer",
-                        ) catch {};
+                        ) catch |append_err| return append_err;
                     }
                     break :blk null;
                 };
@@ -297,7 +295,7 @@ pub const IndexValidator = struct {
                         validator.file_checksum_byte_offset orelse 0,
                         RuleId.mzml_index_checksum,
                         "fileChecksum must be a 40-character hexadecimal string",
-                    ) catch {};
+                    ) catch |append_err| return append_err;
                 } else {
                     decodeHex(hex, &validator.file_checksum_raw);
                     validator.file_checksum_ok = true;
@@ -327,27 +325,27 @@ pub const IndexValidator = struct {
     pub fn finish(
         validator: *IndexValidator,
         file_bytes: ?[]const u8,
-    ) void {
+    ) !void {
         if (!validator.saw_index_elements) return;
 
         if (file_bytes == null) {
-            validator.diagnostics.append(validator.allocator, .{
+            try validator.diagnostics.append(validator.allocator, .{
                 .severity = .info,
                 .rule = RuleId.mzml_index_checksum,
                 .location = .{ .byte_offset = 0 },
                 .path = validator.path,
                 .message = "file bytes unavailable; SHA-1 and truncation checks skipped",
-            }) catch {};
+            });
         }
 
         // Verify indexList declared count matches actual children.
         if (validator.index_list_declared_count) |declared| {
             if (declared != validator.index_list_actual_count) {
-                validator.appendDiagnostic(
+                try validator.appendDiagnostic(
                     validator.index_list_actual_offset orelse 0,
                     RuleId.mzml_index_offset_list,
                     "indexList count does not match actual index elements",
-                ) catch {};
+                );
             }
         }
 
@@ -358,11 +356,11 @@ pub const IndexValidator = struct {
                     // Accept offset pointing to whitespace before element
                     // (e.g. ThermoRawFileParser writes line-start offsets).
                     if (!offsetsMatchWithWhitespace(file_bytes, declared, actual)) {
-                        validator.appendDiagnostic(
+                        try validator.appendDiagnostic(
                             validator.index_list_offset_byte_offset orelse validator.index_list_actual_offset orelse 0,
                             RuleId.mzml_index_offset_list,
                             "declared indexListOffset does not match actual position of indexList",
-                        ) catch {};
+                        );
                     }
                 }
             }
@@ -375,23 +373,23 @@ pub const IndexValidator = struct {
         for (validator.index_entries.items) |entry| {
             // Check for duplicate idRef in index.
             if (seen_ids.contains(entry.id_ref)) {
-                validator.appendDiagnostic(
+                try validator.appendDiagnostic(
                     entry.offset,
                     RuleId.mzml_index_offset,
                     "duplicate idRef in index",
-                ) catch {};
+                );
             } else {
-                seen_ids.put(entry.id_ref, {}) catch {};
+                try seen_ids.put(entry.id_ref, {});
             }
 
             // Check monotonic ordering.
             if (prev_offset) |prev| {
                 if (entry.offset < prev) {
-                    validator.appendDiagnostic(
+                    try validator.appendDiagnostic(
                         entry.offset,
                         RuleId.mzml_index_offset,
                         "index offsets are not monotonically increasing",
-                    ) catch {};
+                    );
                 }
             }
             prev_offset = entry.offset;
@@ -399,11 +397,11 @@ pub const IndexValidator = struct {
             // Check truncation (offset past EOF).
             if (file_bytes) |bytes| {
                 if (entry.offset >= bytes.len) {
-                    validator.appendDiagnostic(
+                    try validator.appendDiagnostic(
                         entry.offset,
                         RuleId.mzml_index_truncated,
                         "index offset points past end of file",
-                    ) catch {};
+                    );
                     continue;
                 }
             }
@@ -412,11 +410,11 @@ pub const IndexValidator = struct {
             const recorded_offset = validator.spectrum_offsets.get(entry.id_ref) orelse
                 validator.chromatogram_offsets.get(entry.id_ref) orelse
                 {
-                    validator.appendDiagnostic(
+                    try validator.appendDiagnostic(
                         entry.offset,
                         RuleId.mzml_index_offset,
                         "index references non-existent spectrum or chromatogram",
-                    ) catch {};
+                    );
                     continue;
                 };
 
@@ -424,11 +422,11 @@ pub const IndexValidator = struct {
                 // Accept offset pointing to whitespace before the element
                 // (ThermoRawFileParser convention: line-start offset).
                 if (!offsetsMatchWithWhitespace(file_bytes, entry.offset, recorded_offset)) {
-                    validator.appendDiagnostic(
+                    try validator.appendDiagnostic(
                         entry.offset,
                         RuleId.mzml_index_offset,
                         "index offset does not match actual byte position",
-                    ) catch {};
+                    );
                 }
             }
         }
@@ -438,11 +436,11 @@ pub const IndexValidator = struct {
             if (validator.file_checksum_ok) {
                 if (validator.file_checksum_byte_offset) |checksum_offset| {
                     if (checksum_offset > bytes.len) {
-                        validator.appendDiagnostic(
+                        try validator.appendDiagnostic(
                             checksum_offset,
                             RuleId.mzml_index_checksum,
                             "fileChecksum offset exceeds file size",
-                        ) catch {};
+                        );
                         return;
                     }
                     if (validator.sha_file_bytes != null and !validator.sha_complete) {
@@ -454,11 +452,11 @@ pub const IndexValidator = struct {
                         computeChecksumBatch(bytes, checksum_offset);
 
                     if (!std.mem.eql(u8, &computed, &validator.file_checksum_raw)) {
-                        validator.appendDiagnostic(
+                        try validator.appendDiagnostic(
                             checksum_offset,
                             RuleId.mzml_index_checksum,
                             "fileChecksum SHA-1 does not match recomputed value",
-                        ) catch {};
+                        );
                     }
                 }
             }
@@ -590,6 +588,7 @@ const testing = std.testing;
 const expect = testing.expect;
 const expectEqual = testing.expectEqual;
 const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
 
 test "IndexValidator: non-indexed file produces no diagnostics" {
     const allocator = testing.allocator;
@@ -602,10 +601,10 @@ test "IndexValidator: non-indexed file produces no diagnostics" {
     // Parse a simple non-indexed mzML structure.
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
     try expect(!v.isIndexed());
@@ -622,14 +621,26 @@ test "IndexValidator: records spectrum and chromatogram offsets" {
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
     try v.consumeStart(test_events.startUnknown("chromatogram", &.{test_events.attr("id", "c1")}, 200), 2);
-    v.consumeEnd(test_events.endUnknown("chromatogram"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("chromatogram"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
     try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?);
     try expectEqual(@as(u64, 200), v.chromatogram_offsets.get("c1").?);
+}
+
+test "IndexValidator: finish propagates diagnostic allocation failure" {
+    var failing_allocator = testing.FailingAllocator.init(testing.allocator, .{ .fail_index = 0 });
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(testing.allocator);
+
+    var v = IndexValidator.init(failing_allocator.allocator(), &diagnostics, null);
+    defer v.deinit();
+    v.saw_index_elements = true;
+
+    try expectError(error.OutOfMemory, v.finish(null));
 }
 
 test "IndexValidator: spectrum with unknown intern id still records offsets" {
@@ -645,9 +656,9 @@ test "IndexValidator: spectrum with unknown intern id still records offsets" {
     var spectrum = test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100);
     spectrum.element_id = .unknown;
     try v.consumeStart(spectrum, 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
     try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?);
 }
@@ -663,26 +674,26 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s2")}, 300), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     // Index list
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
     try v.consumeText(test_events.text("100"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s2")}, 540), 3);
     try v.consumeText(test_events.text("300"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
-    v.consumeEnd(test_events.endUnknown("index"), 2);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("index"), 2);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
 
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
@@ -699,19 +710,19 @@ test "IndexValidator: bad offset value produces diagnostic" {
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
     try v.consumeText(test_events.text("999"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
-    v.consumeEnd(test_events.endUnknown("index"), 2);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("index"), 2);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
@@ -728,18 +739,18 @@ test "IndexValidator: reference to non-existent element produces diagnostic" {
 
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "nonexistent")}, 520), 3);
     try v.consumeText(test_events.text("100"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
-    v.consumeEnd(test_events.endUnknown("index"), 2);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("index"), 2);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
@@ -756,18 +767,18 @@ test "IndexValidator: indexListOffset mismatch produces diagnostic" {
 
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexListOffset", &.{}, 600), 1);
     try v.consumeText(test_events.text("999"));
-    v.consumeEnd(test_events.endUnknown("indexListOffset"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexListOffset"), 1);
 
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
@@ -785,21 +796,21 @@ test "IndexValidator: truncated offset produces diagnostic" {
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
     try v.consumeText(test_events.text("999999"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
-    v.consumeEnd(test_events.endUnknown("index"), 2);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("index"), 2);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
     // file_bytes shorter than 999999
     const file_bytes = "<?xml version=\"1.0\"?><mzML>...</mzML>" ++ [_]u8{0} ** 100;
-    v.finish(file_bytes);
+    try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_truncated, diagnostics.items[0].rule);
@@ -819,18 +830,18 @@ test "IndexValidator: SHA-1 checksum mismatch produces diagnostic" {
 
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
 
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(file_content.len)), 1);
     try v.consumeText(test_events.text("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"));
-    v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
+    try v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
 
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(file_bytes);
+    try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
@@ -868,16 +879,16 @@ test "IndexValidator: valid SHA-1 checksum produces no diagnostic" {
     v.feedShaExclusive(prefix.len);
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "r")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
     try v.consumeText(test_events.text(hex_str));
-    v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
     v.feedShaExclusive(checksum_offset);
 
-    v.finish(file_bytes);
+    try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
     try expect(v.sha_complete);
@@ -899,7 +910,7 @@ test "IndexValidator: online SHA matches batch hash at checksum boundary" {
     v.feedShaExclusive(prefix.len);
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 100), 1);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
 
     const batch = computeChecksumBatch(file_bytes, checksum_offset);
@@ -937,17 +948,17 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
 
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "r")}, 10), 1);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
     try v.consumeText(test_events.text("\n  "));
     try v.consumeText(test_events.text(hex_str));
     try v.consumeText(test_events.text("\n"));
-    v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(file_bytes);
+    try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
@@ -963,23 +974,23 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
-    v.consumeEnd(test_events.endUnknown("spectrum"), 2);
-    v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
 
     // index with duplicate entries for s1
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
     try v.consumeText(test_events.text("100"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 540), 3);
     try v.consumeText(test_events.text("100"));
-    v.consumeEnd(test_events.endUnknown("offset"), 3);
-    v.consumeEnd(test_events.endUnknown("index"), 2);
-    v.consumeEnd(test_events.endUnknown("indexList"), 1);
-    v.consumeEnd(test_events.endUnknown("mzML"), 0);
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+    try v.consumeEnd(test_events.endUnknown("index"), 2);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    v.finish(null);
+    try v.finish(null);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);

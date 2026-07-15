@@ -29,9 +29,28 @@ pub const OutputMode = enum {
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     const summary = diagnostic.summarize(diagnostics);
 
+    try renderTextDiagnostics(writer, diagnostics);
+    try writeSummaryLine(writer, summary);
+}
+
+pub fn renderTextResult(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    results: []const diagnostic.FileResult,
+) std.Io.Writer.Error!void {
+    const emergency = hasEmergencyFailure(results);
+    if (diagnostics.len > 0 or !emergency) try renderTextDiagnostics(writer, diagnostics);
+    for (results) |result| {
+        if (result.first_failure) |failure| {
+            if (!result.failure_diagnostic_emitted) try renderFailureText(writer, failure);
+        }
+    }
+    try writeResultSummaryLine(writer, diagnostic.summarizeResults(results));
+}
+
+fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     if (diagnostics.len == 0) {
         try writer.writeAll("OK: no diagnostics emitted\n");
-        try writeSummaryLine(writer, summary);
         return;
     }
 
@@ -61,7 +80,6 @@ pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.I
     }
 
     try writer.writeByte('\n');
-    try writeSummaryLine(writer, summary);
 }
 
 pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -77,6 +95,10 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
     );
 }
 
+pub fn renderSummaryResult(writer: *std.Io.Writer, results: []const diagnostic.FileResult) std.Io.Writer.Error!void {
+    try writeResultStatusLine(writer, diagnostic.summarizeResults(results));
+}
+
 /// Groups diagnostics by severity+rule+message and prints compact counts.
 /// Columns auto-adjust to content width. Zero heap allocation.
 /// Groups are sorted: errors first (by count desc), then warnings, then info.
@@ -89,7 +111,10 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
         summary.totals.errors,
     });
     if (diagnostics.len == 0) return;
+    try renderBriefGroups(writer, diagnostics);
+}
 
+fn renderBriefGroups(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     const max_groups = 256;
     var sev: [max_groups]Severity = undefined;
     var rule: [max_groups][]const u8 = undefined;
@@ -182,38 +207,87 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
     }
 }
 
+pub fn renderBriefResult(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    results: []const diagnostic.FileResult,
+) std.Io.Writer.Error!void {
+    try writeResultStatusLine(writer, diagnostic.summarizeResults(results));
+    if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
+}
+
 /// Renders diagnostics in a stable JSON shape for automation.
 pub fn renderJson(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
     try writer.writeAll("[\n");
-    for (diagnostics, 0..) |item, index| {
-        if (index != 0) try writer.writeAll(",\n");
-        try writer.writeAll("  {\n");
-        try writer.writeAll("    \"severity\": ");
-        try writeJsonString(writer, item.severity.label());
-        try writer.writeAll(",\n    \"rule\": ");
-        try writeJsonString(writer, item.rule);
-        if (item.path) |path| {
-            try writer.writeAll(",\n    \"path\": ");
-            try writeJsonString(writer, path);
-        }
-        try writer.writeAll(",\n    \"location\": {\n");
-        try writer.writeAll("      \"byte_offset\": ");
-        if (item.location.byte_offset) |byte_offset| {
-            try writer.print("{d}", .{byte_offset});
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll(",\n      \"spectrum_index\": ");
-        if (item.location.spectrum_index) |spectrum_index| {
-            try writer.print("{d}", .{spectrum_index});
-        } else {
-            try writer.writeAll("null");
-        }
-        try writer.writeAll("\n    },\n    \"message\": ");
-        try writeJsonString(writer, item.message);
-        try writer.writeAll("\n  }");
-    }
+    try renderJsonItems(writer, diagnostics, null);
     try writer.writeAll("\n]\n");
+}
+
+pub fn renderJsonResult(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    results: []const diagnostic.FileResult,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("[\n");
+    try renderJsonItems(writer, diagnostics, results);
+    try writer.writeAll("\n]\n");
+}
+
+fn renderJsonItems(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    results: ?[]const diagnostic.FileResult,
+) std.Io.Writer.Error!void {
+    var first = true;
+    for (diagnostics) |item| {
+        if (!first) try writer.writeAll(",\n");
+        try writeJsonDiagnostic(writer, item);
+        first = false;
+    }
+    if (results) |file_results| {
+        for (file_results) |result| {
+            if (result.first_failure) |failure| {
+                if (result.failure_diagnostic_emitted) continue;
+                if (!first) try writer.writeAll(",\n");
+                try writeJsonDiagnostic(writer, .{
+                    .severity = .@"error",
+                    .rule = failure.rule,
+                    .location = failure.location,
+                    .path = failure.path,
+                    .message = failure.message,
+                });
+                first = false;
+            }
+        }
+    }
+}
+
+fn writeJsonDiagnostic(writer: *std.Io.Writer, item: Diagnostic) std.Io.Writer.Error!void {
+    try writer.writeAll("  {\n");
+    try writer.writeAll("    \"severity\": ");
+    try writeJsonString(writer, item.severity.label());
+    try writer.writeAll(",\n    \"rule\": ");
+    try writeJsonString(writer, item.rule);
+    if (item.path) |path| {
+        try writer.writeAll(",\n    \"path\": ");
+        try writeJsonString(writer, path);
+    }
+    try writer.writeAll(",\n    \"location\": {\n");
+    try writer.writeAll("      \"byte_offset\": ");
+    if (item.location.byte_offset) |byte_offset| {
+        try writer.print("{d}", .{byte_offset});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\n      \"spectrum_index\": ");
+    if (item.location.spectrum_index) |spectrum_index| {
+        try writer.print("{d}", .{spectrum_index});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll("\n    },\n    \"message\": ");
+    try writeJsonString(writer, item.message);
+    try writer.writeAll("\n  }");
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
@@ -249,6 +323,52 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     );
 }
 
+fn writeResultStatusLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
+    try writer.print("status={s} completion={s} info={d} warnings={d} errors={d}", .{
+        summary.status().label(),
+        summary.completion.label(),
+        summary.totals.info,
+        summary.totals.warnings,
+        summary.totals.errors,
+    });
+    if (summary.first_failure) |failure| {
+        try writer.print(" failure_stage={s} failure_reason={s}", .{ failure.stage.label(), failure.reason.label() });
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeResultSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
+    try writer.print(
+        "summary: {s} (completion={s} info={d} warnings={d} errors={d}",
+        .{
+            summary.status().label(),
+            summary.completion.label(),
+            summary.totals.info,
+            summary.totals.warnings,
+            summary.totals.errors,
+        },
+    );
+    if (summary.first_failure) |failure| {
+        try writer.print(" failure_stage={s} failure_reason={s}", .{ failure.stage.label(), failure.reason.label() });
+    }
+    try writer.writeAll(")\n");
+}
+
+fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
+    if (failure.path) |path| try writer.print("input: {s}\n", .{path});
+    try writer.print(
+        "  error [{s}] {s} (stage={s} reason={s})\n",
+        .{ failure.rule, failure.message, failure.stage.label(), failure.reason.label() },
+    );
+}
+
+fn hasEmergencyFailure(results: []const diagnostic.FileResult) bool {
+    for (results) |result| {
+        if (result.needsEmergencyDiagnostic()) return true;
+    }
+    return false;
+}
+
 // --- Tests ---
 
 test "renderSummary counts severities" {
@@ -270,6 +390,35 @@ test "renderSummary counts severities" {
         "status=errors-present info=1 warnings=1 errors=1\n",
         allocating_writer.written(),
     );
+}
+
+test "renderSummaryResult reports incomplete completion and first failure" {
+    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    result.recordFailure(.parser, .parser, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderSummaryResult(&allocating_writer.writer, &.{result});
+
+    try std.testing.expectEqualStrings(
+        "status=errors-present completion=incomplete info=0 warnings=0 errors=1 failure_stage=parser failure_reason=parser\n",
+        allocating_writer.written(),
+    );
+}
+
+test "renderJsonResult emits an emergency failure" {
+    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderJsonResult(&allocating_writer.writer, &.{}, &.{result});
+
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"rule\": \"runtime.incomplete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"path\": \"sample.mzML\"") != null);
 }
 
 test "renderJson keeps stable keys" {
