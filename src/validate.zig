@@ -617,15 +617,29 @@ fn runValidation(
 
     var semantic_validator: ?semantic.SemanticValidator = null;
     defer if (semantic_validator) |*v| v.deinit();
+    defer if (semantic_validator) |*v| {
+        const usage = v.resourceUsage();
+        result.resource_usage.semantic_current_bytes = usage.semantic_current_bytes;
+        result.resource_usage.semantic_peak_bytes = usage.semantic_peak_bytes;
+        result.resource_usage.semantic_declaration_bytes = usage.semantic_declaration_bytes;
+        result.resource_usage.semantic_unresolved_bytes = usage.semantic_unresolved_bytes;
+        result.resource_usage.semantic_scope_bytes = usage.semantic_scope_bytes;
+        result.resource_usage.semantic_param_group_bytes = usage.semantic_param_group_bytes;
+        result.resource_usage.semantic_declaration_peak_bytes = usage.semantic_declaration_peak_bytes;
+        result.resource_usage.semantic_unresolved_peak_bytes = usage.semantic_unresolved_peak_bytes;
+        result.resource_usage.semantic_scope_peak_bytes = usage.semantic_scope_peak_bytes;
+        result.resource_usage.semantic_param_group_peak_bytes = usage.semantic_param_group_peak_bytes;
+    };
     if (!context.options.skip_semantic) {
         result.beginStage(.semantic);
         if (context.catalog) |*catalog| {
-            semantic_validator = semantic.SemanticValidator.init(
+            semantic_validator = semantic.SemanticValidator.initWithLimits(
                 context.allocator,
                 &catalog.cv_table,
                 &catalog.rule_engine,
                 diagnostics,
                 path,
+                context.options.resource_limits,
             );
         } else {
             try appendFailureDiagnostic(
@@ -1130,12 +1144,11 @@ test "checkPath_semantic_end_to_end" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Smoke test: semantic validators initialise and process without crashing.
-    try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true });
 
-    // The fixture has known CV issues. We expect CV diagnostics but no crashes.
     try std.testing.expect(diagnostics.items.len > 0);
-    // Verify at least one CV-related diagnostic was produced.
+    try std.testing.expect(result.resource_usage.semantic_peak_bytes > 0);
+    try std.testing.expect(result.resource_usage.semantic_declaration_peak_bytes > 0);
     var has_cv_diag = false;
     for (diagnostics.items) |d| {
         if (std.mem.startsWith(u8, d.rule, "mzml.cv.") or std.mem.startsWith(u8, d.rule, "mzml.ref.")) {
@@ -1144,6 +1157,27 @@ test "checkPath_semantic_end_to_end" {
         }
     }
     try std.testing.expect(has_cv_diag);
+}
+
+test "checkSliceResult_semantic_limit_is_incomplete" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .resource_limits = .{ .max_semantic_bytes = 1 },
+    });
+    defer context.deinit();
+    var diagnostics: std.ArrayList(Diagnostic) = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = context.checkSliceResult(xml, &diagnostics, "semantic-limit.mzML", null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expectEqualStrings(RuleId.runtime_semantic_limit, diagnostics.items[0].rule);
 }
 
 test "checkPath_indexed_fixture_runs_mapping_rules" {

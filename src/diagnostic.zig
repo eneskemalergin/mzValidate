@@ -29,6 +29,7 @@ pub const RuleId = struct {
     pub const runtime_input_mode = "runtime.input-mode";
     pub const runtime_file_stability = "runtime.file-stability";
     pub const runtime_catalog = "runtime.catalog";
+    pub const runtime_semantic_limit = "runtime.semantic-limit";
     pub const runtime_incomplete = "runtime.incomplete";
     pub const runtime_stub = "runtime.stub";
 
@@ -102,6 +103,7 @@ pub const ResourceLimits = struct {
     max_file_checksum_text_bytes: usize = 64,
     max_obo_line_bytes: usize = 1024 * 1024,
     max_obo_xref_accession_bytes: usize = 128,
+    max_semantic_bytes: usize = 64 * 1024 * 1024,
 };
 
 /// Classifies diagnostics so CLI exit codes and renderers stay consistent.
@@ -211,6 +213,16 @@ pub const ResourceUsage = struct {
     parser_peak_bytes: usize = 0,
     binary_scratch_current_bytes: usize = 0,
     binary_scratch_peak_bytes: usize = 0,
+    semantic_current_bytes: usize = 0,
+    semantic_peak_bytes: usize = 0,
+    semantic_declaration_bytes: usize = 0,
+    semantic_unresolved_bytes: usize = 0,
+    semantic_scope_bytes: usize = 0,
+    semantic_param_group_bytes: usize = 0,
+    semantic_declaration_peak_bytes: usize = 0,
+    semantic_unresolved_peak_bytes: usize = 0,
+    semantic_scope_peak_bytes: usize = 0,
+    semantic_param_group_peak_bytes: usize = 0,
 };
 
 /// Fixed, allocation-free metadata for the first failure that stopped a file.
