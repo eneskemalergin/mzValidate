@@ -3,7 +3,7 @@
 <h1 align="center">mzValidate</h1>
 
 <p align="center">
-  Validates mzML files in a single streaming pass. No JVM, no runtime, no setup.
+  Validates mzML files in a single forward validation pass. No JVM, no managed runtime, no setup.
 </p>
 
 <p align="center">
@@ -19,15 +19,15 @@
 
 ---
 
-Validates mzML files in a single streaming pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree in memory, no external dependencies at runtime. Single binary, no JVM or Python stack required.
+Validates mzML files in a single forward validation pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree or DOM is built, and no JVM or Python stack is required. The default native build embeds libdeflate and links the host C runtime; use `-Denable-libdeflate=false` when that dependency is not wanted.
 
 - No JVM, no Python, no .NET, no libxml2
 - Streaming XML parser in one forward pass
-- Input is mmap'd today, so peak RSS tracks file size (see Performance). Next: stream by default, mmap when the file fits
+- Regular files use mmap first with lazy page population; if mapping fails, the current fallback reads the whole file into heap. A bounded stream-default path is planned.
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
-- Zlib arrays validated through streaming inflate with bounded scratch buffers
+- Zlib arrays validated through bounded compressed and decompressed workspaces
 - Uses CPU vector instructions for faster base64 scanning
-- 205 unit tests, CLI contract tests, adversarial edge cases, and randomly generated inputs
+- Unit tests, CLI contract tests, adversarial edge cases, and randomly generated inputs
 
 ## Quick start
 
@@ -46,11 +46,11 @@ Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
 Build from source. You need **Zig 0.16.0** exactly. Other Zig versions will not work.
 
 1. Get Zig 0.16.0 from the [Zig download page](https://ziglang.org/download/#release-0.16.0) for your OS and CPU.
-2. Put the `zig` binary on your `PATH` (or call it by full path).
+2. Keep the portable runner at `./zig-0.16.0/zig` in the repository, or obtain the exact Zig 0.16.0 runner for your platform.
 3. Check the version:
 
 ```sh
-zig version
+./zig-0.16.0/zig version
 # 0.16.0
 ```
 
@@ -59,10 +59,10 @@ Then:
 ```sh
 git clone https://github.com/eneskemalergin/mzValidate.git
 cd mzValidate
-zig build -Doptimize=ReleaseFast
+./zig-0.16.0/zig build -Doptimize=ReleaseFast
 ```
 
-The binary is at `zig-out/bin/mzValidate`. The default build bundles libdeflate via `-lc` (system C runtime). Use `-Denable-libdeflate=false` for a standalone binary with no system C dependency.
+The binary is at `zig-out/bin/mzValidate`. The default build bundles libdeflate and links the host C runtime. Use `-Denable-libdeflate=false` for a build with no system C dependency.
 
 If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. (This is how I work with Zig on my projects. Keeps many copies but at least I know which one I am using and I can change it easily.)
 
@@ -96,7 +96,7 @@ Validation phases (each flag disables one phase). By default all phases run:
 
 I/O and limits:
 
-- `-mmap`: memory-map the input file for random-access SHA-1 verification; without this flag the validator falls back to reading into a heap buffer when mmap is unavailable
+- `-mmap`: retained as a compatibility flag. The current regular-file path already prefers mmap and falls back to a whole-file heap buffer when mapping is unavailable. Explicit `-input-mode stream|mmap` selection is planned.
 - `-max-binary-size N`: reject any binary array larger than N; accepts K, M, G, T suffixes (1024-based)
 - `-obo <path>`: override the embedded psi-ms.obo with a custom file; useful for testing against bleeding-edge CV terms
 
@@ -123,15 +123,19 @@ Fusion stage breakdown (separate runs on the same file):
 | + Semantic (CV + refs)    |     1.8 s |
 | **Full** (all stages)     | **4.1 s** |
 
-On Fusion, most of the ~720 MiB RSS is the mmap'd file (~642 MiB). Validator state adds about 80 MiB. On Astral, full validation hits ~2.2 GiB RSS because the 2.1 GiB plain file stays resident. Binary work is most of the Astral runtime (~8 s of ~10 s).
+On Fusion, most of the ~720 MiB RSS is the mmap'd file (~642 MiB). Validator state adds about 80 MiB. On Astral, full validation hits ~2.2 GiB RSS because the 2.1 GiB plain file stays resident. Binary work is most of the Astral runtime (~8 s of ~10 s). These are single-process observations, not safe parallelism limits.
 
 ### Memory
 
-The default path mmap's the input, or reads the whole file into heap if mapping fails. The parser walks that slice. There is no bounded streaming mode yet.
+The default path mmap's the input with lazy page population, or reads the whole file into heap if mapping fails. The parser walks that slice. There is no bounded streaming mode yet.
 
 One 2 GiB file is fine if the machine has the RAM. Many large files in parallel is a different story. Each process can hold most of its input resident, and Linux does not always reclaim those pages quickly under load. Do not multiply single-file wall time by core count and assume a cohort will finish in that time.
 
 > Working toward: stream as the default input path, with mmap kept for files that fit in memory.
+
+## Current limitations
+
+The current regular-file path is optimized for a fast single-file pass, not a flat memory ceiling. Input-sized mmap pages or heap fallback bytes can dominate RSS. The default libdeflate path still needs explicit zlib-wrapper checksum coverage. Completion state, bounded diagnostic storage, and full reader-mode index integrity remain tracked work for future.
 
 ## Format support
 
@@ -139,7 +143,7 @@ Each format validated against its published specification. No XSD embedded or re
 
 | Format                    | Status  | Structural | Binary  | Index   | Semantic |
 | ------------------------- | ------- | ---------- | ------- | ------- | -------- |
-| **mzML** 1.1.0            | ready   | ready      | ready   | ready   | ready    |
+| **mzML** 1.1.0            | active  | active     | active  | active  | active   |
 | **mzTab** 1.0             | planned | planned    | -       | -       | planned  |
 | **SDRF-Proteomics** 1.1.0 | planned | planned    | -       | -       | planned  |
 | **imzML** 1.0             | planned | planned    | planned | -       | planned  |
@@ -147,7 +151,7 @@ Each format validated against its published specification. No XSD embedded or re
 
 ## Validation
 
-Every file is checked in a single streaming pass. Same parser, same diagnostic list.
+Every file is checked in one forward pass over parser events. The current regular-file source is mmap-backed when possible, with a documented file-sized fallback; the bounded stream source is planned. Same parser, same diagnostic list.
 
 ### Structural
 
@@ -155,11 +159,11 @@ XML well-formedness and mzML 1.1 schema conformance. Catches missing elements, w
 
 ### Binary integrity
 
-Each `binaryDataArray` is checked for base64 validity, zlib integrity, length against `defaultArrayLength`, precision (32/64-bit) against the declared CV term, and duplicate array types within a `binaryDataArrayList`. Uncompressed arrays use a streaming base64 counter that avoids decoding the full payload. Zlib arrays use streaming inflate with no output buffer. Other compression schemes (MS-Numpress, truncation) are recognized and reported as unsupported rather than ignored.
+Each `binaryDataArray` is checked for base64 validity, zlib decompression, length against `defaultArrayLength`, precision (32/64-bit) against the declared CV term, and duplicate array types within a `binaryDataArrayList`. Uncompressed arrays use a streaming base64 counter that avoids decoding the full payload. Zlib arrays use reusable compressed scratch and a bounded decoded workspace. Other compression schemes (MS-Numpress, truncation) are recognized and reported as unsupported rather than ignored.
 
 ### Index and checksum
 
-For indexed mzML files: validates every index offset against the recorded byte position, recomputes SHA-1 without rescanning, and detects truncated data. SHA-1 requires random access (mmap or read into memory). When streaming from a pipe, index validation runs without checksum.
+For indexed mzML files on the regular-file path: validates every index offset against the recorded byte position, recomputes SHA-1 without rescanning, and detects truncated data. SHA-1 requires random access (mmap or read into memory). The reader API can validate offset fields, but currently reports checksum and truncation checks as unavailable when complete file bytes are not supplied.
 
 ### Semantic
 
@@ -226,20 +230,21 @@ Four renderers from the same diagnostic list. Text mode for interactive use. JSO
 - Binary scratch buffers are cleared between arrays without reallocating
 - No per-spectrum accumulation: state is discarded after each element's end event
 - Semantic ID table grows with spectrum count
-- Input file is mmap'd or read whole today; stream-default with optional mmap is the next input work
+- Input file is mmap'd or read whole today; bounded stream-default with explicit mmap is the next input work
 
 ## Build steps
 
-- `zig build`: debug binary
-- `zig build -Doptimize=ReleaseFast`: release binary
-- `zig build test`: unit tests with leak detection
-- `zig build cli-contract`: CLI output and exit-code tests on known fixtures
-- `zig build ci`: test + cli-contract
-- `zig build run -- check file.mzML`: build and run
+- `./zig-0.16.0/zig build`: debug binary
+- `./zig-0.16.0/zig build -Doptimize=ReleaseSafe`: safety-oriented release build
+- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: release binary for measurements
+- `./zig-0.16.0/zig build test`: unit tests with leak detection
+- `./zig-0.16.0/zig build cli-contract`: CLI output and exit-code tests on known fixtures
+- `./zig-0.16.0/zig build ci`: test + cli-contract
+- `./zig-0.16.0/zig build run -- check file.mzML`: build and run
 
 ## Roadmap
 
-- Stream as default input; mmap when the file fits
+- Bounded stream as default input; explicit mmap for measured single-file speed
 - Conformance score for CI integration (`mzValidate score`)
 - Quick summary statistics (`mzValidate stats`)
 - Auto-repair common mzML issues (`mzValidate check --fix`)
