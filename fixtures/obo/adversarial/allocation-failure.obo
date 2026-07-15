@@ -5,7 +5,10 @@ id: MS:9000003
 name: multi-allocation construction case
 namespace: MS
 def: "A term that allocates scalar fields and owned lists." []
+replaced_by: MS:1000001
 is_a: MS:1000001 ! parent
 relationship: part_of MS:1000001 ! parent
+relationship: has_value_type xsd:float
+relationship: has_units UO:0000000
 synonym: "construction synonym" EXACT []
 xref: binary-data-type:MS\:1000521 "32-bit float"

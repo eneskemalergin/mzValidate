@@ -326,13 +326,14 @@ fn runValidation(
         if (obo_text) |text| {
             defer if (options.obo_path != null) allocator.free(text);
             cv_table = obo_parser.CvTable.init(allocator, text) catch |err| {
+                const message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err);
                 try diagnostics.append(allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.runtime_file_open,
                     .path = path,
-                    .message = if (err == error.OutOfMemory) "unable to allocate OBO state" else "unable to parse OBO file",
+                    .message = message,
                 });
-                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, "unable to parse OBO file", .{}, path, true);
+                result.recordFailure(.semantic, if (err == error.OutOfMemory) .allocation else .catalog, RuleId.runtime_file_open, message, .{}, path, true);
                 return;
             };
         }
