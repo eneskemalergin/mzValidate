@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">
+  <cvList count="1"><cv id="MS" fullName="PSI-MS" URI=""/></cvList>
+  <fileDescription><fileContent><cvParam accession="MS:1000524"/></fileContent></fileDescription>
+  <softwareList count="1"><software id="SW1" version="1.0"><cvParam accession="MS:1000531"/></software></softwareList>
+  <instrumentConfigurationList count="1"><instrumentConfiguration id="IC1"><cvParam accession="MS:1000031"/><componentList count="3"><source order="1"><cvParam accession="MS:1000008"/></source><analyzer order="2"><cvParam accession="MS:1000443"/></analyzer><detector order="3"><cvParam accession="MS:1000026"/></detector></componentList></instrumentConfiguration></instrumentConfigurationList>
+  <dataProcessingList count="1"><dataProcessing id="DP1"><processingMethod order="0" softwareRef="SW1"><cvParam accession="MS:1000452"/></processingMethod></dataProcessing></dataProcessingList>
+  <run id="run-1" defaultInstrumentConfigurationRef="IC1">
+    <spectrumList count="0" defaultDataProcessingRef="DP1"/>
+  </run>
+</mzML>

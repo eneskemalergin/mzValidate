@@ -1,0 +1,7 @@
+format-version: 1.4
+
+[Term]
+id: CUSTOM:0000001
+name: term with custom namespace storage
+namespace: CUSTOM
+def: "The namespace and description must remain valid after the source buffer is released." []

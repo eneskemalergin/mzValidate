@@ -1,0 +1,29 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<indexedmzML xmlns="http://psi.hupo.org/ms/mzml">
+  <mzML xmlns="http://psi.hupo.org/ms/mzml" version="1.1.0">
+    <cvList count="1"><cv id="MS" fullName="PSI-MS" URI=""/></cvList>
+    <fileDescription><fileContent/></fileDescription>
+    <softwareList count="1"><software id="SW1" version="1.0"/></softwareList>
+    <instrumentConfigurationList count="1"><instrumentConfiguration id="IC1"><componentList count="3"><source order="1"/><analyzer order="2"/><detector order="3"/></componentList></instrumentConfiguration></instrumentConfigurationList>
+    <dataProcessingList count="1"><dataProcessing id="DP1"><processingMethod order="0" softwareRef="SW1"/></dataProcessing></dataProcessingList>
+    <run id="run-1" defaultInstrumentConfigurationRef="IC1">
+      <spectrumList count="1" defaultDataProcessingRef="DP1">
+        <spectrum index="0" id="s1" defaultArrayLength="0"><cvParam accession="MS:1000559"/><cvParam accession="MS:1000525"/>
+          <scanList count="1"><cvParam accession="MS:1000570"/><scan/></scanList>
+          <binaryDataArrayList count="2">
+            <binaryDataArray encodedLength="0"><cvParam accession="MS:1000513"/><cvParam accession="MS:1000518"/><cvParam accession="MS:1000572"/><cvParam accession="MS:1000521"/><cvParam accession="MS:1000576"/><cvParam accession="MS:1000514"/><binary/></binaryDataArray>
+            <binaryDataArray encodedLength="0"><cvParam accession="MS:1000513"/><cvParam accession="MS:1000518"/><cvParam accession="MS:1000572"/><cvParam accession="MS:1000521"/><cvParam accession="MS:1000576"/><cvParam accession="MS:1000515"/><binary/></binaryDataArray>
+          </binaryDataArrayList>
+        </spectrum>
+      </spectrumList>
+    </run>
+  </mzML>
+  <indexList count="1">
+    <index name="spectrum">
+      <offset idRef="s1">856</offset>
+      <offset idRef="s1">856</offset>
+    </index>
+  </indexList>
+  <indexListOffset>1748</indexListOffset>
+  <fileChecksum>600d620ea48adf92e42e47018b98e6aa8ec06349</fileChecksum>
+</indexedmzML>
