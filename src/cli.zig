@@ -260,7 +260,7 @@ fn runCheck(
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
-        "mzValidate validates mzML inputs without loading the whole document into memory.\n\n" ++
+        "mzValidate validates mzML inputs in one forward pass without building an XML tree.\n\n" ++
             "Usage\n" ++
             "  mzValidate check <input.mzML> [more files...] [options]\n" ++
             "  mzValidate --help\n\n" ++
@@ -274,7 +274,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -skip-index  Skip index offset and checksum checks.\n" ++
             "  -skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
-            "  -mmap        Memory-map the input for random-access SHA-1 verification.\n" ++
+            "  -mmap        Compatibility flag; regular-file input is already mmap-first.\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++

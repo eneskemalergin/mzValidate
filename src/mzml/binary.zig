@@ -13,12 +13,26 @@ const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
 const xml_parse_errors = @import("../xml/parse_errors.zig");
 
-// Optional libdeflate binding. When -Denable-libdeflate=true at build time
-// the C header is imported and libdeflate_* symbols become available; when
-// false the binding is an empty struct so dependent code stays valid.
-const libdeflate = if (build_options.enable_libdeflate) @cImport({
-    @cInclude("libdeflate.h");
-}) else struct {};
+// Optional libdeflate binding. Keep this ABI surface narrow so the build does
+// not need a C header translation step for three decompression calls.
+const libdeflate = if (build_options.enable_libdeflate) struct {
+    const libdeflate_decompressor = opaque {};
+
+    const LIBDEFLATE_SUCCESS: c_int = 0;
+    const LIBDEFLATE_BAD_DATA: c_int = 1;
+
+    extern fn libdeflate_alloc_decompressor() ?*libdeflate_decompressor;
+    extern fn libdeflate_free_decompressor(decompressor: *libdeflate_decompressor) void;
+    extern fn libdeflate_deflate_decompress_ex(
+        decompressor: *libdeflate_decompressor,
+        input: [*]const u8,
+        input_nbytes: usize,
+        output: [*]u8,
+        output_nbytes_avail: usize,
+        actual_in_nbytes_ret: *usize,
+        actual_out_nbytes_ret: *usize,
+    ) c_int;
+} else struct {};
 
 const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
@@ -1026,7 +1040,7 @@ pub const BinaryValidator = struct {
                 const decompressor = try validator.ensureLibdeflateDecompressor();
                 try validator.libdeflate_output.resize(validator.allocator, output_limit);
 
-                const deflate_input = if (compressed.len >= 6) compressed[2..compressed.len - 4] else compressed[0..0];
+                const deflate_input = if (compressed.len >= 6) compressed[2 .. compressed.len - 4] else compressed[0..0];
 
                 var actual_in: usize = 0;
                 var actual_out: usize = 0;

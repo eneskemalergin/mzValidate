@@ -6,9 +6,10 @@
 //!   checkReader                -> caller provides a stream, reader parser.
 //!
 //! All validators (structural, binary, index, semantic) run in one
-//! forward pass over the event stream. State is bounded per phase:
-//! parser buffers, one active binary workspace, index tables, and
-//! the semantic CV/ref tracker. Nothing accumulates across spectra.
+//! forward pass over the event stream. Validator-owned state is bounded per
+//! phase: parser buffers, one active binary workspace, index tables, and the
+//! semantic CV/ref tracker. The current path input itself may be file-sized;
+//! the bounded stream input path is planned separately.
 
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
@@ -35,6 +36,8 @@ pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
+    /// Compatibility hint. The current regular-file path is mmap-first even
+    /// without this flag; explicit input-mode selection is planned.
     mmap: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
@@ -63,7 +66,8 @@ pub fn checkPath(
     try checkPathMapped(allocator, io, file, diagnostics, path, options);
 }
 
-// mmap for random-access index checks; fall back to read-into-heap.
+// mmap for random-access index checks; fall back to a stat-limited whole-file
+// read until the stream path is available.
 fn checkPathMapped(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -81,14 +85,32 @@ fn checkPathMapped(
         });
         return;
     };
-    const len = @as(usize, @intCast(stat.size));
+    const len = std.math.cast(usize, stat.size) orelse {
+        try diagnostics.append(allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.runtime_file_open,
+            .path = path,
+            .message = "input file is too large for this platform",
+        });
+        return;
+    };
 
     var mm = std.Io.File.MemoryMap.create(io, file, .{
         .len = len,
         .protection = .{ .read = true },
+        .populate = false,
     }) catch {
         const cwd = std.Io.Dir.cwd();
-        const buf = try cwd.readFileAlloc(io, path, allocator, .unlimited);
+        const buf = cwd.readFileAlloc(io, path, allocator, .limited(len)) catch |err| {
+            if (err == error.OutOfMemory) return err;
+            try diagnostics.append(allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.runtime_file_open,
+                .path = path,
+                .message = "unable to read input after memory-map failure",
+            });
+            return;
+        };
         defer allocator.free(buf);
         const index_bytes = if (options.skip_index) null else buf;
         try checkSlice(allocator, io, buf, diagnostics, path, options, index_bytes);
@@ -147,8 +169,8 @@ fn runValidation(
     source: ParserSource,
 ) !void {
 
-    // Bounded traversal: parser stacks, structural state, one binary workspace.
-    // No accumulation across spectra; memory flat regardless of file size.
+    // Bounded validator state: parser stacks, structural state, and one
+    // binary workspace. The slice source itself may be file-sized.
     const token_buffer = try allocator.alloc(u8, max_validation_token_bytes);
     defer allocator.free(token_buffer);
 
@@ -753,7 +775,7 @@ test "checkPath_indexed_missingChecksum_noError" {
     }
 }
 
-test "checkPath_mmap_fallsBackToStreamingOnMissingFile" {
+test "checkPath_mmap_flag_onMissingFileReportsOpenError" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -761,10 +783,10 @@ test "checkPath_mmap_fallsBackToStreamingOnMissingFile" {
     var diagnostics: std.ArrayList(Diagnostic) = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act. mmap on a missing file: openFile fails before mmap even starts.
+    // Act. The open fails before input-mode selection starts.
     try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .mmap = true });
 
-    // Assert. should report file open error, not mmap error.
+    // Assert. Report the file-open error, not a memory-map error.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }

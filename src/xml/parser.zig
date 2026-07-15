@@ -285,8 +285,10 @@ pub const Parser = struct {
             parser.absolute_offset = slice.pos;
 
             var event = try parser.finishStartElement(
-                byte_offset, name_parts,
-                namespace_count_before, namespace_bytes_before,
+                byte_offset,
+                name_parts,
+                namespace_count_before,
+                namespace_bytes_before,
                 self_closing,
                 if (self_closing) parser.last_byte_offset - 1 else null,
             );
@@ -2014,6 +2016,7 @@ test "parser accepts valid xml fixtures" {
     try expectFixtureParses(allocator, io, "fixtures/xml/valid/comments-cdata.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/valid/xml10-declaration-basic.xml");
     try expectFixtureParses(allocator, io, "fixtures/xml/valid/xml11-declaration-basic.xml");
+    try expectFixtureParses(allocator, io, "fixtures/xml/valid/quoted-greater-than-attribute.xml");
 }
 
 test "parser rejects invalid xml fixtures" {

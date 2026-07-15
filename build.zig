@@ -37,6 +37,12 @@ pub fn build(b: *std.Build) void {
     }
     b.installArtifact(exe);
 
+    const mutation_tools_step = b.step("mutation-tools", "Build development mutation checkers");
+    const xml_mutation_tool = addMutationTool(b, target, optimize, "xml-mutation-check", "tools/xml-mutation-check.zig", mzvalidate_mod);
+    const obo_mutation_tool = addMutationTool(b, target, optimize, "obo-mutation-check", "tools/obo-mutation-check.zig", mzvalidate_mod);
+    mutation_tools_step.dependOn(&b.addInstallArtifact(xml_mutation_tool, .{}).step);
+    mutation_tools_step.dependOn(&b.addInstallArtifact(obo_mutation_tool, .{}).step);
+
     const mod_tests = b.addTest(.{
         .root_module = mzvalidate_mod,
     });
@@ -55,7 +61,7 @@ pub fn build(b: *std.Build) void {
         run_cmd.addArgs(args);
     }
 
-    const test_step = b.step("test", "Run unit tests (library, CLI; GPA leak detection)");
+    const test_step = b.step("test", "Run unit tests (library and CLI; allocator leak detection)");
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
@@ -92,6 +98,28 @@ pub fn build(b: *std.Build) void {
 
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
     for (fixtures) |fixture| run.addArg(fixture);
+}
+
+fn addMutationTool(
+    b: *std.Build,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+    name: []const u8,
+    root_source: []const u8,
+    mzvalidate_mod: *std.Build.Module,
+) *std.Build.Step.Compile {
+    return b.addExecutable(.{
+        .name = name,
+        .root_module = b.createModule(.{
+            .root_source_file = b.path(root_source),
+            .target = target,
+            .optimize = optimize,
+            .single_threaded = true,
+            .imports = &.{
+                .{ .name = "mzvalidate", .module = mzvalidate_mod },
+            },
+        }),
+    });
 }
 
 fn addVendoredLibdeflateToModule(mod: *std.Build.Module, b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.Build.ResolvedTarget) void {
