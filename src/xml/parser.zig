@@ -4,12 +4,11 @@
 //! events into caller-provided storage. Memory usage is bounded by
 //! the parser buffer sizes, not the document size.
 //!
-//! Design notes:
-//! - Event slices borrow caller buffers. Valid only until next `next()`.
-//! - Comments and processing instructions are skipped silently.
-//! - CDATA surfaces as `text` with `from_cdata = true`.
-//! - Built-in XML entities and numeric character references are decoded.
-//! - DTD declarations (`<!...>`) are rejected. mzML does not need them.
+//! Supported subset: XML declarations, elements, attributes, namespaces,
+//! built-in and numeric entities, comments, processing instructions, and CDATA.
+//! Declarations are syntactically skipped, comments and processing instructions
+//! are ignored, event slices borrow caller buffers until the next `next()`, and
+//! DTDs plus user-defined entities are rejected without external access.
 
 const std = @import("std");
 const elements = @import("../mzml/elements.zig");
@@ -2033,6 +2032,7 @@ test "parser rejects invalid xml fixtures" {
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/mismatched-end-tag.xml", error.MismatchedEndTag);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/unknown-entity.xml", error.UnknownEntity);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/unsupported-doctype.xml", error.UnsupportedMarkup);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/external-entity.xml", error.UnsupportedMarkup);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/namespace-empty-prefix-declaration.xml", error.MalformedXml);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/malformed-processing-instruction.xml", error.UnexpectedEof);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/xml11-unclosed-declaration.xml", error.UnexpectedEof);

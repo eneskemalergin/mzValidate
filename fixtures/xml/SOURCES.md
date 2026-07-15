@@ -38,3 +38,6 @@ Adversarial invalid fixtures added in this pass:
 - `invalid/malformed-processing-instruction.xml`
   Source: XML processing instruction shape reduced to an unterminated case.
   Purpose: reject processing instructions that never terminate with `?>`.
+- `invalid/external-entity.xml`
+  Source: XML external entity declaration reduced to a no-access case.
+  Purpose: reject external declarations before any entity could be fetched or expanded.

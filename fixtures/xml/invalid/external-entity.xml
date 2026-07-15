@@ -1,0 +1,4 @@
+<!DOCTYPE root [
+  <!ENTITY external SYSTEM "file:///definitely-not-read">
+]>
+<root>&external;</root>

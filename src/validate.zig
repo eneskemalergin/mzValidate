@@ -1846,11 +1846,11 @@ test "checkReader_excessive_namespace_bindings_map_parser_limit_to_structure_xml
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "malformed XML input",
+        "XML namespace bindings exceed the configured parser limit",
     );
 }
 
-test "checkReader_excessive_nesting_maps_parser_limit_to_structure_xml_diagnostic" {
+test "checkReader_excessive_element_name_storage_maps_parser_limit_to_structure_xml_diagnostic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1865,7 +1865,7 @@ test "checkReader_excessive_nesting_maps_parser_limit_to_structure_xml_diagnosti
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "malformed XML input",
+        "XML element name storage exceeds the configured parser limit",
     );
 }
 
@@ -2456,7 +2456,6 @@ fn tooDeepXml(allocator: std.mem.Allocator, depth: usize) ![]u8 {
     errdefer xml.deinit(allocator);
 
     try xml.appendSlice(allocator, "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">");
-    // Non-self-closing elements to actually exceed the nesting limit.
     for (0..depth) |_| {
         try xml.appendSlice(allocator, "<cvParam>");
     }

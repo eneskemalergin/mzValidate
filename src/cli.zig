@@ -1009,6 +1009,27 @@ test "runArgs_corrupt_input_renders_json_diagnostic_shape" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
+test "runArgs_external_entity_reports_xml_contract_diagnostic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/xml/invalid/external-entity.xml",
+    };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.structure.xml] DTD or unsupported XML construct") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
 test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
