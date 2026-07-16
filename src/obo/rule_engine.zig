@@ -11,6 +11,7 @@
 
 const std = @import("std");
 const obo = @import("parser.zig");
+const elements = @import("../mzml/elements.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
 const version = @import("../version.zig");
@@ -42,17 +43,28 @@ pub const MappingRule = struct {
     terms: []const MappingTerm,
 };
 
+pub const PathState = u16;
+pub const root_path_state: PathState = 0;
+const no_path_state = std.math.maxInt(PathState);
+
+const PathNode = struct {
+    children: [elements.mask_table_len]PathState = @splat(no_path_state),
+    rules: []const MappingRule = &.{},
+};
+
 /// Path-indexed PSI-MS mapping rules from `ms-mapping.xml`.
 pub const RuleEngine = struct {
     allocator: std.mem.Allocator,
     rules: []MappingRule,
     rule_map: std.StringHashMap([]const MappingRule),
+    path_nodes: std.ArrayList(PathNode),
 
     pub fn init(allocator: std.mem.Allocator, xml_text: []const u8) !RuleEngine {
         var engine = RuleEngine{
             .allocator = allocator,
             .rules = try parseRules(allocator, xml_text),
             .rule_map = std.StringHashMap([]const MappingRule).init(allocator),
+            .path_nodes = .empty,
         };
         errdefer engine.deinit();
         // Build path-to-rules map. Rules are grouped by path in the XML.
@@ -64,6 +76,7 @@ pub const RuleEngine = struct {
             while (i < engine.rules.len and std.mem.eql(u8, engine.rules[i].element_path, path)) : (i += 1) {}
             try engine.rule_map.put(path, engine.rules[group_start..i]);
         }
+        try engine.buildPathIndex();
         return engine;
     }
 
@@ -76,11 +89,23 @@ pub const RuleEngine = struct {
         }
         engine.allocator.free(engine.rules);
         engine.rule_map.deinit();
+        engine.path_nodes.deinit(engine.allocator);
     }
 
     /// Look up rules for a given element path via hash map.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
         return engine.rule_map.get(element_path) orelse &.{};
+    }
+
+    pub fn advancePath(engine: *const RuleEngine, parent: ?PathState, element_id: elements.ElementId) ?PathState {
+        const state = parent orelse return null;
+        if (element_id == .unknown) return null;
+        const child = engine.path_nodes.items[state].children[@intFromEnum(element_id)];
+        return if (child == no_path_state) null else child;
+    }
+
+    pub fn rulesForState(engine: *const RuleEngine, state: ?PathState) []const MappingRule {
+        return engine.path_nodes.items[state orelse return &.{}].rules;
     }
 
     /// Returns the first mapping accession absent from `table`.
@@ -92,6 +117,32 @@ pub const RuleEngine = struct {
             }
         }
         return null;
+    }
+
+    fn buildPathIndex(engine: *RuleEngine) !void {
+        try engine.path_nodes.append(engine.allocator, .{});
+        for (engine.rules) |rule| {
+            var state = root_path_state;
+            var components = std.mem.tokenizeScalar(u8, rule.element_path, '/');
+            var indexable = true;
+            while (components.next()) |component| {
+                const element_id = elements.idFromLocalName(component);
+                if (element_id == .unknown) {
+                    indexable = false;
+                    break;
+                }
+                const child_index = @intFromEnum(element_id);
+                var child = engine.path_nodes.items[state].children[child_index];
+                if (child == no_path_state) {
+                    if (engine.path_nodes.items.len >= no_path_state) return error.MappingPathLimitExceeded;
+                    child = @intCast(engine.path_nodes.items.len);
+                    try engine.path_nodes.append(engine.allocator, .{});
+                    engine.path_nodes.items[state].children[child_index] = child;
+                }
+                state = child;
+            }
+            if (indexable) engine.path_nodes.items[state].rules = engine.rulesFor(rule.element_path);
+        }
     }
 };
 
@@ -298,6 +349,84 @@ test "RuleEngine.rulesFor returns empty for unknown path" {
 
     const rules = engine.rulesFor("/nonexistent/path");
     try std.testing.expectEqual(@as(usize, 0), rules.len);
+}
+
+test "RuleEngine incrementally resolves paths with parent context" {
+    const allocator = std.testing.allocator;
+    const xml = @embedFile("../data/ms-mapping.xml");
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    const spectrum_path = [_]elements.ElementId{
+        .mzML, .run, .spectrumList, .spectrum, .binaryDataArrayList, .binaryDataArray,
+    };
+    var spectrum_state: ?PathState = root_path_state;
+    for (spectrum_path) |element_id| spectrum_state = engine.advancePath(spectrum_state, element_id);
+    const spectrum_rules = engine.rulesForState(spectrum_state);
+    try std.testing.expectEqualStrings("spectrum_binarydataarray_must", spectrum_rules[0].id);
+    try std.testing.expectEqualSlices(
+        MappingRule,
+        engine.rulesFor("/mzML/run/spectrumList/spectrum/binaryDataArrayList/binaryDataArray"),
+        spectrum_rules,
+    );
+
+    const chromatogram_path = [_]elements.ElementId{
+        .mzML, .run, .chromatogramList, .chromatogram, .binaryDataArrayList, .binaryDataArray,
+    };
+    var chromatogram_state: ?PathState = root_path_state;
+    for (chromatogram_path) |element_id| chromatogram_state = engine.advancePath(chromatogram_state, element_id);
+    const chromatogram_rules = engine.rulesForState(chromatogram_state);
+    try std.testing.expectEqualStrings("chromatogram_binarydataarray_must", chromatogram_rules[0].id);
+    try std.testing.expect(spectrum_state != chromatogram_state);
+
+    try std.testing.expect(engine.advancePath(root_path_state, .binaryDataArray) == null);
+    try std.testing.expectEqual(@as(usize, 0), engine.rulesForState(null).len);
+}
+
+test "RuleEngine incremental index covers every embedded mapping path" {
+    const allocator = std.testing.allocator;
+    const xml = @embedFile("../data/ms-mapping.xml");
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    for (engine.rules) |rule| {
+        var state: ?PathState = root_path_state;
+        var components = std.mem.tokenizeScalar(u8, rule.element_path, '/');
+        while (components.next()) |component| {
+            const element_id = elements.idFromLocalName(component);
+            try std.testing.expect(element_id != .unknown);
+            state = engine.advancePath(state, element_id);
+            try std.testing.expect(state != null);
+        }
+
+        try std.testing.expectEqualSlices(
+            MappingRule,
+            engine.rulesFor(rule.element_path),
+            engine.rulesForState(state),
+        );
+    }
+}
+
+test "RuleEngine path index construction cleans allocation failures" {
+    const xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"></CvTerm>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+
+    var reached_success = false;
+    for (0..64) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        if (RuleEngine.init(failing_allocator.allocator(), xml)) |engine_value| {
+            var engine = engine_value;
+            engine.deinit();
+            reached_success = true;
+        } else |err| {
+            try std.testing.expectEqual(error.OutOfMemory, err);
+        }
+        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+        if (reached_success) break;
+    }
+    try std.testing.expect(reached_success);
 }
 
 test "RuleEngine does not parse commented-out rules" {

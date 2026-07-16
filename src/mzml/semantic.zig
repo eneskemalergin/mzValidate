@@ -30,6 +30,14 @@ const ElementId = elements.ElementId;
 const MappingRule = rule_engine.MappingRule;
 const MappingTerm = rule_engine.MappingTerm;
 
+const descendant_cache_len = 128;
+
+const DescendantCacheEntry = struct {
+    accession: ?[]const u8 = null,
+    ancestor: []const u8 = &.{},
+    result: bool = false,
+};
+
 const mzml_namespace = diagnostic.mzml_namespace;
 
 const SemanticOwner = enum {
@@ -169,9 +177,9 @@ const ScopeItem = struct {
 };
 
 const ScopeFrame = struct {
-    element_id: ElementId,
     scope_start: usize,
     rules: []const MappingRule,
+    parent_path_state: ?rule_engine.PathState,
 };
 
 const UnresolvedRef = struct {
@@ -359,12 +367,14 @@ pub const SemanticValidator = struct {
 
     scope_frames: std.ArrayList(ScopeFrame),
     scope_items: std.ArrayList(ScopeItem),
+    path_state: ?rule_engine.PathState,
 
     ref_table: RefTable,
 
     param_groups: std.StringHashMap(std.ArrayList([]const u8)),
     current_group_id: ?[]const u8 = null,
     ancestry_limit_reported: bool = false,
+    descendant_cache: [descendant_cache_len]DescendantCacheEntry = @splat(.{}),
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -394,6 +404,7 @@ pub const SemanticValidator = struct {
             .cv_refs = std.StringHashMap(void).init(allocator),
             .scope_frames = std.ArrayList(ScopeFrame).empty,
             .scope_items = std.ArrayList(ScopeItem).empty,
+            .path_state = rule_engine.root_path_state,
             .ref_table = RefTable.init(allocator),
             .param_groups = std.StringHashMap(std.ArrayList([]const u8)).init(allocator),
         };
@@ -556,25 +567,12 @@ pub const SemanticValidator = struct {
             }
 
             const scope_start = validator.scope_items.items.len;
-
-            var path_buf: [4096]u8 = undefined;
-            var pos: usize = 0;
-            path_buf[pos] = '/';
-            pos += 1;
-            for (validator.scope_frames.items) |frame| {
-                if (frame.element_id == .indexedmzML) continue;
-                const fname = @tagName(frame.element_id);
-                if (pos + fname.len + 1 > path_buf.len) return;
-                @memcpy(path_buf[pos..][0..fname.len], fname);
-                pos += fname.len;
-                path_buf[pos] = '/';
-                pos += 1;
-            }
-            if (pos + start.name.local_name.len > path_buf.len) return;
-            @memcpy(path_buf[pos..][0..start.name.local_name.len], start.name.local_name);
-            pos += start.name.local_name.len;
-            const cur_path = path_buf[0..pos];
-            const rules = validator.rule_engine.rulesFor(cur_path);
+            const parent_path_state = validator.path_state;
+            const path_state = if (tag == .indexedmzML)
+                parent_path_state
+            else
+                validator.rule_engine.advancePath(parent_path_state, tag);
+            const rules = validator.rule_engine.rulesForState(path_state);
 
             try ensureListCapacity(
                 &validator.scope_frames,
@@ -587,10 +585,11 @@ pub const SemanticValidator = struct {
                 start.byte_offset,
             );
             try validator.scope_frames.append(validator.allocator, ScopeFrame{
-                .element_id = tag,
                 .scope_start = scope_start,
                 .rules = rules,
+                .parent_path_state = parent_path_state,
             });
+            validator.path_state = path_state;
 
             switch (tag) {
                 .referenceableParamGroup => {
@@ -782,6 +781,7 @@ pub const SemanticValidator = struct {
         if (validator.scope_frames.items.len == 0) return;
         const frame = validator.scope_frames.items[validator.scope_frames.items.len - 1];
         validator.scope_frames.items.len -= 1;
+        defer validator.path_state = frame.parent_path_state;
         const scope = validator.scope_items.items[frame.scope_start..validator.scope_items.items.len];
         defer validator.scope_items.items.len = frame.scope_start;
         defer {
@@ -846,15 +846,61 @@ pub const SemanticValidator = struct {
 
         // Check rules for required terms and contradictions.
         const rules = frame.rules;
+        var repeat_violation = false;
+        var contradiction_violation = false;
         for (rules) |rule| {
             var matched: usize = 0;
-            for (rule.terms) |rt| {
+            if (rule.logic == .@"or" and rule.terms.len <= @bitSizeOf(u64)) {
+                var matched_terms: u64 = 0;
+                var exact_terms: u64 = 0;
+                var matched_scope_items: usize = 0;
+                var first_term: ?usize = null;
                 for (scope) |st| {
-                    const is_match = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
-                    if (is_match) {
-                        matched += 1;
-                        break;
+                    var scope_term: ?usize = null;
+                    for (rule.terms, 0..) |rt, term_index| {
+                        const term_bit = @as(u64, 1) << @intCast(term_index);
+                        if (std.mem.eql(u8, st.accession, rt.accession)) {
+                            if (!rt.is_repeatable and exact_terms & term_bit != 0) repeat_violation = true;
+                            exact_terms |= term_bit;
+                        }
+                        if (scope_term == null and try validator.matchesMappingTerm(st.accession, rt, end.byte_offset)) {
+                            scope_term = term_index;
+                        }
                     }
+                    if (scope_term) |term_index| {
+                        const term_bit = @as(u64, 1) << @intCast(term_index);
+                        matched_terms |= term_bit;
+                        matched_scope_items += 1;
+                        if (first_term) |first_index| {
+                            if (first_index == term_index and !rule.terms[term_index].is_repeatable) {
+                                contradiction_violation = true;
+                            }
+                        } else {
+                            first_term = term_index;
+                        }
+                    }
+                }
+                matched = @popCount(matched_terms);
+                if (matched_scope_items > 1) {
+                    for (rule.terms) |rt| {
+                        if (!rt.allow_children) {
+                            contradiction_violation = true;
+                            break;
+                        }
+                    }
+                }
+            } else {
+                for (rule.terms) |rt| {
+                    var term_matched = false;
+                    var exact_matches: usize = 0;
+                    for (scope) |st| {
+                        if (std.mem.eql(u8, st.accession, rt.accession)) exact_matches += 1;
+                        if (!term_matched) {
+                            term_matched = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
+                        }
+                    }
+                    if (term_matched) matched += 1;
+                    if (!rt.is_repeatable and exact_matches > 1) repeat_violation = true;
                 }
             }
 
@@ -894,27 +940,17 @@ pub const SemanticValidator = struct {
             }
         }
 
-        // Non-repeatable term duplication (outside OR groups; OR-group
-        // duplicates are caught by contradiction detection above).
-        for (scope, 0..) |item, i| {
-            for (scope[0..i]) |earlier| {
-                if (std.mem.eql(u8, item.accession, earlier.accession)) {
-                    for (rules) |r| {
-                        for (r.terms) |rt| {
-                            if (!rt.is_repeatable and std.mem.eql(u8, rt.accession, item.accession)) {
-                                _ = try validator.diagnostics.append(validator.allocator, .{
-                                    .severity = .warning,
-                                    .rule = RuleId.mzml_cv_term_repeat,
-                                    .location = .{ .byte_offset = end.byte_offset },
-                                    .path = validator.path,
-                                    .message = "non-repeatable CV term appears more than once on the same element",
-                                });
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
+        // Exact duplicate counts are folded into the rule-term scan above,
+        // avoiding a second quadratic pass over the scope.
+        if (repeat_violation) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .warning,
+                .rule = RuleId.mzml_cv_term_repeat,
+                .location = .{ .byte_offset = end.byte_offset },
+                .path = validator.path,
+                .message = "non-repeatable CV term appears more than once on the same element",
+            });
+            return;
         }
 
         // Contradiction: two alternatives from the same OR rule on one element.
@@ -928,7 +964,7 @@ pub const SemanticValidator = struct {
         // attribute" with upper and lower limits).
         if (scope.len >= 2) {
             for (rules) |r| {
-                if (r.logic != .@"or") continue;
+                if (r.logic != .@"or" or r.terms.len <= @bitSizeOf(u64)) continue;
                 var or_matched: usize = 0;
                 var first_term: ?usize = null;
                 for (scope) |st| {
@@ -982,6 +1018,15 @@ pub const SemanticValidator = struct {
                 }
             }
         }
+        if (contradiction_violation) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .warning,
+                .rule = RuleId.mzml_cv_contradiction,
+                .location = .{ .byte_offset = end.byte_offset },
+                .path = validator.path,
+                .message = "element has contradictory CV terms",
+            });
+        }
     }
 
     fn matchesMappingTerm(validator: *SemanticValidator, accession: []const u8, term: MappingTerm, byte_offset: u64) !bool {
@@ -990,6 +1035,40 @@ pub const SemanticValidator = struct {
     }
 
     fn matchesDescendant(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8, byte_offset: u64) !bool {
+        if (std.mem.eql(u8, accession, ancestor)) return true;
+
+        const cache_hash = std.hash.Wyhash.hash(
+            std.hash.Wyhash.hash(0, accession),
+            ancestor,
+        );
+        const cache_index: usize = @intCast(cache_hash & (descendant_cache_len - 1));
+        const cached = validator.descendant_cache[cache_index];
+        if (cached.accession) |cached_accession| {
+            if (std.mem.eql(u8, cached_accession, accession) and
+                std.mem.eql(u8, cached.ancestor, ancestor))
+            {
+                return cached.result;
+            }
+        }
+
+        const result = try validator.resolveDescendant(accession, ancestor, byte_offset);
+        if (!validator.ancestry_limit_reported) {
+            // Scope values may borrow a parser buffer. Retain only canonical
+            // invocation-owned slices from the CV table on a cache miss.
+            if (validator.cv_table.lookup(accession)) |accession_term| {
+                if (validator.cv_table.lookup(ancestor)) |ancestor_term| {
+                    validator.descendant_cache[cache_index] = .{
+                        .accession = accession_term.accession,
+                        .ancestor = ancestor_term.accession,
+                        .result = result,
+                    };
+                }
+            }
+        }
+        return result;
+    }
+
+    fn resolveDescendant(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8, byte_offset: u64) !bool {
         return switch (validator.cv_table.isDescendantOf(accession, ancestor)) {
             .yes => true,
             .no => false,
@@ -1242,6 +1321,36 @@ test "SemanticValidator: valid accession produces no diagnostic" {
     try consumeCv(&sv, "MS");
     try consumeCvParam(&sv, "MS:1000001", "MS", 0);
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "SemanticValidator: descendant cache retains canonical CV accessions" {
+    const allocator = testing.allocator;
+    var cv_table = try CvTable.init(allocator, @embedFile("../data/psi-ms.obo"));
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    const borrowed = try allocator.dupe(u8, "MS:1003378");
+    defer allocator.free(borrowed);
+    try testing.expect(try sv.matchesDescendant(borrowed, "MS:1000031", 0));
+    try testing.expect(try sv.matchesDescendant(borrowed, "MS:1000031", 1));
+
+    const canonical = cv_table.lookup("MS:1003378").?.accession;
+    var found = false;
+    for (sv.descendant_cache) |entry| {
+        if (entry.accession) |cached_accession| {
+            if (std.mem.eql(u8, cached_accession, canonical)) {
+                try testing.expect(cached_accession.ptr == canonical.ptr);
+                found = true;
+            }
+        }
+    }
+    try testing.expect(found);
 }
 
 test "SemanticValidator: raw attribute fallback ignores namespace declarations" {
@@ -2088,6 +2197,33 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
 }
 
 // --- Contradiction detection across all rules ---
+
+test "SemanticValidator: non-repeatable exact duplicates are detected during rule scan" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000130\n" ++ "name: positive scan\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000130\" isRepeatable=\"false\"></CvTerm>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000130", "MS", 10);
+    try consumeCvParam(&sv, "MS:1000130", "MS", 20);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 30));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_term_repeat, diagnostics.items[0].rule);
+}
 
 test "SemanticValidator: contradiction detected when two OR alternatives on same element" {
     const allocator = testing.allocator;
