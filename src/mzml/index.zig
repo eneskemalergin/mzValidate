@@ -22,6 +22,7 @@ const Text = xml_events.Text;
 const QName = xml_events.QName;
 
 const mzml_namespace = diagnostic.mzml_namespace;
+const online_sha_batch_bytes = 64 * 1024;
 
 const IndexKind = enum { spectrum, chromatogram };
 
@@ -108,6 +109,17 @@ pub const IndexValidator = struct {
         validator.sha_ctx = std.crypto.hash.Sha1.init(.{});
         validator.sha_bytes_hashed = 0;
         validator.sha_complete = false;
+    }
+
+    /// Feeds a normal parser boundary only after enough raw input accumulated.
+    /// The checksum-element boundary always flushes through `feedShaExclusive`.
+    pub fn maybeFeedShaExclusive(validator: *IndexValidator, exclusive_end: u64) void {
+        if (validator.sha_file_bytes == null or validator.sha_complete) return;
+        const bytes = validator.sha_file_bytes.?;
+        const cap = validator.file_checksum_byte_offset orelse bytes.len;
+        const end = @min(exclusive_end, cap, bytes.len);
+        if (end -| validator.sha_bytes_hashed < online_sha_batch_bytes) return;
+        validator.feedShaExclusive(end);
     }
 
     /// Hash raw file bytes through `exclusive_end` (not hashed). Stops at the
@@ -1217,6 +1229,29 @@ test "IndexValidator: online SHA matches batch hash at checksum boundary" {
 
     const batch = computeChecksumBatch(file_bytes, checksum_offset);
     try expect(v.sha_complete);
+    try testing.expectEqualSlices(u8, &batch, &v.sha_computed);
+}
+
+test "IndexValidator: online SHA batches parser boundaries and flushes checksum boundary" {
+    var bytes: [online_sha_batch_bytes * 2 + 7]u8 = undefined;
+    @memset(&bytes, 'x');
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(testing.allocator);
+
+    var v = IndexValidator.init(testing.allocator, &diagnostics, null);
+    defer v.deinit();
+
+    v.beginOnlineSha(&bytes);
+    for (0..bytes.len) |end| v.maybeFeedShaExclusive(end);
+    try expectEqual(@as(u64, online_sha_batch_bytes * 2), v.sha_bytes_hashed);
+
+    v.file_checksum_byte_offset = bytes.len;
+    v.feedShaExclusive(bytes.len);
+
+    const batch = computeChecksumBatch(&bytes, bytes.len);
+    try expect(v.sha_complete);
+    try expectEqual(@as(u64, bytes.len), v.sha_bytes_hashed);
     try testing.expectEqualSlices(u8, &batch, &v.sha_computed);
 }
 

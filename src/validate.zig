@@ -784,7 +784,7 @@ fn runValidation(
         }
         if (index_validator) |*validator| {
             result.beginStage(.index);
-            validator.feedShaExclusive(parser.byteOffset() + 1);
+            validator.maybeFeedShaExclusive(parser.byteOffset() + 1);
         }
     }
 
