@@ -10,5 +10,6 @@
         "fixtures",
         "src",
         "src/data",
+        "vendor",
     },
 }
