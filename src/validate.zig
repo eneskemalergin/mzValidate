@@ -2311,7 +2311,7 @@ test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
     );
 }
 
-test "checkReader_oversized_text_token_maps_parser_limit_to_structure_xml_diagnostic" {
+test "checkReader_oversized_attribute_maps_parser_limit_to_structure_xml_diagnostic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2329,7 +2329,7 @@ test "checkReader_oversized_text_token_maps_parser_limit_to_structure_xml_diagno
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "XML token exceeds the configured parser buffer",
+        "XML attribute exceeds the configured attribute limit",
     );
 }
 

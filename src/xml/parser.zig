@@ -29,6 +29,10 @@ pub const ParseError = error{
     MalformedXml,
     InvalidUtf8,
     TokenTooLong,
+    StartTagTooLong,
+    AttributeTooLong,
+    ScalarTextTooLong,
+    BinaryTextTooLong,
     TooManyAttributes,
     TooManyNamespaces,
     NamespaceStorageExceeded,
@@ -65,6 +69,13 @@ const TextState = struct {
     saw_non_whitespace: bool = false,
 };
 
+const LimitField = enum {
+    start_tag,
+    attribute,
+    scalar_text,
+    binary_text,
+};
+
 pub const NamespaceBinding = struct {
     prefix: ?Range,
     namespace_uri: Range,
@@ -89,6 +100,14 @@ pub const Buffers = struct {
     namespace_bytes: []u8,
     element_stack: []ElementFrame,
     element_bytes: []u8,
+    limits: Limits = .{},
+};
+
+pub const Limits = struct {
+    max_start_tag_bytes: usize = 1024 * 1024,
+    max_attribute_bytes: usize = 64 * 1024,
+    max_scalar_text_bytes: usize = 64 * 1024,
+    max_binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
 // --- Parser ---
@@ -113,6 +132,7 @@ pub const Parser = struct {
     namespace_bytes: []u8,
     element_storage: []ElementFrame,
     element_bytes: []u8,
+    limits: Limits,
 
     token_len: usize = 0,
     attribute_count: usize = 0,
@@ -127,6 +147,9 @@ pub const Parser = struct {
     last_byte_offset: u64 = 0,
     pending_self_closing_end: bool = false,
     text_state: ?TextState = null,
+    text_bytes: usize = 0,
+    attribute_token_start: ?usize = null,
+    start_tag_offset: ?u64 = null,
     // True once the UTF-8 BOM (if any) has been checked and skipped.
     bom_checked: bool = false,
     // Bytes replayed after a partial UTF-8 BOM prefix (0xEF without 0xBB 0xBF).
@@ -148,6 +171,7 @@ pub const Parser = struct {
             .namespace_bytes = buffers.namespace_bytes,
             .element_storage = buffers.element_stack,
             .element_bytes = buffers.element_bytes,
+            .limits = buffers.limits,
         };
     }
 
@@ -162,6 +186,7 @@ pub const Parser = struct {
             .namespace_bytes = buffers.namespace_bytes,
             .element_storage = buffers.element_stack,
             .element_bytes = buffers.element_bytes,
+            .limits = buffers.limits,
         };
     }
 
@@ -223,14 +248,61 @@ pub const Parser = struct {
         return parser.last_byte_offset;
     }
 
+    fn textField(parser: *const Parser, from_cdata: bool) LimitField {
+        if (!from_cdata and parser.element_count > 0 and parser.topElementFrame().element_id == .binary) {
+            return .binary_text;
+        }
+        return .scalar_text;
+    }
+
+    fn limitForField(parser: *const Parser, field: LimitField) usize {
+        return switch (field) {
+            .start_tag => parser.limits.max_start_tag_bytes,
+            .attribute => parser.limits.max_attribute_bytes,
+            .scalar_text => parser.limits.max_scalar_text_bytes,
+            .binary_text => parser.limits.max_binary_text_bytes,
+        };
+    }
+
+    fn errorForField(field: LimitField) ParseError {
+        return switch (field) {
+            .start_tag => error.StartTagTooLong,
+            .attribute => error.AttributeTooLong,
+            .scalar_text => error.ScalarTextTooLong,
+            .binary_text => error.BinaryTextTooLong,
+        };
+    }
+
+    fn ensureTokenAppend(parser: *const Parser, field: LimitField, bytes: usize) ParseError!void {
+        const current = switch (field) {
+            .attribute => parser.token_len - (parser.attribute_token_start orelse parser.token_len),
+            .scalar_text, .binary_text => std.math.add(usize, parser.text_bytes, parser.token_len) catch return errorForField(field),
+            .start_tag => 0,
+        };
+        const total = std.math.add(usize, current, bytes) catch return errorForField(field);
+        if (total > parser.limitForField(field)) return errorForField(field);
+        if (parser.token_len > parser.token_buffer.len or bytes > parser.token_buffer.len - parser.token_len) {
+            return errorForField(field);
+        }
+    }
+
+    fn ensureStartTagLimit(parser: *const Parser, extra: usize) ParseError!void {
+        const start = parser.start_tag_offset orelse return;
+        const consumed = std.math.sub(u64, parser.absolute_offset, start) catch return error.StartTagTooLong;
+        const current = std.math.add(u64, consumed, @intCast(extra)) catch return error.StartTagTooLong;
+        if (current > parser.limits.max_start_tag_bytes) return error.StartTagTooLong;
+    }
+
     fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!?Event {
+        const field = parser.textField(from_cdata);
         if (parser.lookahead == null and parser.input == .slice and first_byte != '&') {
             const slice = &parser.input.slice;
             const start = slice.pos - 1;
             const tail = slice.bytes[slice.pos..];
             const plain_len = scan.textPlainRunLen(tail);
             if (plain_len == tail.len or tail[plain_len] != '&') {
-                const value_len = std.math.add(usize, plain_len, 1) catch return error.TokenTooLong;
+                const value_len = std.math.add(usize, plain_len, 1) catch return errorForField(field);
+                if (value_len > parser.limitForField(field)) return errorForField(field);
                 const value = slice.bytes[start..][0..value_len];
                 parser.consumeSliceBytes(plain_len);
                 if (!from_cdata and isWhitespaceOnly(value)) return null;
@@ -244,24 +316,26 @@ pub const Parser = struct {
         }
 
         if (parser.input == .reader) {
-            if (parser.token_buffer.len <= 4) return error.TokenTooLong;
+            if (parser.token_buffer.len <= 4) return errorForField(field);
             parser.text_state = .{
                 .byte_offset = byte_offset,
                 .from_cdata = from_cdata,
             };
-            try parser.appendDecodedTextByte(first_byte);
+            parser.text_bytes = 0;
+            try parser.appendDecodedTextByte(first_byte, field);
             return try parser.continueText();
         }
 
-        try parser.appendDecodedTextByte(first_byte);
+        parser.text_bytes = 0;
+        try parser.appendDecodedTextByte(first_byte, field);
 
-        try parser.consumeSliceTextPlainRun();
+        try parser.consumeSliceTextPlainRun(field);
 
         while (true) {
             const next_byte = try parser.peekOptionalByte();
             if (next_byte == null or next_byte.? == '<') break;
             _ = try parser.takeRequiredByte();
-            try parser.appendDecodedTextByte(next_byte.?);
+            try parser.appendDecodedTextByte(next_byte.?, field);
         }
 
         const value = parser.currentToken();
@@ -277,14 +351,17 @@ pub const Parser = struct {
 
     fn continueText(parser: *Parser) ParseError!?Event {
         if (parser.text_state.?.from_cdata) return @as(?Event, try parser.continueCdata());
+        const field = parser.textField(false);
 
         while (true) {
             const state = &parser.text_state.?;
             const next_byte = try parser.peekOptionalByte();
             if (next_byte == null or next_byte.? == '<') {
                 if (!state.saw_non_whitespace and isWhitespaceOnly(parser.currentToken())) {
+                    try parser.ensureTokenAppend(field, 0);
                     parser.text_state = null;
                     parser.token_len = 0;
+                    parser.text_bytes = 0;
                     return null;
                 }
                 return try parser.emitTextChunk(true);
@@ -301,11 +378,12 @@ pub const Parser = struct {
             }
 
             _ = try parser.takeRequiredByte();
-            try parser.appendDecodedTextByte(next_byte.?);
+            try parser.appendDecodedTextByte(next_byte.?, field);
         }
     }
 
     fn continueCdata(parser: *Parser) ParseError!Event {
+        const field = LimitField.scalar_text;
         while (true) {
             const state = &parser.text_state.?;
             const byte = try parser.peekOptionalByte() orelse return error.UnexpectedEof;
@@ -319,7 +397,7 @@ pub const Parser = struct {
                     if (byte == ']') {
                         state.cdata_brackets = 1;
                     } else {
-                        try parser.appendTokenByte(byte);
+                        try parser.appendTokenByte(byte, field);
                     }
                 },
                 1 => {
@@ -332,9 +410,9 @@ pub const Parser = struct {
                             return try parser.emitTextChunk(false);
                         }
                         _ = try parser.takeRequiredByte();
-                        try parser.appendTokenByte(']');
+                        try parser.appendTokenByte(']', field);
                         state.cdata_brackets = 0;
-                        try parser.appendTokenByte(byte);
+                        try parser.appendTokenByte(byte, field);
                     }
                 },
                 2 => {
@@ -349,13 +427,13 @@ pub const Parser = struct {
                         return try parser.emitTextChunk(false);
                     }
                     _ = try parser.takeRequiredByte();
-                    try parser.appendTokenByte(']');
-                    try parser.appendTokenByte(']');
+                    try parser.appendTokenByte(']', field);
+                    try parser.appendTokenByte(']', field);
                     if (byte == ']') {
                         state.cdata_brackets = 1;
                     } else {
                         state.cdata_brackets = 0;
-                        try parser.appendTokenByte(byte);
+                        try parser.appendTokenByte(byte, field);
                     }
                 },
                 else => return error.MalformedXml,
@@ -367,7 +445,15 @@ pub const Parser = struct {
         const state = parser.text_state orelse return error.MalformedXml;
         const value = parser.currentToken();
         if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
-        if (is_final) parser.text_state = null;
+        const field = if (state.from_cdata) LimitField.scalar_text else parser.textField(false);
+        const total = std.math.add(usize, parser.text_bytes, value.len) catch return errorForField(field);
+        if (total > parser.limitForField(field)) return errorForField(field);
+        if (is_final) {
+            parser.text_state = null;
+            parser.text_bytes = 0;
+        } else {
+            parser.text_bytes = total;
+        }
         return .{ .text = .{
             .byte_offset = state.byte_offset,
             .value = value,
@@ -381,10 +467,13 @@ pub const Parser = struct {
     }
 
     fn parseStartElement(parser: *Parser, byte_offset: u64, first_name_byte: u8) ParseError!Event {
+        parser.start_tag_offset = byte_offset;
+        defer parser.start_tag_offset = null;
+
         const namespace_count_before = parser.namespace_count;
         const namespace_bytes_before = parser.namespace_bytes_len;
 
-        const name_parts = try parser.parseName(first_name_byte);
+        const name_parts = try parser.parseName(first_name_byte, .start_tag);
         const local_name = name_parts.local_name.slice(parser.token_buffer);
         const lazy_attrs = (std.mem.eql(u8, local_name, "cvParam") or
             std.mem.eql(u8, local_name, "userParam")) and parser.input == .slice;
@@ -393,8 +482,19 @@ pub const Parser = struct {
             const slice = &parser.input.slice;
             const raw_start = if (parser.lookahead != null) slice.pos - 1 else slice.pos;
             const raw_source = slice.bytes[raw_start..];
-            if (scan.rawStartTagInfo(raw_source)) |tag_info| {
-                const raw_tag = raw_source[0..tag_info.end];
+            const consumed = std.math.sub(u64, parser.absolute_offset, byte_offset) catch return error.StartTagTooLong;
+            const remaining = if (consumed >= parser.limits.max_start_tag_bytes)
+                0
+            else
+                parser.limits.max_start_tag_bytes - @as(usize, @intCast(consumed));
+            const scan_len = @min(raw_source.len, remaining);
+            const tag_info = scan.rawStartTagInfo(raw_source[0..scan_len]) orelse if (raw_source.len > scan_len)
+                return error.StartTagTooLong
+            else
+                null;
+            if (tag_info) |info| {
+                try parser.ensureStartTagLimit(info.end);
+                const raw_tag = raw_source[0..info.end];
                 var raw_scanner = scan.RawAttributeScanner.init(raw_tag);
                 var use_lazy_attributes = true;
                 while (raw_scanner.next() catch |err| switch (err) {
@@ -402,6 +502,8 @@ pub const Parser = struct {
                     error.Malformed => return error.MalformedXml,
                 }) |attribute| {
                     if (parser.attribute_count >= parser.attribute_storage.len) return error.TooManyAttributes;
+                    const attribute_bytes = std.math.add(usize, attribute.name.len, attribute.value.len) catch return error.AttributeTooLong;
+                    if (attribute_bytes > parser.limits.max_attribute_bytes) return error.AttributeTooLong;
                     const name_colon = std.mem.indexOfScalar(u8, attribute.name, ':');
                     const attribute_offset = std.math.add(usize, raw_start, attribute.name_start) catch return error.UnexpectedEof;
                     parser.attribute_storage[parser.attribute_count] = .{
@@ -421,7 +523,7 @@ pub const Parser = struct {
                     }
                 }
                 if (use_lazy_attributes) {
-                    const raw_end = std.math.add(usize, raw_start, tag_info.end) catch return error.UnexpectedEof;
+                    const raw_end = std.math.add(usize, raw_start, info.end) catch return error.UnexpectedEof;
                     const after_tag = std.math.add(usize, raw_end, 1) catch return error.UnexpectedEof;
                     slice.pos = after_tag;
                     parser.lookahead = null;
@@ -433,10 +535,10 @@ pub const Parser = struct {
                         name_parts,
                         namespace_count_before,
                         namespace_bytes_before,
-                        tag_info.self_closing,
-                        if (tag_info.self_closing) @intCast(raw_end) else null,
+                        info.self_closing,
+                        if (info.self_closing) @intCast(raw_end) else null,
                     );
-                    if (tag_info.self_closing) parser.pending_self_closing_end = true;
+                    if (info.self_closing) parser.pending_self_closing_end = true;
                     event.start_element.raw_tag = raw_tag;
                     return event;
                 }
@@ -446,16 +548,19 @@ pub const Parser = struct {
 
         while (true) {
             try parser.skipWhitespace();
+            try parser.ensureStartTagLimit(0);
             const next_byte = try parser.peekRequiredByte();
 
             switch (next_byte) {
                 '>' => {
                     _ = try parser.takeRequiredByte();
+                    try parser.ensureStartTagLimit(0);
                     break;
                 },
                 '/' => {
                     _ = try parser.takeRequiredByte();
                     try parser.expectByte('>');
+                    try parser.ensureStartTagLimit(0);
                     const event = try parser.finishStartElement(
                         byte_offset,
                         name_parts,
@@ -467,7 +572,10 @@ pub const Parser = struct {
                     parser.pending_self_closing_end = true;
                     return event;
                 },
-                else => try parser.parseAttribute(),
+                else => {
+                    try parser.parseAttribute();
+                    try parser.ensureStartTagLimit(0);
+                },
             }
         }
 
@@ -508,7 +616,7 @@ pub const Parser = struct {
         if (parser.element_count == 0) return error.MalformedXml;
 
         const first_name_byte = try parser.takeRequiredByte();
-        const actual_name = try parser.parseName(first_name_byte);
+        const actual_name = try parser.parseName(first_name_byte, .start_tag);
         try parser.skipWhitespace();
         try parser.expectByte('>');
 
@@ -529,9 +637,12 @@ pub const Parser = struct {
     fn parseAttribute(parser: *Parser) ParseError!void {
         if (parser.attribute_count >= parser.attribute_storage.len) return error.TooManyAttributes;
 
+        parser.attribute_token_start = parser.token_len;
+        defer parser.attribute_token_start = null;
+
         const byte = try parser.takeRequiredByte();
         const byte_offset = parser.last_byte_offset;
-        const name = try parser.parseName(byte);
+        const name = try parser.parseName(byte, .attribute);
 
         try parser.skipWhitespace();
         try parser.expectByte('=');
@@ -542,10 +653,10 @@ pub const Parser = struct {
 
         const value_start = parser.token_len;
         while (true) {
-            try parser.consumeSliceAttrValuePlainRun(quote);
+            try parser.consumeSliceAttrValuePlainRun(quote, .attribute);
             const next_byte = try parser.takeRequiredByte();
             if (next_byte == quote) break;
-            try parser.appendDecodedTextByte(next_byte);
+            try parser.appendDecodedTextByte(next_byte, .attribute);
         }
         const value = parser.token_buffer[value_start..parser.token_len];
         if (!std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
@@ -619,6 +730,7 @@ pub const Parser = struct {
             const start = slice.pos;
             const tail = slice.bytes[start..];
             const content_len = scan.cdataContentLen(tail) orelse return error.UnexpectedEof;
+            if (content_len > parser.limits.max_scalar_text_bytes) return error.ScalarTextTooLong;
             const value = slice.bytes[start..][0..content_len];
             const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
             parser.consumeSliceBytes(consumed_len);
@@ -630,11 +742,12 @@ pub const Parser = struct {
             } };
         }
 
-        if (parser.token_buffer.len <= 4) return error.TokenTooLong;
+        if (parser.token_buffer.len <= 4) return error.ScalarTextTooLong;
         parser.text_state = .{
             .byte_offset = byte_offset,
             .from_cdata = true,
         };
+        parser.text_bytes = 0;
         return try parser.continueCdata();
     }
 
@@ -683,17 +796,18 @@ pub const Parser = struct {
         }
     }
 
-    fn parseName(parser: *Parser, first_byte: u8) ParseError!NameParts {
+    fn parseName(parser: *Parser, first_byte: u8, field: LimitField) ParseError!NameParts {
         const start = parser.token_len;
-        try parser.appendTokenByte(first_byte);
+        try parser.appendTokenByte(first_byte, field);
 
-        try parser.consumeSliceNameCharRun();
+        try parser.consumeSliceNameCharRun(field);
 
         while (true) {
             const next_byte = try parser.peekOptionalByte();
             if (next_byte == null or isNameTerminator(next_byte.?)) break;
+            if (field == .start_tag) try parser.ensureStartTagLimit(0);
             _ = try parser.takeRequiredByte();
-            try parser.appendTokenByte(next_byte.?);
+            try parser.appendTokenByte(next_byte.?, field);
         }
 
         const bytes = parser.token_buffer[start..parser.token_len];
@@ -840,19 +954,19 @@ pub const Parser = struct {
         parser.element_bytes_len = frame.element_bytes_before;
     }
 
-    fn topElementFrame(parser: *Parser) ElementFrame {
+    fn topElementFrame(parser: *const Parser) ElementFrame {
         return parser.element_storage[parser.element_count - 1];
     }
 
-    fn appendDecodedTextByte(parser: *Parser, byte: u8) ParseError!void {
+    fn appendDecodedTextByte(parser: *Parser, byte: u8, field: LimitField) ParseError!void {
         if (byte == '&') {
-            try parser.decodeEntityReference();
+            try parser.decodeEntityReference(field);
             return;
         }
-        try parser.appendTokenByte(byte);
+        try parser.appendTokenByte(byte, field);
     }
 
-    fn decodeEntityReference(parser: *Parser) ParseError!void {
+    fn decodeEntityReference(parser: *Parser, field: LimitField) ParseError!void {
         var entity_buffer: [16]u8 = undefined;
         var entity_len: usize = 0;
 
@@ -865,38 +979,38 @@ pub const Parser = struct {
         }
 
         const entity = entity_buffer[0..entity_len];
-        if (std.mem.eql(u8, entity, "amp")) return parser.appendTokenByte('&');
-        if (std.mem.eql(u8, entity, "lt")) return parser.appendTokenByte('<');
-        if (std.mem.eql(u8, entity, "gt")) return parser.appendTokenByte('>');
-        if (std.mem.eql(u8, entity, "apos")) return parser.appendTokenByte('\'');
-        if (std.mem.eql(u8, entity, "quot")) return parser.appendTokenByte('"');
+        if (std.mem.eql(u8, entity, "amp")) return parser.appendTokenByte('&', field);
+        if (std.mem.eql(u8, entity, "lt")) return parser.appendTokenByte('<', field);
+        if (std.mem.eql(u8, entity, "gt")) return parser.appendTokenByte('>', field);
+        if (std.mem.eql(u8, entity, "apos")) return parser.appendTokenByte('\'', field);
+        if (std.mem.eql(u8, entity, "quot")) return parser.appendTokenByte('"', field);
 
         if (entity.len >= 2 and entity[0] == '#') {
             const codepoint = try parseCharacterReference(entity[1..]);
             var utf8_buffer: [4]u8 = undefined;
             const utf8_len = std.unicode.utf8Encode(codepoint, &utf8_buffer) catch return error.InvalidCharacterReference;
-            try parser.appendTokenSlice(utf8_buffer[0..utf8_len]);
+            try parser.appendTokenSlice(utf8_buffer[0..utf8_len], field);
             return;
         }
 
         return error.UnknownEntity;
     }
 
-    fn appendTokenByte(parser: *Parser, byte: u8) ParseError!void {
-        if (parser.token_len >= parser.token_buffer.len) return error.TokenTooLong;
+    fn appendTokenByte(parser: *Parser, byte: u8, field: LimitField) ParseError!void {
+        try parser.ensureTokenAppend(field, 1);
         parser.token_buffer[parser.token_len] = byte;
         parser.token_len += 1;
     }
 
-    fn appendTokenSlice(parser: *Parser, bytes: []const u8) ParseError!void {
-        if (parser.token_len > parser.token_buffer.len or bytes.len > parser.token_buffer.len - parser.token_len) return error.TokenTooLong;
+    fn appendTokenSlice(parser: *Parser, bytes: []const u8, field: LimitField) ParseError!void {
+        try parser.ensureTokenAppend(field, bytes.len);
         @memcpy(parser.token_buffer[parser.token_len..][0..bytes.len], bytes);
         parser.token_len += bytes.len;
     }
 
     fn copyIntoToken(parser: *Parser, bytes: []const u8) ParseError![]const u8 {
         const start = parser.token_len;
-        try parser.appendTokenSlice(bytes);
+        try parser.appendTokenSlice(bytes, .start_tag);
         return parser.token_buffer[start..parser.token_len];
     }
 
@@ -962,30 +1076,31 @@ pub const Parser = struct {
         return true;
     }
 
-    fn consumeSliceNameCharRun(parser: *Parser) ParseError!void {
+    fn consumeSliceNameCharRun(parser: *Parser, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
         const tail = parser.sliceTail() orelse return;
         const run_len = scan.nameCharRunLen(tail);
         if (run_len == 0) return;
-        try parser.appendTokenSlice(tail[0..run_len]);
+        if (field == .start_tag) try parser.ensureStartTagLimit(run_len);
+        try parser.appendTokenSlice(tail[0..run_len], field);
         parser.consumeSliceBytes(run_len);
     }
 
-    fn consumeSliceTextPlainRun(parser: *Parser) ParseError!void {
+    fn consumeSliceTextPlainRun(parser: *Parser, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
         const tail = parser.sliceTail() orelse return;
         const run_len = scan.textPlainRunLen(tail);
         if (run_len == 0) return;
-        try parser.appendTokenSlice(tail[0..run_len]);
+        try parser.appendTokenSlice(tail[0..run_len], field);
         parser.consumeSliceBytes(run_len);
     }
 
-    fn consumeSliceAttrValuePlainRun(parser: *Parser, quote: u8) ParseError!void {
+    fn consumeSliceAttrValuePlainRun(parser: *Parser, quote: u8, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
         const tail = parser.sliceTail() orelse return;
         const run_len = scan.attrValuePlainRunLen(tail, quote);
         if (run_len == 0) return;
-        try parser.appendTokenSlice(tail[0..run_len]);
+        try parser.appendTokenSlice(tail[0..run_len], field);
         parser.consumeSliceBytes(run_len);
     }
 
@@ -1686,6 +1801,101 @@ test "parser preserves cdata bracket runs across text chunks" {
     try std.testing.expect(second.is_final);
     _ = (try parser.next()).?.end_element;
     try std.testing.expectEqual(@as(?Event, null), try parser.next());
+}
+
+test "parser enforces limits by field" {
+    const limits = Limits{
+        .max_start_tag_bytes = 1 * 1024 * 1024,
+        .max_attribute_bytes = 64,
+        .max_scalar_text_bytes = 4,
+        .max_binary_text_bytes = 12,
+    };
+
+    var scalar_reader: InlineParserHarness = undefined;
+    scalar_reader.initWithLimits("<root>12345</root>", limits);
+    _ = (try scalar_reader.parser.next()).?.start_element;
+    try std.testing.expectError(error.ScalarTextTooLong, scalar_reader.parser.next());
+
+    var scalar_slice: InlineSliceParserHarness = undefined;
+    scalar_slice.initWithLimits("<root>12345</root>", limits);
+    _ = (try scalar_slice.parser.next()).?.start_element;
+    try std.testing.expectError(error.ScalarTextTooLong, scalar_slice.parser.next());
+
+    var scalar_exact: InlineSliceParserHarness = undefined;
+    scalar_exact.initWithLimits("<root>1234</root>", limits);
+    _ = (try scalar_exact.parser.next()).?.start_element;
+    try std.testing.expectEqualStrings("1234", (try scalar_exact.parser.next()).?.text.value);
+
+    var cdata_reader: InlineParserHarness = undefined;
+    cdata_reader.initWithLimits("<root><![CDATA[12345]]></root>", limits);
+    _ = (try cdata_reader.parser.next()).?.start_element;
+    try std.testing.expectError(error.ScalarTextTooLong, cdata_reader.parser.next());
+
+    var cdata_slice: InlineSliceParserHarness = undefined;
+    cdata_slice.initWithLimits("<root><![CDATA[12345]]></root>", limits);
+    _ = (try cdata_slice.parser.next()).?.start_element;
+    try std.testing.expectError(error.ScalarTextTooLong, cdata_slice.parser.next());
+
+    const binary_xml = "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><binary>123456789012</binary></mzML>";
+    var binary_reader: InlineParserHarness = undefined;
+    binary_reader.initWithLimits(binary_xml, limits);
+    _ = (try binary_reader.parser.next()).?.start_element;
+    _ = (try binary_reader.parser.next()).?.start_element;
+    const binary_text = (try binary_reader.parser.next()).?.text;
+    try std.testing.expectEqualStrings("123456789012", binary_text.value);
+    try std.testing.expect(binary_text.is_final);
+
+    const chunk_xml = "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><binary>0123456789012345678901234567890123456789012345678901234567890123456789</binary></mzML>";
+    var chunk_reader = std.Io.Reader.fixed(chunk_xml);
+    var chunk_token: [64]u8 = undefined;
+    var chunk_attributes: [4]Attribute = undefined;
+    var chunk_namespaces: [4]NamespaceBinding = undefined;
+    var chunk_namespace_bytes: [64]u8 = undefined;
+    var chunk_stack: [4]ElementFrame = undefined;
+    var chunk_element_bytes: [64]u8 = undefined;
+    var chunk_parser = Parser.init(&chunk_reader, .{
+        .token = &chunk_token,
+        .attributes = &chunk_attributes,
+        .namespace_bindings = &chunk_namespaces,
+        .namespace_bytes = &chunk_namespace_bytes,
+        .element_stack = &chunk_stack,
+        .element_bytes = &chunk_element_bytes,
+        .limits = .{ .max_attribute_bytes = 64, .max_scalar_text_bytes = 4, .max_binary_text_bytes = 70 },
+    });
+    _ = (try chunk_parser.next()).?.start_element;
+    _ = (try chunk_parser.next()).?.start_element;
+    const first_chunk = (try chunk_parser.next()).?.text;
+    const second_chunk = (try chunk_parser.next()).?.text;
+    try std.testing.expectEqual(@as(usize, 60), first_chunk.value.len);
+    try std.testing.expect(!first_chunk.is_final);
+    try std.testing.expectEqual(@as(usize, 10), second_chunk.value.len);
+    try std.testing.expect(second_chunk.is_final);
+
+    var binary_over: InlineParserHarness = undefined;
+    binary_over.initWithLimits("<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><binary>1234567890123</binary></mzML>", limits);
+    _ = (try binary_over.parser.next()).?.start_element;
+    _ = (try binary_over.parser.next()).?.start_element;
+    try std.testing.expectError(error.BinaryTextTooLong, binary_over.parser.next());
+
+    var start_tag: InlineParserHarness = undefined;
+    start_tag.initWithLimits("<root a=\"1\"/>", .{ .max_start_tag_bytes = 7, .max_attribute_bytes = 64 });
+    try std.testing.expectError(error.StartTagTooLong, start_tag.parser.next());
+
+    var start_tag_exact: InlineParserHarness = undefined;
+    start_tag_exact.initWithLimits("<root/>", .{ .max_start_tag_bytes = 7 });
+    try std.testing.expect((try start_tag_exact.parser.next()).?.start_element.self_closing);
+
+    var start_tag_slice: InlineSliceParserHarness = undefined;
+    start_tag_slice.initWithLimits("<root a=\"1\"/>", .{ .max_start_tag_bytes = 7, .max_attribute_bytes = 64 });
+    try std.testing.expectError(error.StartTagTooLong, start_tag_slice.parser.next());
+
+    var lazy_attribute: InlineSliceParserHarness = undefined;
+    lazy_attribute.initWithLimits("<cvParam unitName=\"abcde\"/>", .{ .max_attribute_bytes = 12 });
+    try std.testing.expectError(error.AttributeTooLong, lazy_attribute.parser.next());
+
+    var eager_attribute: InlineParserHarness = undefined;
+    eager_attribute.initWithLimits("<cvParam unitName=\"abcde\"/>", .{ .max_attribute_bytes = 12 });
+    try std.testing.expectError(error.AttributeTooLong, eager_attribute.parser.next());
 }
 
 test "parser keeps slice and reader parity across refill boundaries" {
@@ -2434,6 +2644,10 @@ const InlineParserHarness = struct {
     parser: Parser = undefined,
 
     fn init(harness: *InlineParserHarness, xml: []const u8) void {
+        harness.initWithLimits(xml, .{});
+    }
+
+    fn initWithLimits(harness: *InlineParserHarness, xml: []const u8, limits: Limits) void {
         harness.reader = std.Io.Reader.fixed(xml);
         harness.parser = Parser.init(&harness.reader, .{
             .token = &harness.token_buffer,
@@ -2442,6 +2656,7 @@ const InlineParserHarness = struct {
             .namespace_bytes = &harness.namespace_bytes,
             .element_stack = &harness.element_stack,
             .element_bytes = &harness.element_bytes,
+            .limits = limits,
         });
     }
 };
@@ -2456,6 +2671,10 @@ const InlineSliceParserHarness = struct {
     parser: Parser = undefined,
 
     fn init(harness: *InlineSliceParserHarness, xml: []const u8) void {
+        harness.initWithLimits(xml, .{});
+    }
+
+    fn initWithLimits(harness: *InlineSliceParserHarness, xml: []const u8, limits: Limits) void {
         harness.parser = Parser.initSlice(xml, .{
             .token = &harness.token_buffer,
             .attributes = &harness.attributes,
@@ -2463,6 +2682,7 @@ const InlineSliceParserHarness = struct {
             .namespace_bytes = &harness.namespace_bytes,
             .element_stack = &harness.element_stack,
             .element_bytes = &harness.element_bytes,
+            .limits = limits,
         });
     }
 };
