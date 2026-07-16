@@ -3,8 +3,9 @@
 //! Decodes base64, decompresses zlib, and validates array lengths against
 //! `defaultArrayLength` and declared precision. Skips materializing the
 //! decoded output for uncompressed arrays (streaming base64 counter).
-//! For zlib arrays, streams base64 into reusable compressed-byte scratch
-//! and counts decompressed bytes without keeping the decoded numeric array.
+//! For zlib arrays, streams base64 into reusable compressed-byte scratch.
+//! Known bounded output uses libdeflate scratch; the fallback counts output
+//! with a bounded flate history buffer and never retains the numeric array.
 
 const std = @import("std");
 const build_options = @import("build_options");
@@ -49,7 +50,23 @@ const max_binary_token_bytes = 1024 * 1024;
 const base64_decoder = std.base64.standard.decoderWithIgnore(" \t\r\n");
 const base64_simd_chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
 const base64_scalar_short_len = 64;
-const flate_buffer_len = 1024 * 1024;
+// Keep one extra decoder window beyond Zig's required 64 KiB minimum so ordinary
+// arrays need fewer output toss cycles without retaining the former 1 MiB.
+const flate_buffer_len = 2 * std.compress.flate.max_window_len;
+const scratch_capacity_classes = [_]usize{
+    4 * 1024,
+    16 * 1024,
+    64 * 1024,
+};
+
+fn scratchCapacityClass(required: usize) usize {
+    if (required == 0) return 0;
+    for (scratch_capacity_classes) |capacity| {
+        if (required <= capacity) return capacity;
+    }
+    return required;
+}
+
 const LibdeflateDecompressor = if (build_options.enable_libdeflate) libdeflate.libdeflate_decompressor else opaque {};
 const OptionalLibdeflateDecompressor = if (build_options.enable_libdeflate) ?*LibdeflateDecompressor else void;
 
@@ -444,42 +461,14 @@ pub const BinaryValidator = struct {
         validator.* = undefined;
     }
 
-    // Prevent a single oversized array from hogging scratch capacity.
-    // Only kicks in when capacity > 1 MiB AND 4x the actual data.
-    fn maybeShrinkScratch(validator: *BinaryValidator) !void {
-        validator.maybeShrinkPayload(&validator.compressed_payload, validator.compressed_payload.items.len);
-        validator.maybeShrinkLibdeflateOutput();
-        try validator.updateScratchAccounting();
-    }
-
-    fn maybeShrinkPayload(validator: *BinaryValidator, payload: *std.ArrayList(u8), used: usize) void {
-        const min_threshold: usize = 1024 * 1024; // 1 MiB
-        if (used == 0) {
-            if (payload.capacity > min_threshold) payload.shrinkAndFree(validator.allocator, 0);
-            return;
-        }
-        const max_headroom: usize = 4;
-        const retained_limit = std.math.mul(usize, used, max_headroom) catch return;
-        if (payload.capacity > min_threshold and
-            payload.capacity > retained_limit)
-        {
-            payload.shrinkAndFree(validator.allocator, used);
-        }
-    }
-
-    fn maybeShrinkLibdeflateOutput(validator: *BinaryValidator) void {
-        if (validator.libdeflate_output.capacity > validator.limits.max_binary_materialized_bytes) {
-            validator.libdeflate_output.shrinkAndFree(validator.allocator, 0);
-        }
-    }
-
     fn ensureScratchCapacity(validator: *BinaryValidator, buffer: *std.ArrayList(u8), required: usize) !void {
         if (required > buffer.capacity) {
+            const selected = scratchCapacityClass(required);
             const current = try validator.scratchCapacity();
             const other = std.math.sub(usize, current, buffer.capacity) catch return error.ResourceLimitExceeded;
-            const total = std.math.add(usize, other, required) catch return error.ResourceLimitExceeded;
+            const total = std.math.add(usize, other, selected) catch return error.ResourceLimitExceeded;
             if (total > validator.limits.max_binary_scratch_bytes) return error.ResourceLimitExceeded;
-            try buffer.ensureTotalCapacityPrecise(validator.allocator, required);
+            try buffer.ensureTotalCapacityPrecise(validator.allocator, selected);
         }
         try validator.updateScratchAccounting();
     }
@@ -815,7 +804,6 @@ pub const BinaryValidator = struct {
                             }
                         }
 
-                        try validator.maybeShrinkScratch();
                         validator.binary_array = null;
                     }
                 }
@@ -1713,19 +1701,59 @@ test "binary validator rejects zlib integrity and trailing-byte mutations" {
     }
 }
 
-test "binary fallback stops at the decoded output limit" {
+test "binary fallback uses the bounded flate workspace and validates boundaries" {
+    const allocator = std.testing.allocator;
     const compressed = [_]u8{
         0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07,
         0x00, 0x06, 0x2c, 0x02, 0x15,
     };
-    var flate_buffer: [1024 * 1024]u8 = undefined;
+    const flate_buffer = try allocator.alloc(u8, flate_buffer_len);
+    defer allocator.free(flate_buffer);
     var adler: std.hash.Adler32 = .{};
     adler.update("hello");
 
+    try std.testing.expectEqual(@as(usize, 2 * std.compress.flate.max_window_len), flate_buffer.len);
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try inflateCountWithBuffer(&compressed, flate_buffer, 5, adler.adler),
+    );
     try std.testing.expectError(
         error.DecodedLimitExceeded,
-        inflateCountWithBuffer(&compressed, &flate_buffer, 4, adler.adler),
+        inflateCountWithBuffer(&compressed, flate_buffer, 4, adler.adler),
     );
+
+    const with_trailing = compressed ++ [_]u8{0};
+    try std.testing.expectError(
+        error.InvalidBinaryPayload,
+        inflateCountWithBuffer(&with_trailing, flate_buffer, 5, adler.adler),
+    );
+
+    var corrupt = compressed;
+    corrupt[5] ^= 1;
+    try std.testing.expectError(
+        error.InvalidBinaryPayload,
+        inflateCountWithBuffer(&corrupt, flate_buffer, 5, adler.adler),
+    );
+}
+
+test "binary fallback owner accounts only the bounded flate workspace" {
+    const compressed = [_]u8{
+        0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07,
+        0x00, 0x06, 0x2c, 0x02, 0x15,
+    };
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    var validator = BinaryValidator.init(std.testing.allocator, &diagnostics, "fixture");
+    defer validator.deinit();
+
+    try std.testing.expectEqual(
+        @as(usize, 5),
+        try validator.inflateDecodedZlib(&compressed, null),
+    );
+    try std.testing.expectEqual(@as(usize, 2 * std.compress.flate.max_window_len), validator.flate_buffer.capacity);
+    try std.testing.expectEqual(validator.flate_buffer.capacity, validator.scratch_current_bytes);
+    try std.testing.expectEqual(validator.scratch_current_bytes, validator.scratch_peak_bytes);
 }
 
 test "binary zlib validation bounds insufficient materialized output" {
@@ -1764,24 +1792,71 @@ test "binary validator reports fallback decoded limit" {
     );
 }
 
-test "binary scratch accounting enforces the configured capacity" {
+test "binary scratch uses bounded capacity classes and reuses them" {
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    const allocator = counting_allocator.allocator();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    var validator = BinaryValidator.init(allocator, &diagnostics, "fixture");
+    defer validator.deinit();
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, 1);
+    try std.testing.expectEqual(@as(usize, 4 * 1024), validator.compressed_payload.capacity);
+    const operations_after_first_growth = counting_allocator.allocations + counting_allocator.resize_index;
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, 4 * 1024);
+    try std.testing.expectEqual(
+        operations_after_first_growth,
+        counting_allocator.allocations + counting_allocator.resize_index,
+    );
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, 4 * 1024 + 1);
+    try std.testing.expectEqual(@as(usize, 16 * 1024), validator.compressed_payload.capacity);
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, 64 * 1024 + 1);
+    try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), validator.compressed_payload.capacity);
+    try std.testing.expectEqual(validator.compressed_payload.capacity, validator.scratch_current_bytes);
+    try std.testing.expectEqual(validator.scratch_current_bytes, validator.scratch_peak_bytes);
+}
+
+test "binary scratch limit applies to selected capacity class" {
     const allocator = std.testing.allocator;
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
     var validator = BinaryValidator.init(allocator, &diagnostics, "fixture");
     defer validator.deinit();
-    validator.limits.max_binary_scratch_bytes = 32;
+    validator.limits.max_binary_scratch_bytes = 8 * 1024;
 
-    try validator.ensureScratchCapacity(&validator.compressed_payload, 16);
-    try std.testing.expectEqual(@as(usize, 16), validator.scratch_current_bytes);
-    try std.testing.expectEqual(@as(usize, 16), validator.scratch_peak_bytes);
+    try validator.ensureScratchCapacity(&validator.compressed_payload, 1);
+    try std.testing.expectEqual(@as(usize, 4 * 1024), validator.scratch_current_bytes);
     try std.testing.expectError(
         error.ResourceLimitExceeded,
-        validator.ensureScratchCapacity(&validator.flate_buffer, 17),
+        validator.ensureScratchCapacity(&validator.flate_buffer, 4 * 1024 + 1),
     );
-    try std.testing.expectEqual(@as(usize, 16), validator.scratch_current_bytes);
-    try std.testing.expectEqual(@as(usize, 16), validator.scratch_peak_bytes);
+    try std.testing.expectEqual(@as(usize, 4 * 1024), validator.scratch_current_bytes);
+    try std.testing.expectEqual(@as(usize, 4 * 1024), validator.scratch_peak_bytes);
+}
+
+test "binary scratch growth failure releases retained capacity" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    {
+        var validator = BinaryValidator.init(failing_allocator.allocator(), &diagnostics, "fixture");
+        defer validator.deinit();
+
+        try validator.ensureScratchCapacity(&validator.compressed_payload, 1);
+        try std.testing.expectError(
+            error.OutOfMemory,
+            validator.ensureScratchCapacity(&validator.compressed_payload, 4 * 1024 + 1),
+        );
+    }
+
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
 }
 
 test "binary validator accepts valid chromatogram payloads" {
