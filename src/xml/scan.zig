@@ -1,7 +1,8 @@
-//! SIMD-assisted byte scanning for the XML parser slice path.
+//! SIMD-assisted byte scanning for the XML parser slice path and raw start tags.
 //!
+//! Raw attribute views borrow the supplied tag bytes and never decode values.
 //! Scalar tail handling keeps behavior identical at chunk boundaries.
-//! Used only when the parser reads from a contiguous slice (mmap).
+//! Raw-tag helpers operate on any supplied contiguous tag slice.
 
 const std = @import("std");
 
@@ -11,6 +12,130 @@ const V = @Vector(chunk_len, u8);
 fn isWhitespaceByte(byte: u8) bool {
     return switch (byte) {
         ' ', '\t', '\r', '\n' => true,
+        else => false,
+    };
+}
+
+pub const RawAttributeError = error{
+    Malformed,
+    InvalidUtf8,
+};
+
+/// Raw start-tag boundary; `end` excludes the unquoted `>` delimiter.
+pub const RawTagInfo = struct {
+    end: usize,
+    self_closing: bool,
+};
+
+/// Borrowed raw attribute names and values from one start tag.
+pub const RawAttribute = struct {
+    name_start: usize,
+    name: []const u8,
+    local_name: []const u8,
+    value: []const u8,
+    has_entity: bool,
+    is_namespace_declaration: bool,
+};
+
+/// Iterates one raw start tag without allocating or decoding values.
+pub const RawAttributeScanner = struct {
+    bytes: []const u8,
+    pos: usize = 0,
+
+    pub fn init(bytes: []const u8) RawAttributeScanner {
+        return .{ .bytes = bytes };
+    }
+
+    /// Returns the next borrowed attribute, or null after the tag body.
+    pub fn next(scanner: *RawAttributeScanner) RawAttributeError!?RawAttribute {
+        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        if (scanner.pos == scanner.bytes.len) return null;
+
+        if (scanner.bytes[scanner.pos] == '/') {
+            scanner.pos += 1;
+            if (scanner.pos != scanner.bytes.len) return error.Malformed;
+            return null;
+        }
+
+        const name_start = scanner.pos;
+        while (scanner.pos < scanner.bytes.len and !isRawNameTerminator(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        if (scanner.pos == name_start) return error.Malformed;
+        const name = scanner.bytes[name_start..scanner.pos];
+        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
+        const local_name = try rawLocalName(name);
+
+        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        if (scanner.pos == scanner.bytes.len or scanner.bytes[scanner.pos] != '=') return error.Malformed;
+        scanner.pos += 1;
+        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        if (scanner.pos == scanner.bytes.len) return error.Malformed;
+
+        const quote = scanner.bytes[scanner.pos];
+        if (quote != '"' and quote != '\'') return error.Malformed;
+        scanner.pos += 1;
+        const value_start = scanner.pos;
+        var has_entity = false;
+        while (scanner.pos < scanner.bytes.len and scanner.bytes[scanner.pos] != quote) : (scanner.pos += 1) {
+            if (scanner.bytes[scanner.pos] == '&') has_entity = true;
+        }
+        if (scanner.pos == scanner.bytes.len) return error.Malformed;
+        const value = scanner.bytes[value_start..scanner.pos];
+        if (!has_entity and !std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+        scanner.pos += 1;
+
+        const colon = std.mem.indexOfScalar(u8, name, ':');
+        return .{
+            .name_start = name_start,
+            .name = name,
+            .local_name = local_name,
+            .value = value,
+            .has_entity = has_entity,
+            .is_namespace_declaration = std.mem.eql(u8, name, "xmlns") or
+                (colon != null and std.mem.eql(u8, name[0..colon.?], "xmlns")),
+        };
+    }
+};
+
+/// Finds the first `>` outside a quoted value without allocating.
+pub fn rawStartTagInfo(bytes: []const u8) ?RawTagInfo {
+    var quote: u8 = 0;
+    var after_equals = false;
+    for (bytes, 0..) |byte, index| {
+        if (quote != 0) {
+            if (byte == quote) quote = 0;
+            continue;
+        }
+        if (byte == '=') {
+            after_equals = true;
+        } else if (after_equals and isWhitespaceByte(byte)) {
+            continue;
+        } else if (after_equals and (byte == '"' or byte == '\'')) {
+            quote = byte;
+            after_equals = false;
+        } else if (byte == '>') {
+            var last = index;
+            while (last > 0 and isWhitespaceByte(bytes[last - 1])) : (last -= 1) {}
+            return .{ .end = index, .self_closing = last > 0 and bytes[last - 1] == '/' };
+        } else {
+            after_equals = false;
+        }
+    }
+    return null;
+}
+
+fn rawLocalName(name: []const u8) RawAttributeError![]const u8 {
+    var colon: ?usize = null;
+    for (name, 0..) |byte, index| {
+        if (byte != ':') continue;
+        if (colon != null or index == 0 or index + 1 == name.len) return error.Malformed;
+        colon = index;
+    }
+    return if (colon) |index| name[index + 1 ..] else name;
+}
+
+fn isRawNameTerminator(byte: u8) bool {
+    return std.ascii.isWhitespace(byte) or switch (byte) {
+        '/', '>', '=', '?', '"', '\'' => true,
         else => false,
     };
 }
@@ -220,6 +345,41 @@ test "attrValuePlainRunLen stops at quote or entity" {
 
     // Assert.
     try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+test "raw start tag scanner keeps quoted greater-than bytes inside values" {
+    const bytes = " accession=\"MS:1000130\" unitName=\"text > still\"/>";
+    const info = rawStartTagInfo(bytes).?;
+
+    try std.testing.expectEqual(bytes.len - 1, info.end);
+    try std.testing.expect(info.self_closing);
+
+    var scanner = RawAttributeScanner.init(bytes[0..info.end]);
+    const accession = (try scanner.next()).?;
+    const unit_name = (try scanner.next()).?;
+    try std.testing.expectEqualStrings("accession", accession.local_name);
+    try std.testing.expectEqualStrings("MS:1000130", accession.value);
+    try std.testing.expectEqualStrings("unitName", unit_name.local_name);
+    try std.testing.expectEqualStrings("text > still", unit_name.value);
+    try std.testing.expectEqual(@as(?RawAttribute, null), try scanner.next());
+}
+
+test "raw start tag scanner reports entities and namespace declarations" {
+    const bytes = " unitName=\"a &amp; b\" xmlns:ms=\"urn:ms\"/>";
+    const info = rawStartTagInfo(bytes).?;
+    var scanner = RawAttributeScanner.init(bytes[0..info.end]);
+
+    const unit_name = (try scanner.next()).?;
+    const namespace = (try scanner.next()).?;
+    try std.testing.expect(unit_name.has_entity);
+    try std.testing.expect(namespace.is_namespace_declaration);
+}
+
+test "raw start tag scanner rejects an unterminated quoted value" {
+    var scanner = RawAttributeScanner.init(" value=\"unfinished");
+
+    try std.testing.expectError(error.Malformed, scanner.next());
+    try std.testing.expectEqual(@as(?RawTagInfo, null), rawStartTagInfo(" value=\"unfinished"));
 }
 
 test "cdataContentLen uses SIMD for large content" {

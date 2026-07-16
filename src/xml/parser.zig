@@ -390,39 +390,58 @@ pub const Parser = struct {
             std.mem.eql(u8, local_name, "userParam")) and parser.input == .slice;
 
         if (lazy_attrs) {
-            // cvParam/userParam attributes are parsed lazily from raw_tag
-            // in the semantic validator. Skip eager parsing to save ~7M attribute scans.
             const slice = &parser.input.slice;
-            const raw_start = slice.pos;
-            var self_closing = false;
-            while (slice.pos < slice.bytes.len) {
-                const b = slice.bytes[slice.pos];
-                slice.pos += 1;
-                if (b == '>') break;
-                if (b == '/') {
-                    if (slice.pos < slice.bytes.len and slice.bytes[slice.pos] == '>') {
-                        slice.pos += 1;
-                        self_closing = true;
+            const raw_start = if (parser.lookahead != null) slice.pos - 1 else slice.pos;
+            const raw_source = slice.bytes[raw_start..];
+            if (scan.rawStartTagInfo(raw_source)) |tag_info| {
+                const raw_tag = raw_source[0..tag_info.end];
+                var raw_scanner = scan.RawAttributeScanner.init(raw_tag);
+                var use_lazy_attributes = true;
+                while (raw_scanner.next() catch |err| switch (err) {
+                    error.InvalidUtf8 => return error.InvalidUtf8,
+                    error.Malformed => return error.MalformedXml,
+                }) |attribute| {
+                    if (parser.attribute_count >= parser.attribute_storage.len) return error.TooManyAttributes;
+                    const name_colon = std.mem.indexOfScalar(u8, attribute.name, ':');
+                    const attribute_offset = std.math.add(usize, raw_start, attribute.name_start) catch return error.UnexpectedEof;
+                    parser.attribute_storage[parser.attribute_count] = .{
+                        .byte_offset = @intCast(attribute_offset),
+                        .name = .{
+                            .prefix = if (name_colon) |index| attribute.name[0..index] else null,
+                            .local_name = attribute.local_name,
+                            .namespace_uri = null,
+                        },
+                        .value = attribute.value,
+                        .is_namespace_declaration = attribute.is_namespace_declaration,
+                    };
+                    parser.attribute_count += 1;
+                    if (attribute.has_entity or attribute.is_namespace_declaration) {
+                        use_lazy_attributes = false;
                         break;
                     }
                 }
-            }
-            const raw_end = slice.pos - 1;
-            const raw_bytes = if (raw_end > raw_start) slice.bytes[raw_start..raw_end] else "";
-            parser.last_byte_offset = slice.pos;
-            parser.absolute_offset = slice.pos;
+                if (use_lazy_attributes) {
+                    const raw_end = std.math.add(usize, raw_start, tag_info.end) catch return error.UnexpectedEof;
+                    const after_tag = std.math.add(usize, raw_end, 1) catch return error.UnexpectedEof;
+                    slice.pos = after_tag;
+                    parser.lookahead = null;
+                    parser.last_byte_offset = @intCast(raw_end);
+                    parser.absolute_offset = @intCast(after_tag);
 
-            var event = try parser.finishStartElement(
-                byte_offset,
-                name_parts,
-                namespace_count_before,
-                namespace_bytes_before,
-                self_closing,
-                if (self_closing) parser.last_byte_offset - 1 else null,
-            );
-            if (self_closing) parser.pending_self_closing_end = true;
-            event.start_element.raw_tag = raw_bytes;
-            return event;
+                    var event = try parser.finishStartElement(
+                        byte_offset,
+                        name_parts,
+                        namespace_count_before,
+                        namespace_bytes_before,
+                        tag_info.self_closing,
+                        if (tag_info.self_closing) @intCast(raw_end) else null,
+                    );
+                    if (tag_info.self_closing) parser.pending_self_closing_end = true;
+                    event.start_element.raw_tag = raw_tag;
+                    return event;
+                }
+                parser.attribute_count = 0;
+            }
         }
 
         while (true) {
@@ -1229,6 +1248,113 @@ test "parser emits elements text attributes and namespaces" {
 
     const terminal = try harness.parser.next();
     try std.testing.expectEqual(@as(?Event, null), terminal);
+}
+
+test "slice lazy attributes match eager values around quoted delimiters" {
+    const xml = "<cvParam accession=\"MS:1000130\" unitName=\"text > still\"/>";
+
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    const slice_start = (try slice_harness.parser.next()).?.start_element;
+
+    var reader_harness: InlineParserHarness = undefined;
+    reader_harness.init(xml);
+    const reader_start = (try reader_harness.parser.next()).?.start_element;
+
+    try std.testing.expect(slice_start.self_closing);
+    try std.testing.expectEqual(@as(usize, 2), slice_start.attributes.len);
+    try std.testing.expectEqual(@as(usize, 2), reader_start.attributes.len);
+    try std.testing.expectEqualStrings("MS:1000130", slice_start.attr("accession").?);
+    try std.testing.expectEqualStrings("text > still", slice_start.attr("unitName").?);
+    try std.testing.expectEqualStrings("text > still", reader_start.attr("unitName").?);
+}
+
+test "slice lazy attributes use eager decoding for entities and namespaces" {
+    const entity_xml = "<cvParam unitName=\"a &quot; b\"/>";
+    var entity_harness: InlineSliceParserHarness = undefined;
+    entity_harness.init(entity_xml);
+    const entity_start = (try entity_harness.parser.next()).?.start_element;
+    try std.testing.expectEqual(@as(usize, 1), entity_start.attributes.len);
+    try std.testing.expectEqualStrings("a \" b", entity_start.attr("unitName").?);
+
+    const namespace_xml = "<cvParam xmlns=\"urn:test\" accession=\"MS:1000130\"/>";
+    var namespace_harness: InlineSliceParserHarness = undefined;
+    namespace_harness.init(namespace_xml);
+    const namespace_start = (try namespace_harness.parser.next()).?.start_element;
+    try std.testing.expect(namespace_start.name.matches("urn:test", "cvParam"));
+    try std.testing.expectEqual(@as(usize, 2), namespace_start.attributes.len);
+    try std.testing.expectEqualStrings("MS:1000130", namespace_start.attr("accession").?);
+}
+
+test "slice and reader raw attribute paths agree on duplicate names" {
+    const xml = "<cvParam accession=\"first\" accession=\"second\"/>";
+
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    const slice_start = (try slice_harness.parser.next()).?.start_element;
+
+    var reader_harness: InlineParserHarness = undefined;
+    reader_harness.init(xml);
+    const reader_start = (try reader_harness.parser.next()).?.start_element;
+
+    try std.testing.expectEqualStrings("first", slice_start.attr("accession").?);
+    try std.testing.expectEqualStrings("first", reader_start.attr("accession").?);
+}
+
+test "lazy raw attribute path preserves invalid UTF8 and unterminated quote errors" {
+    const invalid_utf8 = "<cvParam unitName=\"\xc0\"/>";
+    var invalid_slice: InlineSliceParserHarness = undefined;
+    invalid_slice.init(invalid_utf8);
+    try std.testing.expectError(error.InvalidUtf8, invalid_slice.parser.next());
+
+    var invalid_reader: InlineParserHarness = undefined;
+    invalid_reader.init(invalid_utf8);
+    try std.testing.expectError(error.InvalidUtf8, invalid_reader.parser.next());
+
+    const unterminated = "<cvParam unitName=\"text > still/>";
+    var unterminated_slice: InlineSliceParserHarness = undefined;
+    unterminated_slice.init(unterminated);
+    try std.testing.expectError(error.UnexpectedEof, unterminated_slice.parser.next());
+
+    var unterminated_reader: InlineParserHarness = undefined;
+    unterminated_reader.init(unterminated);
+    try std.testing.expectError(error.UnexpectedEof, unterminated_reader.parser.next());
+
+    const invalid_entity = "<cvParam unitName=\"\xc0&bogus;\"/>";
+    var invalid_entity_slice: InlineSliceParserHarness = undefined;
+    invalid_entity_slice.init(invalid_entity);
+    try std.testing.expectError(error.UnknownEntity, invalid_entity_slice.parser.next());
+
+    var invalid_entity_reader: InlineParserHarness = undefined;
+    invalid_entity_reader.init(invalid_entity);
+    try std.testing.expectError(error.UnknownEntity, invalid_entity_reader.parser.next());
+
+    const entity_before_invalid = "<cvParam unitName=\"&bogus;\" accession=\"\xc0\"/>";
+    var entity_before_invalid_slice: InlineSliceParserHarness = undefined;
+    entity_before_invalid_slice.init(entity_before_invalid);
+    try std.testing.expectError(error.UnknownEntity, entity_before_invalid_slice.parser.next());
+
+    var entity_before_invalid_reader: InlineParserHarness = undefined;
+    entity_before_invalid_reader.init(entity_before_invalid);
+    try std.testing.expectError(error.UnknownEntity, entity_before_invalid_reader.parser.next());
+
+    const unquoted_with_quote = "<cvParam unitName=abc\">";
+    var unquoted_slice: InlineSliceParserHarness = undefined;
+    unquoted_slice.init(unquoted_with_quote);
+    try std.testing.expectError(error.MalformedXml, unquoted_slice.parser.next());
+
+    var unquoted_reader: InlineParserHarness = undefined;
+    unquoted_reader.init(unquoted_with_quote);
+    try std.testing.expectError(error.MalformedXml, unquoted_reader.parser.next());
+
+    const unclosed_unquoted = "<cvParam unitName=abc";
+    var unclosed_unquoted_slice: InlineSliceParserHarness = undefined;
+    unclosed_unquoted_slice.init(unclosed_unquoted);
+    try std.testing.expectError(error.MalformedXml, unclosed_unquoted_slice.parser.next());
+
+    var unclosed_unquoted_reader: InlineParserHarness = undefined;
+    unclosed_unquoted_reader.init(unclosed_unquoted);
+    try std.testing.expectError(error.MalformedXml, unclosed_unquoted_reader.parser.next());
 }
 
 test "initSlice parses identically to init on a fixed reader" {
@@ -2310,6 +2436,27 @@ const InlineParserHarness = struct {
     fn init(harness: *InlineParserHarness, xml: []const u8) void {
         harness.reader = std.Io.Reader.fixed(xml);
         harness.parser = Parser.init(&harness.reader, .{
+            .token = &harness.token_buffer,
+            .attributes = &harness.attributes,
+            .namespace_bindings = &harness.namespace_bindings,
+            .namespace_bytes = &harness.namespace_bytes,
+            .element_stack = &harness.element_stack,
+            .element_bytes = &harness.element_bytes,
+        });
+    }
+};
+
+const InlineSliceParserHarness = struct {
+    token_buffer: [512]u8 = undefined,
+    attributes: [8]Attribute = undefined,
+    namespace_bindings: [8]NamespaceBinding = undefined,
+    namespace_bytes: [256]u8 = undefined,
+    element_stack: [8]ElementFrame = undefined,
+    element_bytes: [256]u8 = undefined,
+    parser: Parser = undefined,
+
+    fn init(harness: *InlineSliceParserHarness, xml: []const u8) void {
+        harness.parser = Parser.initSlice(xml, .{
             .token = &harness.token_buffer,
             .attributes = &harness.attributes,
             .namespace_bindings = &harness.namespace_bindings,

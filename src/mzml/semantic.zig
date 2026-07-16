@@ -15,6 +15,7 @@ const diagnostic = @import("../diagnostic.zig");
 const obo = @import("../obo/parser.zig");
 const rule_engine = @import("../obo/rule_engine.zig");
 const xml_events = @import("../xml/events.zig");
+const xml_scan = @import("../xml/scan.zig");
 const elements = @import("elements.zig");
 
 const Attribute = xml_events.Attribute;
@@ -458,46 +459,16 @@ pub const SemanticValidator = struct {
         var ucr: ?[]const u8 = null;
         var un: ?[]const u8 = null;
         if (tag == .cvParam or tag == .userParam) {
-            if (start.raw_tag.len > 0) {
-                var pos: usize = 0;
-                const bytes = start.raw_tag;
-                while (pos < bytes.len) {
-                    while (pos < bytes.len and switch (bytes[pos]) {
-                        ' ', '\t', '\r', '\n' => true,
-                        else => false,
-                    }) : (pos += 1) {}
-                    if (pos >= bytes.len) break;
-                    const ns = pos;
-                    while (pos < bytes.len and bytes[pos] != '=' and !std.ascii.isWhitespace(bytes[pos])) : (pos += 1) {}
-                    if (pos >= bytes.len or bytes[pos] != '=') break;
-                    const attr_name = bytes[ns..pos];
-                    pos += 1;
-                    if (pos >= bytes.len) break;
-                    const q = bytes[pos];
-                    if (q != '"' and q != '\'') break;
-                    pos += 1;
-                    const vs = pos;
-                    while (pos < bytes.len and bytes[pos] != q) : (pos += 1) {}
-                    const attr_val = bytes[vs..pos];
-                    if (pos < bytes.len) pos += 1;
-                    if (std.mem.eql(u8, attr_name, "accession")) {
-                        pa = attr_val;
-                    } else if (std.mem.eql(u8, attr_name, "cvRef")) {
-                        cvr = attr_val;
-                    } else if (std.mem.eql(u8, attr_name, "unitAccession")) {
-                        ua = attr_val;
-                    } else if (std.mem.eql(u8, attr_name, "unitCvRef")) {
-                        ucr = attr_val;
-                    } else if (std.mem.eql(u8, attr_name, "unitName")) {
-                        un = attr_val;
-                    }
+            if (start.attributes.len > 0) {
+                for (start.attributes) |attribute| {
+                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.name.local_name, attribute.value);
                 }
-            } else {
-                pa = start.attr("accession");
-                cvr = start.attr("cvRef");
-                ua = start.attr("unitAccession");
-                ucr = start.attr("unitCvRef");
-                un = start.attr("unitName");
+            } else if (start.raw_tag.len > 0) {
+                var raw_scanner = xml_scan.RawAttributeScanner.init(start.raw_tag);
+                while (try raw_scanner.next()) |attribute| {
+                    if (attribute.is_namespace_declaration) continue;
+                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.local_name, attribute.value);
+                }
             }
         }
 
@@ -1070,6 +1041,28 @@ pub const SemanticValidator = struct {
     }
 };
 
+fn setParamAttribute(
+    accession: *?[]const u8,
+    cv_ref: *?[]const u8,
+    unit_accession: *?[]const u8,
+    unit_cv_ref: *?[]const u8,
+    unit_name: *?[]const u8,
+    name: []const u8,
+    value: []const u8,
+) void {
+    if (std.mem.eql(u8, name, "accession") and accession.* == null) {
+        accession.* = value;
+    } else if (std.mem.eql(u8, name, "cvRef") and cv_ref.* == null) {
+        cv_ref.* = value;
+    } else if (std.mem.eql(u8, name, "unitAccession") and unit_accession.* == null) {
+        unit_accession.* = value;
+    } else if (std.mem.eql(u8, name, "unitCvRef") and unit_cv_ref.* == null) {
+        unit_cv_ref.* = value;
+    } else if (std.mem.eql(u8, name, "unitName") and unit_name.* == null) {
+        unit_name.* = value;
+    }
+}
+
 // Recognised external CV prefixes not defined in psi-ms.obo.
 // Matching OpenMS behaviour: BTO, GO, PATO terms are not validated
 // because their ontologies are not embedded.
@@ -1248,6 +1241,28 @@ test "SemanticValidator: valid accession produces no diagnostic" {
     defer sv.deinit();
     try consumeCv(&sv, "MS");
     try consumeCvParam(&sv, "MS:1000001", "MS", 0);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "SemanticValidator: raw attribute fallback ignores namespace declarations" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    var start = test_events.startUnknown("cvParam", &.{}, 10);
+    start.raw_tag = " xmlns:accession=\"urn:test\" accession=\"MS:1000001\" cvRef=\"MS\"";
+    try sv.consumeStart(start);
+
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 

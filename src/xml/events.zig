@@ -16,6 +16,7 @@
 
 const std = @import("std");
 const elements = @import("../mzml/elements.zig");
+const scan = @import("scan.zig");
 
 pub const ElementId = elements.ElementId;
 
@@ -46,41 +47,14 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
-// Scans a raw tag byte slice for an attribute value by local name.
-// Used when eager attribute parsing was skipped (cvParam/userParam).
 fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const u8 {
-    var pos: usize = 0;
-    while (pos < tag_bytes.len) {
-        while (pos < tag_bytes.len and switch (tag_bytes[pos]) {
-            ' ', '\t', '\r', '\n' => true,
-            else => false,
-        }) : (pos += 1) {}
-        if (pos >= tag_bytes.len) return null;
-
-        const name_start = pos;
-        while (pos < tag_bytes.len and tag_bytes[pos] != '=' and !std.ascii.isWhitespace(tag_bytes[pos])) : (pos += 1) {}
-        if (pos >= tag_bytes.len or tag_bytes[pos] != '=') return null;
-        if (!std.mem.eql(u8, tag_bytes[name_start..pos], local_name)) {
-            pos += 1;
-            if (pos >= tag_bytes.len) return null;
-            const q = tag_bytes[pos];
-            if (q != '"' and q != '\'') return null;
-            pos += 1;
-            while (pos < tag_bytes.len and tag_bytes[pos] != q) : (pos += 1) {}
-            if (pos >= tag_bytes.len) return null;
-            pos += 1;
-            continue;
-        }
-        pos += 1;
-        if (pos >= tag_bytes.len) return null;
-        const q = tag_bytes[pos];
-        if (q != '"' and q != '\'') return null;
-        pos += 1;
-        const val_start = pos;
-        while (pos < tag_bytes.len and tag_bytes[pos] != q) : (pos += 1) {}
-        return tag_bytes[val_start..pos];
+    var scanner = scan.RawAttributeScanner.init(tag_bytes);
+    while (true) {
+        const attribute = scanner.next() catch return null;
+        const raw_attribute = attribute orelse return null;
+        if (raw_attribute.is_namespace_declaration) continue;
+        if (std.mem.eql(u8, raw_attribute.local_name, local_name)) return raw_attribute.value;
     }
-    return null;
 }
 
 /// Looks up mzML attributes by local name, ignoring `xmlns*` declarations.
@@ -99,9 +73,8 @@ pub const StartElement = struct {
     element_id: ElementId = .unknown,
     attributes: []const Attribute,
     self_closing: bool,
-    /// When eager attribute parsing was skipped, raw_tag holds the raw bytes
-    /// from the start of the tag name to `>` (exclusive), used by
-    /// `rawTagAttributeValue`. Borrows from the parser buffer.
+    /// Raw bytes after the element name through any self-closing slash.
+    /// Borrows from the parser buffer when eager parsing was skipped.
     raw_tag: []const u8 = "",
 
     /// Intern ID from the parser when set; otherwise derived from the QName.
@@ -198,4 +171,16 @@ test "EndElement.resolvedId matches start for same local name" {
     };
     const end = EndElement{ .byte_offset = 10, .name = name, .element_id = .unknown };
     try std.testing.expectEqual(start.resolvedId(), end.resolvedId());
+}
+
+test "StartElement.attr scans raw QName attributes by local name" {
+    const start = StartElement{
+        .byte_offset = 0,
+        .name = .{ .local_name = "cvParam" },
+        .attributes = &.{},
+        .self_closing = true,
+        .raw_tag = " xmlns:accession='urn:test' p:accession='MS:1000130' /",
+    };
+
+    try std.testing.expectEqualStrings("MS:1000130", start.attr("accession").?);
 }
