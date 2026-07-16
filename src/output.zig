@@ -37,7 +37,6 @@ pub fn renderTextResult(
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     const emergency = hasEmergencyFailure(results);
     const truncated = hasDiagnosticTruncation(results);
@@ -61,7 +60,7 @@ pub fn renderTextResult(
         }
     }
     if (rendered_failure) try writer.writeByte('\n');
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
 }
 
 pub fn renderTextFile(
@@ -90,7 +89,6 @@ pub fn renderTextFinal(
     writer: *std.Io.Writer,
     results: []const diagnostic.FileResult,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     var rendered = false;
     for (results) |result| {
@@ -100,7 +98,7 @@ pub fn renderTextFinal(
         }
     }
     if (!rendered) try writer.writeAll("OK: no diagnostics emitted\n\n");
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
 }
 
 fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -154,9 +152,8 @@ pub fn renderSummaryResult(
     writer: *std.Io.Writer,
     results: []const diagnostic.FileResult,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
 }
 
 /// Groups diagnostics by severity+rule+message and prints compact counts.
@@ -265,9 +262,8 @@ pub fn renderBriefResult(
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
     if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
     for (results) |result| {
         if (hasDroppedDiagnostics(result)) try renderTruncationText(writer, result.dropped_diagnostics, null);
@@ -279,9 +275,8 @@ pub fn renderBriefGroupsResult(
     groups: *BriefGroups,
     results: []const diagnostic.FileResult,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode, memory_limit);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
     if (groups.length > 0) try groups.render(writer);
     for (results) |result| {
         if (hasDroppedDiagnostics(result)) {
@@ -469,7 +464,6 @@ fn writeResultBlock(
     writer: *std.Io.Writer,
     summary: diagnostic.Summary,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     try writer.print("{s}: {s} (info={d} warnings={d} errors={d})\n", .{
         summary.completion.label(),
@@ -483,7 +477,7 @@ fn writeResultBlock(
         if (failure.path) |path| try writer.print(" input={s}", .{path});
         try writer.writeByte('\n');
     }
-    try writeConfigLine(writer, requested_input_mode, memory_limit);
+    try writeConfigLine(writer, requested_input_mode);
 }
 
 fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
@@ -497,40 +491,11 @@ fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
 fn writeConfigLine(
     writer: *std.Io.Writer,
     requested_input_mode: []const u8,
-    memory_limit: ?usize,
 ) std.Io.Writer.Error!void {
     const mode_changed = !std.mem.eql(u8, requested_input_mode, "mmap");
-    if (!mode_changed and memory_limit == null) return;
+    if (!mode_changed) return;
 
-    try writer.writeAll("config:");
-    var has_field = false;
-    if (mode_changed) {
-        try writer.print(" input={s} behavior=explicit", .{requested_input_mode});
-        has_field = true;
-    }
-    if (memory_limit) |limit| {
-        if (has_field) try writer.writeAll(";");
-        try writer.writeAll(" limit=");
-        try writeHumanSize(writer, limit);
-        try writer.writeAll("; ledger=not-enforced");
-    }
-    try writer.writeByte('\n');
-}
-
-fn writeHumanSize(writer: *std.Io.Writer, bytes: usize) std.Io.Writer.Error!void {
-    const units = [_]struct { size: usize, label: []const u8 }{
-        .{ .size = 1024 * 1024 * 1024 * 1024, .label = "TiB" },
-        .{ .size = 1024 * 1024 * 1024, .label = "GiB" },
-        .{ .size = 1024 * 1024, .label = "MiB" },
-        .{ .size = 1024, .label = "KiB" },
-    };
-    for (units) |unit| {
-        if (bytes >= unit.size and bytes % unit.size == 0) {
-            try writer.print("{d} {s}", .{ bytes / unit.size, unit.label });
-            return;
-        }
-    }
-    try writer.print("{d} bytes", .{bytes});
+    try writer.print("config: input={s} behavior=explicit\n", .{requested_input_mode});
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
@@ -604,7 +569,7 @@ test "renderSummaryResult reports incomplete completion and first failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap", null);
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap");
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
@@ -620,11 +585,11 @@ test "renderSummaryResult_separates_nondefault_config" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "stream", 500 * 1024 * 1024);
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "stream");
 
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit\n",
         allocating_writer.written(),
     );
 }
@@ -641,7 +606,7 @@ test "renderSummaryResult_uses_friendly_warning_status" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap", null);
+    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap");
 
     try std.testing.expectEqualStrings(
         "complete: warnings (info=2 warnings=1 errors=0)\n",
@@ -656,12 +621,12 @@ test "renderTextResult_separates_result_and_config" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "stream", 500 * 1024 * 1024);
+    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "stream");
 
     try std.testing.expectEqualStrings(
         "OK: no diagnostics emitted\n\n" ++
             "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit\n",
         allocating_writer.written(),
     );
 }
@@ -673,11 +638,11 @@ test "renderBriefResult_uses_the_same_result_block" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result}, "stream", 500 * 1024 * 1024);
+    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result}, "stream");
 
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=explicit; limit=500 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit\n",
         allocating_writer.written(),
     );
 }
@@ -829,7 +794,7 @@ test "bounded diagnostic output exposes dropped severity totals" {
 
     var text_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer text_writer.deinit();
-    try renderTextResult(&text_writer.writer, &.{}, &.{result}, "mmap", null);
+    try renderTextResult(&text_writer.writer, &.{}, &.{result}, "mmap");
     try std.testing.expect(std.mem.indexOf(u8, text_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
 
     var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);

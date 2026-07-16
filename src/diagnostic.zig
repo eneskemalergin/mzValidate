@@ -74,7 +74,6 @@ pub const RuleId = struct {
     pub const mzml_cv_contradiction = "mzml.cv.contradiction";
     /// CV ancestry traversal reached its configured bound.
     pub const mzml_cv_ancestry_limit = "mzml.cv.ancestry-limit";
-    // TODO: Need to either wire this into a validator or remove it.
     /// Non-repeatable CV term appears more than once on the same element.
     pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";
     /// A *Ref attribute does not resolve to any declared id.

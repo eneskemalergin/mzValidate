@@ -47,7 +47,6 @@ pub const CheckOptions = struct {
     skip_index: bool = false,
     skip_semantic: bool = false,
     input_mode: InputMode = .mmap,
-    memory_limit: ?usize = null,
     mmap: bool = false,
     max_binary_size: ?usize = null,
     resource_limits: diagnostic.ResourceLimits = .{},

@@ -25,7 +25,6 @@ pub const CheckCommand = struct {
     skip_index: bool = false,
     skip_semantic: bool = false,
     input_mode: validate.InputMode = .mmap,
-    memory_limit: ?usize = null,
     mmap: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
@@ -59,9 +58,6 @@ const ParseError = error{
     Overflow,
     MissingInputMode,
     InvalidInputMode,
-    MissingMemoryLimit,
-    InvalidMemoryLimit,
-    MemoryLimitOverflow,
 };
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
@@ -120,9 +116,6 @@ pub fn runArgs(
         error.Overflow,
         error.MissingInputMode,
         error.InvalidInputMode,
-        error.MissingMemoryLimit,
-        error.InvalidMemoryLimit,
-        error.MemoryLimitOverflow,
         => {
             const parse_err: ParseError = @errorCast(err);
             try writeParseError(stderr, parse_err, args);
@@ -151,7 +144,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var skip_index = false;
     var skip_semantic = false;
     var input_mode: validate.InputMode = .mmap;
-    var memory_limit: ?usize = null;
     var mmap = false;
     var max_binary_size: ?usize = null;
     var obo_path: ?[]const u8 = null;
@@ -187,15 +179,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         if (std.mem.eql(u8, arg, "-mmap")) {
             input_mode = .mmap;
             mmap = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-memory-limit")) {
-            i += 1;
-            if (i >= args.len) return error.MissingMemoryLimit;
-            memory_limit = parseSize(args[i]) catch |err| switch (err) {
-                error.InvalidValue => return error.InvalidMemoryLimit,
-                error.Overflow => return error.MemoryLimitOverflow,
-            };
             continue;
         }
         if (std.mem.eql(u8, arg, "-obo")) {
@@ -235,7 +218,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         .skip_index = skip_index,
         .skip_semantic = skip_semantic,
         .input_mode = input_mode,
-        .memory_limit = memory_limit,
         .mmap = mmap,
         .max_binary_size = max_binary_size,
         .obo_path = obo_path,
@@ -283,7 +265,6 @@ fn runCheck(
         .skip_index = check.skip_index,
         .skip_semantic = check.skip_semantic,
         .input_mode = check.input_mode,
-        .memory_limit = check.memory_limit,
         .mmap = check.mmap,
         .max_binary_size = check.max_binary_size,
         .obo_path = check.obo_path,
@@ -310,10 +291,10 @@ fn runCheck(
     }
 
     switch (check.output_mode) {
-        .text => try output.renderTextFinal(writer, results.items, @tagName(check.input_mode), check.memory_limit),
+        .text => try output.renderTextFinal(writer, results.items, @tagName(check.input_mode)),
         .json => if (json_stream) |*stream| try stream.finish(),
-        .summary => try output.renderSummaryResult(writer, results.items, @tagName(check.input_mode), check.memory_limit),
-        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items, @tagName(check.input_mode), check.memory_limit),
+        .summary => try output.renderSummaryResult(writer, results.items, @tagName(check.input_mode)),
+        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items, @tagName(check.input_mode)),
     }
 
     return diagnostic.exitCodeForResults(results.items);
@@ -340,9 +321,6 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -input-mode stream|mmap\n" ++
             "               Use bounded stream input or explicit read-only mmap.\n" ++
             "  -mmap        Compatibility alias for -input-mode mmap.\n" ++
-            "  -memory-limit N\n" ++
-            "               Record the validator-state limit; ledger enforcement is pending.\n" ++
-            "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
@@ -354,7 +332,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Behavior\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
             "  Human result lines show completion, status, and severity counts.\n" ++
-            "  A config line appears only when input or memory settings differ from defaults.\n" ++
+            "  A config line appears only when the input mode differs from the default.\n" ++
             "  Text mode groups diagnostics by input path and ends with the result.\n" ++
             "  JSON mode emits one diagnostic object per finding and keeps keys stable.\n" ++
             "  Summary mode reports the aggregate result for the whole invocation.\n" ++
@@ -405,9 +383,6 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
                 try writer.writeAll("error: invalid -input-mode value (expected stream or mmap)");
             }
         },
-        error.MissingMemoryLimit => try writer.writeAll("error: -memory-limit requires a value"),
-        error.InvalidMemoryLimit => try writer.writeAll("error: invalid -memory-limit value"),
-        error.MemoryLimitOverflow => try writer.writeAll("error: -memory-limit value overflow (too large)"),
     }
 }
 
@@ -426,7 +401,6 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
             !std.mem.eql(u8, arg, "-skip-semantic") and
             !std.mem.eql(u8, arg, "-input-mode") and
             !std.mem.eql(u8, arg, "-mmap") and
-            !std.mem.eql(u8, arg, "-memory-limit") and
             !std.mem.eql(u8, arg, "-max-binary-size") and
             !std.mem.eql(u8, arg, "-obo") and
             !std.mem.eql(u8, arg, "-json") and
@@ -564,7 +538,7 @@ test "parseArgs_input_mode_rejects_invalid_value" {
     try std.testing.expectError(error.InvalidInputMode, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_memory_limit_records_bytes" {
+test "parseArgs_rejects_removed_memory_limit" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -573,24 +547,7 @@ test "parseArgs_memory_limit_records_bytes" {
         "2M",
     };
 
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
-
-    switch (command) {
-        .check => |check| try std.testing.expectEqual(@as(?usize, 2 * 1024 * 1024), check.memory_limit),
-    }
-}
-
-test "parseArgs_memory_limit_rejects_invalid_value" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-        "-memory-limit",
-        "unlimited",
-    };
-
-    try std.testing.expectError(error.InvalidMemoryLimit, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 
 test "parseArgs_rejects_conflicting_output_modes" {
@@ -768,7 +725,7 @@ test "runArgs_help_flag_writes_usage_to_stdout_and_returns_zero" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-input-mode stream|mmap") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -806,11 +763,10 @@ test "runArgs_check_help_flag_writes_usage_to_stdout_and_returns_zero" {
     // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-mmap        Compatibility alias") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "enforcement lands in P2.1") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_summary_records_requested_mode_and_memory_limit" {
+test "runArgs_summary_records_requested_mode" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -822,8 +778,6 @@ test "runArgs_summary_records_requested_mode_and_memory_limit" {
         "-skip-semantic",
         "-input-mode",
         "stream",
-        "-memory-limit",
-        "2M",
         "-summary",
     };
 
@@ -837,7 +791,7 @@ test "runArgs_summary_records_requested_mode_and_memory_limit" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=explicit; limit=2 MiB; ledger=not-enforced\n",
+            "config: input=stream behavior=explicit\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
