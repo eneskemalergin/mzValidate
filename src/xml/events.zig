@@ -69,6 +69,8 @@ pub fn attributeByLocalName(attributes: []const Attribute, local_name: []const u
 /// Borrowed attribute views. Valid until the next `Parser.next()` call.
 pub const StartElement = struct {
     byte_offset: u64,
+    /// Byte offset of the opening tag's closing `>` when emitted by Parser.
+    end_byte_offset: ?u64 = null,
     name: QName,
     element_id: ElementId = .unknown,
     attributes: []const Attribute,

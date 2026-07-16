@@ -1390,6 +1390,58 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
     }
 }
 
+test "checkPath_indexedSha_completeStartTag_noChecksumError" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const checksum_start_tag = "<fileChecksum data-origin=\"test\" >";
+    const prefix =
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
+        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
+        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
+        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
+        "    <fileDescription><fileContent/></fileDescription>\n" ++
+        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
+        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
+        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
+        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
+        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
+        "    </run>\n" ++
+        "  </mzML>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexListOffset>10</indexListOffset>\n";
+    var sha_ctx = std.crypto.hash.Sha1.init(.{});
+    sha_ctx.update(prefix);
+    sha_ctx.update("  ");
+    sha_ctx.update(checksum_start_tag);
+    var raw: [20]u8 = undefined;
+    sha_ctx.final(&raw);
+    const hex = std.fmt.bytesToHex(raw, .lower);
+    const xml = try indexedMzmlWithShaTag(allocator, checksum_start_tag, &hex);
+    defer allocator.free(xml);
+
+    var temp_dir = std.testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    try temp_dir.dir.writeFile(io, .{ .sub_path = "complete-start-tag-sha.mzML", .data = xml });
+    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "complete-start-tag-sha.mzML");
+    defer allocator.free(path);
+
+    for ([_]InputMode{ .mmap, .stream }) |input_mode| {
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+        try checkPath(allocator, io, &diagnostics, path, .{
+            .skip_binary = true,
+            .skip_semantic = true,
+            .input_mode = input_mode,
+        });
+
+        for (diagnostics.items) |d| {
+            if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+                return error.TestUnexpectedChecksumError;
+            }
+        }
+    }
+}
+
 test "checkPath_indexedSha_skipIndex_noShaCheck" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2673,6 +2725,14 @@ fn stageFixtureInTempDir(
 // Builds bytes of a minimal indexed mzML whose fileChecksum is correct
 // for the content before the `<fileChecksum>` element.
 fn indexedMzmlWithSha(allocator: std.mem.Allocator, sha_hex: []const u8) ![]u8 {
+    return indexedMzmlWithShaTag(allocator, "<fileChecksum>", sha_hex);
+}
+
+fn indexedMzmlWithShaTag(
+    allocator: std.mem.Allocator,
+    checksum_start_tag: []const u8,
+    sha_hex: []const u8,
+) ![]u8 {
     const prefix =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
         "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
@@ -2694,7 +2754,7 @@ fn indexedMzmlWithSha(allocator: std.mem.Allocator, sha_hex: []const u8) ![]u8 {
     errdefer buf.deinit(allocator);
     try buf.appendSlice(allocator, prefix);
     try buf.appendSlice(allocator, indent);
-    try buf.appendSlice(allocator, "<fileChecksum>");
+    try buf.appendSlice(allocator, checksum_start_tag);
     try buf.appendSlice(allocator, sha_hex);
     try buf.appendSlice(allocator, "</fileChecksum>\n</indexedmzML>\n");
     return try buf.toOwnedSlice(allocator);

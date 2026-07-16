@@ -605,6 +605,7 @@ pub const Parser = struct {
 
         return .{ .start_element = .{
             .byte_offset = byte_offset,
+            .end_byte_offset = parser.last_byte_offset,
             .name = name,
             .element_id = element_id,
             .attributes = parser.attribute_storage[0..parser.attribute_count],
@@ -1226,6 +1227,7 @@ fn eventsSemanticallyEqual(left: Event, right: Event) bool {
             const right_start = right.start_element;
             if (!qnameEql(left_start.name, right_start.name)) return false;
             if (left_start.byte_offset != right_start.byte_offset) return false;
+            if (left_start.end_byte_offset != right_start.end_byte_offset) return false;
             if (left_start.element_id != right_start.element_id) return false;
             if (left_start.self_closing != right_start.self_closing) return false;
             if (left_start.attributes.len != right_start.attributes.len) return false;
@@ -2122,6 +2124,16 @@ test "parser accepts exact element nesting depth and rejects one more" {
     });
     _ = (try overflow_parser.next()).?.start_element;
     try std.testing.expectError(error.ElementNestingTooDeep, overflow_parser.next());
+}
+
+test "Parser start element reports closing tag byte offset" {
+    const xml = "<root a=\"1\" >";
+    var harness: InlineParserHarness = undefined;
+    harness.init(xml);
+
+    const start = (try harness.parser.next()).?.start_element;
+
+    try std.testing.expectEqual(@as(?u64, xml.len - 1), start.end_byte_offset);
 }
 
 test "parser accepts exact element name storage and rejects overflow" {

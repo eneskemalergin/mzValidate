@@ -295,7 +295,11 @@ pub const IndexValidator = struct {
             },
             .fileChecksum => {
                 validator.file_checksum_depth = element_depth;
-                const checksum_offset = std.math.add(u64, start.byte_offset, "<fileChecksum>".len) catch {
+                const checksum_end = if (start.end_byte_offset) |end_byte_offset|
+                    std.math.add(u64, end_byte_offset, 1)
+                else
+                    std.math.add(u64, start.byte_offset, "<fileChecksum>".len);
+                const checksum_offset = checksum_end catch {
                     try validator.limitDiagnostic(start.byte_offset, "fileChecksum offset arithmetic overflow");
                     return error.ResourceLimitExceeded;
                 };
