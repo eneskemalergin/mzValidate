@@ -213,6 +213,7 @@ const RefTable = struct {
         element_id: ElementId,
         byte_offset: u64,
     ) !bool {
+        if (id.len == 0) return true;
         if (table.declarations.contains(id)) return false;
 
         const bytes = std.math.add(usize, @sizeOf(Declaration), id.len) catch {
@@ -249,16 +250,7 @@ const RefTable = struct {
         expected_element: ?ElementId,
         byte_offset: u64,
     ) !void {
-        if (ref_value.len == 0) {
-            _ = try diagnostics.append(table.allocator, .{
-                .severity = .@"error",
-                .rule = RuleId.mzml_ref_empty,
-                .location = .{ .byte_offset = byte_offset },
-                .path = path,
-                .message = "reference value is empty",
-            });
-            return;
-        }
+        if (ref_value.len == 0) return;
 
         if (table.declarations.get(ref_value)) |declaration| {
             try table.checkResolved(diagnostics, path, expected_element, declaration, byte_offset);
@@ -477,7 +469,7 @@ pub const SemanticValidator = struct {
                         &validator.budget,
                         validator.diagnostics,
                         validator.path,
-                        id,
+                        trimSchemaWhitespace(id),
                         tag,
                         start.byte_offset,
                     )) {
@@ -508,14 +500,14 @@ pub const SemanticValidator = struct {
             }
         } else {
             if (start.attr("id")) |id| {
-                // mzML and run IDs are plain xs:string and cannot be *Ref targets;
-                // excluding them avoids false duplicate-ID findings.
-                if (tag != .mzML and tag != .run) {
+                // mzML id is neither xs:ID nor a semantic reference target.
+                if (tag != .mzML) {
+                    const declaration_id = if (hasSchemaId(tag)) trimSchemaWhitespace(id) else id;
                     if (!try validator.ref_table.declare(
                         &validator.budget,
                         validator.diagnostics,
                         validator.path,
-                        id,
+                        declaration_id,
                         tag,
                         start.byte_offset,
                     )) {
@@ -534,11 +526,12 @@ pub const SemanticValidator = struct {
                 if (attr.is_namespace_declaration or attr.name.prefix != null or attr.name.namespace_uri != null) continue;
                 const name_attr = attr.name.local_name;
                 if (isRefAttr(name_attr)) {
+                    const ref_value = if (hasSchemaIdRef(name_attr)) trimSchemaWhitespace(attr.value) else attr.value;
                     try validator.ref_table.addRef(
                         &validator.budget,
                         validator.diagnostics,
                         validator.path,
-                        attr.value,
+                        ref_value,
                         expectedReferenceTarget(tag, name_attr),
                         start.byte_offset,
                     );
@@ -547,7 +540,7 @@ pub const SemanticValidator = struct {
 
             if (tag == .referenceableParamGroupRef) {
                 if (start.attr("ref")) |ref_id| {
-                    if (validator.param_groups.get(ref_id)) |group_terms| {
+                    if (validator.param_groups.get(trimSchemaWhitespace(ref_id))) |group_terms| {
                         if (validator.scope_frames.items.len >= 1) {
                             for (group_terms.items) |acc| {
                                 try validator.appendScopeItem(acc, true, start.byte_offset);
@@ -591,40 +584,22 @@ pub const SemanticValidator = struct {
                         validator.current_group_id = null;
                     }
                     if (id_attr) |id| {
-                        try validator.budget.reserve(.param_group, id.len, start.byte_offset);
-                        const owned_id = validator.allocator.dupe(u8, id) catch |err| {
-                            validator.budget.release(.param_group, id.len);
-                            return err;
-                        };
-                        validator.current_group_id = owned_id;
+                        const normalized_id = trimSchemaWhitespace(id);
+                        if (normalized_id.len > 0) {
+                            try validator.budget.reserve(.param_group, normalized_id.len, start.byte_offset);
+                            const owned_id = validator.allocator.dupe(u8, normalized_id) catch |err| {
+                                validator.budget.release(.param_group, normalized_id.len);
+                                return err;
+                            };
+                            validator.current_group_id = owned_id;
+                        }
                     }
                 },
                 else => {},
             }
         }
 
-        if (tag == .cvParam) {
-            if (cvr == null) {
-                _ = try validator.diagnostics.append(validator.allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_ref_missing,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "cvParam is missing required attribute cvRef",
-                });
-                return;
-            }
-            if (cvr.?.len == 0) {
-                _ = try validator.diagnostics.append(validator.allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_ref_empty,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "reference value is empty",
-                });
-                return;
-            }
-        }
+        if (tag == .cvParam and (cvr == null or cvr.?.len == 0)) return;
 
         const accession = pa orelse return;
 
@@ -716,7 +691,7 @@ pub const SemanticValidator = struct {
 
             if (validator.cv_table.lookup(unit_acc)) |unit_term| {
                 if (unit_cv_ref) |ref| {
-                    if (!std.mem.eql(u8, ref, unit_term.namespace)) {
+                    if (ref.len > 0 and !std.mem.eql(u8, ref, unit_term.namespace)) {
                         _ = try validator.diagnostics.append(validator.allocator, .{
                             .severity = .@"error",
                             .rule = RuleId.mzml_cv_namespace,
@@ -1094,6 +1069,10 @@ pub const SemanticValidator = struct {
     }
 };
 
+fn trimSchemaWhitespace(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t\r\n");
+}
+
 fn setParamAttribute(
     accession: *?[]const u8,
     cv_ref: *?[]const u8,
@@ -1106,11 +1085,11 @@ fn setParamAttribute(
     if (std.mem.eql(u8, name, "accession") and accession.* == null) {
         accession.* = value;
     } else if (std.mem.eql(u8, name, "cvRef") and cv_ref.* == null) {
-        cv_ref.* = value;
+        cv_ref.* = trimSchemaWhitespace(value);
     } else if (std.mem.eql(u8, name, "unitAccession") and unit_accession.* == null) {
         unit_accession.* = value;
     } else if (std.mem.eql(u8, name, "unitCvRef") and unit_cv_ref.* == null) {
-        unit_cv_ref.* = value;
+        unit_cv_ref.* = trimSchemaWhitespace(value);
     } else if (std.mem.eql(u8, name, "unitName") and unit_name.* == null) {
         unit_name.* = value;
     }
@@ -1141,6 +1120,37 @@ fn isRefAttr(name: []const u8) bool {
     // Reference elements use attribute name "ref" instead of a *Ref suffix.
     if (std.mem.eql(u8, name, "ref")) return true;
     return name.len >= 3 and std.mem.eql(u8, name[name.len - 3 ..], "Ref");
+}
+
+fn hasSchemaId(tag: ElementId) bool {
+    return switch (tag) {
+        .cv,
+        .dataProcessing,
+        .instrumentConfiguration,
+        .referenceableParamGroup,
+        .run,
+        .sample,
+        .scanSettings,
+        .software,
+        .sourceFile,
+        => true,
+        else => false,
+    };
+}
+
+fn hasSchemaIdRef(name: []const u8) bool {
+    return std.mem.eql(u8, name, "ref") or
+        std.mem.eql(u8, name, "cvRef") or
+        std.mem.eql(u8, name, "unitCvRef") or
+        std.mem.eql(u8, name, "scanSettingsRef") or
+        std.mem.eql(u8, name, "softwareRef") or
+        std.mem.eql(u8, name, "defaultInstrumentConfigurationRef") or
+        std.mem.eql(u8, name, "defaultSourceFileRef") or
+        std.mem.eql(u8, name, "sampleRef") or
+        std.mem.eql(u8, name, "defaultDataProcessingRef") or
+        std.mem.eql(u8, name, "sourceFileRef") or
+        std.mem.eql(u8, name, "instrumentConfigurationRef") or
+        std.mem.eql(u8, name, "dataProcessingRef");
 }
 
 fn expectedReferenceTarget(tag: ElementId, ref_attr: []const u8) ?ElementId {
@@ -1973,7 +1983,7 @@ test "SemanticValidator: foreign reference attributes are ignored" {
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "SemanticValidator: missing cvRef produces reference diagnostic" {
+test "[unit]: semantic validator leaves missing cvRef to structural validation" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -1989,11 +1999,10 @@ test "SemanticValidator: missing cvRef produces reference diagnostic" {
 
     try sv.consumeStart(test_events.startInterned("cvParam", &.{}, 10));
 
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_ref_missing, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "SemanticValidator: empty ref produces distinct diagnostic" {
+test "[unit]: semantic validator leaves empty references to structural validation" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -2012,8 +2021,49 @@ test "SemanticValidator: empty ref produces distinct diagnostic" {
     }, 10));
 
     try sv.finish();
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: semantic validator resolves collapsed IDREF whitespace" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try sv.consumeStart(test_events.startInterned("software", &.{test_events.attr("id", " SW1 ")}, 0));
+    try sv.consumeStart(test_events.startInterned("processingMethod", &.{test_events.attr("softwareRef", "\tSW1\n")}, 10));
+    try sv.finish();
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: semantic validator includes run IDs in XML ID uniqueness" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try sv.consumeStart(test_events.startInterned("run", &.{test_events.attr("id", "duplicate")}, 0));
+    try sv.consumeStart(test_events.startInterned("software", &.{test_events.attr("id", " duplicate ")}, 10));
+
     try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_ref_empty, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
 }
 
 test "SemanticValidator: wrong ref target produces distinct diagnostic" {

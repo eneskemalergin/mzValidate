@@ -354,6 +354,7 @@ const OwnerState = struct {
     depth: usize,
     index: ?usize,
     default_array_length: ?usize,
+    default_array_length_invalid: bool,
 };
 
 const BinaryArrayState = struct {
@@ -361,6 +362,7 @@ const BinaryArrayState = struct {
     depth: usize,
     owner_spectrum_index: ?usize,
     default_array_length: ?usize,
+    default_array_length_invalid: bool,
     encoded_length: ?usize = null,
     encoded_length_declared: ?usize = null,
     precision: ?Precision = null,
@@ -391,6 +393,7 @@ const BinaryArrayState = struct {
             .depth = depth,
             .owner_spectrum_index = owner.index,
             .default_array_length = owner.default_array_length,
+            .default_array_length_invalid = owner.default_array_length_invalid,
             .encoded_length = encoded_length,
             .encoded_length_declared = encoded_length,
         };
@@ -597,65 +600,50 @@ pub const BinaryValidator = struct {
         switch (tag) {
             .cv, .userParam => return,
             .spectrum => {
-                const index_attr = start.attr("index");
                 const dal_attr = start.attr("defaultArrayLength");
-                const index = parseOptionalUnsigned(index_attr);
-                const dal = parseOptionalUnsigned(dal_attr);
-                if (index_attr != null and index == null) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_base64,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "spectrum index must be a non-negative integer",
-                    });
-                }
-                if (dal_attr != null and dal == null) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_base64,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "spectrum defaultArrayLength must be a non-negative integer",
-                    });
+                const dal_signed = parseOptionalSchemaInt(dal_attr);
+                if (dal_signed) |value| {
+                    if (value < 0) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_base64,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "spectrum defaultArrayLength must be a non-negative integer",
+                        });
+                    }
                 }
                 validator.spectrum = .{
                     .depth = element_depth,
-                    .index = index,
-                    .default_array_length = dal,
+                    .index = parseOptionalUnsigned(start.attr("index")),
+                    .default_array_length = if (dal_signed) |value| if (value >= 0) @intCast(value) else null else null,
+                    .default_array_length_invalid = dal_attr != null and (dal_signed == null or dal_signed.? < 0),
                 };
             },
             .chromatogram => {
                 const dal_attr = start.attr("defaultArrayLength");
-                const dal = parseOptionalUnsigned(dal_attr);
-                if (dal_attr != null and dal == null) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_base64,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "chromatogram defaultArrayLength must be a non-negative integer",
-                    });
+                const dal_signed = parseOptionalSchemaInt(dal_attr);
+                if (dal_signed) |value| {
+                    if (value < 0) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_binary_base64,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "chromatogram defaultArrayLength must be a non-negative integer",
+                        });
+                    }
                 }
                 validator.chromatogram = .{
                     .depth = element_depth,
                     .index = null,
-                    .default_array_length = dal,
+                    .default_array_length = if (dal_signed) |value| if (value >= 0) @intCast(value) else null else null,
+                    .default_array_length_invalid = dal_attr != null and (dal_signed == null or dal_signed.? < 0),
                 };
             },
             .binaryDataArray => {
                 if (validator.binary_array != null) return;
-                const enc_attr = start.attr("encodedLength");
-                const encoded_length = parseOptionalUnsigned(enc_attr);
-                if (enc_attr != null and encoded_length == null) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_base64,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "binaryDataArray encodedLength must be a non-negative integer",
-                    });
-                }
+                const encoded_length = parseOptionalUnsigned(start.attr("encodedLength"));
                 if (validator.spectrum) |owner| {
                     validator.binary_array = BinaryArrayState.init(start.byte_offset, element_depth, owner, encoded_length);
                     return;
@@ -1120,6 +1108,7 @@ pub const BinaryValidator = struct {
         }
 
         const element_count = decoded_bytes / width;
+        if (state.default_array_length_invalid) return;
         if (state.default_array_length == null and decoded_bytes > 0) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
@@ -1315,8 +1304,13 @@ fn zlibAdler32(compressed: []const u8) error{InvalidBinaryPayload}!u32 {
 
 fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
     const slice = value orelse return null;
-    const parsed = std.fmt.parseUnsigned(u64, slice, 10) catch return null;
+    const parsed = std.fmt.parseUnsigned(u64, std.mem.trim(u8, slice, " \t\r\n"), 10) catch return null;
     return std.math.cast(usize, parsed);
+}
+
+fn parseOptionalSchemaInt(value: ?[]const u8) ?i32 {
+    const slice = value orelse return null;
+    return std.fmt.parseInt(i32, std.mem.trim(u8, slice, " \t\r\n"), 10) catch null;
 }
 
 fn base64SizeUpperBound(encoded_len: usize) error{Overflow}!usize {
@@ -2406,24 +2400,59 @@ test "binary validator rejects huge encodedLength before zlib reservation" {
     try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
 }
 
-test "binary validator reports count-width multiplication overflow" {
+test "[unit]: binary validator reports count-width multiplication overflow" {
     const allocator = std.testing.allocator;
-    const io = std.testing.io;
 
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
+    var validator = BinaryValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    var state: BinaryArrayState = .{
+        .byte_offset = 0,
+        .depth = 0,
+        .owner_spectrum_index = null,
+        .default_array_length = std.math.maxInt(usize),
+        .default_array_length_invalid = false,
+        .encoded_length = 8,
+        .encoded_length_declared = 8,
+        .saw_precision_32 = true,
+        .saw_no_compression = true,
+    };
+    state.base64_stream.feed("AAAAAA==");
 
     try std.testing.expectError(
         error.ResourceLimitExceeded,
-        runBinaryValidationInto(
-            allocator,
-            io,
-            minimalSpectrumMzml("AAAAAA==", std.math.maxInt(usize), "MS:1000576"),
-            &diagnostics,
-        ),
+        validator.validateBinaryArray(&state),
     );
 
     try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
+}
+
+test "[unit]: malformed owner length does not suppress binary payload validation" {
+    const allocator = std.testing.allocator;
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = BinaryValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    var state: BinaryArrayState = .{
+        .byte_offset = 0,
+        .depth = 0,
+        .owner_spectrum_index = null,
+        .default_array_length = null,
+        .default_array_length_invalid = true,
+        .encoded_length = 4,
+        .encoded_length_declared = 4,
+        .saw_precision_32 = true,
+        .saw_no_compression = true,
+    };
+    state.base64_stream.feed("%%%%");
+
+    try validator.validateBinaryArray(&state);
+
+    try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_base64, null);
 }
 
 test "binary base64 size upper bound checks arithmetic boundaries" {

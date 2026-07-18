@@ -7,6 +7,7 @@
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const elements = @import("elements.zig");
+const xml_characters = @import("../xml/characters.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
 const xml_parse_errors = @import("../xml/parse_errors.zig");
@@ -26,6 +27,23 @@ const max_structural_depth = 128;
 const ElementFrame = struct {
     tag: ElementId = .unknown,
     param_phase: u8 = 0,
+    nilled: bool = false,
+};
+
+const AttributeValueKind = enum {
+    string,
+    any_uri,
+    id,
+    id_ref,
+    non_negative_integer,
+    int,
+    date_time,
+    double,
+    spectrum_id,
+};
+
+const AttributeSpec = struct {
+    kind: AttributeValueKind,
 };
 
 const TopLevelSlot = enum(u8) {
@@ -44,11 +62,6 @@ const IndexedChildSlot = enum(u8) {
     index_list = 1,
     index_list_offset = 2,
     file_checksum = 3,
-};
-
-const ContainerKind = enum {
-    spectrum,
-    chromatogram,
 };
 
 const RunChildSlot = enum(u8) {
@@ -298,7 +311,11 @@ pub const StructuralValidator = struct {
             }
         }
 
-        validator.frames[validator.depth] = .{ .tag = if (accepted) tag else .unknown };
+        const nilled = if (accepted and tag != .unknown)
+            try validator.validateAttributes(start, tag)
+        else
+            false;
+        validator.frames[validator.depth] = .{ .tag = if (accepted) tag else .unknown, .nilled = nilled };
         if (!accepted) {
             validator.depth += 1;
             return;
@@ -430,7 +447,6 @@ pub const StructuralValidator = struct {
                 });
             } else {
                 validator.mzml_depth = element_depth;
-                try validator.requireAttribute(start, "version", "mzML is missing required attribute version");
             }
             return;
         }
@@ -447,7 +463,6 @@ pub const StructuralValidator = struct {
             validator.root_valid = true;
             validator.root_byte_offset = start.byte_offset;
             validator.mzml_depth = element_depth;
-            try validator.requireAttribute(start, "version", "mzML is missing required attribute version");
             return;
         }
 
@@ -458,7 +473,6 @@ pub const StructuralValidator = struct {
             switch (tag) {
                 .indexList => {
                     try validator.noteIndexedChild(start.byte_offset, &validator.index_list_seen, .index_list);
-                    try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
                     validator.index_list = try validator.initListCountState(start, element_depth, "indexList", "index", 1);
                     return;
                 },
@@ -497,7 +511,6 @@ pub const StructuralValidator = struct {
         switch (tag) {
             .cvList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.cv_list_seen, "cvList", .cv_list);
-                try validator.requireAttribute(start, "count", "cvList is missing required attribute count");
                 validator.cv_list = try validator.initListCountState(start, element_depth, "cvList", "cv", 1);
             },
             .fileDescription => {
@@ -506,32 +519,26 @@ pub const StructuralValidator = struct {
             },
             .referenceableParamGroupList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.referenceable_param_group_list_seen, "referenceableParamGroupList", .referenceable_param_group_list);
-                try validator.requireAttribute(start, "count", "referenceableParamGroupList is missing required attribute count");
                 validator.referenceable_param_group_list = try validator.initListCountState(start, element_depth, "referenceableParamGroupList", "referenceableParamGroup", 1);
             },
             .sampleList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.sample_list_seen, "sampleList", .sample_list);
-                try validator.requireAttribute(start, "count", "sampleList is missing required attribute count");
                 validator.sample_list = try validator.initListCountState(start, element_depth, "sampleList", "sample", 1);
             },
             .softwareList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.software_list_seen, "softwareList", .software_list);
-                try validator.requireAttribute(start, "count", "softwareList is missing required attribute count");
                 validator.software_list = try validator.initListCountState(start, element_depth, "softwareList", "software", 1);
             },
             .scanSettingsList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.scan_settings_list_seen, "scanSettingsList", .scan_settings_list);
-                try validator.requireAttribute(start, "count", "scanSettingsList is missing required attribute count");
                 validator.scan_settings_list = try validator.initListCountState(start, element_depth, "scanSettingsList", "scanSettings", 1);
             },
             .instrumentConfigurationList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.instrument_configuration_list_seen, "instrumentConfigurationList", .instrument_configuration_list);
-                try validator.requireAttribute(start, "count", "instrumentConfigurationList is missing required attribute count");
                 validator.instrument_configuration_list = try validator.initListCountState(start, element_depth, "instrumentConfigurationList", "instrumentConfiguration", 1);
             },
             .dataProcessingList => {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.data_processing_list_seen, "dataProcessingList", .data_processing_list);
-                try validator.requireAttribute(start, "count", "dataProcessingList is missing required attribute count");
                 validator.data_processing_list = try validator.initListCountState(start, element_depth, "dataProcessingList", "dataProcessing", 1);
             },
             .run => {
@@ -545,8 +552,6 @@ pub const StructuralValidator = struct {
                 validator.run_has_spectrum_list = false;
                 validator.run_has_chromatogram_list = false;
                 validator.run_last_child_slot = 0;
-                try validator.requireAttribute(start, "id", "run is missing required attribute id");
-                try validator.requireReferenceAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
             },
             .indexList, .indexListOffset, .fileChecksum => try validator.nestingError(start.byte_offset, "index metadata must be a direct child of indexedmzML"),
             .fileContent => {
@@ -583,14 +588,10 @@ pub const StructuralValidator = struct {
                         }
                     }
                 }
-                try validator.requireAttribute(start, "count", "sourceFileList is missing required attribute count");
                 validator.source_file_list = try validator.initListCountState(start, element_depth, "sourceFileList", "sourceFile", 1);
             },
             .sourceFile => {
                 validator.bumpListItemCount(&validator.source_file_list, element_depth);
-                try validator.requireAttribute(start, "id", "sourceFile is missing required attribute id");
-                try validator.requireAttribute(start, "name", "sourceFile is missing required attribute name");
-                try validator.requireAttribute(start, "location", "sourceFile is missing required attribute location");
             },
             .spectrumList => {
                 try validator.noteRunChild(start.byte_offset, .spectrum_list);
@@ -600,8 +601,6 @@ pub const StructuralValidator = struct {
                     validator.run_has_spectrum_list = true;
                 }
                 validator.spectrum_list_depth = element_depth;
-                try validator.requireAttribute(start, "count", "spectrumList is missing required attribute count");
-                try validator.requireReferenceAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef");
                 validator.spectrum_list = try validator.initListCountState(start, element_depth, "spectrumList", "spectrum", 0);
             },
             .chromatogramList => {
@@ -612,8 +611,6 @@ pub const StructuralValidator = struct {
                     validator.run_has_chromatogram_list = true;
                 }
                 validator.chromatogram_list_depth = element_depth;
-                try validator.requireAttribute(start, "count", "chromatogramList is missing required attribute count");
-                try validator.requireReferenceAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef");
                 validator.chromatogram_list = try validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
             },
             .spectrum => {
@@ -622,7 +619,6 @@ pub const StructuralValidator = struct {
                     try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
                 }
                 validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth };
-                try validator.requireSpectrumLikeAttributes(start, .spectrum);
             },
             .chromatogram => {
                 validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
@@ -630,38 +626,26 @@ pub const StructuralValidator = struct {
                     try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
                 }
                 validator.chromatogram = .{ .byte_offset = start.byte_offset, .depth = element_depth };
-                try validator.requireSpectrumLikeAttributes(start, .chromatogram);
             },
             .cv => {
                 validator.bumpListItemCount(&validator.cv_list, element_depth);
-                try validator.requireAttribute(start, "id", "cv is missing required attribute id");
-                try validator.requireAttribute(start, "fullName", "cv is missing required attribute fullName");
-                try validator.requireAttribute(start, "URI", "cv is missing required attribute URI");
             },
             .referenceableParamGroup => {
                 validator.bumpListItemCount(&validator.referenceable_param_group_list, element_depth);
-                try validator.requireAttribute(start, "id", "referenceableParamGroup is missing required attribute id");
             },
-            .referenceableParamGroupRef => {
-                try validator.requireReferenceAttribute(start, "ref", "referenceableParamGroupRef is missing required attribute ref");
-            },
+            .referenceableParamGroupRef => {},
             .sample => {
                 validator.bumpListItemCount(&validator.sample_list, element_depth);
-                try validator.requireAttribute(start, "id", "sample is missing required attribute id");
             },
             .software => {
                 validator.bumpListItemCount(&validator.software_list, element_depth);
-                try validator.requireAttribute(start, "id", "software is missing required attribute id");
-                try validator.requireAttribute(start, "version", "software is missing required attribute version");
             },
             .scanSettings => {
                 validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
-                try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
                 validator.scan_settings = .{};
             },
             .instrumentConfiguration => {
                 validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
-                try validator.requireAttribute(start, "id", "instrumentConfiguration is missing required attribute id");
                 validator.instrument_configuration = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             },
             .componentList => {
@@ -678,7 +662,6 @@ pub const StructuralValidator = struct {
                         state.component_list_seen = true;
                     }
                 }
-                try validator.requireAttribute(start, "count", "componentList is missing required attribute count");
                 const count_state = try validator.initListCountState(start, element_depth, "componentList", "component", 3);
                 if (count_state) |active| {
                     validator.component_list = .{ .count_state = active };
@@ -697,30 +680,21 @@ pub const StructuralValidator = struct {
                         state.software_ref_seen = true;
                     }
                 }
-                try validator.requireReferenceAttribute(start, "ref", "softwareRef is missing required attribute ref");
             },
             .sourceFileRef => {
                 validator.bumpListItemCount(&validator.source_file_ref_list, element_depth);
-                try validator.requireReferenceAttribute(start, "ref", "sourceFileRef is missing required attribute ref");
             },
             .source => {
                 try validator.noteComponentChild(start.byte_offset, .source);
-                try validator.requireAttribute(start, "order", "source is missing required attribute order");
-                try validator.requireNonNegativeAttribute(start, "order", "source");
             },
             .analyzer => {
                 try validator.noteComponentChild(start.byte_offset, .analyzer);
-                try validator.requireAttribute(start, "order", "analyzer is missing required attribute order");
-                try validator.requireNonNegativeAttribute(start, "order", "analyzer");
             },
             .detector => {
                 try validator.noteComponentChild(start.byte_offset, .detector);
-                try validator.requireAttribute(start, "order", "detector is missing required attribute order");
-                try validator.requireNonNegativeAttribute(start, "order", "detector");
             },
             .dataProcessing => {
                 validator.bumpListItemCount(&validator.data_processing_list, element_depth);
-                try validator.requireAttribute(start, "id", "dataProcessing is missing required attribute id");
                 validator.data_processing = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             },
             .processingMethod => {
@@ -731,16 +705,12 @@ pub const StructuralValidator = struct {
                         state.processing_method_seen = true;
                     }
                 }
-                try validator.requireAttribute(start, "order", "processingMethod is missing required attribute order");
-                try validator.requireNonNegativeAttribute(start, "order", "processingMethod");
-                try validator.requireReferenceAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef");
             },
             .scanList => {
                 if (validator.spectrum == null) {
                     try validator.nestingError(start.byte_offset, "scanList must be a child of spectrum");
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .scan_list);
-                try validator.requireAttribute(start, "count", "scanList is missing required attribute count");
                 validator.scan_list = try validator.initListCountState(start, element_depth, "scanList", "scan", 1);
             },
             .precursorList => {
@@ -748,7 +718,6 @@ pub const StructuralValidator = struct {
                     try validator.nestingError(start.byte_offset, "precursorList must be a child of spectrum");
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
-                try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
                 validator.precursor_list = try validator.initListCountState(start, element_depth, "precursorList", "precursor", 1);
             },
             .productList => {
@@ -756,7 +725,6 @@ pub const StructuralValidator = struct {
                     try validator.nestingError(start.byte_offset, "productList must be a child of spectrum");
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .product_list);
-                try validator.requireAttribute(start, "count", "productList is missing required attribute count");
                 validator.product_list = try validator.initListCountState(start, element_depth, "productList", "product", 1);
             },
             .precursor => {
@@ -794,7 +762,6 @@ pub const StructuralValidator = struct {
                     }
                     state.scan_window_list_seen = true;
                 }
-                try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
                 validator.scan_window_list = try validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 1);
             },
             .scanWindow => {
@@ -804,7 +771,6 @@ pub const StructuralValidator = struct {
                 if (validator.precursor) |*state| {
                     try validator.notePrecursorChild(state, start.byte_offset, 2);
                 }
-                try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
                 validator.selected_ion_list = try validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 1);
             },
             .selectedIon => {
@@ -812,7 +778,6 @@ pub const StructuralValidator = struct {
             },
             .binaryDataArrayList => {
                 try validator.noteBinaryDataArrayListChild(start.byte_offset);
-                try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
                 validator.binary_data_array_list = try validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
             },
             .binaryDataArray => {
@@ -837,7 +802,6 @@ pub const StructuralValidator = struct {
                     }
                     state.source_file_ref_list_seen = true;
                 }
-                try validator.requireAttribute(start, "count", "sourceFileRefList is missing required attribute count");
                 validator.source_file_ref_list = try validator.initListCountState(start, element_depth, "sourceFileRefList", "sourceFileRef", 0);
             },
             .targetList => {
@@ -847,7 +811,6 @@ pub const StructuralValidator = struct {
                     }
                     state.target_list_seen = true;
                 }
-                try validator.requireAttribute(start, "count", "targetList is missing required attribute count");
                 validator.target_list = try validator.initListCountState(start, element_depth, "targetList", "target", 1);
             },
             .target => validator.bumpListItemCount(&validator.target_list, element_depth),
@@ -1059,9 +1022,13 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        const tag = validator.frames[validator.depth - 1].tag;
-        if (tag == .unknown) return;
-        switch (tag) {
+        const frame = validator.frames[validator.depth - 1];
+        if (frame.tag == .unknown) return;
+        if (frame.nilled) {
+            try validator.nestingError(byte_offset, "nilled element must not contain text");
+            return;
+        }
+        switch (frame.tag) {
             .binary, .offset, .indexListOffset, .fileChecksum => return,
             else => try validator.nestingError(byte_offset, "non-whitespace text is not allowed in element-only mzML content"),
         }
@@ -1296,10 +1263,13 @@ pub const StructuralValidator = struct {
 
     fn parseCountAttribute(validator: *StructuralValidator, start: StartElement, label: []const u8) !?usize {
         const value = start.attr("count") orelse return null;
-        return std.fmt.parseUnsigned(usize, value, 10) catch {
-            try validator.countError(start.byte_offset, invalidCountMessage(label));
+        if (std.mem.eql(u8, label, "scanWindowList")) {
+            const signed = parseSchemaInt(value) orelse return null;
+            if (signed >= 0) return @intCast(signed);
+            try validator.countError(start.byte_offset, "scanWindowList count must not be negative");
             return null;
-        };
+        }
+        return parseNonNegativeInteger(value);
     }
 
     fn bumpListItemCount(validator: *StructuralValidator, state: *?ListCountState, element_depth: usize) void {
@@ -1395,57 +1365,178 @@ pub const StructuralValidator = struct {
         return element_depth >= validator.mzml_depth.?;
     }
 
-    fn requireSpectrumLikeAttributes(validator: *StructuralValidator, start: StartElement, kind: ContainerKind) !void {
-        if (!hasAttribute(start.attributes, "id")) {
-            try validator.attributeError(start.byte_offset, if (kind == .spectrum)
-                "spectrum is missing required attribute id"
-            else
-                "chromatogram is missing required attribute id");
+    fn validateAttributes(validator: *StructuralValidator, start: StartElement, tag: ElementId) !bool {
+        var nilled = false;
+
+        for (start.attributes) |attribute| {
+            if (attribute.is_namespace_declaration) continue;
+            if (attribute.name.namespace_uri) |namespace_uri| {
+                if (tag == .indexListOffset and
+                    std.mem.eql(u8, namespace_uri, xml_schema_instance_namespace) and
+                    std.mem.eql(u8, attribute.name.local_name, "nil"))
+                {
+                    const value = trimSchemaWhitespace(attribute.value);
+                    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                        nilled = true;
+                    } else if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "0")) {
+                        try validator.attributeError(attribute.byte_offset, "xsi:nil must be true, false, 1, or 0");
+                    }
+                }
+                continue;
+            }
+            if (attribute.name.prefix != null) continue;
+
+            const spec = attributeSpec(tag, attribute.name.local_name) orelse {
+                try validator.attributeError(attribute.byte_offset, "mzML element has an unknown unqualified attribute");
+                continue;
+            };
+            try validator.validateAttributeValue(attribute, spec, start.name.local_name);
         }
-        if (!hasAttribute(start.attributes, "index")) {
-            try validator.attributeError(start.byte_offset, if (kind == .spectrum)
-                "spectrum is missing required attribute index"
-            else
-                "chromatogram is missing required attribute index");
-        } else {
-            const label = if (kind == .spectrum) "spectrum" else "chromatogram";
-            try validator.requireNonNegativeAttribute(start, "index", label);
+
+        try validator.validateRequiredAttributes(start, tag);
+
+        return nilled;
+    }
+
+    fn validateAttributeValue(validator: *StructuralValidator, attribute: Attribute, spec: AttributeSpec, element_name: []const u8) !void {
+        const value = attribute.value;
+        const valid = switch (spec.kind) {
+            .string, .any_uri => true,
+            .id, .id_ref => isNcName(value),
+            .non_negative_integer => parseNonNegativeInteger(value) != null,
+            .int => parseSchemaInt(value) != null,
+            .date_time => isDateTime(value),
+            .double => isDouble(value),
+            .spectrum_id => isSpectrumId(value),
+        };
+        if (valid) return;
+
+        if (std.mem.eql(u8, attribute.name.local_name, "count")) {
+            try validator.countError(attribute.byte_offset, invalidCountMessage(element_name));
+            return;
         }
-        if (!hasAttribute(start.attributes, "defaultArrayLength")) {
-            try validator.attributeError(start.byte_offset, if (kind == .spectrum)
-                "spectrum is missing required attribute defaultArrayLength"
-            else
-                "chromatogram is missing required attribute defaultArrayLength");
-        } else {
-            const label = if (kind == .spectrum) "spectrum" else "chromatogram";
-            try validator.requireNonNegativeAttribute(start, "defaultArrayLength", label);
+
+        if (spec.kind == .id_ref and trimSchemaWhitespace(value).len == 0) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_ref_empty,
+                .location = .{ .byte_offset = attribute.byte_offset },
+                .path = validator.path,
+                .message = "reference value is empty",
+            });
+            return;
+        }
+
+        const message = switch (spec.kind) {
+            .string, .any_uri => unreachable,
+            .id => "ID attribute must be an XML NCName",
+            .id_ref => "reference attribute must be an XML NCName",
+            .non_negative_integer => "attribute must be a non-negative integer within the supported range",
+            .int => "attribute must be a 32-bit integer",
+            .date_time => "attribute must be an XML Schema dateTime",
+            .double => "attribute must be an XML Schema double",
+            .spectrum_id => "spectrum id must match the native identifier pattern",
+        };
+        try validator.attributeError(attribute.byte_offset, message);
+    }
+
+    fn validateRequiredAttributes(validator: *StructuralValidator, start: StartElement, tag: ElementId) !void {
+        switch (tag) {
+            .mzML => try validator.requireSchemaAttribute(start, "version", "mzML is missing required attribute version", false),
+            .cvList => try validator.requireSchemaAttribute(start, "count", "cvList is missing required attribute count", false),
+            .cv => {
+                try validator.requireSchemaAttribute(start, "id", "cv is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "fullName", "cv is missing required attribute fullName", false);
+                try validator.requireSchemaAttribute(start, "URI", "cv is missing required attribute URI", false);
+            },
+            .sourceFileList => try validator.requireSchemaAttribute(start, "count", "sourceFileList is missing required attribute count", false),
+            .sourceFile => {
+                try validator.requireSchemaAttribute(start, "id", "sourceFile is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "name", "sourceFile is missing required attribute name", false);
+                try validator.requireSchemaAttribute(start, "location", "sourceFile is missing required attribute location", false);
+            },
+            .referenceableParamGroupList => try validator.requireSchemaAttribute(start, "count", "referenceableParamGroupList is missing required attribute count", false),
+            .referenceableParamGroup => try validator.requireSchemaAttribute(start, "id", "referenceableParamGroup is missing required attribute id", false),
+            .referenceableParamGroupRef => try validator.requireSchemaAttribute(start, "ref", "referenceableParamGroupRef is missing required attribute ref", true),
+            .cvParam => {
+                try validator.requireSchemaAttribute(start, "cvRef", "cvParam is missing required attribute cvRef", true);
+                try validator.requireSchemaAttribute(start, "accession", "cvParam is missing required attribute accession", false);
+                try validator.requireSchemaAttribute(start, "name", "cvParam is missing required attribute name", false);
+            },
+            .userParam => try validator.requireSchemaAttribute(start, "name", "userParam is missing required attribute name", false),
+            .sampleList => try validator.requireSchemaAttribute(start, "count", "sampleList is missing required attribute count", false),
+            .sample => try validator.requireSchemaAttribute(start, "id", "sample is missing required attribute id", false),
+            .instrumentConfigurationList => try validator.requireSchemaAttribute(start, "count", "instrumentConfigurationList is missing required attribute count", false),
+            .source => try validator.requireSchemaAttribute(start, "order", "source is missing required attribute order", false),
+            .analyzer => try validator.requireSchemaAttribute(start, "order", "analyzer is missing required attribute order", false),
+            .detector => try validator.requireSchemaAttribute(start, "order", "detector is missing required attribute order", false),
+            .componentList => try validator.requireSchemaAttribute(start, "count", "componentList is missing required attribute count", false),
+            .instrumentConfiguration => try validator.requireSchemaAttribute(start, "id", "instrumentConfiguration is missing required attribute id", false),
+            .softwareRef => try validator.requireSchemaAttribute(start, "ref", "softwareRef is missing required attribute ref", true),
+            .softwareList => try validator.requireSchemaAttribute(start, "count", "softwareList is missing required attribute count", false),
+            .software => {
+                try validator.requireSchemaAttribute(start, "id", "software is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "version", "software is missing required attribute version", false);
+            },
+            .dataProcessingList => try validator.requireSchemaAttribute(start, "count", "dataProcessingList is missing required attribute count", false),
+            .dataProcessing => try validator.requireSchemaAttribute(start, "id", "dataProcessing is missing required attribute id", false),
+            .processingMethod => {
+                try validator.requireSchemaAttribute(start, "order", "processingMethod is missing required attribute order", false);
+                try validator.requireSchemaAttribute(start, "softwareRef", "processingMethod is missing required attribute softwareRef", true);
+            },
+            .scanSettingsList => try validator.requireSchemaAttribute(start, "count", "scanSettingsList is missing required attribute count", false),
+            .scanSettings => try validator.requireSchemaAttribute(start, "id", "scanSettings is missing required attribute id", false),
+            .targetList => try validator.requireSchemaAttribute(start, "count", "targetList is missing required attribute count", false),
+            .run => {
+                try validator.requireSchemaAttribute(start, "id", "run is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef", true);
+            },
+            .sourceFileRef => try validator.requireSchemaAttribute(start, "ref", "sourceFileRef is missing required attribute ref", true),
+            .sourceFileRefList => try validator.requireSchemaAttribute(start, "count", "sourceFileRefList is missing required attribute count", false),
+            .spectrumList => {
+                try validator.requireSchemaAttribute(start, "count", "spectrumList is missing required attribute count", false);
+                try validator.requireSchemaAttribute(start, "defaultDataProcessingRef", "spectrumList is missing required attribute defaultDataProcessingRef", true);
+            },
+            .scanWindowList => try validator.requireSchemaAttribute(start, "count", "scanWindowList is missing required attribute count", false),
+            .scanList => try validator.requireSchemaAttribute(start, "count", "scanList is missing required attribute count", false),
+            .precursorList => try validator.requireSchemaAttribute(start, "count", "precursorList is missing required attribute count", false),
+            .selectedIonList => try validator.requireSchemaAttribute(start, "count", "selectedIonList is missing required attribute count", false),
+            .productList => try validator.requireSchemaAttribute(start, "count", "productList is missing required attribute count", false),
+            .binaryDataArrayList => try validator.requireSchemaAttribute(start, "count", "binaryDataArrayList is missing required attribute count", false),
+            .binaryDataArray => try validator.requireSchemaAttribute(start, "encodedLength", "binaryDataArray is missing required attribute encodedLength", false),
+            .spectrum => {
+                try validator.requireSchemaAttribute(start, "id", "spectrum is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "index", "spectrum is missing required attribute index", false);
+                try validator.requireSchemaAttribute(start, "defaultArrayLength", "spectrum is missing required attribute defaultArrayLength", false);
+            },
+            .chromatogramList => {
+                try validator.requireSchemaAttribute(start, "count", "chromatogramList is missing required attribute count", false);
+                try validator.requireSchemaAttribute(start, "defaultDataProcessingRef", "chromatogramList is missing required attribute defaultDataProcessingRef", true);
+            },
+            .chromatogram => {
+                try validator.requireSchemaAttribute(start, "id", "chromatogram is missing required attribute id", false);
+                try validator.requireSchemaAttribute(start, "index", "chromatogram is missing required attribute index", false);
+                try validator.requireSchemaAttribute(start, "defaultArrayLength", "chromatogram is missing required attribute defaultArrayLength", false);
+            },
+            .indexList => try validator.requireSchemaAttribute(start, "count", "indexList is missing required attribute count", false),
+            .index => try validator.requireSchemaAttribute(start, "name", "index is missing required attribute name", false),
+            .offset => try validator.requireSchemaAttribute(start, "idRef", "offset is missing required attribute idRef", false),
+            else => {},
         }
     }
 
-    fn requireAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, message: []const u8) !void {
-        if (hasAttribute(start.attributes, attribute_name)) return;
-        try validator.attributeError(start.byte_offset, message);
-    }
-
-    fn requireReferenceAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, message: []const u8) !void {
-        if (hasAttribute(start.attributes, attribute_name)) return;
-        try validator.appendDiagnostic(.{
-            .severity = .@"error",
-            .rule = RuleId.mzml_ref_missing,
-            .location = .{ .byte_offset = start.byte_offset },
-            .path = validator.path,
-            .message = message,
-        });
-    }
-
-    fn requireNonNegativeAttribute(validator: *StructuralValidator, start: StartElement, attribute_name: []const u8, element_label: []const u8) !void {
-        _ = element_label;
-        const value = start.attr(attribute_name) orelse return;
-        if (std.fmt.parseUnsigned(usize, value, 10) catch null) |_| return;
-        const message = if (value.len > 0 and value[0] == '-')
-            "attribute must not be negative"
-        else
-            "attribute must be a non-negative integer";
+    fn requireSchemaAttribute(validator: *StructuralValidator, start: StartElement, name: []const u8, message: []const u8, reference: bool) !void {
+        if (start.attr(name) != null) return;
+        if (reference) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_ref_missing,
+                .location = .{ .byte_offset = start.byte_offset },
+                .path = validator.path,
+                .message = message,
+            });
+            return;
+        }
         try validator.attributeError(start.byte_offset, message);
     }
 
@@ -1485,6 +1576,303 @@ pub const StructuralValidator = struct {
         _ = try validator.diagnostics.append(validator.allocator, item);
     }
 };
+
+const xml_schema_instance_namespace = "http://www.w3.org/2001/XMLSchema-instance";
+
+fn attributeSpec(tag: ElementId, name: []const u8) ?AttributeSpec {
+    if (std.mem.eql(u8, name, "count")) {
+        return switch (tag) {
+            .scanWindowList => .{ .kind = .int },
+            .binaryDataArrayList,
+            .chromatogramList,
+            .componentList,
+            .cvList,
+            .dataProcessingList,
+            .indexList,
+            .instrumentConfigurationList,
+            .precursorList,
+            .productList,
+            .referenceableParamGroupList,
+            .sampleList,
+            .scanList,
+            .scanSettingsList,
+            .selectedIonList,
+            .softwareList,
+            .sourceFileList,
+            .sourceFileRefList,
+            .spectrumList,
+            .targetList,
+            => .{ .kind = .non_negative_integer },
+            else => null,
+        };
+    }
+
+    if (std.mem.eql(u8, name, "id")) {
+        return switch (tag) {
+            .cv, .dataProcessing, .instrumentConfiguration, .referenceableParamGroup, .run, .sample, .scanSettings, .software, .sourceFile => .{ .kind = .id },
+            .spectrum => .{ .kind = .spectrum_id },
+            .chromatogram => .{ .kind = .string },
+            .mzML => .{ .kind = .string },
+            else => null,
+        };
+    }
+
+    return switch (tag) {
+        .mzML => if (std.mem.eql(u8, name, "accession"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "version"))
+            .{ .kind = .string }
+        else
+            null,
+        .cv => if (std.mem.eql(u8, name, "fullName"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "version"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "URI"))
+            .{ .kind = .any_uri }
+        else
+            null,
+        .sourceFile => if (std.mem.eql(u8, name, "name"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "location"))
+            .{ .kind = .any_uri }
+        else
+            null,
+        .referenceableParamGroupRef, .softwareRef, .sourceFileRef => if (std.mem.eql(u8, name, "ref"))
+            .{ .kind = .id_ref }
+        else
+            null,
+        .cvParam => paramAttributeSpec(name, true),
+        .userParam => paramAttributeSpec(name, false),
+        .sample => if (std.mem.eql(u8, name, "name")) .{ .kind = .string } else null,
+        .source, .analyzer, .detector => if (std.mem.eql(u8, name, "order")) .{ .kind = .int } else null,
+        .instrumentConfiguration => if (std.mem.eql(u8, name, "scanSettingsRef")) .{ .kind = .id_ref } else null,
+        .software => if (std.mem.eql(u8, name, "version")) .{ .kind = .string } else null,
+        .processingMethod => if (std.mem.eql(u8, name, "order"))
+            .{ .kind = .non_negative_integer }
+        else if (std.mem.eql(u8, name, "softwareRef"))
+            .{ .kind = .id_ref }
+        else
+            null,
+        .run => if (std.mem.eql(u8, name, "defaultInstrumentConfigurationRef"))
+            .{ .kind = .id_ref }
+        else if (std.mem.eql(u8, name, "defaultSourceFileRef") or std.mem.eql(u8, name, "sampleRef"))
+            .{ .kind = .id_ref }
+        else if (std.mem.eql(u8, name, "startTimeStamp"))
+            .{ .kind = .date_time }
+        else
+            null,
+        .spectrumList, .chromatogramList => if (std.mem.eql(u8, name, "defaultDataProcessingRef")) .{ .kind = .id_ref } else null,
+        .scan => if (std.mem.eql(u8, name, "spectrumRef") or std.mem.eql(u8, name, "externalSpectrumID"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "sourceFileRef") or std.mem.eql(u8, name, "instrumentConfigurationRef"))
+            .{ .kind = .id_ref }
+        else
+            null,
+        .precursor => if (std.mem.eql(u8, name, "spectrumRef") or std.mem.eql(u8, name, "externalSpectrumID"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "sourceFileRef"))
+            .{ .kind = .id_ref }
+        else
+            null,
+        .binaryDataArray => if (std.mem.eql(u8, name, "arrayLength"))
+            .{ .kind = .non_negative_integer }
+        else if (std.mem.eql(u8, name, "dataProcessingRef"))
+            .{ .kind = .id_ref }
+        else if (std.mem.eql(u8, name, "encodedLength"))
+            .{ .kind = .non_negative_integer }
+        else
+            null,
+        .spectrum => spectrumAttributeSpec(name),
+        .chromatogram => chromatogramAttributeSpec(name),
+        .index => if (std.mem.eql(u8, name, "name")) .{ .kind = .string } else null,
+        .offset => if (std.mem.eql(u8, name, "idRef"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "spotID"))
+            .{ .kind = .string }
+        else if (std.mem.eql(u8, name, "scanTime"))
+            .{ .kind = .double }
+        else
+            null,
+        else => null,
+    };
+}
+
+fn paramAttributeSpec(name: []const u8, cv_param: bool) ?AttributeSpec {
+    if (cv_param and std.mem.eql(u8, name, "cvRef")) return .{ .kind = .id_ref };
+    if (cv_param and std.mem.eql(u8, name, "accession")) return .{ .kind = .string };
+    if (std.mem.eql(u8, name, "name")) return .{ .kind = .string };
+    if (std.mem.eql(u8, name, "value") or
+        std.mem.eql(u8, name, "unitAccession") or
+        std.mem.eql(u8, name, "unitName") or
+        (!cv_param and std.mem.eql(u8, name, "type"))) return .{ .kind = .string };
+    if (std.mem.eql(u8, name, "unitCvRef")) return .{ .kind = .id_ref };
+    return null;
+}
+
+fn spectrumAttributeSpec(name: []const u8) ?AttributeSpec {
+    if (std.mem.eql(u8, name, "spotID")) return .{ .kind = .string };
+    if (std.mem.eql(u8, name, "index")) return .{ .kind = .non_negative_integer };
+    if (std.mem.eql(u8, name, "defaultArrayLength")) return .{ .kind = .int };
+    if (std.mem.eql(u8, name, "dataProcessingRef") or std.mem.eql(u8, name, "sourceFileRef")) return .{ .kind = .id_ref };
+    return null;
+}
+
+fn chromatogramAttributeSpec(name: []const u8) ?AttributeSpec {
+    if (std.mem.eql(u8, name, "index")) return .{ .kind = .non_negative_integer };
+    if (std.mem.eql(u8, name, "defaultArrayLength")) return .{ .kind = .int };
+    if (std.mem.eql(u8, name, "dataProcessingRef")) return .{ .kind = .id_ref };
+    return null;
+}
+
+fn trimSchemaWhitespace(value: []const u8) []const u8 {
+    return std.mem.trim(u8, value, " \t\r\n");
+}
+
+fn parseNonNegativeInteger(value: []const u8) ?usize {
+    var token = trimSchemaWhitespace(value);
+    if (token.len > 0 and token[0] == '+') token = token[1..];
+    if (token.len == 0) return null;
+    return std.fmt.parseUnsigned(usize, token, 10) catch null;
+}
+
+fn parseSchemaInt(value: []const u8) ?i32 {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return null;
+    return std.fmt.parseInt(i32, token, 10) catch null;
+}
+
+fn isNcName(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0 or std.mem.indexOfScalar(u8, token, ':') != null) return false;
+    xml_characters.validateQName(token) catch return false;
+    return true;
+}
+
+fn isSpectrumId(value: []const u8) bool {
+    if (value.len == 0 or value[0] == ' ' or value[value.len - 1] == ' ') return false;
+    var token_start: usize = 0;
+    for (value, 0..) |byte, index| {
+        if (byte == '\t' or byte == '\r' or byte == '\n') return false;
+        if (byte != ' ') continue;
+        if (!isSpectrumIdToken(value[token_start..index])) return false;
+        token_start = index + 1;
+    }
+    return isSpectrumIdToken(value[token_start..]);
+}
+
+fn isSpectrumIdToken(token: []const u8) bool {
+    const equals = std.mem.indexOfScalar(u8, token, '=') orelse return false;
+    return equals > 0 and equals + 1 < token.len;
+}
+
+fn isDouble(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (std.mem.eql(u8, token, "INF") or
+        std.mem.eql(u8, token, "-INF") or
+        std.mem.eql(u8, token, "NaN")) return true;
+
+    var index: usize = 0;
+    if (index < token.len and (token[index] == '+' or token[index] == '-')) index += 1;
+    var integer_digits: usize = 0;
+    while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) integer_digits += 1;
+    var fraction_digits: usize = 0;
+    if (index < token.len and token[index] == '.') {
+        index += 1;
+        while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) fraction_digits += 1;
+    }
+    if (integer_digits == 0 and fraction_digits == 0) return false;
+    if (index < token.len and (token[index] == 'e' or token[index] == 'E')) {
+        index += 1;
+        if (index < token.len and (token[index] == '+' or token[index] == '-')) index += 1;
+        const exponent_start = index;
+        while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) {}
+        if (index == exponent_start) return false;
+    }
+    return index == token.len;
+}
+
+fn isDateTime(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    var index: usize = 0;
+    if (index < token.len and token[index] == '-') index += 1;
+
+    const year_start = index;
+    while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) {}
+    const year_digits = token[year_start..index];
+    if (year_digits.len < 4 or allZero(year_digits)) return false;
+    if (year_digits.len > 4 and year_digits[0] == '0') return false;
+    const year = year_digits;
+    if (!takeByte(token, &index, '-')) return false;
+    const month = takeTwoDigits(token, &index) orelse return false;
+    if (!takeByte(token, &index, '-')) return false;
+    const day = takeTwoDigits(token, &index) orelse return false;
+    if (!takeByte(token, &index, 'T')) return false;
+    const hour = takeTwoDigits(token, &index) orelse return false;
+    if (!takeByte(token, &index, ':')) return false;
+    const minute = takeTwoDigits(token, &index) orelse return false;
+    if (!takeByte(token, &index, ':')) return false;
+    const second = takeTwoDigits(token, &index) orelse return false;
+
+    var fraction_nonzero = false;
+    if (index < token.len and token[index] == '.') {
+        index += 1;
+        const fraction_start = index;
+        while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) {
+            fraction_nonzero = fraction_nonzero or token[index] != '0';
+        }
+        if (index == fraction_start) return false;
+    }
+
+    if (month < 1 or month > 12 or day < 1 or day > daysInMonth(month, year)) return false;
+    if (hour > 24 or minute > 59 or second > 59) return false;
+    if (hour == 24 and (minute != 0 or second != 0 or fraction_nonzero)) return false;
+
+    if (index == token.len) return true;
+    if (token[index] == 'Z') return index + 1 == token.len;
+    if (token[index] != '+' and token[index] != '-') return false;
+    index += 1;
+    const timezone_hour = takeTwoDigits(token, &index) orelse return false;
+    if (!takeByte(token, &index, ':')) return false;
+    const timezone_minute = takeTwoDigits(token, &index) orelse return false;
+    if (timezone_hour > 14 or timezone_minute > 59) return false;
+    if (timezone_hour == 14 and timezone_minute != 0) return false;
+    return index == token.len;
+}
+
+fn takeByte(value: []const u8, index: *usize, expected: u8) bool {
+    if (index.* >= value.len or value[index.*] != expected) return false;
+    index.* += 1;
+    return true;
+}
+
+fn takeTwoDigits(value: []const u8, index: *usize) ?u8 {
+    if (index.* + 2 > value.len) return null;
+    const first = value[index.*];
+    const second = value[index.* + 1];
+    if (!std.ascii.isDigit(first) or !std.ascii.isDigit(second)) return null;
+    index.* += 2;
+    return (first - '0') * 10 + second - '0';
+}
+
+fn allZero(value: []const u8) bool {
+    for (value) |byte| if (byte != '0') return false;
+    return true;
+}
+
+fn daysInMonth(month: u8, leading_year_digits: []const u8) u8 {
+    return switch (month) {
+        2 => if (isLeapYear(leading_year_digits)) 29 else 28,
+        4, 6, 9, 11 => 30,
+        else => 31,
+    };
+}
+
+fn isLeapYear(leading_year_digits: []const u8) bool {
+    var year_mod_400: u16 = 0;
+    for (leading_year_digits) |byte| year_mod_400 = (year_mod_400 * 10 + byte - '0') % 400;
+    return year_mod_400 % 4 == 0 and (year_mod_400 % 100 != 0 or year_mod_400 == 0);
+}
 
 fn isAllowedParent(child: ElementId, parent: ElementId) bool {
     return switch (child) {
@@ -1581,10 +1969,6 @@ fn invalidParentMessage(child: ElementId, parent: ElementId) []const u8 {
     if (child == .binaryDataArrayList) return "binaryDataArrayList must be a child of spectrum or chromatogram";
     if (child == .indexList or child == .indexListOffset or child == .fileChecksum) return "index metadata must be a direct child of indexedmzML";
     return "mzML element is not allowed under its parent";
-}
-
-fn hasAttribute(attributes: []const Attribute, local_name: []const u8) bool {
-    return xml_events.attributeByLocalName(attributes, local_name) != null;
 }
 
 fn topLevelDirectChildMessage(element_name: []const u8) []const u8 {
@@ -2664,7 +3048,7 @@ test "structural validator: enforces index list count and offset minimum" {
     try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
     try validator.consumeEnd(test_events.endInterned("mzML", 20));
     try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "1")}, 30));
-    try validator.consumeStart(test_events.startInterned("index", &.{}, 40));
+    try validator.consumeStart(test_events.startInterned("index", &.{test_events.attr("name", "spectrum")}, 40));
     try validator.consumeEnd(test_events.endInterned("index", 50));
     try validator.consumeEnd(test_events.endInterned("indexList", 60));
 
@@ -2696,6 +3080,164 @@ test "structural validator: out-of-order components remain counted" {
         RuleId.mzml_structure_nesting,
         "analyzer appears out of order under componentList",
     );
+}
+
+test "[unit]: missing binary metadata is rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("", "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\">" ++
+        "<binaryDataArrayList count=\"2\">" ++
+        "<binaryDataArray><binary/></binaryDataArray>" ++
+        "<binaryDataArray encodedLength=\"0\"><binary/></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList>");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, "binaryDataArray is missing required attribute encodedLength");
+}
+
+test "[unit]: cvParam identity fields are required" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("<cvParam value=\"\"/>", "");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.items.len);
+    try std.testing.expectEqualStrings("cvParam is missing required attribute cvRef", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings("cvParam is missing required attribute accession", diagnostics.items[1].message);
+    try std.testing.expectEqualStrings("cvParam is missing required attribute name", diagnostics.items[2].message);
+}
+
+test "[unit]: unknown unqualified attributes are rejected" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("<cvParam xmlns:ext=\"urn:extension\" cvRef=\"MS\" accession=\"MS:1\" name=\"term\" ext:note=\"allowed\" bogus=\"rejected\"/>", "");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, "mzML element has an unknown unqualified attribute");
+}
+
+test "[unit]: structural attribute validator rejects empty typed required values" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    _ = try validator.validateAttributes(test_events.startInterned("run", &.{
+        test_events.attr("id", ""),
+        test_events.attr("defaultInstrumentConfigurationRef", "IC1"),
+    }, 0), .run);
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, "ID attribute must be an XML NCName");
+
+    diagnostics.clearRetainingCapacity();
+    _ = try validator.validateAttributes(test_events.startInterned("run", &.{
+        test_events.attr("id", "run-1"),
+        test_events.attr("defaultInstrumentConfigurationRef", ""),
+    }, 0), .run);
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_ref_empty, "reference value is empty");
+
+    diagnostics.clearRetainingCapacity();
+    _ = try validator.validateAttributes(test_events.startInterned("cvList", &.{test_events.attr("count", "")}, 0), .cvList);
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_count, "cvList count attribute must be a non-negative integer");
+}
+
+test "[unit]: structural numeric attribute lexical forms cover boundaries" {
+    var max_usize_buffer: [32]u8 = undefined;
+    const max_usize = try std.fmt.bufPrint(&max_usize_buffer, "{d}", .{std.math.maxInt(usize)});
+
+    try std.testing.expectEqual(@as(?usize, 0), parseNonNegativeInteger("0"));
+    try std.testing.expectEqual(@as(?usize, 0), parseNonNegativeInteger(" +0 "));
+    try std.testing.expectEqual(std.math.maxInt(usize), parseNonNegativeInteger(max_usize).?);
+    try std.testing.expectEqual(@as(?usize, null), parseNonNegativeInteger("-1"));
+    try std.testing.expectEqual(@as(?usize, null), parseNonNegativeInteger("1.0"));
+    try std.testing.expectEqual(@as(?usize, null), parseNonNegativeInteger("9999999999999999999999999999999999999999"));
+
+    try std.testing.expectEqual(@as(?i32, std.math.minInt(i32)), parseSchemaInt("-2147483648"));
+    try std.testing.expectEqual(@as(?i32, std.math.maxInt(i32)), parseSchemaInt("+2147483647"));
+    try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("-2147483649"));
+    try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("2147483648"));
+    try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("1e2"));
+}
+
+test "[unit]: structural ID reference and spectrum lexical forms are exact" {
+    try std.testing.expect(isNcName(" valid_id-1 "));
+    try std.testing.expect(isNcName("\u{03b1}name"));
+    try std.testing.expect(!isNcName(""));
+    try std.testing.expect(!isNcName("1invalid"));
+    try std.testing.expect(!isNcName("prefix:name"));
+
+    try std.testing.expect(isSpectrumId("scan=1"));
+    try std.testing.expect(isSpectrumId("controllerType=0 controllerNumber=1 scan=2"));
+    try std.testing.expect(!isSpectrumId("scan="));
+    try std.testing.expect(!isSpectrumId("scan=1  index=2"));
+    try std.testing.expect(!isSpectrumId(" scan=1"));
+    try std.testing.expect(!isSpectrumId("scan=1\tindex=2"));
+}
+
+test "[unit]: structural date and floating attribute lexical forms are exact" {
+    try std.testing.expect(isDouble("0"));
+    try std.testing.expect(isDouble("-.5E+2"));
+    try std.testing.expect(isDouble("INF"));
+    try std.testing.expect(isDouble("-INF"));
+    try std.testing.expect(isDouble("NaN"));
+    try std.testing.expect(!isDouble("+INF"));
+    try std.testing.expect(!isDouble("."));
+    try std.testing.expect(!isDouble("1e"));
+
+    try std.testing.expect(isDateTime("2000-02-29T24:00:00Z"));
+    try std.testing.expect(isDateTime("2026-07-18T12:34:56.125-07:00"));
+    try std.testing.expect(isDateTime("-0001-01-01T00:00:00+14:00"));
+    try std.testing.expect(!isDateTime("0000-01-01T00:00:00Z"));
+    try std.testing.expect(!isDateTime("02026-01-01T00:00:00Z"));
+    try std.testing.expect(!isDateTime("2023-02-29T00:00:00Z"));
+    try std.testing.expect(!isDateTime("2026-01-01T24:00:00.1Z"));
+    try std.testing.expect(!isDateTime("2026-01-01T00:00:00+14:01"));
+}
+
+test "[unit]: structural validator accepts only XML Schema boolean nil values" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    const true_nil = Attribute{
+        .byte_offset = 5,
+        .name = .{ .prefix = "xsi", .local_name = "nil", .namespace_uri = xml_schema_instance_namespace },
+        .value = "1",
+    };
+    const nilled = try validator.validateAttributes(test_events.startInterned("indexListOffset", &.{true_nil}, 0), .indexListOffset);
+
+    try std.testing.expect(nilled);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+
+    const invalid_nil = Attribute{
+        .byte_offset = 5,
+        .name = .{ .prefix = "xsi", .local_name = "nil", .namespace_uri = xml_schema_instance_namespace },
+        .value = "yes",
+    };
+    _ = try validator.validateAttributes(test_events.startInterned("indexListOffset", &.{invalid_nil}, 0), .indexListOffset);
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, "xsi:nil must be true, false, 1, or 0");
 }
 
 test "structural validator repeated clean and broken runs do not accumulate diagnostics" {

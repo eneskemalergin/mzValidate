@@ -223,17 +223,10 @@ pub const IndexValidator = struct {
                 validator.saw_index_elements = true;
                 const count_attr = start.attr("count");
                 validator.index_list_declared_count = if (count_attr) |c|
-                    if (std.fmt.parseUnsigned(u64, c, 10)) |count| blk: {
+                    if (std.fmt.parseUnsigned(u64, std.mem.trim(u8, c, " \t\r\n"), 10)) |count| blk: {
                         _ = try validator.boundedCount(count, start.byte_offset, "indexList count exceeds the configured index-entry limit");
                         break :blk count;
-                    } else |_| blk: {
-                        try validator.appendDiagnostic(
-                            start.byte_offset,
-                            RuleId.mzml_index_offset_list,
-                            "indexList count must be a non-negative integer",
-                        );
-                        break :blk null;
-                    }
+                    } else |_| null
                 else
                     null;
             },
@@ -250,10 +243,7 @@ pub const IndexValidator = struct {
                 };
                 _ = try validator.boundedCount(next_count, start.byte_offset, "index element count exceeds the configured index-entry limit");
                 validator.index_list_actual_count = next_count;
-                const name = start.attr("name") orelse {
-                    try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset_list, "index element is missing required attribute name");
-                    return;
-                };
+                const name = start.attr("name") orelse return;
                 validator.current_index_kind = if (std.mem.eql(u8, name, "spectrum"))
                     IndexKind.spectrum
                 else if (std.mem.eql(u8, name, "chromatogram"))
@@ -265,10 +255,7 @@ pub const IndexValidator = struct {
             },
             .offset => {
                 if (validator.current_index_kind == null) return;
-                const id_ref = start.attr("idRef") orelse {
-                    try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_offset, "offset element is missing required attribute idRef");
-                    return;
-                };
+                const id_ref = start.attr("idRef") orelse return;
                 if (validator.offset_id_ref) |old_ref| {
                     validator.releaseIndexBytes(old_ref.len);
                     validator.allocator.free(old_ref);
@@ -1387,7 +1374,7 @@ test "IndexValidator: count limit rejects before reservation" {
     try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
 }
 
-test "IndexValidator: invalid indexList counts produce diagnostics" {
+test "[unit]: index validator leaves malformed indexList counts to structural validation" {
     for ([_][]const u8{ "not-a-count", "18446744073709551616" }) |value| {
         const allocator = testing.allocator;
         var diagnostics: DiagnosticSink = .empty;
@@ -1399,8 +1386,7 @@ test "IndexValidator: invalid indexList counts produce diagnostics" {
         try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
         try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", value)}, 10), 1);
 
-        try expectEqual(@as(usize, 1), diagnostics.items.len);
-        try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+        try expectEqual(@as(usize, 0), diagnostics.items.len);
     }
 }
 

@@ -2087,6 +2087,66 @@ test "reader check: reports a broken attribute quote" {
     );
 }
 
+test "[unit]: malformed spectrum index has one structural diagnostic" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml = spectrumListMzml(
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+            "<spectrum index=\"invalid\" id=\"scan=1\" defaultArrayLength=\"0\"/>" ++
+            "</spectrumList>",
+    );
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-invalid-index.mzML", .{ .skip_index = true, .skip_semantic = true }, null);
+
+    try expectSingleDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_attribute,
+        "attribute must be a non-negative integer within the supported range",
+    );
+}
+
+test "[unit]: overflowing defaultArrayLength stays a complete structural error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const mz_array =
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/>" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/>" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000514\" name=\"m/z array\"/>" ++
+        "<binary>AAAAAA==</binary>" ++
+        "</binaryDataArray>";
+    const intensity_array =
+        "<binaryDataArray encodedLength=\"8\">" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/>" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/>" ++
+        "<cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\"/>" ++
+        "<binary>AAAAAA==</binary>" ++
+        "</binaryDataArray>";
+    const xml = spectrumListMzml(
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+            "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"2147483648\">" ++
+            "<binaryDataArrayList count=\"2\">" ++ mz_array ++ intensity_array ++ "</binaryDataArrayList>" ++
+            "</spectrum></spectrumList>",
+    );
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    const result = checkReaderResult(allocator, io, &reader, &diagnostics, "inline-overflowing-array-length.mzML", .{ .skip_index = true, .skip_semantic = true }, null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+    try expectSingleDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_attribute,
+        "attribute must be a 32-bit integer",
+    );
+}
+
 test "reader check: reports a mismatched end tag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2565,7 +2625,7 @@ test "path check: is clean when corrupt binary checks are disabled" {
 test "reader check: reports an empty binary length mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const xml = binarySpectrumListMzml("", "AAAAAA==", 1, "MS:1000576");
+    const xml = binarySpectrumListMzml("", "AAAAAA==", 1, "MS:1000576", "no compression");
 
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
@@ -2583,7 +2643,7 @@ test "reader check: reports an empty binary length mismatch" {
 test "reader check: reports a zlib length mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const xml = binarySpectrumListMzml("eJxjYGBgAAAABAAB", "AAAAAAAAAAA=", 2, "MS:1000574");
+    const xml = binarySpectrumListMzml("eJxjYGBgAAAABAAB", "AAAAAAAAAAA=", 2, "MS:1000574", "zlib compression");
 
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
@@ -2920,8 +2980,8 @@ fn chromatogramMzmlWithPayloads(comptime first_payload: []const u8, comptime sec
         "<precursor><activation/></precursor>" ++
         "<product/>" ++
         "<binaryDataArrayList count=\"2\">" ++
-        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000595\"/><binary>" ++ first_payload ++ "</binary></binaryDataArray>" ++
-        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000515\"/><binary>" ++ second_payload ++ "</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000595\" name=\"time array\"/><binary>" ++ first_payload ++ "</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\"/><binary>" ++ second_payload ++ "</binary></binaryDataArray>" ++
         "</binaryDataArrayList>" ++
         "</chromatogram>" ++
         "</chromatogramList>" ++
@@ -2929,22 +2989,28 @@ fn chromatogramMzmlWithPayloads(comptime first_payload: []const u8, comptime sec
         "</mzML>";
 }
 
-fn binarySpectrumListMzml(comptime payload: []const u8, comptime second_payload: []const u8, comptime default_array_length: usize, comptime compression_accession: []const u8) []const u8 {
+fn binarySpectrumListMzml(
+    comptime payload: []const u8,
+    comptime second_payload: []const u8,
+    comptime default_array_length: usize,
+    comptime compression_accession: []const u8,
+    comptime compression_name: []const u8,
+) []const u8 {
     return spectrumListMzml(
         "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
             "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"" ++ comptimeUnsigned(default_array_length) ++ "\">" ++
             "<scanList count=\"1\"><scan/></scanList>" ++
             "<binaryDataArrayList count=\"2\">" ++
             "<binaryDataArray encodedLength=\"" ++ comptimeUnsigned(payload.len) ++ "\">" ++
-            "<cvParam accession=\"MS:1000521\"/>" ++
-            "<cvParam accession=\"" ++ compression_accession ++ "\"/>" ++
-            "<cvParam accession=\"MS:1000514\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"" ++ compression_accession ++ "\" name=\"" ++ compression_name ++ "\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"MS:1000514\" name=\"m/z array\"/>" ++
             "<binary>" ++ payload ++ "</binary>" ++
             "</binaryDataArray>" ++
             "<binaryDataArray encodedLength=\"" ++ comptimeUnsigned(second_payload.len) ++ "\">" ++
-            "<cvParam accession=\"MS:1000521\"/>" ++
-            "<cvParam accession=\"MS:1000576\"/>" ++
-            "<cvParam accession=\"MS:1000515\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/>" ++
+            "<cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\"/>" ++
             "<binary>" ++ second_payload ++ "</binary>" ++
             "</binaryDataArray>" ++
             "</binaryDataArrayList>" ++
