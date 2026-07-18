@@ -457,12 +457,14 @@ pub const SemanticValidator = struct {
         if (tag == .cvParam or tag == .userParam) {
             if (start.attributes.len > 0) {
                 for (start.attributes) |attribute| {
+                    if (attribute.is_namespace_declaration or attribute.name.prefix != null or attribute.name.namespace_uri != null) continue;
                     setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.name.local_name, attribute.value);
                 }
             } else if (start.raw_tag.len > 0) {
                 var raw_scanner = xml_scan.RawAttributeScanner.init(start.raw_tag);
                 while (try raw_scanner.next()) |attribute| {
                     if (attribute.is_namespace_declaration) continue;
+                    if (!std.mem.eql(u8, attribute.name, attribute.local_name)) continue;
                     setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.local_name, attribute.value);
                 }
             }
@@ -529,6 +531,7 @@ pub const SemanticValidator = struct {
             }
 
             for (start.attributes) |attr| {
+                if (attr.is_namespace_declaration or attr.name.prefix != null or attr.name.namespace_uri != null) continue;
                 const name_attr = attr.name.local_name;
                 if (isRefAttr(name_attr)) {
                     try validator.ref_table.addRef(
@@ -1316,7 +1319,7 @@ test "SemanticValidator: descendant cache retains canonical CV accessions" {
     try testing.expect(found);
 }
 
-test "SemanticValidator: raw attribute fallback ignores namespace declarations" {
+test "SemanticValidator: raw attribute fallback ignores foreign attributes" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -1332,7 +1335,34 @@ test "SemanticValidator: raw attribute fallback ignores namespace declarations" 
     try consumeCv(&sv, "MS");
 
     var start = test_events.startUnknown("cvParam", &.{}, 10);
-    start.raw_tag = " xmlns:accession=\"urn:test\" accession=\"MS:1000001\" cvRef=\"MS\"";
+    start.raw_tag = " accession=\"MS:1000001\" xmlns:p=\"urn:test\" p:accession=\"MS:9999999\" cvRef=\"MS\"";
+    try sv.consumeStart(start);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "SemanticValidator: eager attributes ignore foreign names" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    const attributes = [_]Attribute{
+        test_events.attr("accession", "MS:1000001"),
+        .{ .byte_offset = 11, .name = .{ .prefix = "p", .local_name = "accession", .namespace_uri = "urn:test" }, .value = "MS:9999999" },
+        test_events.attr("cvRef", "MS"),
+    };
+    const start = test_events.startUnknown("cvParam", &attributes, 10);
+
     try sv.consumeStart(start);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
@@ -1916,6 +1946,31 @@ test "SemanticValidator: unresolved ref produces error" {
     try sv.finish();
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_ref_unresolved, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: foreign reference attributes are ignored" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 10, .name = .{ .prefix = "x", .local_name = "softwareRef", .namespace_uri = "urn:foreign" }, .value = "NONEXISTENT" },
+    };
+    const start = test_events.startInterned("instrumentConfiguration", &attributes, 10);
+
+    try sv.consumeStart(start);
+    try sv.finish();
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "SemanticValidator: missing cvRef produces reference diagnostic" {

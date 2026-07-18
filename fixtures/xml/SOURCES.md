@@ -32,6 +32,15 @@ Curated sourced fixtures added in this pass:
 
 Adversarial invalid fixtures added in this pass:
 
+- `invalid/undeclared-prefix.xml`
+  Source: W3C Namespaces `Prefix Declared` constraint reduced to an mzML root QName.
+  Purpose: reject a prefixed mzML root with no in-scope binding.
+- `invalid/duplicate-attribute.xml`
+  Source: W3C Namespaces `Attributes Unique` constraint reduced to two prefixes bound to one namespace.
+  Purpose: reject attributes with the same expanded name.
+- `invalid/duplicate-namespace-declaration.xml`
+  Source: W3C XML attribute uniqueness reduced to repeated declarations for one prefix.
+  Purpose: reject two bindings for the same prefix on one element.
 - `invalid/invalid-name-start.xml`
   Source: W3C XML `NameStartChar` production reduced to an ASCII boundary case.
   Purpose: reject an element name that starts with a digit.

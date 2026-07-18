@@ -10,6 +10,9 @@ const characters = @import("characters.zig");
 const events = @import("events.zig");
 const scan = @import("scan.zig");
 
+const xml_namespace = "http://www.w3.org/XML/1998/namespace";
+const xmlns_namespace = "http://www.w3.org/2000/xmlns/";
+
 const Attribute = events.Attribute;
 const EndElement = events.EndElement;
 const Event = events.Event;
@@ -593,6 +596,7 @@ pub const Parser = struct {
     ) ParseError!Event {
         const name = try parser.resolveQName(name_parts, true);
         try parser.resolveAttributeNamespaces();
+        try parser.ensureUniqueAttributes();
         const element_id = elements.idFromParts(name.local_name, name.namespace_uri);
         try parser.pushElementFrame(name, namespace_count_before, namespace_bytes_before, synthetic_end_byte_offset, element_id);
 
@@ -679,7 +683,16 @@ pub const Parser = struct {
         for (parser.attribute_storage[0..parser.attribute_count]) |*attribute| {
             if (attribute.is_namespace_declaration) continue;
             if (attribute.name.prefix) |prefix| {
-                attribute.name.namespace_uri = try parser.lookupNamespace(prefix, false);
+                attribute.name.namespace_uri = try parser.lookupNamespace(prefix, false) orelse return error.MalformedXml;
+            }
+        }
+    }
+
+    fn ensureUniqueAttributes(parser: *const Parser) ParseError!void {
+        const attributes = parser.attribute_storage[0..parser.attribute_count];
+        for (attributes, 0..) |left, left_index| {
+            for (attributes[left_index + 1 ..]) |right| {
+                if (attributesHaveSameIdentity(left, right)) return error.MalformedXml;
             }
         }
     }
@@ -877,15 +890,23 @@ pub const Parser = struct {
 
     fn resolveQName(parser: *Parser, name: NameParts, allow_default_namespace: bool) ParseError!QName {
         const prefix = if (name.prefix) |range| range.slice(parser.token_buffer) else null;
+        if (prefix) |prefix_bytes| {
+            if (std.mem.eql(u8, prefix_bytes, "xmlns")) return error.MalformedXml;
+        }
+        const namespace_uri = try parser.lookupNamespace(prefix, allow_default_namespace);
+        if (prefix != null and namespace_uri == null) return error.MalformedXml;
         return .{
             .prefix = prefix,
             .local_name = name.local_name.slice(parser.token_buffer),
-            .namespace_uri = try parser.lookupNamespace(prefix, allow_default_namespace),
+            .namespace_uri = namespace_uri,
         };
     }
 
     fn lookupNamespace(parser: *Parser, prefix: ?[]const u8, allow_default_namespace: bool) ParseError!?[]const u8 {
         if (prefix == null and !allow_default_namespace) return null;
+        if (prefix) |prefix_bytes| {
+            if (std.mem.eql(u8, prefix_bytes, "xml")) return xml_namespace;
+        }
 
         var index = parser.namespace_count;
         while (index > 0) {
@@ -893,7 +914,8 @@ pub const Parser = struct {
             const binding = parser.namespace_storage[index];
             const binding_prefix = if (binding.prefix) |range| range.slice(parser.namespace_bytes) else null;
             if (optionalSliceEql(binding_prefix, prefix)) {
-                return binding.namespace_uri.slice(parser.namespace_bytes);
+                const namespace_uri = binding.namespace_uri.slice(parser.namespace_bytes);
+                return if (namespace_uri.len == 0) null else namespace_uri;
             }
         }
 
@@ -911,6 +933,19 @@ pub const Parser = struct {
         if (parser.namespace_count >= parser.namespace_storage.len) return error.TooManyNamespaces;
 
         const prefix = if (name.prefix) |_| name.local_name.slice(parser.token_buffer) else null;
+        if (prefix) |prefix_bytes| {
+            if (std.mem.eql(u8, prefix_bytes, "xmlns")) return error.MalformedXml;
+            if (std.mem.eql(u8, prefix_bytes, "xml")) {
+                if (!std.mem.eql(u8, value, xml_namespace)) return error.MalformedXml;
+            } else {
+                if (std.mem.eql(u8, value, xml_namespace)) return error.MalformedXml;
+                if (value.len == 0 and parser.xml_version == .xml_1_0) return error.MalformedXml;
+            }
+        } else if (std.mem.eql(u8, value, xml_namespace)) {
+            return error.MalformedXml;
+        }
+        if (std.mem.eql(u8, value, xmlns_namespace)) return error.MalformedXml;
+
         const prefix_range = if (prefix) |prefix_bytes|
             try parser.appendNamespaceBytes(prefix_bytes)
         else
@@ -1363,6 +1398,17 @@ fn qnameEql(left: QName, right: QName) bool {
     return optionalSliceEql(left.prefix, right.prefix) and
         std.mem.eql(u8, left.local_name, right.local_name) and
         optionalSliceEql(left.namespace_uri, right.namespace_uri);
+}
+
+fn attributesHaveSameIdentity(left: Attribute, right: Attribute) bool {
+    if (left.is_namespace_declaration or right.is_namespace_declaration) {
+        return left.is_namespace_declaration and
+            right.is_namespace_declaration and
+            optionalSliceEql(left.name.prefix, right.name.prefix) and
+            std.mem.eql(u8, left.name.local_name, right.name.local_name);
+    }
+    return std.mem.eql(u8, left.name.local_name, right.name.local_name) and
+        optionalSliceEql(left.name.namespace_uri, right.name.namespace_uri);
 }
 
 fn eventsSemanticallyEqual(left: Event, right: Event) bool {
@@ -2073,19 +2119,154 @@ test "slice lazy attributes use eager decoding for entities and namespaces" {
     try std.testing.expectEqualStrings("MS:1000130", namespace_start.attr("accession").?);
 }
 
-test "slice and reader raw attribute paths agree on duplicate names" {
-    const xml = "<cvParam accession=\"first\" accession=\"second\"/>";
+test "parser rejects namespace and expanded-attribute identity violations with parity" {
+    const cases = [_][]const u8{
+        "<p:mzML/>",
+        "<root p:id=\"value\"/>",
+        "<root id=\"first\" id=\"second\"/>",
+        "<cvParam accession=\"first\" accession=\"second\"/>",
+        "<root xmlns:a=\"urn:same\" xmlns:b=\"urn:same\" a:id=\"first\" b:id=\"second\"/>",
+        "<root xmlns:a=\"urn:same\" xmlns:b=\"urn:same\"><cvParam a:id=\"first\" b:id=\"second\"/></root>",
+        "<root xmlns:p=\"urn:first\" xmlns:p=\"urn:second\"/>",
+    };
 
-    var slice_harness: InlineSliceParserHarness = undefined;
-    slice_harness.init(xml);
-    const slice_start = (try slice_harness.parser.next()).?.start_element;
+    for (cases) |xml| {
+        var reader_harness: InlineParserHarness = undefined;
+        reader_harness.init(xml);
+        const reader_error = firstParserError(&reader_harness.parser);
+
+        var slice_harness: InlineSliceParserHarness = undefined;
+        slice_harness.init(xml);
+        const slice_error = firstParserError(&slice_harness.parser);
+
+        try std.testing.expectEqual(@as(?ParseError, error.MalformedXml), reader_error);
+        try std.testing.expectEqual(reader_error, slice_error);
+        try std.testing.expectEqual(reader_harness.parser.byteOffset(), slice_harness.parser.byteOffset());
+    }
+}
+
+test "parser enforces reserved namespace bindings with parity" {
+    const xml_namespace_uri = "http://www.w3.org/XML/1998/namespace";
+    const xmlns_namespace_uri = "http://www.w3.org/2000/xmlns/";
+    const cases = [_][]const u8{
+        "<root xmlns:xml=\"urn:wrong\"/>",
+        "<root xmlns:p=\"" ++ xml_namespace_uri ++ "\"/>",
+        "<root xmlns=\"" ++ xml_namespace_uri ++ "\"/>",
+        "<root xmlns:xmlns=\"urn:wrong\"/>",
+        "<root xmlns:p=\"" ++ xmlns_namespace_uri ++ "\"/>",
+        "<xmlns:root/>",
+    };
+
+    for (cases) |xml| {
+        var reader_harness: InlineParserHarness = undefined;
+        reader_harness.init(xml);
+        const reader_error = firstParserError(&reader_harness.parser);
+
+        var slice_harness: InlineSliceParserHarness = undefined;
+        slice_harness.init(xml);
+        const slice_error = firstParserError(&slice_harness.parser);
+
+        try std.testing.expectEqual(@as(?ParseError, error.MalformedXml), reader_error);
+        try std.testing.expectEqual(reader_error, slice_error);
+        try std.testing.expectEqual(reader_harness.parser.byteOffset(), slice_harness.parser.byteOffset());
+    }
+}
+
+test "parser accepts implicit xml binding and distinct expanded attributes" {
+    const xml =
+        "<root xmlns:p=\"urn:foreign\" xml:lang=\"en\" id=\"plain\" p:id=\"foreign\"/>";
 
     var reader_harness: InlineParserHarness = undefined;
     reader_harness.init(xml);
     const reader_start = (try reader_harness.parser.next()).?.start_element;
 
-    try std.testing.expectEqualStrings("first", slice_start.attr("accession").?);
-    try std.testing.expectEqualStrings("first", reader_start.attr("accession").?);
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    const slice_start = (try slice_harness.parser.next()).?.start_element;
+
+    const reader_xml_namespace = reader_start.attributes[1].name.namespace_uri;
+
+    try std.testing.expect(reader_xml_namespace != null);
+    try std.testing.expectEqualStrings("http://www.w3.org/XML/1998/namespace", reader_xml_namespace.?);
+    try std.testing.expectEqualStrings("plain", reader_start.attr("id").?);
+    try std.testing.expectEqualStrings("plain", slice_start.attr("id").?);
+    try std.testing.expect(eventsSemanticallyEqual(.{ .start_element = reader_start }, .{ .start_element = slice_start }));
+}
+
+test "parser accepts the fixed explicit xml namespace binding" {
+    const xml =
+        "<root xmlns:xml=\"http://www.w3.org/XML/1998/namespace\" xml:lang=\"en\"/>";
+
+    var reader_harness: InlineParserHarness = undefined;
+    reader_harness.init(xml);
+    const reader_start = (try reader_harness.parser.next()).?.start_element;
+
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    const slice_start = (try slice_harness.parser.next()).?.start_element;
+
+    try std.testing.expectEqualStrings("http://www.w3.org/XML/1998/namespace", reader_start.attributes[1].name.namespace_uri.?);
+    try std.testing.expect(eventsSemanticallyEqual(.{ .start_element = reader_start }, .{ .start_element = slice_start }));
+}
+
+test "slice lazy attributes keep unqualified lookup namespace-correct" {
+    const xml =
+        "<root xmlns:p=\"urn:foreign\">" ++
+        "<cvParam p:accession=\"foreign\" accession=\"plain\"/>" ++
+        "</root>";
+
+    var reader_harness: InlineParserHarness = undefined;
+    reader_harness.init(xml);
+    _ = (try reader_harness.parser.next()).?.start_element;
+    const reader_start = (try reader_harness.parser.next()).?.start_element;
+
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    _ = (try slice_harness.parser.next()).?.start_element;
+    const slice_start = (try slice_harness.parser.next()).?.start_element;
+
+    try std.testing.expectEqualStrings("plain", reader_start.attr("accession").?);
+    try std.testing.expectEqualStrings("plain", slice_start.attr("accession").?);
+    try std.testing.expectEqualStrings("urn:foreign", slice_start.attributes[0].name.namespace_uri.?);
+    try std.testing.expect(eventsSemanticallyEqual(.{ .start_element = reader_start }, .{ .start_element = slice_start }));
+}
+
+test "parser applies namespace undeclaration rules by XML version" {
+    const xml10 = "<?xml version=\"1.0\"?><root xmlns:p=\"\"/>";
+    var xml10_reader: InlineParserHarness = undefined;
+    xml10_reader.init(xml10);
+    const xml10_reader_error = firstParserError(&xml10_reader.parser);
+
+    var xml10_slice: InlineSliceParserHarness = undefined;
+    xml10_slice.init(xml10);
+    const xml10_slice_error = firstParserError(&xml10_slice.parser);
+
+    try std.testing.expectEqual(@as(?ParseError, error.MalformedXml), xml10_reader_error);
+    try std.testing.expectEqual(xml10_reader_error, xml10_slice_error);
+    try std.testing.expectEqual(xml10_reader.parser.byteOffset(), xml10_slice.parser.byteOffset());
+
+    const xml11 =
+        "<?xml version=\"1.1\"?><outer xmlns=\"urn:outer\" xmlns:p=\"urn:p\">" ++
+        "<inner xmlns=\"\" xmlns:p=\"\"><leaf/></inner></outer>";
+    var xml11_reader: InlineParserHarness = undefined;
+    xml11_reader.init(xml11);
+    const xml11_reader_error = firstParserError(&xml11_reader.parser);
+
+    var xml11_slice: InlineSliceParserHarness = undefined;
+    xml11_slice.init(xml11);
+    const xml11_slice_error = firstParserError(&xml11_slice.parser);
+
+    try std.testing.expectEqual(@as(?ParseError, null), xml11_reader_error);
+    try std.testing.expectEqual(xml11_reader_error, xml11_slice_error);
+
+    var resolution_harness: InlineSliceParserHarness = undefined;
+    resolution_harness.init(xml11);
+    const outer = (try resolution_harness.parser.next()).?.start_element;
+    try std.testing.expect(outer.name.matches("urn:outer", "outer"));
+    const inner = (try resolution_harness.parser.next()).?.start_element;
+    try std.testing.expect(inner.name.matches(null, "inner"));
+    const leaf = (try resolution_harness.parser.next()).?.start_element;
+    try std.testing.expect(leaf.name.matches(null, "leaf"));
 }
 
 test "lazy raw attribute path preserves invalid UTF8 and unterminated quote errors" {
@@ -3227,6 +3408,9 @@ test "parser rejects invalid xml fixtures" {
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/invalid-attribute-value.xml", error.InvalidXmlCharacter);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/invalid-character-reference.xml", error.InvalidCharacterReference);
     try expectFixtureError(allocator, io, "fixtures/xml/invalid/forbidden-text-close.xml", error.MalformedXml);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/undeclared-prefix.xml", error.MalformedXml);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/duplicate-attribute.xml", error.MalformedXml);
+    try expectFixtureError(allocator, io, "fixtures/xml/invalid/duplicate-namespace-declaration.xml", error.MalformedXml);
 }
 
 test "parser handles xml corpus fixtures" {

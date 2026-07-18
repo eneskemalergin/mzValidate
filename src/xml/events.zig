@@ -35,10 +35,10 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
-/// Looks up mzML attributes by local name, ignoring `xmlns*` declarations.
+/// Looks up an unqualified mzML attribute by local name.
 pub fn attributeByLocalName(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
     for (attributes) |attribute| {
-        if (attribute.is_namespace_declaration) continue;
+        if (attribute.is_namespace_declaration or attribute.name.prefix != null or attribute.name.namespace_uri != null) continue;
         if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
     }
     return null;
@@ -69,10 +69,7 @@ pub const StartElement = struct {
     /// Looks up an attribute by local name, checking eagerly-parsed attributes
     /// first, then falling back to raw_tag scanning (cvParam/userParam path).
     pub fn attr(self: StartElement, local_name: []const u8) ?[]const u8 {
-        for (self.attributes) |attribute| {
-            if (attribute.is_namespace_declaration) continue;
-            if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
-        }
+        if (attributeByLocalName(self.attributes, local_name)) |value| return value;
         if (self.raw_tag.len > 0) return rawTagAttributeValue(self.raw_tag, local_name);
         return null;
     }
@@ -122,7 +119,7 @@ fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const 
         const attribute = scanner.next() catch return null;
         const raw_attribute = attribute orelse return null;
         if (raw_attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, raw_attribute.local_name, local_name)) return raw_attribute.value;
+        if (std.mem.eql(u8, raw_attribute.name, local_name)) return raw_attribute.value;
     }
 }
 
@@ -165,16 +162,31 @@ test "EndElement.resolvedId matches start for same local name" {
     try std.testing.expectEqual(start.resolvedId(), end.resolvedId());
 }
 
-test "StartElement.attr scans raw QName attributes by local name" {
+test "StartElement.attr accepts only unqualified attributes" {
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 2, .name = .{ .prefix = "p", .local_name = "id", .namespace_uri = "urn:test" }, .value = "foreign" },
+        .{ .byte_offset = 1, .name = .{ .local_name = "id" }, .value = "plain" },
+    };
+    const start = StartElement{
+        .byte_offset = 0,
+        .name = .{ .local_name = "cvParam" },
+        .attributes = &attributes,
+        .self_closing = true,
+    };
+
+    try std.testing.expectEqualStrings("plain", start.attr("id").?);
+}
+
+test "StartElement.attr raw fallback ignores prefixed attributes" {
     const start = StartElement{
         .byte_offset = 0,
         .name = .{ .local_name = "cvParam" },
         .attributes = &.{},
         .self_closing = true,
-        .raw_tag = " xmlns:accession='urn:test' p:accession='MS:1000130' /",
+        .raw_tag = " xmlns:p='urn:test' p:accession='foreign' accession='plain' /",
     };
 
-    try std.testing.expectEqualStrings("MS:1000130", start.attr("accession").?);
+    try std.testing.expectEqualStrings("plain", start.attr("accession").?);
 }
 
 const diagnostic = @import("../diagnostic.zig");

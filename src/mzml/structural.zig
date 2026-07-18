@@ -1256,11 +1256,7 @@ pub const StructuralValidator = struct {
 };
 
 fn hasAttribute(attributes: []const Attribute, local_name: []const u8) bool {
-    for (attributes) |attribute| {
-        if (attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, attribute.name.local_name, local_name)) return true;
-    }
-    return false;
+    return xml_events.attributeByLocalName(attributes, local_name) != null;
 }
 
 fn topLevelDirectChildMessage(element_name: []const u8) []const u8 {
@@ -1833,6 +1829,44 @@ test "structural validator reports wrong root namespace" {
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_structure_root, diagnostics.items[0].rule);
+}
+
+test "structural validator rejects a complete unqualified mzML document" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/unqualified-complete.mzML");
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_root,
+        "root element must be mzML in the http://psi.hupo.org/ms/mzml namespace",
+    );
+}
+
+test "structural validator does not accept a foreign required attribute" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/foreign-required-attribute.mzML");
+    defer allocator.free(fixture);
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_attribute,
+        "run is missing required attribute id",
+    );
 }
 
 test "structural validator reports missing binaryDataArrayList" {

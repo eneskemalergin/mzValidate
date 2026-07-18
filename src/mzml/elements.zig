@@ -89,11 +89,10 @@ pub fn idFromLocalName(local_name: []const u8) ElementId {
     return element_map.get(local_name) orelse .unknown;
 }
 
-/// Rejects an explicitly foreign namespace; an absent URI preserves local-name lookup.
+/// Maps only names in the exact mzML namespace.
 pub fn idFromParts(local_name: []const u8, namespace_uri: ?[]const u8) ElementId {
-    if (namespace_uri) |ns| {
-        if (!std.mem.eql(u8, ns, mzml_namespace)) return .unknown;
-    }
+    const ns = namespace_uri orelse return .unknown;
+    if (!std.mem.eql(u8, ns, mzml_namespace)) return .unknown;
     return idFromLocalName(local_name);
 }
 
@@ -205,6 +204,7 @@ test "every ElementId tag maps back from its local name" {
 
 test "idFromParts rejects foreign namespaces" {
     try std.testing.expectEqual(ElementId.unknown, idFromParts("spectrum", "urn:other"));
+    try std.testing.expectEqual(ElementId.unknown, idFromParts("spectrum", null));
 }
 
 test "every non-unknown ElementId has a dispatch mask" {
