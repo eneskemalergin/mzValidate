@@ -1,14 +1,8 @@
-//! CV validation, scope tracking, contradiction detection, and reference resolution.
+//! CV, mapping-rule, and reference validation for mzML.
 //!
-//! Validates every `<cvParam>` and `<userParam>` against the CvTable built
-//! from psi-ms.obo. Checks:
-//!   - cvRef resolves to a declared `<cv>` entry in `<cvList>`
-//!   - Accession exists in the CV
-//!   - Term is not obsolete
-//!   - cvRef matches the term's namespace
-//!   - unitAccession (if present) exists in the CV
-//!   - Contradictory OR terms on the same element
-//!   - All *Ref attributes resolve to declared id values
+//! Tracks element scopes incrementally, validates CV terms and units, detects
+//! mapping contradictions, and resolves id/*Ref links within a bounded
+//! per-file semantic owner.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -20,7 +14,6 @@ const elements = @import("elements.zig");
 
 const Attribute = xml_events.Attribute;
 const CvTable = obo.CvTable;
-const Diagnostic = diagnostic.Diagnostic;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const RuleEngine = rule_engine.RuleEngine;
 const RuleId = diagnostic.RuleId;
@@ -164,15 +157,13 @@ fn ensureListAppendCapacity(
     try ensureListCapacity(list, budget, owner, required, byte_offset);
 }
 
-// A declared id in the document.
 const Declaration = struct {
     element_id: ElementId,
 };
 
-// A *Ref attribute encountered before its target id was declared.
 const ScopeItem = struct {
     accession: []const u8,
-    /// Whether `accession` was heap-allocated and must be freed.
+    // Parser-backed accessions are borrowed; copied accessions are freed at scope exit.
     owned: bool,
 };
 
@@ -363,8 +354,6 @@ pub const SemanticValidator = struct {
     path: ?[]const u8,
     budget: SemanticBudget,
 
-    cv_refs: std.StringHashMap(void),
-
     scope_frames: std.ArrayList(ScopeFrame),
     scope_items: std.ArrayList(ScopeItem),
     path_state: ?rule_engine.PathState,
@@ -401,7 +390,6 @@ pub const SemanticValidator = struct {
             .diagnostics = diagnostics,
             .path = path,
             .budget = SemanticBudget.init(allocator, diagnostics, path, limits),
-            .cv_refs = std.StringHashMap(void).init(allocator),
             .scope_frames = std.ArrayList(ScopeFrame).empty,
             .scope_items = std.ArrayList(ScopeItem).empty,
             .path_state = rule_engine.root_path_state,
@@ -426,9 +414,6 @@ pub const SemanticValidator = struct {
     }
 
     pub fn deinit(validator: *SemanticValidator) void {
-        var it = validator.cv_refs.iterator();
-        while (it.next()) |entry| validator.allocator.free(entry.key_ptr.*);
-        validator.cv_refs.deinit();
         validator.scope_frames.deinit(validator.allocator);
         for (validator.scope_items.items) |item| {
             if (item.owned) validator.allocator.free(item.accession);
@@ -486,16 +471,22 @@ pub const SemanticValidator = struct {
         switch (tag) {
             .cv => {
                 if (start.attr("id")) |id| {
-                    if (validator.cv_refs.contains(id)) return;
-                    const bytes = std.math.add(usize, @sizeOf([]const u8), id.len) catch {
-                        try validator.budget.limitDiagnostic(start.byte_offset);
-                        return error.ResourceLimitExceeded;
-                    };
-                    try validator.budget.reserve(.declaration, bytes, start.byte_offset);
-                    errdefer validator.budget.release(.declaration, bytes);
-                    const owned = try validator.allocator.dupe(u8, id);
-                    errdefer validator.allocator.free(owned);
-                    try validator.cv_refs.put(owned, {});
+                    if (!try validator.ref_table.declare(
+                        &validator.budget,
+                        validator.diagnostics,
+                        validator.path,
+                        id,
+                        tag,
+                        start.byte_offset,
+                    )) {
+                        _ = try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_ref_duplicate_id,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "duplicate id",
+                        });
+                    }
                 }
                 return;
             },
@@ -515,11 +506,8 @@ pub const SemanticValidator = struct {
             }
         } else {
             if (start.attr("id")) |id| {
-                // Only register ids for elements that are xs:ID typed or
-                // xs:key constrained by the mzML schema.  <mzML> and <run>
-                // use plain xs:string with no key constraint and no *Ref
-                // attribute targets them, so skip them to avoid false
-                // duplicate-id errors when all three share the same value.
+                // mzML and run IDs are plain xs:string and cannot be *Ref targets;
+                // excluding them avoids false duplicate-ID findings.
                 if (tag != .mzML and tag != .run) {
                     if (!try validator.ref_table.declare(
                         &validator.budget,
@@ -644,8 +632,11 @@ pub const SemanticValidator = struct {
             break :blk accession[0..colon];
         } else return;
 
-        if (!validator.cv_refs.contains(cv_ref)) {
-            // BTO/GO/PATO may not be declared in cvList; skip cvRef check.
+        const cv_declared = if (validator.ref_table.declarations.get(cv_ref)) |declaration|
+            declaration.element_id == .cv
+        else
+            false;
+        if (!cv_declared) {
             if (!isKnownExternalPrefix(cv_ref)) {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
@@ -674,7 +665,6 @@ pub const SemanticValidator = struct {
                 return;
             }
             if (!std.mem.eql(u8, t.namespace, cv_ref)) {
-                // Skip namespace check for BTO/GO/PATO (externally-managed CVs).
                 if (!isKnownExternalPrefix(cv_ref)) {
                     _ = try validator.diagnostics.append(validator.allocator, .{
                         .severity = .@"error",
@@ -706,7 +696,6 @@ pub const SemanticValidator = struct {
                 }
             }
         } else {
-            // BTO/GO/PATO terms may not be in our embedded psi-ms.obo.
             if (!isKnownExternalPrefix(extractAccessionPrefix(accession))) {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
@@ -718,7 +707,6 @@ pub const SemanticValidator = struct {
             }
         }
 
-        // Unit term validation.
         if (ua) |unit_acc| {
             const unit_cv_ref = ucr;
             const unit_name = un;
@@ -844,7 +832,6 @@ pub const SemanticValidator = struct {
             else => {},
         }
 
-        // Check rules for required terms and contradictions.
         const rules = frame.rules;
         var repeat_violation = false;
         var contradiction_violation = false;
@@ -854,6 +841,7 @@ pub const SemanticValidator = struct {
                 var matched_terms: u64 = 0;
                 var exact_terms: u64 = 0;
                 var matched_scope_items: usize = 0;
+                var matched_disallow_children = false;
                 var first_term: ?usize = null;
                 for (scope) |st| {
                     var scope_term: ?usize = null;
@@ -871,6 +859,8 @@ pub const SemanticValidator = struct {
                         const term_bit = @as(u64, 1) << @intCast(term_index);
                         matched_terms |= term_bit;
                         matched_scope_items += 1;
+                        matched_disallow_children = matched_disallow_children or
+                            !rule.terms[term_index].allow_children;
                         if (first_term) |first_index| {
                             if (first_index == term_index and !rule.terms[term_index].is_repeatable) {
                                 contradiction_violation = true;
@@ -881,14 +871,7 @@ pub const SemanticValidator = struct {
                     }
                 }
                 matched = @popCount(matched_terms);
-                if (matched_scope_items > 1) {
-                    for (rule.terms) |rt| {
-                        if (!rt.allow_children) {
-                            contradiction_violation = true;
-                            break;
-                        }
-                    }
-                }
+                if (matched_scope_items > 1 and matched_disallow_children) contradiction_violation = true;
             } else {
                 for (rule.terms) |rt| {
                     var term_matched = false;
@@ -966,15 +949,16 @@ pub const SemanticValidator = struct {
             for (rules) |r| {
                 if (r.logic != .@"or" or r.terms.len <= @bitSizeOf(u64)) continue;
                 var or_matched: usize = 0;
+                var matched_disallow_children = false;
                 var first_term: ?usize = null;
                 for (scope) |st| {
                     for (r.terms, 0..) |rt, i| {
                         const is_match = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
                         if (is_match) {
                             or_matched += 1;
+                            matched_disallow_children = matched_disallow_children or !rt.allow_children;
                             if (first_term) |idx| {
                                 if (i == idx) {
-                                    // Same term matched twice.
                                     if (!rt.is_repeatable) {
                                         _ = try validator.diagnostics.append(validator.allocator, .{
                                             .severity = .warning,
@@ -993,28 +977,15 @@ pub const SemanticValidator = struct {
                         }
                     }
                 }
-                if (or_matched > 1) {
-                    // Multiple different terms matched. Only a contradiction if
-                    // any term uses allow_children=false (specific alternatives).
-                    // When all terms use allow_children=true, they represent
-                    // independent attribute categories that can coexist.
-                    var all_allow_children = true;
-                    for (r.terms) |rt| {
-                        if (!rt.allow_children) {
-                            all_allow_children = false;
-                            break;
-                        }
-                    }
-                    if (!all_allow_children) {
-                        _ = try validator.diagnostics.append(validator.allocator, .{
-                            .severity = .warning,
-                            .rule = RuleId.mzml_cv_contradiction,
-                            .location = .{ .byte_offset = end.byte_offset },
-                            .path = validator.path,
-                            .message = "element has contradictory CV terms",
-                        });
-                        return;
-                    }
+                if (or_matched > 1 and matched_disallow_children) {
+                    _ = try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .warning,
+                        .rule = RuleId.mzml_cv_contradiction,
+                        .location = .{ .byte_offset = end.byte_offset },
+                        .path = validator.path,
+                        .message = "element has contradictory CV terms",
+                    });
+                    return;
                 }
             }
         }
@@ -1158,7 +1129,6 @@ fn isKnownExternalPrefix(prefix: []const u8) bool {
     return false;
 }
 
-// Extracts the namespace prefix from an accession string (e.g. "MS" from "MS:1000001").
 fn extractAccessionPrefix(accession: []const u8) []const u8 {
     const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return accession;
     return accession[0..colon];
@@ -1189,15 +1159,6 @@ fn expectedReferenceTarget(tag: ElementId, ref_attr: []const u8) ?ElementId {
     }
     return null;
 }
-
-// --- Unit tests ---
-
-const test_events = @import("test_events.zig");
-const testing = std.testing;
-const expectEqual = testing.expectEqual;
-const expectEqualStrings = testing.expectEqualStrings;
-const expectError = testing.expectError;
-const Severity = diagnostic.Severity;
 
 fn consumeCvParam(validator: *SemanticValidator, accession: []const u8, cv_ref: []const u8, byte_offset: u64) !void {
     const attributes = [_]Attribute{
@@ -1304,6 +1265,8 @@ fn consumeUserParam(validator: *SemanticValidator, byte_offset: u64, accession: 
 fn testEngine(allocator: std.mem.Allocator) !RuleEngine {
     return try RuleEngine.init(allocator, "<CvMapping><CvMappingRuleList></CvMappingRuleList></CvMapping>");
 }
+
+// --- Unit Tests ---
 
 test "SemanticValidator: valid accession produces no diagnostic" {
     const allocator = testing.allocator;
@@ -1641,7 +1604,6 @@ test "SemanticValidator: userParam without accession is skipped" {
 }
 
 test "SemanticValidator: cvRef after cvList declaration works" {
-    // Verify that cvRef resolution works when <cv> is processed before <cvParam>.
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -1661,7 +1623,6 @@ test "SemanticValidator: cvRef after cvList declaration works" {
 }
 
 test "SemanticValidator: multiple diagnostics on one cvParam" {
-    // cvRef not in cvList AND invalid accession -> 2 diagnostics.
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -1687,7 +1648,6 @@ test "SemanticValidator: no contradiction with single term" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Create engine with an OR rule for spectrum: MS:1000130 or MS:1000129
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
         "<CvTerm termAccession=\"MS:1000130\"></CvTerm>" ++
@@ -1718,7 +1678,6 @@ test "SemanticValidator: must rule fires when term missing" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // MUST/AND rule: source must have MS:1000008
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
         "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
@@ -1812,7 +1771,6 @@ test "SemanticValidator: must or rule fires when no term matches" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // MUST/OR rule: source must have MS:1000008 or MS:1000443
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
         "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
@@ -2085,6 +2043,50 @@ test "SemanticValidator: duplicate id produces error" {
     try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
 }
 
+test "SemanticValidator: duplicate cv id produces error" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try consumeCv(&sv, "MS");
+    try consumeCv(&sv, "MS");
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: cv id conflicts with another document id" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try consumeCv(&sv, "shared");
+    try sv.consumeStart(test_events.startInterned("software", &.{
+        .{ .byte_offset = 0, .name = .{ .local_name = "id" }, .value = "shared" },
+    }, 10));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_ref_duplicate_id, diagnostics.items[0].rule);
+}
+
 test "SemanticValidator: forward reference resolves in finish" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
@@ -2135,7 +2137,7 @@ test "SemanticValidator: IM-MS and DIA CV terms are recognised" {
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-// --- userParam CV validation ---
+// --- userParam CV Validation ---
 
 test "SemanticValidator: userParam with valid accession triggers CV validation" {
     const allocator = testing.allocator;
@@ -2176,7 +2178,7 @@ test "SemanticValidator: userParam with invalid accession produces error" {
     try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
 }
 
-// --- BTO/GO/PATO support ---
+// --- BTO/GO/PATO Support ---
 
 test "SemanticValidator: BTO accession does not produce unrecognized error" {
     const allocator = testing.allocator;
@@ -2196,7 +2198,7 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-// --- Contradiction detection across all rules ---
+// --- Contradiction Detection Across All Rules ---
 
 test "SemanticValidator: non-repeatable exact duplicates are detected during rule scan" {
     const allocator = testing.allocator;
@@ -2235,7 +2237,6 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // OR rule: spectrum must have MS:1000130 or MS:1000129
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
         "<CvTerm termAccession=\"MS:1000130\"></CvTerm>" ++
@@ -2257,3 +2258,56 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_contradiction, diagnostics.items[0].rule);
 }
+
+test "SemanticValidator: unmatched exact OR term does not create contradiction" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: broad term\n" ++
+        "namespace: MS\n" ++
+        "[Term]\n" ++
+        "id: MS:1000002\n" ++
+        "name: child one\n" ++
+        "namespace: MS\n" ++
+        "is_a: MS:1000001 ! broad term\n" ++
+        "[Term]\n" ++
+        "id: MS:1000003\n" ++
+        "name: child two\n" ++
+        "namespace: MS\n" ++
+        "is_a: MS:1000001 ! broad term\n" ++
+        "[Term]\n" ++
+        "id: MS:1000004\n" ++
+        "name: unmatched exact term\n" ++
+        "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\" allowChildren=\"true\" isRepeatable=\"true\"></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000004\" allowChildren=\"false\"></CvTerm>" ++
+        "</CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000002", "MS", 10);
+    try consumeCvParam(&sv, "MS:1000003", "MS", 20);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 30));
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+const test_events = @import("test_events.zig");
+const testing = std.testing;
+const expectEqual = testing.expectEqual;
+const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;
+const Severity = diagnostic.Severity;

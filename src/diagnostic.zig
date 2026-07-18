@@ -1,24 +1,11 @@
-//! Diagnostic types and helpers for the shared reporting model.
+//! Shared diagnostic records, bounded sinks, and completion state.
 //!
-//! Every public symbol here is part of the external contract between
-//! the validator and its consumers (CLI, JSON output, CI pipelines).
-//! Change them carefully.
-//!
-//! Types:
-//!   Severity:     info / warning / error
-//!   Location:     optional byte offset and spectrum index
-//!   Diagnostic:   one validation result (severity, rule, location, message, path)
-//!   Totals:       counts by severity
-//!   Summary:      totals + derived status (clean / warnings-only / errors-present)
-//!   ResultStatus: the three states the CLI exit code maps to
-//!   RuleId:       stable string constants in `domain.category.slug` form
-
-/// mzML namespace URI, shared across all mzML validators.
-pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+//! Rule IDs and exit-code mappings are stable output contracts.
 
 const std = @import("std");
 
-// --- Types ---
+/// mzML namespace URI, shared across all mzML validators.
+pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
 
 /// Stable rule IDs emitted in diagnostics and serialized output.
 ///
@@ -130,7 +117,7 @@ pub const Location = struct {
     spectrum_index: ?usize = null,
 };
 
-/// Describes a single validation result in the shared reporting format.
+/// Describes one validation result. String fields borrow caller-owned storage.
 pub const Diagnostic = struct {
     severity: Severity,
     rule: []const u8,
@@ -139,7 +126,7 @@ pub const Diagnostic = struct {
     message: []const u8,
 };
 
-/// Per-file borrowed diagnostic detail with fixed totals and explicit drops.
+/// Per-file borrowed detail with bounded retention and complete severity totals.
 pub const DiagnosticSink = struct {
     items: []Diagnostic = &.{},
     capacity: usize = 0,
@@ -156,25 +143,21 @@ pub const DiagnosticSink = struct {
         retain_details: bool = true,
     };
 
+    /// Snapshot used to calculate totals for one validation scope.
     pub const Mark = struct {
-        item_len: usize,
         totals: Totals,
         dropped: Totals,
     };
 
-    pub const empty: DiagnosticSink = .{
-        .limits = .{
-            .max_diagnostics = 4096,
-            .max_rendered_bytes = 4 * 1024 * 1024,
-            .retain_details = true,
-        },
-        .configured = false,
-    };
+    /// Zero-allocation sink using default limits until explicitly configured.
+    pub const empty: DiagnosticSink = .{ .configured = false };
 
+    /// Creates a sink with explicit retention limits.
     pub fn init(limits: Limits) DiagnosticSink {
         return .{ .limits = limits, .configured = true };
     }
 
+    /// Applies shared limits only to a sink that has not been explicitly configured.
     pub fn configureFromResourceLimits(sink: *DiagnosticSink, resource_limits: ResourceLimits) void {
         if (sink.configured) return;
         sink.limits.max_diagnostics = resource_limits.max_diagnostics;
@@ -182,6 +165,8 @@ pub const DiagnosticSink = struct {
         sink.configured = true;
     }
 
+    /// Counts every item and retains detail until a configured limit is reached.
+    /// Returns false when a retention limit drops detail; allocation failures propagate.
     pub fn append(sink: *DiagnosticSink, allocator: std.mem.Allocator, item: Diagnostic) !bool {
         if (!sink.limits.retain_details) {
             sink.addTotal(item.severity);
@@ -198,7 +183,11 @@ pub const DiagnosticSink = struct {
             return false;
         }
 
-        try sink.ensureTotalCapacity(allocator, sink.items.len + 1);
+        const requested = std.math.add(usize, sink.items.len, 1) catch {
+            sink.addDropped(item.severity);
+            return false;
+        };
+        try sink.ensureTotalCapacity(allocator, requested);
         const index = sink.items.len;
         sink.items.len += 1;
         sink.items[index] = item;
@@ -207,6 +196,7 @@ pub const DiagnosticSink = struct {
         return true;
     }
 
+    /// Grows the retained-detail buffer without exceeding max_diagnostics.
     pub fn ensureTotalCapacity(sink: *DiagnosticSink, allocator: std.mem.Allocator, requested: usize) !void {
         if (requested <= sink.capacity) return;
         if (requested > sink.limits.max_diagnostics) return error.OutOfMemory;
@@ -231,11 +221,13 @@ pub const DiagnosticSink = struct {
         sink.capacity = new_capacity;
     }
 
+    /// Releases retained detail and resets the sink to its unconfigured state.
     pub fn deinit(sink: *DiagnosticSink, allocator: std.mem.Allocator) void {
         if (sink.capacity > 0) allocator.free(sink.items.ptr[0..sink.capacity]);
         sink.* = .empty;
     }
 
+    /// Clears detail and totals while retaining the allocated buffer and limits.
     pub fn clearRetainingCapacity(sink: *DiagnosticSink) void {
         sink.items.len = 0;
         sink.totals = .{};
@@ -244,7 +236,7 @@ pub const DiagnosticSink = struct {
     }
 
     pub fn mark(sink: *const DiagnosticSink) Mark {
-        return .{ .item_len = sink.items.len, .totals = sink.totals, .dropped = sink.dropped };
+        return .{ .totals = sink.totals, .dropped = sink.dropped };
     }
 
     pub fn totalsSince(sink: *const DiagnosticSink, mark_value: Mark) Totals {
@@ -336,6 +328,7 @@ pub const ValidationStage = enum(u3) {
 
 pub const StageMask = u8;
 
+/// Returns the mask bit assigned to a validation stage.
 pub fn stageBit(stage: ValidationStage) StageMask {
     return @as(StageMask, 1) << @intFromEnum(stage);
 }
@@ -394,6 +387,7 @@ pub const ResourceUsage = struct {
 };
 
 /// Fixed, allocation-free metadata for the first failure that stopped a file.
+/// Rule, message, and path slices borrow storage owned by the caller.
 pub const FirstFailure = struct {
     stage: ValidationStage,
     reason: FailureReason,
@@ -405,6 +399,7 @@ pub const FirstFailure = struct {
 };
 
 /// Per-file result independent of the normal diagnostic-list allocator.
+/// Its failure metadata borrows the rule, message, and path supplied by the caller.
 pub const FileResult = struct {
     completion: CompletionState = .incomplete,
     enabled_stages: StageMask = 0,
@@ -467,21 +462,17 @@ pub const FileResult = struct {
 
     pub fn finalize(result: *FileResult, diagnostics: []const Diagnostic) void {
         result.totals = count(diagnostics);
-        if (result.first_failure != null) {
-            if (!result.failure_diagnostic_emitted and !result.failure_diagnostic_counted) {
-                result.totals.errors = std.math.add(usize, result.totals.errors, 1) catch std.math.maxInt(usize);
-            }
-        }
-        result.completion = if (result.first_failure == null and result.completed_stages == result.enabled_stages)
-            .complete
-        else
-            .incomplete;
+        result.finish();
     }
 
     pub fn finalizeSink(result: *FileResult, sink: *const DiagnosticSink, mark_value: DiagnosticSink.Mark) void {
         result.totals = sink.totalsSince(mark_value);
         result.dropped_diagnostics = sink.droppedSince(mark_value);
         result.diagnostics_truncated = result.diagnostics_truncated or sink.truncatedSince(mark_value);
+        result.finish();
+    }
+
+    fn finish(result: *FileResult) void {
         if (result.first_failure != null) {
             if (!result.failure_diagnostic_emitted and !result.failure_diagnostic_counted) {
                 result.totals.errors = std.math.add(usize, result.totals.errors, 1) catch std.math.maxInt(usize);
@@ -521,6 +512,7 @@ pub const ResultStatus = enum {
 };
 
 /// Bundles severity totals with the derived result status.
+/// A first failure, when present, borrows the source metadata from its results.
 pub const Summary = struct {
     totals: Totals,
     completion: CompletionState = .complete,
@@ -540,9 +532,9 @@ pub fn count(diagnostics: []const Diagnostic) Totals {
     var totals: Totals = .{};
     for (diagnostics) |diagnostic| {
         switch (diagnostic.severity) {
-            .info => totals.info += 1,
-            .warning => totals.warnings += 1,
-            .@"error" => totals.errors += 1,
+            .info => totals.info = saturatingAdd(totals.info, 1),
+            .warning => totals.warnings = saturatingAdd(totals.warnings, 1),
+            .@"error" => totals.errors = saturatingAdd(totals.errors, 1),
         }
     }
     return totals;
@@ -579,6 +571,7 @@ pub fn exitCode(diagnostics: []const Diagnostic) u8 {
     };
 }
 
+/// Maps per-file completion and severity results to the process exit code.
 pub fn exitCodeForResults(results: []const FileResult) u8 {
     return switch (summarizeResults(results).status()) {
         .clean => 0,
@@ -587,26 +580,20 @@ pub fn exitCodeForResults(results: []const FileResult) u8 {
     };
 }
 
-// --- Tests ---
+// --- Unit Tests ---
 
-test "exitCode prefers errors over warnings" {
-    // Arrange.
+test "errors take precedence over warnings in exit codes" {
     const diagnostics = [_]Diagnostic{
         .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
 
-    // Act.
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exitCode(&diagnostics));
 }
 
-test "summarize distinguishes clean warnings and errors" {
-    // Arrange.
+test "summary status follows diagnostic severity" {
     const clean_summary = summarize(&.{});
 
-    // Act.
-    // Assert.
     try std.testing.expectEqual(ResultStatus.clean, clean_summary.status());
 
     const warning_diagnostics = [_]Diagnostic{
@@ -673,4 +660,17 @@ test "diagnostic sink bounds detail while retaining complete totals" {
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_diagnostics.errors);
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+}
+
+test "diagnostic sink can count without retaining detail" {
+    var sink = DiagnosticSink.init(.{ .retain_details = false });
+    defer sink.deinit(std.testing.allocator);
+
+    try std.testing.expect(try sink.append(std.testing.allocator, .{
+        .severity = .warning,
+        .rule = "test.warning",
+        .message = "counted",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqual(Totals{ .warnings = 1 }, sink.totals);
 }

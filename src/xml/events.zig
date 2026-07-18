@@ -1,26 +1,14 @@
-//! Event types the streaming parser emits.
+//! Borrowed event values emitted by the streaming XML parser.
 //!
-//! Every slice field borrows from the parser input or caller-supplied
-//! buffers. Text values on the mmap slice path point into the mapped
-//! bytes. Other fields use the token buffer. All slices are only valid
-//! until the next `Parser.next()` call. Copy anything you need to keep.
-//!
-//! Types:
-//!   StartElement: opening tag with name, attributes, self-closing flag
-//!   EndElement:   closing tag
-//!   Text:         character data or CDATA (distinguished by `from_cdata`)
-//!   Attribute:    one attribute within a start event
-//!   QName:        namespace-expanded element or attribute name
-//!   Event:        union of the three event kinds
-//!   EventKind:    enum discriminators for the union
+//! Slice fields reference parser input or caller scratch and remain valid only
+//! until the next `Parser.next()` call. Reader text may span multiple events;
+//! mmap text may point directly into mapped bytes.
 
 const std = @import("std");
 const elements = @import("../mzml/elements.zig");
 const scan = @import("scan.zig");
 
 pub const ElementId = elements.ElementId;
-
-// --- Types ---
 
 pub const QName = struct {
     prefix: ?[]const u8 = null,
@@ -47,26 +35,16 @@ pub const Attribute = struct {
     is_namespace_declaration: bool = false,
 };
 
-fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const u8 {
-    var scanner = scan.RawAttributeScanner.init(tag_bytes);
-    while (true) {
-        const attribute = scanner.next() catch return null;
-        const raw_attribute = attribute orelse return null;
-        if (raw_attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, raw_attribute.local_name, local_name)) return raw_attribute.value;
-    }
-}
-
 /// Looks up mzML attributes by local name, ignoring `xmlns*` declarations.
 pub fn attributeByLocalName(attributes: []const Attribute, local_name: []const u8) ?[]const u8 {
-    for (attributes) |attr| {
-        if (attr.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, attr.name.local_name, local_name)) return attr.value;
+    for (attributes) |attribute| {
+        if (attribute.is_namespace_declaration) continue;
+        if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
     }
     return null;
 }
 
-/// Borrowed attribute views. Valid until the next `Parser.next()` call.
+/// Opening-tag event whose slice fields expire at the next `Parser.next()` call.
 pub const StartElement = struct {
     byte_offset: u64,
     /// Byte offset of the opening tag's closing `>` when emitted by Parser.
@@ -90,12 +68,12 @@ pub const StartElement = struct {
 
     /// Looks up an attribute by local name, checking eagerly-parsed attributes
     /// first, then falling back to raw_tag scanning (cvParam/userParam path).
-    pub fn attr(self: StartElement, name: []const u8) ?[]const u8 {
-        for (self.attributes) |a| {
-            if (a.is_namespace_declaration) continue;
-            if (std.mem.eql(u8, a.name.local_name, name)) return a.value;
+    pub fn attr(self: StartElement, local_name: []const u8) ?[]const u8 {
+        for (self.attributes) |attribute| {
+            if (attribute.is_namespace_declaration) continue;
+            if (std.mem.eql(u8, attribute.name.local_name, local_name)) return attribute.value;
         }
-        if (self.raw_tag.len > 0) return rawTagAttributeValue(self.raw_tag, name);
+        if (self.raw_tag.len > 0) return rawTagAttributeValue(self.raw_tag, local_name);
         return null;
     }
 };
@@ -137,9 +115,18 @@ pub const Event = union(EventKind) {
     text: Text,
 };
 
-// --- Tests ---
+fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const u8 {
+    var scanner = scan.RawAttributeScanner.init(tag_bytes);
+    while (true) {
+        // Parser-produced raw tags were validated before the event was emitted.
+        const attribute = scanner.next() catch return null;
+        const raw_attribute = attribute orelse return null;
+        if (raw_attribute.is_namespace_declaration) continue;
+        if (std.mem.eql(u8, raw_attribute.local_name, local_name)) return raw_attribute.value;
+    }
+}
 
-const diagnostic = @import("../diagnostic.zig");
+// --- Unit Tests ---
 
 test "StartElement.resolvedId prefers parser intern id" {
     const start = StartElement{
@@ -149,6 +136,7 @@ test "StartElement.resolvedId prefers parser intern id" {
         .attributes = &.{},
         .self_closing = false,
     };
+
     try std.testing.expectEqual(ElementId.chromatogram, start.resolvedId());
 }
 
@@ -159,6 +147,7 @@ test "StartElement.resolvedId falls back to element name" {
         .attributes = &.{},
         .self_closing = false,
     };
+
     try std.testing.expectEqual(ElementId.cvParam, start.resolvedId());
 }
 
@@ -172,6 +161,7 @@ test "EndElement.resolvedId matches start for same local name" {
         .self_closing = false,
     };
     const end = EndElement{ .byte_offset = 10, .name = name, .element_id = .unknown };
+
     try std.testing.expectEqual(start.resolvedId(), end.resolvedId());
 }
 
@@ -186,3 +176,5 @@ test "StartElement.attr scans raw QName attributes by local name" {
 
     try std.testing.expectEqualStrings("MS:1000130", start.attr("accession").?);
 }
+
+const diagnostic = @import("../diagnostic.zig");

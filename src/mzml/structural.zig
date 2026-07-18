@@ -1,16 +1,8 @@
-//! Structural validation: element nesting, ordering, required attributes.
+//! Incremental mzML 1.1 structural validation.
 //!
-//! Validates every element in the mzML 1.1 schema:
-//!   - Root element is `mzML` in the correct namespace
-//!   - Top-level children appear in schema order (cvList, fileDescription, ...)
-//!   - Required attributes are present on every element type
-//!   - List counts match actual children (`count` attribute vs children seen)
-//!   - Required children exist (e.g. fileContent in fileDescription)
-//!   - No duplicate top-level elements
-//!   - Spectrum/chromatogram/component child ordering
-//!
-//! Does not handle binary payloads, index offsets, or CV terms.
-//! Those are delegated to their own validators.
+//! Checks nesting, child order, required attributes, and declared list counts
+//! with fixed per-file state. Binary payloads, index cross-checks, and CV terms
+//! remain owned by their stage validators.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -23,19 +15,11 @@ const Attribute = xml_events.Attribute;
 const Diagnostic = diagnostic.Diagnostic;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
-const Event = xml_events.Event;
-const ParseError = xml_parser.ParseError;
-const QName = xml_events.QName;
 const RuleId = diagnostic.RuleId;
-const Severity = diagnostic.Severity;
 const StartElement = xml_events.StartElement;
-
-// --- Constants ---
 
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_structural_token_bytes = 1024 * 1024;
-
-// --- Element slot enums ---
 
 const TopLevelSlot = enum(u8) {
     cv_list = 1,
@@ -47,12 +31,12 @@ const TopLevelSlot = enum(u8) {
     instrument_configuration_list = 7,
     data_processing_list = 8,
     run = 9,
-    // Index and checksum elements are optional and appear after run.
-    // They are validated at the structural level only for ordering and duplication;
-    // deep index cross-checks live in the IndexValidator (index.zig).
-    index_list = 10,
-    index_list_offset = 11,
-    file_checksum = 12,
+};
+
+const IndexedChildSlot = enum(u8) {
+    index_list = 1,
+    index_list_offset = 2,
+    file_checksum = 3,
 };
 
 const ContainerKind = enum {
@@ -90,8 +74,6 @@ const ComponentChildSlot = enum(u8) {
     analyzer = 2,
     detector = 3,
 };
-
-// --- Per-element state structs ---
 
 const ContainerState = struct {
     byte_offset: u64,
@@ -143,15 +125,13 @@ const ComponentListState = struct {
     last_child_slot: u8 = 0,
 };
 
-// --- Public validator ---
-
-/// mzML 1.1 structural schema validator (nesting, order, required attributes).
+/// Incremental validator whose retained state is independent of document length.
 pub const StructuralValidator = struct {
     allocator: std.mem.Allocator,
     diagnostics: *DiagnosticSink,
     path: ?[]const u8,
 
-    // Bounded: spectra/chromatograms are discarded after their end element.
+    // Container state is replaced at its end tag, independent of spectrum count.
     depth: usize = 0,
     root_seen: bool = false,
     root_valid: bool = false,
@@ -167,8 +147,7 @@ pub const StructuralValidator = struct {
     instrument_configuration_list_seen: bool = false,
     data_processing_list_seen: bool = false,
     last_top_level_slot: u8 = 0,
-    // Bitmask of TopLevelSlot values already reported as duplicates.
-    // Stops N duplicate children from emitting N-1 identical errors.
+    // Suppresses repeated diagnostics for the same duplicated top-level slot.
     dup_reported_mask: u32 = 0,
 
     run_seen: bool = false,
@@ -178,10 +157,10 @@ pub const StructuralValidator = struct {
     run_has_chromatogram_list: bool = false,
     run_last_child_slot: u8 = 0,
 
-    // Index and checksum elements (optional, post-run top-level children of mzML).
     index_list_seen: bool = false,
     index_list_offset_seen: bool = false,
     file_checksum_seen: bool = false,
+    last_indexed_child_slot: u8 = 0,
 
     file_description: ?FileDescriptionState = null,
 
@@ -253,7 +232,9 @@ pub const StructuralValidator = struct {
         });
 
         var validator = StructuralValidator.init(allocator, diagnostics, path);
-        try validator.run(io, &parser);
+        defer validator.deinit();
+        _ = io;
+        try validator.run(&parser);
     }
 
     pub fn consumeStart(validator: *StructuralValidator, start: StartElement) !void {
@@ -306,7 +287,6 @@ pub const StructuralValidator = struct {
 
         try validator.reportMissingTopLevelChildren();
 
-        // indexedmzML wrapper requires indexList, indexListOffset, and fileChecksum.
         if (validator.indexed_mzml_depth != null) {
             if (!validator.index_list_seen) {
                 try validator.appendDiagnostic(.{
@@ -338,9 +318,7 @@ pub const StructuralValidator = struct {
         }
     }
 
-    fn run(validator: *StructuralValidator, io: std.Io, parser: *xml_parser.Parser) !void {
-        _ = io;
-
+    fn run(validator: *StructuralValidator, parser: *xml_parser.Parser) !void {
         while (true) {
             const maybe_event = parser.next() catch |err| {
                 try validator.appendDiagnostic(.{
@@ -402,38 +380,28 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        // indexList, indexListOffset, fileChecksum sit outside <mzML> under
-        // <indexedmzML>. Need explicit handling since mzml_depth is null.
+        // Wrapper metadata is outside mzML scope but still structurally required.
         if (validator.indexed_mzml_depth != null and
             element_depth == validator.indexed_mzml_depth.? + 1)
         {
             switch (tag) {
                 .indexList => {
-                    if (validator.index_list_seen) {
-                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexList");
-                    } else {
-                        validator.index_list_seen = true;
-                    }
+                    try validator.noteIndexedChild(start.byte_offset, &validator.index_list_seen, .index_list);
                     try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
                     return;
                 },
                 .indexListOffset => {
-                    if (validator.index_list_offset_seen) {
-                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one indexListOffset");
-                    } else {
-                        validator.index_list_offset_seen = true;
-                    }
+                    try validator.noteIndexedChild(start.byte_offset, &validator.index_list_offset_seen, .index_list_offset);
                     return;
                 },
                 .fileChecksum => {
-                    if (validator.file_checksum_seen) {
-                        try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one fileChecksum");
-                    } else {
-                        validator.file_checksum_seen = true;
-                    }
+                    try validator.noteIndexedChild(start.byte_offset, &validator.file_checksum_seen, .file_checksum);
                     return;
                 },
-                else => {},
+                else => {
+                    try validator.nestingError(start.byte_offset, "element is not allowed as a direct child of indexedmzML");
+                    return;
+                },
             }
         }
 
@@ -494,30 +462,7 @@ pub const StructuralValidator = struct {
                 try validator.requireAttribute(start, "id", "run is missing required attribute id");
                 try validator.requireReferenceAttribute(start, "defaultInstrumentConfigurationRef", "run is missing required attribute defaultInstrumentConfigurationRef");
             },
-            // Post-run: indexList > indexListOffset > fileChecksum.
-            // Content validation delegated to IndexValidator.
-            .indexList => {
-                if (!validator.run_seen) {
-                    try validator.nestingError(start.byte_offset, "indexList must appear after run");
-                    return;
-                }
-                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_seen, "indexList", .index_list);
-                try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
-            },
-            .indexListOffset => {
-                if (!validator.run_seen) {
-                    try validator.nestingError(start.byte_offset, "indexListOffset must appear after run");
-                    return;
-                }
-                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.index_list_offset_seen, "indexListOffset", .index_list_offset);
-            },
-            .fileChecksum => {
-                if (!validator.run_seen) {
-                    try validator.nestingError(start.byte_offset, "fileChecksum must appear after run");
-                    return;
-                }
-                try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.file_checksum_seen, "fileChecksum", .file_checksum);
-            },
+            .indexList, .indexListOffset, .fileChecksum => try validator.nestingError(start.byte_offset, "index metadata must be a direct child of indexedmzML"),
             .fileContent => {
                 if (validator.file_description) |*state| {
                     if (state.depth + 1 != element_depth) {
@@ -785,7 +730,7 @@ pub const StructuralValidator = struct {
             .binaryDataArray => {
                 validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
             },
-            // Handled by SemanticValidator. Return early to avoid the catch-all.
+            // SemanticValidator owns CV terms, including unknown intern IDs.
             .cvParam, .userParam => return,
             else => {
                 const in_mzml_ns = if (start.name.namespace_uri) |ns|
@@ -953,6 +898,24 @@ pub const StructuralValidator = struct {
         }
 
         validator.run_last_child_slot = @intFromEnum(slot);
+    }
+
+    fn noteIndexedChild(validator: *StructuralValidator, byte_offset: u64, seen: *bool, slot: IndexedChildSlot) !void {
+        if (!validator.root_valid) {
+            try validator.nestingError(byte_offset, indexedChildBeforeMzmlMessage(slot));
+        }
+        if (seen.*) {
+            try validator.nestingError(byte_offset, duplicateIndexedChildMessage(slot));
+            return;
+        }
+
+        const slot_value = @intFromEnum(slot);
+        if (slot_value < validator.last_indexed_child_slot) {
+            try validator.nestingError(byte_offset, indexedChildOutOfOrderMessage(slot));
+        } else {
+            validator.last_indexed_child_slot = slot_value;
+        }
+        seen.* = true;
     }
 
     fn noteSpectrumChild(validator: *StructuralValidator, byte_offset: u64, slot: SpectrumChildSlot) !void {
@@ -1414,11 +1377,73 @@ fn componentChildOutOfOrderMessage(slot: ComponentChildSlot) []const u8 {
     };
 }
 
-// --- Unit tests ---
+fn indexedChildBeforeMzmlMessage(slot: IndexedChildSlot) []const u8 {
+    return switch (slot) {
+        .index_list => "indexList must appear after mzML",
+        .index_list_offset => "indexListOffset must appear after mzML",
+        .file_checksum => "fileChecksum must appear after mzML",
+    };
+}
 
-const test_events = @import("test_events.zig");
+fn duplicateIndexedChildMessage(slot: IndexedChildSlot) []const u8 {
+    return switch (slot) {
+        .index_list => "indexedmzML must not contain more than one indexList",
+        .index_list_offset => "indexedmzML must not contain more than one indexListOffset",
+        .file_checksum => "indexedmzML must not contain more than one fileChecksum",
+    };
+}
 
-// Tests: valid fixtures.
+fn indexedChildOutOfOrderMessage(slot: IndexedChildSlot) []const u8 {
+    return switch (slot) {
+        .index_list => "indexList appears out of order under indexedmzML",
+        .index_list_offset => "indexListOffset appears out of order under indexedmzML",
+        .file_checksum => "fileChecksum appears out of order under indexedmzML",
+    };
+}
+
+fn runStructuralValidationInto(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: []const u8,
+    diagnostics: *DiagnosticSink,
+) !void {
+    diagnostics.clearRetainingCapacity();
+    var reader = std.Io.Reader.fixed(fixture);
+    try StructuralValidator.validateReader(allocator, io, &reader, diagnostics, "fixture");
+}
+
+fn expectSingleStructuralDiagnostic(diagnostics: []const Diagnostic, expected_rule: []const u8, expected_message: ?[]const u8) !void {
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
+    try std.testing.expectEqualStrings(expected_rule, diagnostics[0].rule);
+    if (expected_message) |message| {
+        try std.testing.expectEqualStrings(message, diagnostics[0].message);
+    }
+}
+
+fn readFixtureAlloc(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
+    return try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
+}
+
+fn minimalChromatogramMzml(comptime chromatogram_inner: []const u8) []const u8 {
+    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"https://example.invalid/psi-ms.obo\"/></cvList>" ++
+        "<fileDescription><fileContent/></fileDescription>" ++
+        "<softwareList count=\"1\"><software id=\"SW1\" version=\"1.0\"/></softwareList>" ++
+        "<instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"IC1\"/></instrumentConfigurationList>" ++
+        "<dataProcessingList count=\"1\"><dataProcessing id=\"DP1\"><processingMethod order=\"0\" softwareRef=\"SW1\"/></dataProcessing></dataProcessingList>" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
+        "<chromatogramList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<chromatogram index=\"0\" id=\"tic=1\" defaultArrayLength=\"1\">" ++
+        chromatogram_inner ++
+        "</chromatogram>" ++
+        "</chromatogramList>" ++
+        "</run>" ++
+        "</mzML>";
+}
+
+// --- Unit Tests ---
+
+// --- Valid Fixtures ---
 
 test "structural validator accepts realistic one-spectrum mzML fixture" {
     const allocator = std.testing.allocator;
@@ -1487,7 +1512,7 @@ test "structural validator cvParam with unknown intern id does not report unreco
     }
 }
 
-// Tests: required children and attributes.
+// --- Required Children and Attributes ---
 
 test "structural validator reports missing required top-level mzML children" {
     const allocator = std.testing.allocator;
@@ -1570,7 +1595,7 @@ test "structural validator reports missing required reference element attributes
     try std.testing.expect(param_group_missing);
 }
 
-// Tests: ordering and nesting rules.
+// --- Ordering and Nesting Rules ---
 
 test "structural validator reports out of order top-level child" {
     const allocator = std.testing.allocator;
@@ -1901,11 +1926,88 @@ test "structural validator reports chromatogram child ordering violations" {
     );
 }
 
+test "structural validator reports indexed wrapper child ordering violations" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
+    try validator.consumeEnd(test_events.endInterned("mzML", 20));
+    try validator.consumeStart(test_events.startInterned("indexListOffset", &.{}, 30));
+    try validator.consumeEnd(test_events.endInterned("indexListOffset", 40));
+    try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "0")}, 50));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "indexList appears out of order under indexedmzML",
+    );
+}
+
+test "structural validator reports index metadata before mzML" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "0")}, 10));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "indexList must appear after mzML",
+    );
+}
+
+test "structural validator rejects index metadata inside plain mzML" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
+    try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "0")}, 10));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "index metadata must be a direct child of indexedmzML",
+    );
+}
+
+test "structural validator rejects unexpected indexed wrapper children" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
+    try validator.consumeEnd(test_events.endInterned("mzML", 20));
+    try validator.consumeStart(test_events.startUnknown("unexpected", &.{}, 30));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "element is not allowed as a direct child of indexedmzML",
+    );
+}
+
 test "structural validator repeated clean and broken runs do not accumulate diagnostics" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const clean_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
     defer allocator.free(clean_fixture);
     const broken_fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/wrong-namespace.mzML");
@@ -1914,12 +2016,10 @@ test "structural validator repeated clean and broken runs do not accumulate diag
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     for (0..24) |index| {
         const fixture = if (index % 2 == 0) clean_fixture else broken_fixture;
         try runStructuralValidationInto(allocator, io, fixture, &diagnostics);
 
-        // Assert.
         if (index % 2 == 0) {
             try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
         } else {
@@ -1939,42 +2039,4 @@ test "structural validator propagates diagnostic allocation failure" {
     try std.testing.expectError(error.OutOfMemory, validator.countError(0, "count mismatch"));
 }
 
-fn runStructuralValidationInto(
-    allocator: std.mem.Allocator,
-    io: std.Io,
-    fixture: []const u8,
-    diagnostics: *DiagnosticSink,
-) !void {
-    diagnostics.clearRetainingCapacity();
-    var reader = std.Io.Reader.fixed(fixture);
-    try StructuralValidator.validateReader(allocator, io, &reader, diagnostics, "fixture");
-}
-
-fn expectSingleStructuralDiagnostic(diagnostics: []const Diagnostic, expected_rule: []const u8, expected_message: ?[]const u8) !void {
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
-    try std.testing.expectEqualStrings(expected_rule, diagnostics[0].rule);
-    if (expected_message) |message| {
-        try std.testing.expectEqualStrings(message, diagnostics[0].message);
-    }
-}
-
-fn readFixtureAlloc(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) ![]u8 {
-    return try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
-}
-
-fn minimalChromatogramMzml(comptime chromatogram_inner: []const u8) []const u8 {
-    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
-        "<cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"https://example.invalid/psi-ms.obo\"/></cvList>" ++
-        "<fileDescription><fileContent/></fileDescription>" ++
-        "<softwareList count=\"1\"><software id=\"SW1\" version=\"1.0\"/></softwareList>" ++
-        "<instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"IC1\"/></instrumentConfigurationList>" ++
-        "<dataProcessingList count=\"1\"><dataProcessing id=\"DP1\"><processingMethod order=\"0\" softwareRef=\"SW1\"/></dataProcessing></dataProcessingList>" ++
-        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
-        "<chromatogramList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
-        "<chromatogram index=\"0\" id=\"tic=1\" defaultArrayLength=\"1\">" ++
-        chromatogram_inner ++
-        "</chromatogram>" ++
-        "</chromatogramList>" ++
-        "</run>" ++
-        "</mzML>";
-}
+const test_events = @import("test_events.zig");

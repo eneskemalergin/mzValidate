@@ -1,13 +1,6 @@
-//! CLI argument parsing, dispatch, and output.
+//! CLI parsing, validation dispatch, and output selection.
 //!
-//! Three layers:
-//!   `run`:      Juicy Main entry point, wires stdout/stderr writers.
-//!   `runArgs`:  Public test seam that accepts caller-provided writers.
-//!   `runCheck`: Iterates inputs, bounds per-file detail, and picks the renderer.
-//!
-//! The rest is helpers: `parseArgs` converts argv into a `CheckCommand`,
-//! `writeUsage` and `writeParseError` format output, `findUnexpectedFlag`
-//! keeps the parsing loop clean.
+//! Regular-file validation defaults to bounded stream input; mmap is explicit.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -15,7 +8,6 @@ const output = @import("output.zig");
 const validate = @import("validate.zig");
 const version = @import("version.zig");
 
-const Diagnostic = diagnostic.Diagnostic;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 
 /// Parsed `check` subcommand flags and input paths.
@@ -24,12 +16,13 @@ pub const CheckCommand = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
-    input_mode: validate.InputMode = .mmap,
+    input_mode: validate.InputMode = .stream,
     mmap: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
     inputs: []const []const u8,
 
+    /// Releases the owned input-path list. Path bytes remain borrowed from argv.
     pub fn deinit(command: *CheckCommand, allocator: std.mem.Allocator) void {
         allocator.free(command.inputs);
         command.* = undefined;
@@ -53,7 +46,8 @@ const ParseError = error{
     UnsupportedCommand,
     UnexpectedFlag,
     ConflictingOutputMode,
-    MissingValue,
+    MissingBinarySize,
+    MissingOboPath,
     InvalidValue,
     Overflow,
     MissingInputMode,
@@ -62,7 +56,7 @@ const ParseError = error{
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
-/// Juicy Main entry: parse argv, run checks, render output, return exit code.
+/// Parses process arguments, runs validation, flushes output, and returns the exit code.
 pub fn run(init: std.process.Init) !u8 {
     const gpa = init.gpa;
     const args = try init.minimal.args.toSlice(gpa);
@@ -71,18 +65,22 @@ pub fn run(init: std.process.Init) !u8 {
     var stdout_buffer: [4096]u8 = undefined;
     var stdout_file_writer: std.Io.File.Writer = .init(.stdout(), init.io, &stdout_buffer);
     const stdout = &stdout_file_writer.interface;
-    defer stdout.flush() catch {};
-
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
-    defer stderr.flush() catch {};
 
-    return runArgs(gpa, init.io, stdout, stderr, args);
+    const exit_code = runArgs(gpa, init.io, stdout, stderr, args) catch |err| {
+        // Preserve the original failure; output after a failed run is best effort.
+        stdout.flush() catch {};
+        stderr.flush() catch {};
+        return err;
+    };
+    try stdout.flush();
+    try stderr.flush();
+    return exit_code;
 }
 
-/// Keeps the process-based `run` entry point thin and gives tests a stable
-/// public seam that does not depend on `std.process.Init` construction.
+/// Runs borrowed argv through caller-provided writers, returning a CLI exit code.
 pub fn runArgs(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -111,7 +109,8 @@ pub fn runArgs(
         error.UnsupportedCommand,
         error.UnexpectedFlag,
         error.ConflictingOutputMode,
-        error.MissingValue,
+        error.MissingBinarySize,
+        error.MissingOboPath,
         error.InvalidValue,
         error.Overflow,
         error.MissingInputMode,
@@ -131,6 +130,7 @@ pub fn runArgs(
     };
 }
 
+/// Parses argv into an allocator-owned command; path strings borrow `args`.
 pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseArgsError!Command {
     if (args.len < 2) return error.MissingCommand;
     if (!std.mem.eql(u8, args[1], "check")) return error.UnsupportedCommand;
@@ -143,7 +143,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var skip_binary = false;
     var skip_index = false;
     var skip_semantic = false;
-    var input_mode: validate.InputMode = .mmap;
+    var input_mode: validate.InputMode = .stream;
     var mmap = false;
     var max_binary_size: ?usize = null;
     var obo_path: ?[]const u8 = null;
@@ -153,7 +153,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         const arg = args[i];
         if (std.mem.eql(u8, arg, "-max-binary-size")) {
             i += 1;
-            if (i >= args.len) return error.MissingValue;
+            if (i >= args.len) return error.MissingBinarySize;
             max_binary_size = try parseSize(args[i]);
             continue;
         }
@@ -183,7 +183,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         }
         if (std.mem.eql(u8, arg, "-obo")) {
             i += 1;
-            if (i >= args.len) return error.MissingValue;
+            if (i >= args.len) return error.MissingOboPath;
             obo_path = args[i];
             continue;
         }
@@ -300,7 +300,7 @@ fn runCheck(
     return diagnostic.exitCodeForResults(results.items);
 }
 
-// Usage and parse helpers.
+// --- Private Helpers ---
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
@@ -319,7 +319,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
             "  -input-mode stream|mmap\n" ++
-            "               Use bounded stream input or explicit read-only mmap.\n" ++
+            "               Use bounded stream input (default) or explicit read-only mmap.\n" ++
             "  -mmap        Compatibility alias for -input-mode mmap.\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
@@ -372,7 +372,8 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
             }
         },
         error.ConflictingOutputMode => try writer.writeAll("error: choose one of -json, -summary, or -brief"),
-        error.MissingValue => try writer.writeAll("error: -max-binary-size requires a value"),
+        error.MissingBinarySize => try writer.writeAll("error: -max-binary-size requires a value"),
+        error.MissingOboPath => try writer.writeAll("error: -obo requires a path"),
         error.InvalidValue => try writer.writeAll("error: invalid -max-binary-size value"),
         error.Overflow => try writer.writeAll("error: -max-binary-size value overflow (too large)"),
         error.MissingInputMode => try writer.writeAll("error: -input-mode requires a value (stream or mmap)"),
@@ -388,32 +389,31 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
 
 fn findFlagValue(args: []const []const u8, flag: []const u8) ?[]const u8 {
     for (0..args.len) |i| {
-        if (std.mem.eql(u8, args[i], flag) and i + 1 < args.len) return args[i + 1];
+        if (std.mem.eql(u8, args[i], flag) and args.len - i > 1) return args[i + 1];
     }
     return null;
 }
 
 fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
     for (args) |arg| {
-        if (std.mem.startsWith(u8, arg, "-") and
-            !std.mem.eql(u8, arg, "-skip-binary") and
-            !std.mem.eql(u8, arg, "-skip-index") and
-            !std.mem.eql(u8, arg, "-skip-semantic") and
-            !std.mem.eql(u8, arg, "-input-mode") and
-            !std.mem.eql(u8, arg, "-mmap") and
-            !std.mem.eql(u8, arg, "-max-binary-size") and
-            !std.mem.eql(u8, arg, "-obo") and
-            !std.mem.eql(u8, arg, "-json") and
-            !std.mem.eql(u8, arg, "-summary") and
-            !std.mem.eql(u8, arg, "-brief") and
-            !std.mem.eql(u8, arg, "-version") and
-            !std.mem.eql(u8, arg, "--version") and
-            !isHelpFlag(arg))
-        {
-            return arg;
-        }
+        if (std.mem.startsWith(u8, arg, "-") and !isKnownFlag(arg)) return arg;
     }
     return null;
+}
+
+fn isKnownFlag(arg: []const u8) bool {
+    return isHelpFlag(arg) or
+        isVersionFlag(arg) or
+        std.mem.eql(u8, arg, "-skip-binary") or
+        std.mem.eql(u8, arg, "-skip-index") or
+        std.mem.eql(u8, arg, "-skip-semantic") or
+        std.mem.eql(u8, arg, "-input-mode") or
+        std.mem.eql(u8, arg, "-mmap") or
+        std.mem.eql(u8, arg, "-max-binary-size") or
+        std.mem.eql(u8, arg, "-obo") or
+        std.mem.eql(u8, arg, "-json") or
+        std.mem.eql(u8, arg, "-summary") or
+        std.mem.eql(u8, arg, "-brief");
 }
 
 fn parseInputMode(value: []const u8) error{InvalidValue}!validate.InputMode {
@@ -422,20 +422,22 @@ fn parseInputMode(value: []const u8) error{InvalidValue}!validate.InputMode {
     return error.InvalidValue;
 }
 
-// Parses a byte-size string with optional binary suffix (K, M, G, T).
-// Examples: "1024", "1K" (1024), "2M" (2 MiB), "1G" (1 GiB).
-fn parseSize(s: []const u8) error{ Overflow, InvalidValue }!usize {
-    if (s.len == 0) return error.InvalidValue;
+// Bare K/M/G/T suffixes use binary units; KB/MB/GB use decimal units.
+fn parseSize(value: []const u8) error{ Overflow, InvalidValue }!usize {
+    if (value.len == 0) return error.InvalidValue;
 
-    var i: usize = 0;
-    while (i < s.len and std.ascii.isDigit(s[i])) : (i += 1) {}
+    var digits_len: usize = 0;
+    while (digits_len < value.len and std.ascii.isDigit(value[digits_len])) : (digits_len += 1) {}
 
-    if (i == 0) return error.InvalidValue;
+    if (digits_len == 0) return error.InvalidValue;
 
-    const num = std.fmt.parseUnsigned(usize, s[0..i], 10) catch return error.InvalidValue;
-    if (i == s.len) return num;
+    const number = std.fmt.parseUnsigned(usize, value[0..digits_len], 10) catch |err| switch (err) {
+        error.Overflow => return error.Overflow,
+        error.InvalidCharacter => return error.InvalidValue,
+    };
+    if (digits_len == value.len) return number;
 
-    const suffix = s[i..];
+    const suffix = value[digits_len..];
     const multiplier = if (std.ascii.eqlIgnoreCase(suffix, "K") or std.ascii.eqlIgnoreCase(suffix, "Ki"))
         @as(usize, 1024)
     else if (std.ascii.eqlIgnoreCase(suffix, "M") or std.ascii.eqlIgnoreCase(suffix, "Mi"))
@@ -453,12 +455,12 @@ fn parseSize(s: []const u8) error{ Overflow, InvalidValue }!usize {
     else
         return error.InvalidValue;
 
-    return std.math.mul(usize, num, multiplier) catch error.Overflow;
+    return std.math.mul(usize, number, multiplier) catch error.Overflow;
 }
 
-// Tests: argument parsing.
+// --- Unit Tests ---
 
-test "parseArgs_check_parsesFlagsAndInputs" {
+test "parses flags and input paths" {
     const allocator = std.testing.allocator;
     const argv = [_][]const u8{
         "mzValidate",
@@ -486,7 +488,7 @@ test "parseArgs_check_parsesFlagsAndInputs" {
     }
 }
 
-test "parseArgs_input_mode_stream_records_requested_mode" {
+test "records explicit stream input mode" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -506,7 +508,25 @@ test "parseArgs_input_mode_stream_records_requested_mode" {
     }
 }
 
-test "parseArgs_input_mode_mmap_records_requested_mode" {
+test "defaults to stream input" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+    };
+
+    var command = try parseArgs(std.testing.allocator, &argv);
+    defer command.deinit(std.testing.allocator);
+
+    switch (command) {
+        .check => |check| {
+            try std.testing.expectEqual(validate.InputMode.stream, check.input_mode);
+            try std.testing.expect(!check.mmap);
+        },
+    }
+}
+
+test "records explicit mmap input mode" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -526,7 +546,7 @@ test "parseArgs_input_mode_mmap_records_requested_mode" {
     }
 }
 
-test "parseArgs_input_mode_rejects_invalid_value" {
+test "rejects an invalid input mode" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -538,7 +558,7 @@ test "parseArgs_input_mode_rejects_invalid_value" {
     try std.testing.expectError(error.InvalidInputMode, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_rejects_removed_memory_limit" {
+test "rejects the removed memory limit flag" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -550,7 +570,7 @@ test "parseArgs_rejects_removed_memory_limit" {
     try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_rejects_conflicting_output_modes" {
+test "rejects conflicting output modes" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -562,7 +582,7 @@ test "parseArgs_rejects_conflicting_output_modes" {
     try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_rejects_check_without_inputs_even_when_flags_are_present" {
+test "requires an input path after check" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -573,7 +593,7 @@ test "parseArgs_rejects_check_without_inputs_even_when_flags_are_present" {
     try std.testing.expectError(error.MissingInputPath, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_rejects_unknown_flag_before_any_input" {
+test "rejects an unknown flag" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -584,7 +604,7 @@ test "parseArgs_rejects_unknown_flag_before_any_input" {
     try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_max_binary_size_parses_byte_value" {
+test "parses a raw binary size limit" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -603,7 +623,7 @@ test "parseArgs_max_binary_size_parses_byte_value" {
     }
 }
 
-test "parseArgs_max_binary_size_parses_suffix" {
+test "parses a suffixed binary size limit" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -622,7 +642,7 @@ test "parseArgs_max_binary_size_parses_suffix" {
     }
 }
 
-test "parseArgs_max_binary_size_rejects_missing_value" {
+test "rejects a missing binary size limit" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -630,10 +650,21 @@ test "parseArgs_max_binary_size_rejects_missing_value" {
         "-max-binary-size",
     };
 
-    try std.testing.expectError(error.MissingValue, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MissingBinarySize, parseArgs(std.testing.allocator, &argv));
 }
 
-test "parseArgs_max_binary_size_rejects_invalid_suffix" {
+test "rejects a missing OBO path" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "-obo",
+    };
+
+    try std.testing.expectError(error.MissingOboPath, parseArgs(std.testing.allocator, &argv));
+}
+
+test "rejects an invalid binary size suffix" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
@@ -645,39 +676,42 @@ test "parseArgs_max_binary_size_rejects_invalid_suffix" {
     try std.testing.expectError(error.InvalidValue, parseArgs(std.testing.allocator, &argv));
 }
 
-// Tests: size parsing.
-
-test "parseSize_understands_raw_bytes" {
+test "parses raw byte sizes" {
     try std.testing.expectEqual(@as(usize, 0), try parseSize("0"));
     try std.testing.expectEqual(@as(usize, 1), try parseSize("1"));
     try std.testing.expectEqual(@as(usize, 999), try parseSize("999"));
 }
 
-test "parseSize_understands_binary_suffixes" {
+test "rejects a size number overflow" {
+    const too_large = comptime std.fmt.comptimePrint("{d}0", .{std.math.maxInt(usize)});
+    try std.testing.expectError(error.Overflow, parseSize(too_large));
+}
+
+test "parses binary size suffixes" {
     try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1K"));
     try std.testing.expectEqual(@as(usize, 2 * 1024 * 1024), try parseSize("2M"));
     try std.testing.expectEqual(@as(usize, 3 * 1024 * 1024 * 1024), try parseSize("3G"));
 }
 
-test "parseSize_understands_decimal_suffixes" {
+test "parses decimal size suffixes" {
     try std.testing.expectEqual(@as(usize, 1 * 1000), try parseSize("1KB"));
     try std.testing.expectEqual(@as(usize, 2 * 1000 * 1000), try parseSize("2MB"));
     try std.testing.expectEqual(@as(usize, 3 * 1000 * 1000 * 1000), try parseSize("3GB"));
 }
 
-test "parseSize_rejects_empty" {
+test "rejects an empty size" {
     try std.testing.expectError(error.InvalidValue, parseSize(""));
 }
 
-test "parseSize_rejects_non_numeric_prefix" {
+test "rejects a non-numeric size" {
     try std.testing.expectError(error.InvalidValue, parseSize("abc"));
 }
 
-test "parseSize_rejects_unknown_suffix" {
+test "rejects an unknown size suffix" {
     try std.testing.expectError(error.InvalidValue, parseSize("1X"));
 }
 
-test "parseSize_is_case_insensitive" {
+test "parses size suffixes case-insensitively" {
     try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1k"));
     try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1K"));
     try std.testing.expectEqual(@as(usize, 1 * 1024), try parseSize("1ki"));
@@ -685,7 +719,7 @@ test "parseSize_is_case_insensitive" {
     try std.testing.expectEqual(@as(usize, 1 * 1024 * 1024 * 1024), try parseSize("1g"));
 }
 
-test "parseArgs_mmap_flag_is_parsed" {
+test "parses the mmap compatibility flag" {
     const allocator = std.testing.allocator;
     const argv = [_][]const u8{
         "mzValidate",
@@ -694,11 +728,9 @@ test "parseArgs_mmap_flag_is_parsed" {
         "-mmap",
     };
 
-    // Act.
     var command = try parseArgs(allocator, &argv);
     defer command.deinit(allocator);
 
-    // Assert.
     switch (command) {
         .check => |check| {
             try std.testing.expect(check.mmap);
@@ -708,28 +740,25 @@ test "parseArgs_mmap_flag_is_parsed" {
     }
 }
 
-test "runArgs_help_flag_writes_usage_to_stdout_and_returns_zero" {
+test "help writes usage to stdout" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "--help" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-input-mode stream|mmap") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_version_reports_mapping_policy" {
+test "version reports the mapping policy" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "-version" };
@@ -742,31 +771,31 @@ test "runArgs_version_reports_mapping_policy" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expectEqualStrings("mzValidate v0.1.4 mapping=mzML.xsd@1.0.0\n", stdout_writer.written());
+    try std.testing.expectEqualStrings(
+        "mzValidate v" ++ version.semantic ++ " mapping=" ++ version.mapping_model ++ "@" ++ version.mapping_model_version ++ "\n",
+        stdout_writer.written(),
+    );
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_check_help_flag_writes_usage_to_stdout_and_returns_zero" {
+test "check help writes usage to stdout" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "check", "-h" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-mmap        Compatibility alias") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_summary_records_requested_mode" {
+test "summary reports the requested input mode" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -777,7 +806,7 @@ test "runArgs_summary_records_requested_mode" {
         "-skip-index",
         "-skip-semantic",
         "-input-mode",
-        "stream",
+        "mmap",
         "-summary",
     };
 
@@ -791,13 +820,13 @@ test "runArgs_summary_records_requested_mode" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=stream behavior=explicit\n",
+            "config: input=mmap behavior=explicit\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_invalid_input_mode_reports_contract_error" {
+test "invalid input mode reports a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-input-mode", "auto" };
@@ -818,21 +847,18 @@ test "runArgs_invalid_input_mode_reports_contract_error" {
     );
 }
 
-test "runArgs_unsupported_command_reports_parse_error_on_stderr" {
+test "unsupported command reports a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "scan" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "unsupported command: scan") != null);
@@ -843,70 +869,82 @@ test "runArgs_unsupported_command_reports_parse_error_on_stderr" {
     );
 }
 
-test "runArgs_unexpected_flag_reports_parse_error_on_stderr" {
+test "unexpected flag reports a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-wat" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "unexpected flag: -wat") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
-test "runArgs_missing_input_path_reports_parse_error_on_stderr" {
+test "missing input path reports a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{ "mzValidate", "check", "-summary" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "missing input path after `check`") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
-test "runArgs_conflicting_output_modes_returns_usage_failure_on_stderr" {
+test "missing OBO path reports the correct flag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-json", "-summary" };
+    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-obo" };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqualStrings("", stdout_writer.written());
+    try std.testing.expectEqualStrings(
+        "error: -obo requires a path\n" ++
+            "usage: mzValidate check <input.mzML> [more files...] [options]\n",
+        stderr_writer.written(),
+    );
+}
+
+test "conflicting output modes report a usage error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-json", "-summary" };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of -json, -summary, or -brief") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
-test "runArgs_mixed_clean_and_corrupt_inputs_reports_aggregate_error_summary" {
+test "summary aggregates clean and corrupt inputs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -917,16 +955,13 @@ test "runArgs_mixed_clean_and_corrupt_inputs_reports_aggregate_error_summary" {
         "-summary",
     };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
         "complete: errors (info=0 warnings=0 errors=1)\n",
@@ -935,7 +970,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_reports_aggregate_error_summary" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_corrupt_input_renders_json_diagnostic_shape" {
+test "json output renders a corrupt input diagnostic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -945,16 +980,13 @@ test "runArgs_corrupt_input_renders_json_diagnostic_shape" {
         "-json",
     };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(std.mem.startsWith(u8, stdout_writer.written(), "[\n  {\n"));
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"rule\": \"mzml.binary.base64\"") != null);
@@ -964,7 +996,7 @@ test "runArgs_corrupt_input_renders_json_diagnostic_shape" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_external_entity_reports_xml_contract_diagnostic" {
+test "external entities report an XML contract diagnostic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -985,7 +1017,7 @@ test "runArgs_external_entity_reports_xml_contract_diagnostic" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
+test "text output groups clean and corrupt inputs" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -995,16 +1027,13 @@ test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
         "fixtures/mzml/invalid/invalid-base64.mzML",
     };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "input: fixtures/mzml/invalid/invalid-base64.mzML") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.binary.base64] binary payload is not valid base64") != null);
@@ -1013,7 +1042,7 @@ test "runArgs_mixed_clean_and_corrupt_inputs_render_text_grouping_and_summary" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_skip_binary_keeps_corrupt_payload_clean_when_structure_is_valid" {
+test "skipping binary checks keeps valid structure clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -1024,16 +1053,13 @@ test "runArgs_skip_binary_keeps_corrupt_payload_clean_when_structure_is_valid" {
         "-summary",
     };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
         "complete: clean (info=0 warnings=0 errors=0)\n",
@@ -1042,7 +1068,7 @@ test "runArgs_skip_binary_keeps_corrupt_payload_clean_when_structure_is_valid" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "runArgs_multiple_missing_inputs_report_each_open_failure" {
+test "summary reports each missing input failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -1053,16 +1079,13 @@ test "runArgs_multiple_missing_inputs_report_each_open_failure" {
         "-summary",
     };
 
-    // Arrange.
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stderr_writer.deinit();
 
-    // Act.
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    // Assert.
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
         "complete: errors (info=0 warnings=0 errors=2)\n",

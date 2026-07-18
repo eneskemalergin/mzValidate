@@ -1,16 +1,5 @@
-//! OBO format 1.4 parser for psi-ms.obo controlled vocabularies.
-//!
-//! Parses stanzas (`[Term]`, `[Typedef]`), tag-value pairs, line
-//! continuations, and escape sequences. Builds a `CvTable` keyed by
-//! accession for fast lookup of CV terms, relationships, synonyms,
-//! and metadata (obsoletion, unit constraints, xsd types).
-//!
-//! The table is embedded at compile time via `@embedFile("data/psi-ms.obo")`
-//! and overridable at runtime with `-obo`. Callers get a read-only view:
-//!
-//!   var table = try CvTable.init(allocator, obo_text);
-//!   defer table.deinit();
-//!   const term = table.lookup("MS:1000001");
+//! Parses the OBO fields used by mzValidate's CV and mapping checks.
+//! `CvTable` owns the term data copied from the input buffer.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -28,7 +17,7 @@ pub const DescendantResult = enum {
     limit_exceeded,
 };
 
-pub const max_descendant_nodes: usize = 256;
+const max_descendant_nodes: usize = 256;
 
 pub const CvTerm = struct {
     accession: []const u8,
@@ -48,7 +37,7 @@ pub const CvTerm = struct {
     binary_data_types: [][]const u8 = &.{},
 };
 
-/// Accession-keyed lookup table built from an OBO text buffer.
+/// Accession-keyed lookup table that owns data copied from an OBO text buffer.
 pub const CvTable = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap(CvTerm),
@@ -85,8 +74,10 @@ pub const CvTable = struct {
         var ns_it = table.ns_prefix.iterator();
         while (ns_it.next()) |entry| table.allocator.free(entry.key_ptr.*);
         table.ns_prefix.deinit();
+        table.* = undefined;
     }
 
+    /// Returns a term whose slices remain valid while `table` is alive.
     pub fn lookup(table: *const CvTable, accession: []const u8) ?CvTerm {
         return table.map.get(accession);
     }
@@ -111,9 +102,7 @@ pub const CvTable = struct {
         var count: usize = 0;
         if (table.lookup(term_acc)) |t| {
             for (t.is_a) |parent| {
-                if (count == stack.len) return .limit_exceeded;
-                stack[count] = parent;
-                count += 1;
+                if (!queueDescendant(&stack, &count, parent)) return .limit_exceeded;
             }
         }
         var visited: usize = 0;
@@ -122,9 +111,7 @@ pub const CvTable = struct {
             if (std.mem.eql(u8, current, ancestor_acc)) return .yes;
             if (table.lookup(current)) |t| {
                 for (t.is_a) |parent| {
-                    if (count == stack.len) return .limit_exceeded;
-                    stack[count] = parent;
-                    count += 1;
+                    if (!queueDescendant(&stack, &count, parent)) return .limit_exceeded;
                 }
             }
         }
@@ -155,13 +142,12 @@ pub const CvTable = struct {
         }
 
         while (lines.next()) |raw_line| {
-            const line = raw_line;
-
-            if (line.len > table.limits.max_obo_line_bytes) return error.LineTooLong;
+            if (raw_line.len > table.limits.max_obo_line_bytes) return error.LineTooLong;
+            const line = std.mem.trim(u8, raw_line, " \t\r");
 
             if (line.len == 0 or line[0] == '!') continue;
 
-            if (line[0] == '[') {
+            if (line.len > 0 and line[0] == '[') {
                 if (in_term) {
                     try table.insertTerm(id, name, def_val, namespace, is_obsolete, replaced_by, xsd_type, &is_a_list, &rel_list, &syn_list, &unit_list, &binary_type_list);
                     id = null;
@@ -177,15 +163,15 @@ pub const CvTable = struct {
                     unit_list.clearRetainingCapacity();
                     binary_type_list.clearRetainingCapacity();
                 }
-                in_term = true;
+                in_term = std.mem.eql(u8, line, "[Term]");
                 continue;
             }
 
             if (!in_term) continue;
 
             const colon = std.mem.indexOfScalar(u8, line, ':') orelse continue;
-            const tag = std.mem.trim(u8, line[0..colon], " ");
-            const value = std.mem.trim(u8, line[colon + 1 ..], " ");
+            const tag = std.mem.trim(u8, line[0..colon], " \t");
+            const value = std.mem.trim(u8, line[colon + 1 ..], " \t\r");
 
             if (std.mem.eql(u8, tag, "id")) {
                 id = value;
@@ -199,7 +185,7 @@ pub const CvTable = struct {
             } else if (std.mem.eql(u8, tag, "name")) {
                 name = value;
             } else if (std.mem.eql(u8, tag, "def")) {
-                def_val = extractQuotedString(value);
+                def_val = extractQuotedString(value) orelse value;
             } else if (std.mem.eql(u8, tag, "namespace")) {
                 namespace = value;
             } else if (std.mem.eql(u8, tag, "is_obsolete") and std.mem.eql(u8, value, "true")) {
@@ -209,12 +195,10 @@ pub const CvTable = struct {
             } else if (std.mem.eql(u8, tag, "consider")) {
                 if (replaced_by == null) replaced_by = value;
             } else if (std.mem.eql(u8, tag, "xref")) {
-                // Parse xref: binary-data-type:MS\:1000521 "32-bit float"
                 if (std.mem.startsWith(u8, value, "binary-data-type:")) {
                     const acc_start = "binary-data-type:".len;
                     const rest = value[acc_start..];
-                    // The accession may use backslash-escaped colons.
-                    const space_pos = std.mem.indexOfScalar(u8, rest, ' ') orelse rest.len;
+                    const space_pos = std.mem.indexOfAny(u8, rest, " \t") orelse rest.len;
                     var acc_buf: [max_xref_accession_bytes]u8 = undefined;
                     var acc_len: usize = 0;
                     var i: usize = 0;
@@ -231,28 +215,27 @@ pub const CvTable = struct {
                     try binary_type_list.append(table.allocator, owned);
                 }
             } else if (std.mem.eql(u8, tag, "is_a")) {
-                const space = std.mem.indexOfScalar(u8, value, ' ') orelse value.len;
-                try appendOwnedString(table.allocator, &is_a_list, value[0..space]);
+                var parts = std.mem.tokenizeAny(u8, value, " \t");
+                const parent = parts.next() orelse continue;
+                try appendOwnedString(table.allocator, &is_a_list, parent);
             } else if (std.mem.eql(u8, tag, "relationship")) {
-                var parts = std.mem.tokenizeScalar(u8, value, ' ');
+                var parts = std.mem.tokenizeAny(u8, value, " \t");
                 const rname = parts.next() orelse continue;
                 const rtarget = parts.next() orelse continue;
                 try appendOwnedRelationship(table.allocator, &rel_list, rname, rtarget);
-                // Extract xsd type for cv value validation.
                 if (std.mem.eql(u8, rname, "has_value_type")) {
                     if (std.mem.startsWith(u8, rtarget, "xsd:")) {
                         xsd_type = rtarget;
                     }
                 }
-                // Extract allowed units.
                 if (std.mem.eql(u8, rname, "has_units")) {
                     const space = std.mem.indexOfScalar(u8, rtarget, ' ') orelse rtarget.len;
                     try appendOwnedString(table.allocator, &unit_list, rtarget[0..space]);
                 }
             } else if (std.mem.eql(u8, tag, "synonym")) {
                 if (value.len > 0 and value[0] == '"') {
-                    const close = std.mem.indexOfScalar(u8, value[1..], '"') orelse continue;
-                    try appendOwnedString(table.allocator, &syn_list, value[1..][0..close]);
+                    const synonym = extractQuotedString(value) orelse continue;
+                    try appendOwnedString(table.allocator, &syn_list, synonym);
                 }
             }
         }
@@ -328,6 +311,20 @@ pub fn parseErrorMessage(err: anyerror) []const u8 {
     };
 }
 
+fn queueDescendant(
+    stack: *[max_descendant_nodes][]const u8,
+    count: *usize,
+    accession: []const u8,
+) bool {
+    for (stack[0..count.*]) |queued| {
+        if (std.mem.eql(u8, queued, accession)) return true;
+    }
+    if (count.* == stack.len) return false;
+    stack[count.*] = accession;
+    count.* += 1;
+    return true;
+}
+
 fn appendOwnedString(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8), value: []const u8) !void {
     const owned = try allocator.dupe(u8, value);
     errdefer allocator.free(owned);
@@ -382,23 +379,37 @@ fn deinitTerm(allocator: std.mem.Allocator, term: *const CvTerm) void {
     if (term.binary_data_types.len > 0) allocator.free(term.binary_data_types);
 }
 
-// Extracts text between the first pair of double-quotes in `value`.
-fn extractQuotedString(value: []const u8) []const u8 {
-    const start = std.mem.indexOfScalar(u8, value, '"') orelse return value;
-    const remaining = value[start + 1 ..];
-    const end = std.mem.indexOfScalar(u8, remaining, '"') orelse return value;
-    return remaining[0..end];
+fn extractQuotedString(value: []const u8) ?[]const u8 {
+    const start = std.mem.indexOfScalar(u8, value, '"') orelse return null;
+    var escaped = false;
+    var index = start + 1;
+    while (index < value.len) : (index += 1) {
+        const byte = value[index];
+        if (byte == '\\') {
+            escaped = !escaped;
+            continue;
+        }
+        if (byte == '"' and !escaped) return value[start + 1 .. index];
+        escaped = false;
+    }
+    return null;
 }
 
-fn readFixture(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    return std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(64 * 1024));
+fn readFixture(allocator: std.mem.Allocator, io: std.Io, path: []const u8) ![]u8 {
+    return std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(64 * 1024));
 }
 
-test "CvTable parses known OBO snippet" {
+// --- Unit Tests ---
+
+test "cv table parses a known OBO snippet" {
     const allocator = std.testing.allocator;
     const obo =
         "format-version: 1.2\n" ++
         "data-version: test\n" ++
+        "\n" ++
+        "[Typedef]\n" ++
+        "id: TEST:relation\n" ++
+        "name: relation\n" ++
         "\n" ++
         "[Term]\n" ++
         "id: MS:1000001\n" ++
@@ -421,7 +432,6 @@ test "CvTable parses known OBO snippet" {
     try std.testing.expectEqualStrings("sample name", t1.?.name);
     try std.testing.expectEqualStrings("MS", t1.?.namespace);
     try std.testing.expect(!t1.?.is_obsolete);
-    // def value should be the clean quoted text, not the raw line
     try std.testing.expectEqualStrings("A test term", t1.?.description);
 
     const t2 = table.lookup("MS:1000002");
@@ -431,26 +441,42 @@ test "CvTable parses known OBO snippet" {
 
     const t3 = table.lookup("MS:9999999");
     try std.testing.expect(t3 == null);
+    try std.testing.expect(table.lookup("TEST:relation") == null);
 }
 
-test "CvTable parses real psi-ms.obo" {
+test "cv table handles CRLF and escaped quotes" {
+    const allocator = std.testing.allocator;
+    const obo =
+        "  [Term]\r\n" ++
+        "\tid: MS:1000001\r\n" ++
+        " name: quoted term\r\n" ++
+        " def: \"A \\\"quoted\\\" term\" []\r\n" ++
+        " synonym: \"A \\\"short\\\" name\" EXACT []\r\n";
+
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+
+    const term = table.lookup("MS:1000001") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("A \\\"quoted\\\" term", term.description);
+    try std.testing.expectEqualStrings("A \\\"short\\\" name", term.synonyms[0]);
+}
+
+test "cv table parses the embedded psi-ms vocabulary" {
     const allocator = std.testing.allocator;
     const obo = @embedFile("../data/psi-ms.obo");
     var table = try CvTable.init(allocator, obo);
     defer table.deinit();
 
-    // Verify known accessions
     try std.testing.expect(table.lookup("MS:1000001") != null);
     try std.testing.expect(table.lookup("MS:1000511") != null);
     try std.testing.expect(table.lookup("MS:1000130") != null);
     try std.testing.expect(table.lookup("UO:0000000") != null);
 
-    // Verify namespace prefixes were extracted
     try std.testing.expect(table.ns_prefix.contains("MS"));
     try std.testing.expect(table.ns_prefix.contains("UO"));
 }
 
-test "CvTable.validate catches errors" {
+test "cv table validates namespace, obsolete, and unknown terms" {
     const allocator = std.testing.allocator;
     const obo =
         "[Term]\n" ++
@@ -466,17 +492,13 @@ test "CvTable.validate catches errors" {
     var table = try CvTable.init(allocator, obo);
     defer table.deinit();
 
-    // Valid
     try std.testing.expect(table.validate("MS", "MS:1000001") == null);
-    // Wrong namespace
     try std.testing.expect(table.validate("UO", "MS:1000001") != null);
-    // Obsolete
     try std.testing.expect(table.validate("MS", "MS:1000002") != null);
-    // Non-existent
     try std.testing.expect(table.validate("MS", "MS:9999999") != null);
 }
 
-test "CvTable parses is_a and relationship" {
+test "cv table parses is_a and relationships" {
     const allocator = std.testing.allocator;
     const obo =
         "[Term]\n" ++
@@ -486,8 +508,8 @@ test "CvTable parses is_a and relationship" {
         "[Term]\n" ++
         "id: MS:1000002\n" ++
         "name: child term\n" ++
-        "is_a: MS:1000001 ! parent term\n" ++
-        "relationship: part_of MS:1000001 ! parent term\n";
+        "is_a:\tMS:1000001\t! parent term\n" ++
+        "relationship:\tpart_of\tMS:1000001\t! parent term\n";
 
     var table = try CvTable.init(allocator, obo);
     defer table.deinit();
@@ -501,21 +523,37 @@ test "CvTable parses is_a and relationship" {
     try std.testing.expectEqualStrings("MS:1000001", t.?.relationships[0].target);
 }
 
-test "isDescendantOf traverses hierarchy in real OBO" {
+test "isDescendantOf traverses the embedded hierarchy" {
     const allocator = std.testing.allocator;
     const obo = @embedFile("../data/psi-ms.obo");
     var table = try CvTable.init(allocator, obo);
     defer table.deinit();
 
-    // MS:1003378 (Orbitrap Astral) -> MS:1000494 -> MS:1000483 -> MS:1000031 (instrument model)
     try std.testing.expectEqual(DescendantResult.yes, table.isDescendantOf("MS:1003378", "MS:1000031"));
-    // MS:1003378 is not a descendant of itself via is_a (identity check)
     try std.testing.expectEqual(DescendantResult.yes, table.isDescendantOf("MS:1003378", "MS:1003378"));
-    // MS:1000031 is not a descendant of MS:1003378
     try std.testing.expectEqual(DescendantResult.no, table.isDescendantOf("MS:1000031", "MS:1003378"));
 }
 
-test "isDescendantOf reports its bounded traversal limit" {
+test "isDescendantOf terminates on cyclic hierarchy" {
+    const allocator = std.testing.allocator;
+    const obo =
+        "[Term]\n" ++
+        "id: TEST:A\n" ++
+        "name: A\n" ++
+        "is_a: TEST:B\n" ++
+        "\n" ++
+        "[Term]\n" ++
+        "id: TEST:B\n" ++
+        "name: B\n" ++
+        "is_a: TEST:A\n";
+
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+
+    try std.testing.expectEqual(DescendantResult.no, table.isDescendantOf("TEST:A", "TEST:C"));
+}
+
+test "isDescendantOf reports its traversal limit" {
     const allocator = std.testing.allocator;
     var obo = std.ArrayList(u8).empty;
     defer obo.deinit(allocator);
@@ -541,15 +579,16 @@ test "isDescendantOf reports its bounded traversal limit" {
     );
 }
 
-test "CvTable rejects an overlong binary-data xref" {
+test "cv table rejects an overlong binary-data xref" {
     const allocator = std.testing.allocator;
-    const obo = try readFixture(allocator, "fixtures/obo/adversarial/overlong-xref.obo");
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/overlong-xref.obo");
     defer allocator.free(obo);
 
     try std.testing.expectError(error.XrefTooLong, CvTable.init(allocator, obo));
 }
 
-test "CvTable rejects an overlong line before field allocation" {
+test "cv table rejects an overlong line before field allocation" {
     const allocator = std.testing.allocator;
     const obo = "[Term]\nname: " ++ "abcdefghijklmnop";
 
@@ -559,17 +598,19 @@ test "CvTable rejects an overlong line before field allocation" {
     );
 }
 
-test "CvTable rejects duplicate IDs without replacing the first term" {
+test "cv table rejects duplicate IDs without replacing the first term" {
     const allocator = std.testing.allocator;
-    const obo = try readFixture(allocator, "fixtures/obo/adversarial/duplicate-ids.obo");
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/duplicate-ids.obo");
     defer allocator.free(obo);
 
     try std.testing.expectError(error.DuplicateId, CvTable.init(allocator, obo));
 }
 
-test "CvTable owns term data after the source is freed" {
+test "cv table owns term data after the source is freed" {
     const allocator = std.testing.allocator;
-    const source = try readFixture(allocator, "fixtures/obo/adversarial/custom-namespace.obo");
+    const io = std.testing.io;
+    const source = try readFixture(allocator, io, "fixtures/obo/adversarial/custom-namespace.obo");
     var table = CvTable.init(allocator, source) catch |err| {
         allocator.free(source);
         return err;
@@ -583,9 +624,10 @@ test "CvTable owns term data after the source is freed" {
     try std.testing.expectEqualStrings("term with custom namespace storage", term.name);
 }
 
-test "CvTable term construction owns every field and cleans allocation failures" {
+test "cv table cleans every field on allocation failure" {
     const allocator = std.testing.allocator;
-    const obo = try readFixture(allocator, "fixtures/obo/adversarial/allocation-failure.obo");
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/allocation-failure.obo");
     defer allocator.free(obo);
     var succeeded = false;
 

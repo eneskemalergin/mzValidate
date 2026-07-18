@@ -1,22 +1,15 @@
-//! Rule engine for PSI-MS CV mapping rules (ms-mapping.xml).
-//!
-//! Parses the PSI's official mapping rules and provides path-based lookup.
-//! Each rule defines which CV terms MUST, SHOULD, or MAY appear on a given
-//! XML element path, and whether they combine via AND or OR logic.
-//!
-//! Usage:
-//!   var engine = try RuleEngine.init(allocator, mapping_xml);
-//!   defer engine.deinit();
-//!   const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
+//! Parses and indexes PSI-MS CV mapping rules for mzML elements.
+//! Owned rule strings are shared by path lookup and the incremental path index.
 
 const std = @import("std");
 const obo = @import("parser.zig");
 const elements = @import("../mzml/elements.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_parser = @import("../xml/parser.zig");
-const version = @import("../version.zig");
 
 const Attribute = xml_events.Attribute;
+const max_mapping_rules: usize = 4096;
+const max_mapping_terms_per_rule: usize = 256;
 
 pub const RequirementLevel = enum(u8) {
     must,
@@ -29,12 +22,14 @@ pub const CombinationLogic = enum(u8) {
     @"or",
 };
 
+/// A CV term reference owned by the containing `RuleEngine`.
 pub const MappingTerm = struct {
     accession: []const u8,
     allow_children: bool,
     is_repeatable: bool,
 };
 
+/// A mapping rule owned by the containing `RuleEngine`.
 pub const MappingRule = struct {
     id: []const u8,
     element_path: []const u8,
@@ -44,6 +39,7 @@ pub const MappingRule = struct {
 };
 
 pub const PathState = u16;
+/// State used to start incremental path traversal.
 pub const root_path_state: PathState = 0;
 const no_path_state = std.math.maxInt(PathState);
 
@@ -57,6 +53,7 @@ pub const RuleEngine = struct {
     allocator: std.mem.Allocator,
     rules: []MappingRule,
     rule_map: std.StringHashMap([]const MappingRule),
+    grouped_rules: []MappingRule,
     path_nodes: std.ArrayList(PathNode),
 
     pub fn init(allocator: std.mem.Allocator, xml_text: []const u8) !RuleEngine {
@@ -64,23 +61,34 @@ pub const RuleEngine = struct {
             .allocator = allocator,
             .rules = try parseRules(allocator, xml_text),
             .rule_map = std.StringHashMap([]const MappingRule).init(allocator),
+            .grouped_rules = &.{},
             .path_nodes = .empty,
         };
         errdefer engine.deinit();
-        // Build path-to-rules map. Rules are grouped by path in the XML.
+
+        engine.grouped_rules = try allocator.alloc(MappingRule, engine.rules.len);
         var i: usize = 0;
+        var group_index: usize = 0;
         while (i < engine.rules.len) {
             const path = engine.rules[i].element_path;
-            const group_start = i;
             i += 1;
-            while (i < engine.rules.len and std.mem.eql(u8, engine.rules[i].element_path, path)) : (i += 1) {}
-            try engine.rule_map.put(path, engine.rules[group_start..i]);
+            if (engine.rule_map.contains(path)) continue;
+
+            const group_start = group_index;
+            for (engine.rules) |rule| {
+                if (!std.mem.eql(u8, rule.element_path, path)) continue;
+                engine.grouped_rules[group_index] = rule;
+                group_index += 1;
+            }
+            try engine.rule_map.put(path, engine.grouped_rules[group_start..group_index]);
         }
         try engine.buildPathIndex();
         return engine;
     }
 
     pub fn deinit(engine: *RuleEngine) void {
+        engine.rule_map.deinit();
+
         for (engine.rules) |rule| {
             engine.allocator.free(rule.id);
             engine.allocator.free(rule.element_path);
@@ -88,27 +96,34 @@ pub const RuleEngine = struct {
             engine.allocator.free(rule.terms);
         }
         engine.allocator.free(engine.rules);
-        engine.rule_map.deinit();
+        engine.allocator.free(engine.grouped_rules);
         engine.path_nodes.deinit(engine.allocator);
+        engine.* = undefined;
     }
 
-    /// Look up rules for a given element path via hash map.
+    /// Returns rules for `element_path`; the slice remains valid while `engine` lives.
     pub fn rulesFor(engine: *const RuleEngine, element_path: []const u8) []const MappingRule {
         return engine.rule_map.get(element_path) orelse &.{};
     }
 
+    /// Advances an indexed path, returning null for an unknown or unindexed child.
     pub fn advancePath(engine: *const RuleEngine, parent: ?PathState, element_id: elements.ElementId) ?PathState {
         const state = parent orelse return null;
         if (element_id == .unknown) return null;
-        const child = engine.path_nodes.items[state].children[@intFromEnum(element_id)];
+        const state_index: usize = state;
+        if (state_index >= engine.path_nodes.items.len) return null;
+        const child = engine.path_nodes.items[state_index].children[@intFromEnum(element_id)];
         return if (child == no_path_state) null else child;
     }
 
+    /// Returns rules for an indexed state, or an empty slice for no state.
     pub fn rulesForState(engine: *const RuleEngine, state: ?PathState) []const MappingRule {
-        return engine.path_nodes.items[state orelse return &.{}].rules;
+        const state_index: usize = state orelse return &.{};
+        if (state_index >= engine.path_nodes.items.len) return &.{};
+        return engine.path_nodes.items[state_index].rules;
     }
 
-    /// Returns the first mapping accession absent from `table`.
+    /// Returns the first engine-owned mapping accession absent from `table`.
     pub fn firstMissingVocabularyTerm(engine: *const RuleEngine, table: *const obo.CvTable) ?[]const u8 {
         for (engine.rules) |rule| {
             for (rule.terms) |term| {
@@ -146,20 +161,15 @@ pub const RuleEngine = struct {
     }
 };
 
-// --- Parser internals ---
-
-// Walk the mapping document with the project's streaming XML parser and
-// collect rules. Single pass; comments and PIs are skipped by the parser.
-// Attribute slices borrow the parser's token buffer and are only valid
-// until the next event, so we dupe the strings we need to keep.
+// Attributes borrow parser storage, so retained values are duplicated here.
 fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
     var rules: std.ArrayList(MappingRule) = .empty;
     errdefer {
-        for (rules.items) |r| {
-            allocator.free(r.id);
-            allocator.free(r.element_path);
-            for (r.terms) |t| allocator.free(t.accession);
-            allocator.free(r.terms);
+        for (rules.items) |rule| {
+            allocator.free(rule.id);
+            allocator.free(rule.element_path);
+            for (rule.terms) |term| allocator.free(term.accession);
+            allocator.free(rule.terms);
         }
         rules.deinit(allocator);
     }
@@ -170,10 +180,6 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         t.deinit(allocator);
     };
 
-    // Buffers sized for ms-mapping.xml: max nesting ~6 (CvMapping >
-    // CvReferenceList/CvMappingRuleList > CvMappingRule > CvTerm), max
-    // attributes per element ~7. Generous slack for future schema
-    // additions.
     var token: [4096]u8 = undefined;
     var attributes: [16]Attribute = undefined;
     var namespace_bindings: [16]xml_parser.NamespaceBinding = undefined;
@@ -192,12 +198,11 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
 
     var parser = xml_parser.Parser.initSlice(xml, buffers);
 
-    // Owned strings for the in-progress rule. Reset to null after the
-    // rule's closing tag is processed.
     var current_id: ?[]u8 = null;
     var current_path: ?[]u8 = null;
     var current_requirement: RequirementLevel = .may;
     var current_logic: CombinationLogic = .@"and";
+    var mapping_rule_depth: usize = 0;
     errdefer {
         if (current_id) |id| allocator.free(id);
         if (current_path) |p| allocator.free(p);
@@ -210,15 +215,21 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         switch (ev) {
             .start_element => |start| {
                 if (std.mem.eql(u8, start.name.local_name, "CvMappingRule")) {
-                    current_id = try dupeAttr(allocator, start.attributes, "id");
-                    current_path = try dupeAttr(allocator, start.attributes, "scopePath");
-                    current_requirement = parseRequirement(findAttr(start.attributes, "requirementLevel") orelse "");
-                    current_logic = parseLogic(findAttr(start.attributes, "cvTermsCombinationLogic") orelse "AND");
+                    mapping_rule_depth = std.math.add(usize, mapping_rule_depth, 1) catch
+                        return error.MappingRuleNestingTooDeep;
+                    if (mapping_rule_depth != 1) continue;
 
-                    if (current_terms != null) {
-                        // Stray <CvMappingRule> inside another; ignore.
-                        continue;
-                    }
+                    current_id = try dupeRequiredAttr(allocator, start.attributes, "id");
+                    current_path = try dupeRequiredAttr(allocator, start.attributes, "scopePath");
+                    current_requirement = try parseRequirement(
+                        findAttr(start.attributes, "requirementLevel") orelse
+                            return error.MissingMappingAttribute,
+                    );
+                    current_logic = try parseLogic(
+                        findAttr(start.attributes, "cvTermsCombinationLogic") orelse
+                            return error.MissingMappingAttribute,
+                    );
+
                     var terms: std.ArrayList(MappingTerm) = .empty;
                     errdefer {
                         for (terms.items) |term| allocator.free(term.accession);
@@ -226,9 +237,11 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                     }
                     current_terms = terms;
                 } else if (std.mem.eql(u8, start.name.local_name, "CvTerm")) {
-                    if (current_terms == null) continue;
-                    const acc = findAttr(start.attributes, "termAccession") orelse continue;
-                    const owned = try allocator.dupe(u8, acc);
+                    if (mapping_rule_depth != 1 or current_terms == null) continue;
+                    if (current_terms.?.items.len >= max_mapping_terms_per_rule) {
+                        return error.MappingTermLimitExceeded;
+                    }
+                    const owned = try dupeRequiredAttr(allocator, start.attributes, "termAccession");
                     errdefer allocator.free(owned);
                     const allow_children = eqTrue(findAttr(start.attributes, "allowChildren"));
                     const is_repeatable = eqTrue(findAttr(start.attributes, "isRepeatable"));
@@ -241,7 +254,10 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
             },
             .end_element => |end| {
                 if (!std.mem.eql(u8, end.name.local_name, "CvMappingRule")) continue;
-                if (current_terms == null) continue;
+                if (mapping_rule_depth == 0) continue;
+                mapping_rule_depth -= 1;
+                if (mapping_rule_depth != 0 or current_terms == null) continue;
+                if (rules.items.len >= max_mapping_rules) return error.MappingRuleLimitExceeded;
 
                 const owned_terms = try current_terms.?.toOwnedSlice(allocator);
                 errdefer {
@@ -256,7 +272,6 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                     .terms = owned_terms,
                 });
 
-                // Rule is now owned by `rules`; release the in-progress state.
                 current_terms = null;
                 current_id = null;
                 current_path = null;
@@ -268,9 +283,6 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
     return try rules.toOwnedSlice(allocator);
 }
 
-// Looks up an attribute by local name on a parsed start element.
-// Skips namespace declarations (xmlns, xmlns:foo) so they never match
-// a real attribute.
 fn findAttr(attrs: []const Attribute, local_name: []const u8) ?[]const u8 {
     for (attrs) |attr| {
         if (attr.is_namespace_declaration) continue;
@@ -279,26 +291,26 @@ fn findAttr(attrs: []const Attribute, local_name: []const u8) ?[]const u8 {
     return null;
 }
 
-// Dupe the value of an attribute for storage; the parser's token buffer
-// is invalidated by the next event.
-fn dupeAttr(allocator: std.mem.Allocator, attrs: []const Attribute, local_name: []const u8) ![]u8 {
-    const value = findAttr(attrs, local_name) orelse "";
+fn dupeRequiredAttr(allocator: std.mem.Allocator, attrs: []const Attribute, local_name: []const u8) ![]u8 {
+    const value = findAttr(attrs, local_name) orelse return error.MissingMappingAttribute;
     return allocator.dupe(u8, value);
 }
 
-fn eqTrue(s: ?[]const u8) bool {
-    return if (s) |v| std.mem.eql(u8, v, "true") else false;
+fn eqTrue(value: ?[]const u8) bool {
+    return if (value) |item| std.mem.eql(u8, item, "true") else false;
 }
 
-fn parseRequirement(s: []const u8) RequirementLevel {
-    if (std.mem.eql(u8, s, "MUST")) return .must;
-    if (std.mem.eql(u8, s, "SHOULD")) return .should;
-    return .may;
+fn parseRequirement(value: []const u8) !RequirementLevel {
+    if (std.mem.eql(u8, value, "MUST")) return .must;
+    if (std.mem.eql(u8, value, "SHOULD")) return .should;
+    if (std.mem.eql(u8, value, "MAY")) return .may;
+    return error.InvalidRequirementLevel;
 }
 
-fn parseLogic(s: []const u8) CombinationLogic {
-    if (std.mem.eql(u8, s, "AND")) return .@"and";
-    return .@"or";
+fn parseLogic(value: []const u8) !CombinationLogic {
+    if (std.mem.eql(u8, value, "AND")) return .@"and";
+    if (std.mem.eql(u8, value, "OR")) return .@"or";
+    return error.InvalidCombinationLogic;
 }
 
 fn isExternalPrefix(accession: []const u8) bool {
@@ -309,7 +321,9 @@ fn isExternalPrefix(accession: []const u8) bool {
         std.mem.eql(u8, prefix, "PATO");
 }
 
-test "RuleEngine parses ms-mapping.xml" {
+// --- Unit Tests ---
+
+test "rule engine parses the embedded mapping" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
     try std.testing.expect(std.mem.indexOf(u8, xml, "modelName=\"" ++ version.mapping_model ++ "\"") != null);
@@ -317,31 +331,26 @@ test "RuleEngine parses ms-mapping.xml" {
     var engine = try RuleEngine.init(allocator, xml);
     defer engine.deinit();
 
-    // Verify known rules exist.
     const rules = engine.rulesFor("/mzML/run/spectrumList/spectrum");
     try std.testing.expect(rules.len > 0);
     for (rules) |r| {
         try std.testing.expect(r.terms.len > 0);
     }
-    // Verify must rule exists.
     var has_must = false;
     for (rules) |r| {
         if (r.requirement == .must) has_must = true;
     }
     try std.testing.expect(has_must);
 
-    // Verify instrument configuration rules.
     const ic_rules = engine.rulesFor("/mzML/instrumentConfigurationList/instrumentConfiguration");
     try std.testing.expect(ic_rules.len > 0);
 
-    // Verify source rules.
     const source_rules = engine.rulesFor("/mzML/instrumentConfigurationList/instrumentConfiguration/componentList/source");
     try std.testing.expect(source_rules.len > 0);
-    // source_must + source_may should be returned.
     try std.testing.expect(source_rules.len >= 2);
 }
 
-test "RuleEngine.rulesFor returns empty for unknown path" {
+test "rule engine returns no rules for an unknown path" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
     var engine = try RuleEngine.init(allocator, xml);
@@ -351,7 +360,7 @@ test "RuleEngine.rulesFor returns empty for unknown path" {
     try std.testing.expectEqual(@as(usize, 0), rules.len);
 }
 
-test "RuleEngine incrementally resolves paths with parent context" {
+test "rule engine resolves paths with parent context" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
     var engine = try RuleEngine.init(allocator, xml);
@@ -383,7 +392,7 @@ test "RuleEngine incrementally resolves paths with parent context" {
     try std.testing.expectEqual(@as(usize, 0), engine.rulesForState(null).len);
 }
 
-test "RuleEngine incremental index covers every embedded mapping path" {
+test "rule engine indexes every embedded mapping path" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
     var engine = try RuleEngine.init(allocator, xml);
@@ -407,7 +416,101 @@ test "RuleEngine incremental index covers every embedded mapping path" {
     }
 }
 
-test "RuleEngine path index construction cleans allocation failures" {
+test "rule engine groups rules when paths are interleaved" {
+    const allocator = std.testing.allocator;
+    const xml =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"run_first\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"><CvTerm termAccession=\"MS:1\"/></CvMappingRule>" ++
+        "<CvMappingRule id=\"spectrum\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"/></CvMappingRule>" ++
+        "<CvMappingRule id=\"run_second\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:3\"/></CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    const rules = engine.rulesFor("/mzML/run");
+    try std.testing.expectEqual(@as(usize, 2), rules.len);
+    try std.testing.expectEqualStrings("run_first", rules[0].id);
+    try std.testing.expectEqualStrings("run_second", rules[1].id);
+
+    var state = engine.advancePath(root_path_state, .mzML);
+    state = engine.advancePath(state, .run);
+    try std.testing.expectEqualSlices(MappingRule, rules, engine.rulesForState(state));
+}
+
+test "rule engine ignores nested mapping rules" {
+    const allocator = std.testing.allocator;
+    const xml =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"outer\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1\"/>" ++
+        "<CvMappingRule id=\"inner\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"/></CvMappingRule>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), engine.rules.len);
+    try std.testing.expectEqualStrings("outer", engine.rules[0].id);
+    try std.testing.expectEqual(@as(usize, 1), engine.rules[0].terms.len);
+}
+
+test "rule engine rejects missing and invalid rule attributes" {
+    const allocator = std.testing.allocator;
+    const missing_id =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"/>" ++
+        "</CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.MissingMappingAttribute, RuleEngine.init(allocator, missing_id));
+
+    const invalid_requirement =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"REQUIRED\" cvTermsCombinationLogic=\"AND\"/>" ++
+        "</CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.InvalidRequirementLevel, RuleEngine.init(allocator, invalid_requirement));
+
+    const invalid_logic =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"XOR\"/>" ++
+        "</CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.InvalidCombinationLogic, RuleEngine.init(allocator, invalid_logic));
+
+    const missing_term_accession =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm/></CvMappingRule>" ++
+        "</CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.MissingMappingAttribute, RuleEngine.init(allocator, missing_term_accession));
+}
+
+test "rule engine enforces the mapping rule limit" {
+    const allocator = std.testing.allocator;
+    var xml = std.ArrayList(u8).empty;
+    defer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<CvMapping><CvMappingRuleList>");
+    for (0..max_mapping_rules + 1) |i| {
+        var id_buf: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buf, "rule_{d}", .{i});
+        try xml.appendSlice(allocator, "<CvMappingRule id=\"");
+        try xml.appendSlice(allocator, id);
+        try xml.appendSlice(allocator, "\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"/>");
+    }
+    try xml.appendSlice(allocator, "</CvMappingRuleList></CvMapping>");
+
+    try std.testing.expectError(error.MappingRuleLimitExceeded, RuleEngine.init(allocator, xml.items));
+}
+
+test "rule engine returns empty rules for invalid path state" {
+    const allocator = std.testing.allocator;
+    const xml = @embedFile("../data/ms-mapping.xml");
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    const invalid_state = std.math.maxInt(PathState);
+    try std.testing.expect(engine.advancePath(invalid_state, .mzML) == null);
+    try std.testing.expectEqual(@as(usize, 0), engine.rulesForState(invalid_state).len);
+}
+
+test "rule engine cleans path index allocation failures" {
     const xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
         "<CvTerm termAccession=\"MS:1000001\"></CvTerm>" ++
@@ -429,18 +532,17 @@ test "RuleEngine path index construction cleans allocation failures" {
     try std.testing.expect(reached_success);
 }
 
-test "RuleEngine does not parse commented-out rules" {
+test "rule engine ignores commented-out rules" {
     const allocator = std.testing.allocator;
     const xml = @embedFile("../data/ms-mapping.xml");
     var engine = try RuleEngine.init(allocator, xml);
     defer engine.deinit();
 
-    // sourcefile_must is inside <!-- --> and must not be parsed.
     const src_rules = engine.rulesFor("/mzML/fileDescription/sourceFileList/sourceFile");
     try std.testing.expectEqual(@as(usize, 0), src_rules.len);
 }
 
-test "RuleEngine accepts the embedded vocabulary and rejects incompatible custom vocabulary" {
+test "rule engine checks mapping terms against the vocabulary" {
     const allocator = std.testing.allocator;
     const mapping_xml = @embedFile("../data/ms-mapping.xml");
     var engine = try RuleEngine.init(allocator, mapping_xml);
@@ -458,3 +560,5 @@ test "RuleEngine accepts the embedded vocabulary and rejects incompatible custom
         engine.firstMissingVocabularyTerm(&custom_table).?,
     );
 }
+
+const version = @import("../version.zig");

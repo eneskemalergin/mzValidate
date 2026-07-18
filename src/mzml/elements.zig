@@ -1,7 +1,6 @@
-//! mzML 1.1.0 element intern IDs for hot-path dispatch.
+//! mzML 1.1.0 element intern IDs and comptime validation dispatch masks.
 //!
 //! `unknown` covers non-mzML XML and unrecognized local names.
-//! Validators call `StartElement.resolvedId` / `EndElement.resolvedId`.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
@@ -90,7 +89,7 @@ pub fn idFromLocalName(local_name: []const u8) ElementId {
     return element_map.get(local_name) orelse .unknown;
 }
 
-/// Like `idFromLocalName`, but requires the mzML namespace URI.
+/// Rejects an explicitly foreign namespace; an absent URI preserves local-name lookup.
 pub fn idFromParts(local_name: []const u8, namespace_uri: ?[]const u8) ElementId {
     if (namespace_uri) |ns| {
         if (!std.mem.eql(u8, ns, mzml_namespace)) return .unknown;
@@ -104,7 +103,6 @@ pub fn resolveId(id: ElementId, local_name: []const u8, namespace_uri: ?[]const 
     return idFromParts(local_name, namespace_uri);
 }
 
-/// True when `local_name` is a defined mzML 1.1.0 element.
 pub fn isKnownMzmlLocalName(local_name: []const u8) bool {
     return idFromLocalName(local_name) != .unknown;
 }
@@ -133,8 +131,8 @@ fn comptimeMask(index: bool, semantic: bool) IndexSemanticMask {
     return .{ .index = index, .semantic = semantic };
 }
 
-/// Hand-traced from index/semantic `switch (tag)` prongs.
-/// `false` means that validator is a no-op for the event and may be skipped.
+// Hand-traced from index/semantic `switch (tag)` prongs. A false bit means
+// that validator is a no-op for the event and may be skipped.
 fn startMaskFor(comptime tag: ElementId) IndexSemanticMask {
     return switch (tag) {
         .unknown => .none,
@@ -169,12 +167,10 @@ fn buildMaskTable(comptime mask_fn: anytype) [mask_table_len]IndexSemanticMask {
     return table;
 }
 
-/// Start-event fusion mask for `tag` (index and semantic bits only).
 pub fn startMask(id: ElementId) IndexSemanticMask {
     return start_masks[@intFromEnum(id)];
 }
 
-/// End-event fusion mask for `tag` (index and semantic bits only).
 pub fn endMask(id: ElementId) IndexSemanticMask {
     return end_masks[@intFromEnum(id)];
 }
@@ -188,7 +184,7 @@ pub fn activeMask(_skip_binary: bool, skip_index: bool, skip_semantic: bool) Ind
     };
 }
 
-// --- Tests ---
+// --- Unit Tests ---
 
 test "idFromLocalName maps schema element names" {
     try std.testing.expectEqual(ElementId.spectrum, idFromLocalName("spectrum"));
@@ -230,21 +226,20 @@ test "dispatch mask tables match comptime tracers" {
 }
 
 test "dispatch masks hand-traced spot checks" {
-    const all = comptimeMask(true, true);
+    const index_and_semantic = comptimeMask(true, true);
     const sem_only = comptimeMask(false, true);
-    const idx_sem = comptimeMask(true, true);
 
-    try std.testing.expectEqual(all, startMask(.spectrum));
-    try std.testing.expectEqual(all, startMask(.chromatogram));
-    try std.testing.expectEqual(idx_sem, startMask(.spectrumList));
-    try std.testing.expectEqual(idx_sem, startMask(.chromatogramList));
+    try std.testing.expectEqual(index_and_semantic, startMask(.spectrum));
+    try std.testing.expectEqual(index_and_semantic, startMask(.chromatogram));
+    try std.testing.expectEqual(index_and_semantic, startMask(.spectrumList));
+    try std.testing.expectEqual(index_and_semantic, startMask(.chromatogramList));
     try std.testing.expectEqual(sem_only, startMask(.cvParam));
     try std.testing.expectEqual(sem_only, startMask(.activation));
     try std.testing.expectEqual(IndexSemanticMask.none, startMask(.unknown));
-    try std.testing.expectEqual(idx_sem, startMask(.indexList));
+    try std.testing.expectEqual(index_and_semantic, startMask(.indexList));
     try std.testing.expectEqual(sem_only, endMask(.spectrum));
     try std.testing.expectEqual(IndexSemanticMask.none, endMask(.cvParam));
-    try std.testing.expectEqual(idx_sem, endMask(.offset));
+    try std.testing.expectEqual(index_and_semantic, endMask(.offset));
 }
 
 test "activeMask respects skip flags" {
@@ -254,9 +249,6 @@ test "activeMask respects skip flags" {
 }
 
 test "dispatch masks align with tiny mzML fixture tags" {
-    const xml_parser = @import("../xml/parser.zig");
-    const xml_events = @import("../xml/events.zig");
-
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     const xml = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", allocator, .limited(64 * 1024));
@@ -296,3 +288,6 @@ test "dispatch masks align with tiny mzML fixture tags" {
         }
     }
 }
+
+const xml_parser = @import("../xml/parser.zig");
+const xml_events = @import("../xml/events.zig");

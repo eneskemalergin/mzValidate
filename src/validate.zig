@@ -1,14 +1,9 @@
 //! Entry points for running validation against files or streams.
 //!
-//! Three I/O paths:
-//!   checkPath                  -> explicit mmap or bounded stream, selected by options.
-//!   checkSlice                 -> caller provides contiguous bytes, slice parser.
-//!   checkReader                -> caller provides a stream, reader parser.
+//! Coordinates slice, reader, and regular-file validation.
 //!
-//! All validators (structural, binary, index, semantic) run in one
-//! forward pass over the event stream. Validator-owned state is bounded per
-//! phase: parser buffers, one active binary workspace, index tables, and the
-//! semantic CV/ref tracker. A path never falls back to a file-sized heap buffer.
+//! Parser and validators share one event pass. Regular files use bounded stream
+//! input by default; explicit mmap keeps the same parser and validation flow.
 
 const std = @import("std");
 const binary = @import("mzml/binary.zig");
@@ -42,11 +37,12 @@ pub const InputMode = enum {
 };
 
 /// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
+/// The legacy `mmap` flag takes precedence over `input_mode` when enabled.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
-    input_mode: InputMode = .mmap,
+    input_mode: InputMode = .stream,
     mmap: bool = false,
     max_binary_size: ?usize = null,
     resource_limits: diagnostic.ResourceLimits = .{},
@@ -80,12 +76,15 @@ pub const InvocationContext = struct {
     /// Builds the semantic catalog once. A catalog failure is retained as fixed
     /// metadata so file validation can stop before opening an input.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: CheckOptions) InvocationContext {
+        var effective_options = options;
+        if (effective_options.mmap) effective_options.input_mode = .mmap;
+
         var context = InvocationContext{
             .allocator = allocator,
             .io = io,
-            .options = options,
+            .options = effective_options,
         };
-        if (!options.skip_semantic) context.buildCatalog();
+        if (!effective_options.skip_semantic) context.buildCatalog();
         return context;
     }
 
@@ -180,7 +179,7 @@ pub const InvocationContext = struct {
         var table = obo_parser.CvTable.initWithLimits(context.allocator, text, options.resource_limits) catch |err| {
             context.catalog_failure = .{
                 .reason = if (err == error.OutOfMemory) .allocation else .catalog,
-                .rule = RuleId.runtime_file_open,
+                .rule = RuleId.runtime_catalog,
                 .message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err),
             };
             return;
@@ -190,7 +189,7 @@ pub const InvocationContext = struct {
             table.deinit();
             context.catalog_failure = .{
                 .reason = if (err == error.OutOfMemory) .allocation else .catalog,
-                .rule = RuleId.runtime_file_open,
+                .rule = RuleId.runtime_catalog,
                 .message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules",
             };
             return;
@@ -514,6 +513,7 @@ pub fn checkSlice(
 }
 
 /// Validates a contiguous input and returns completion metadata.
+/// `bytes` and optional `file_bytes` are borrowed for the duration of the call.
 pub fn checkSliceResult(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -543,6 +543,7 @@ pub fn checkReader(
 }
 
 /// Validates a reader input and returns completion metadata.
+/// `file_bytes` is the complete borrowed source when indexed checks need it.
 pub fn checkReaderResult(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -567,9 +568,6 @@ fn runValidation(
     stream_file: ?std.Io.File,
     stream_size: ?u64,
 ) !void {
-
-    // Bounded validator state: parser stacks, structural state, and one
-    // binary workspace. The slice source itself may be file-sized.
     result.beginStage(.parser);
     const token_buffer = try context.allocator.alloc(u8, max_validation_token_bytes);
     defer {
@@ -715,7 +713,7 @@ fn runValidation(
 
         switch (event) {
             .start_element => |start| {
-                element_depth += 1;
+                element_depth = std.math.add(usize, element_depth, 1) catch return error.ResourceLimitExceeded;
                 result.beginStage(.structural);
                 try structural_validator.consumeStart(start);
                 if (binary_validator) |*validator| {
@@ -760,7 +758,7 @@ fn runValidation(
                         }
                     }
                 }
-                element_depth -= 1;
+                element_depth = std.math.sub(usize, element_depth, 1) catch return error.ResourceLimitExceeded;
             },
             .text => |text| {
                 result.beginStage(.structural);
@@ -783,7 +781,8 @@ fn runValidation(
         }
         if (index_validator) |*validator| {
             result.beginStage(.index);
-            validator.maybeFeedShaExclusive(parser.byteOffset() + 1);
+            const exclusive_end = std.math.add(u64, parser.byteOffset(), 1) catch return error.ResourceLimitExceeded;
+            validator.maybeFeedShaExclusive(exclusive_end);
         }
     }
 
@@ -881,28 +880,23 @@ fn expectAllocationFailuresIncomplete(
     }
 }
 
-// --- Unit tests ---
+// --- Unit Tests ---
 
-// Tests: file and reader entry points.
-
-test "checkPath_missingFile_reportsOpenError" {
+test "path check: reports a missing file" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, "definitely-missing-file.mzML", .{});
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.@"error", diagnostics.items[0].severity);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }
 
-test "checkPath_streamMode_usesBoundedReaderPath" {
+test "path check: uses bounded stream input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = try std.Io.Dir.cwd().readFileAlloc(
@@ -932,7 +926,23 @@ test "checkPath_streamMode_usesBoundedReaderPath" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "explicit mmap failure_reports_mode_error_without_fallback" {
+test "check options: default to stream input" {
+    const options = CheckOptions{};
+    try std.testing.expectEqual(InputMode.stream, options.input_mode);
+    try std.testing.expect(!options.mmap);
+}
+
+test "check options: legacy mmap flag selects mmap input" {
+    var context = InvocationContext.init(std.testing.allocator, std.testing.io, .{
+        .skip_semantic = true,
+        .mmap = true,
+    });
+    defer context.deinit();
+
+    try std.testing.expectEqual(InputMode.mmap, context.options.input_mode);
+}
+
+test "path check: reports mmap failure without fallback" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -974,7 +984,7 @@ test "explicit mmap failure_reports_mode_error_without_fallback" {
     try std.testing.expectEqualStrings(RuleId.runtime_input_mode, diagnostics.items[0].rule);
 }
 
-test "file stability check_rejects_changed_file" {
+test "path check: rejects a changed file" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1002,7 +1012,7 @@ test "file stability check_rejects_changed_file" {
     try std.testing.expectEqualStrings(RuleId.runtime_file_stability, diagnostics.items[0].rule);
 }
 
-test "mapped validation_rejects_truncation_after_mapping" {
+test "mmap validation: detects truncation after mapping" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = "<?xml version=\"1.0\"?><mzML xmlns=\"http://psi.hupo.org/ms/mzml\"/>";
@@ -1049,11 +1059,10 @@ test "mapped validation_rejects_truncation_after_mapping" {
     try std.testing.expect(found_stability_failure);
 }
 
-test "checkPath_existingFile_runsStructuralValidationWhenSkippingBinary" {
+test "path check: validates structure when binary checks are skipped" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -1066,18 +1075,15 @@ test "checkPath_existingFile_runsStructuralValidationWhenSkippingBinary" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_existingFile_reportsCleanResultWhenStructureAndBinaryPass" {
+test "path check: reports a clean file when structure and binary pass" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -1090,20 +1096,15 @@ test "checkPath_existingFile_reportsCleanResultWhenStructureAndBinaryPass" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-// Tests: indexed and corpus fixtures.
-
-test "checkPath_indexedMzMLFixture_runsStructuralValidationWhenSkippingBinary" {
+test "path check: validates indexed fixture structure when binary checks are skipped" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -1116,45 +1117,38 @@ test "checkPath_indexedMzMLFixture_runsStructuralValidationWhenSkippingBinary" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_largeIndexedMzMLFixture_runsStructuralValidationWhenSkippingBinary" {
+test "path check: validates the larger indexed fixture structure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/small.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexedMzMLFixture_runsStructuralWhenSkippingIndex" {
+test "path check: validates indexed structure with index checks disabled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act. Skip index because the pwiz fixture has a bad checksum.
+    // Skip index because the pwiz fixture has a bad checksum.
     // Index SHA-1 verification is tested separately with correct fixtures.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_semantic_end_to_end" {
+test "path check: runs semantic validation end to end" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1176,7 +1170,7 @@ test "checkPath_semantic_end_to_end" {
     try std.testing.expect(has_cv_diag);
 }
 
-test "checkSliceResult_semantic_limit_is_incomplete" {
+test "slice result: reports a semantic resource limit" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
@@ -1197,7 +1191,7 @@ test "checkSliceResult_semantic_limit_is_incomplete" {
     try std.testing.expectEqualStrings(RuleId.runtime_semantic_limit, diagnostics.items[0].rule);
 }
 
-test "checkPath_indexed_fixture_runs_mapping_rules" {
+test "path check: runs mapping rules for an indexed fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1219,7 +1213,7 @@ test "checkPath_indexed_fixture_runs_mapping_rules" {
     try std.testing.expect(found_required_mapping_error);
 }
 
-test "checkPath_nonempty_binary_without_array_length_is_incomplete" {
+test "path check: reports incomplete binary validation without array length" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1247,7 +1241,7 @@ test "checkPath_nonempty_binary_without_array_length_is_incomplete" {
     try std.testing.expect(found_binary_diagnostic);
 }
 
-test "checkPath_missing_required_reference_emits_reference_rule" {
+test "path check: reports a missing required reference" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1265,29 +1259,23 @@ test "checkPath_missing_required_reference_emits_reference_rule" {
     try std.testing.expectEqualStrings("run is missing required attribute defaultInstrumentConfigurationRef", diagnostics.items[0].message);
 }
 
-test "checkPath_indexedMzMLFixture_skipIndexSkipsIndexChecks" {
+test "path check: skips index checks for indexed input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true, .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexedSha_stream_noChecksumError" {
+test "path check: validates a stream SHA-1 checksum" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. Build a file with a correct SHA-1 embedded in fileChecksum.
-    // The hash must cover everything up to the hex content, which is:
-    // prefix (= content up to and including the newline after </indexListOffset>)
-    // + indent (= "  ") + "<fileChecksum>".
+    // The digest covers the bytes through the opening fileChecksum tag.
     const prefix =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
         "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
@@ -1319,7 +1307,7 @@ test "checkPath_indexedSha_stream_noChecksumError" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha.mzML");
     defer allocator.free(path);
 
-    // Act. Stream path: checksum is recomputed from the seekable source.
+    // Stream path: checksum is recomputed from the seekable source.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     const result = checkPathResult(allocator, io, &diagnostics, path, .{
@@ -1328,7 +1316,6 @@ test "checkPath_indexedSha_stream_noChecksumError" {
         .input_mode = .stream,
     });
 
-    // Assert. No checksum error.
     for (diagnostics.items) |d| {
         if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
             return error.TestUnexpectedChecksumError;
@@ -1337,11 +1324,10 @@ test "checkPath_indexedSha_stream_noChecksumError" {
     try std.testing.expect(result.resource_usage.index_peak_bytes > 0);
 }
 
-test "checkPath_indexedSha_mmap_noChecksumError" {
+test "path check: validates an mmap SHA-1 checksum" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. Same fixture, explicit mmap path.
     const prefix =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
         "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
@@ -1372,7 +1358,6 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha-mmap.mzML");
     defer allocator.free(path);
 
-    // Act. Explicit mmap.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
@@ -1381,7 +1366,6 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
         .mmap = true,
     });
 
-    // Assert. No checksum error.
     for (diagnostics.items) |d| {
         if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
             return error.TestUnexpectedChecksumError;
@@ -1389,7 +1373,7 @@ test "checkPath_indexedSha_mmap_noChecksumError" {
     }
 }
 
-test "checkPath_indexedSha_completeStartTag_noChecksumError" {
+test "path check: accepts a complete checksum start tag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const checksum_start_tag = "<fileChecksum data-origin=\"test\" >";
@@ -1441,11 +1425,10 @@ test "checkPath_indexedSha_completeStartTag_noChecksumError" {
     }
 }
 
-test "checkPath_indexedSha_skipIndex_noShaCheck" {
+test "path check: skips SHA-1 when index checks are disabled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. Same fixture, skip-index path.
     const prefix =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
         "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
@@ -1476,7 +1459,6 @@ test "checkPath_indexedSha_skipIndex_noShaCheck" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "skip-sha.mzML");
     defer allocator.free(path);
 
-    // Act. Skip-index: pure streaming, no SHA-1 at all.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
@@ -1485,15 +1467,13 @@ test "checkPath_indexedSha_skipIndex_noShaCheck" {
         .skip_index = true,
     });
 
-    // Assert. No index work at all.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexedSha_corruptedChecksum_detected" {
+test "path check: detects a corrupt SHA-1 checksum" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. Same fixture but with deliberately wrong SHA-1 (all zeros).
     const bad_hex = "0000000000000000000000000000000000000000";
     const xml = try indexedMzmlWithSha(allocator, bad_hex);
     defer allocator.free(xml);
@@ -1504,7 +1484,6 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "bad-sha.mzML");
     defer allocator.free(path);
 
-    // Act.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
@@ -1513,7 +1492,6 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
         .input_mode = .stream,
     });
 
-    // Assert. The wrong checksum must produce a mismatch diagnostic.
     var found = false;
     for (diagnostics.items) |d| {
         if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
@@ -1524,11 +1502,11 @@ test "checkPath_indexedSha_corruptedChecksum_detected" {
     try std.testing.expect(found);
 }
 
-test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
+test "path check: does not hash non-indexed input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. A non-indexed file (no indexList). Index validation runs but
+    // A non-indexed file (no indexList). Index validation runs but
     // sees no index elements, so no SHA-1 is attempted.
     const xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
@@ -1549,7 +1527,6 @@ test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "non-indexed.mzML");
     defer allocator.free(path);
 
-    // Act.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, path, .{
@@ -1557,34 +1534,30 @@ test "checkPath_indexedSha_nonIndexed_noShaAttempted" {
         .skip_semantic = true,
     });
 
-    // Assert. Clean. No SHA-1 check because no index elements.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexed_skipIndex_noSha1Check" {
+test "path check: skips SHA-1 for an indexed fixture when requested" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act. Skip-index path: pure streaming, no SHA-1.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
         .skip_binary = true,
         .skip_semantic = true,
         .skip_index = true,
     });
 
-    // Assert. No index work done, no SHA-1 check.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_indexed_missingChecksum_noError" {
+test "path check: accepts indexed input without a checksum" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange. A minimal indexed mzML without a fileChecksum element.
+    // A minimal indexed mzML without a fileChecksum element.
     // The spec allows indexed mzML without checksum.
     const xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
@@ -1612,13 +1585,11 @@ test "checkPath_indexed_missingChecksum_noError" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
     });
 
-    // Assert. No checksum error (no fileChecksum element found).
     for (diagnostics.items) |d| {
         if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
             return error.TestUnexpectedChecksumError;
@@ -1626,28 +1597,24 @@ test "checkPath_indexed_missingChecksum_noError" {
     }
 }
 
-test "checkPath_mmap_flag_onMissingFileReportsOpenError" {
+test "path check: reports a missing file before mmap selection" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act. The open fails before input-mode selection starts.
     try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .mmap = true });
 
-    // Assert. Report the file-open error, not a memory-map error.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
 }
 
-test "checkPath_validMzMLCorpus_runsStructuralValidationWhenSkippingBinary" {
+test "path check: validates the valid fixture corpus" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const root = "fixtures/mzml/valid";
 
-    // Act.
     const fixture_count = try expectCorpusDiagnostics(
         allocator,
         io,
@@ -1656,18 +1623,14 @@ test "checkPath_validMzMLCorpus_runsStructuralValidationWhenSkippingBinary" {
         .clean,
     );
 
-    // Assert.
     try std.testing.expect(fixture_count > 0);
 }
 
-// Tests: synthetic large streaming input.
-
-test "checkPath_syntheticLargeMzMLFixture_runsCleanInOnePass" {
+test "path check: validates a large synthetic mzML stream" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const spectrum_count = 2048;
 
-    // Arrange.
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
     const written_len = try writeSyntheticLargeMzmlFixture(io, &temp_dir, "synthetic-large.mzML", spectrum_count);
@@ -1679,14 +1642,12 @@ test "checkPath_syntheticLargeMzMLFixture_runsCleanInOnePass" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_stream_largeBinaryText_fixture_reportsLengthMismatch" {
+test "path check: reports a binary length mismatch in stream mode" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var diagnostics: DiagnosticSink = .empty;
@@ -1704,23 +1665,20 @@ test "checkPath_stream_largeBinaryText_fixture_reportsLengthMismatch" {
     );
 }
 
-test "writeSyntheticLargeMzmlFixture_writes_expected_streamed_shape" {
+test "synthetic fixture: writes the expected streamed shape" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const spectrum_count = 3;
 
-    // Arrange.
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
 
-    // Act.
     const written_len = try writeSyntheticLargeMzmlFixture(io, &temp_dir, "synthetic-shape.mzML", spectrum_count);
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "synthetic-shape.mzML");
     defer allocator.free(path);
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(128 * 1024));
     defer allocator.free(fixture);
 
-    // Assert.
     try std.testing.expectEqual(fixture.len, written_len);
     try std.testing.expect(std.mem.startsWith(u8, fixture, "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n<mzML "));
     try std.testing.expect(std.mem.indexOf(u8, fixture, "<spectrumList count=\"3\" defaultDataProcessingRef=\"DP1\">") != null);
@@ -1730,24 +1688,19 @@ test "writeSyntheticLargeMzmlFixture_writes_expected_streamed_shape" {
     try std.testing.expect(std.mem.endsWith(u8, fixture, "    </spectrumList>\n  </run>\n</mzML>\n"));
 }
 
-// Tests: adversarial public reader API.
-
-test "checkReader_truncated_xml_reports_exact_structure_xml_diagnostic" {
+test "reader check: reports truncated XML" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-truncated.mzML", .{ .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -1755,7 +1708,7 @@ test "checkReader_truncated_xml_reports_exact_structure_xml_diagnostic" {
     );
 }
 
-test "checkReader_truncated_xml_returns_incomplete_file_result" {
+test "reader result: marks truncated XML incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -1778,7 +1731,7 @@ test "checkReader_truncated_xml_returns_incomplete_file_result" {
     try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
 }
 
-test "checkReader_clean_input_returns_complete_file_result" {
+test "reader result: marks clean input complete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
@@ -1800,7 +1753,7 @@ test "checkReader_clean_input_returns_complete_file_result" {
     try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_peak_bytes);
 }
 
-test "checkReader_out_of_memory_returns_incomplete_file_result" {
+test "reader result: marks allocation failure incomplete" {
     const io = std.testing.io;
 
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -1820,7 +1773,7 @@ test "checkReader_out_of_memory_returns_incomplete_file_result" {
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
 }
 
-test "required-state allocation failures stay incomplete and leak-free" {
+test "required state: allocation failures stay incomplete and leak-free" {
     const semantic_xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
     try expectAllocationFailuresIncomplete(semantic_xml, .{
         .skip_binary = true,
@@ -1846,7 +1799,7 @@ test "required-state allocation failures stay incomplete and leak-free" {
     }, null, true);
 }
 
-test "failure diagnostic allocation uses the fixed emergency result" {
+test "failure diagnostics: allocation failure uses emergency metadata" {
     const xml = "<?xml version=\"1.0\"?><mzML><run";
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
     var diagnostics: DiagnosticSink = .empty;
@@ -1868,7 +1821,7 @@ test "failure diagnostic allocation uses the fixed emergency result" {
     try std.testing.expect(result.needsEmergencyDiagnostic());
 }
 
-test "checkPath_missing_catalog_returns_incomplete_file_result" {
+test "path result: missing catalog is incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1886,7 +1839,7 @@ test "checkPath_missing_catalog_returns_incomplete_file_result" {
     try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
 }
 
-test "InvocationContext_owns_catalog_across_multiple_paths" {
+test "invocation context: owns the catalog across multiple paths" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1920,7 +1873,7 @@ test "InvocationContext_owns_catalog_across_multiple_paths" {
     try std.testing.expect(context.catalog != null);
 }
 
-test "checkPath_incompatible_custom_vocabulary_is_non_clean" {
+test "path check: rejects an incompatible custom vocabulary" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1939,7 +1892,25 @@ test "checkPath_incompatible_custom_vocabulary_is_non_clean" {
     try std.testing.expectEqualStrings(RuleId.runtime_catalog, result.first_failure.?.rule);
 }
 
-test "checkPath_invalid_zlib_returns_complete_result_with_error" {
+test "path check: reports a malformed custom vocabulary as a catalog failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .obo_path = "fixtures/obo/adversarial/duplicate-ids.obo",
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog, result.first_failure.?.rule);
+}
+
+test "path result: invalid zlib is complete with an error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1956,7 +1927,7 @@ test "checkPath_invalid_zlib_returns_complete_result_with_error" {
     try std.testing.expect(result.resource_usage.binary_scratch_peak_bytes > 0);
 }
 
-test "checkPath_resource_limit_returns_incomplete_resource_result" {
+test "path result: resource limit is incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1980,7 +1951,7 @@ test "checkPath_resource_limit_returns_incomplete_resource_result" {
     try std.testing.expect(found_limit);
 }
 
-test "checkSlice_index_state_limit_returns_incomplete_resource_result" {
+test "slice result: index state limit is incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = try std.Io.Dir.cwd().readFileAlloc(
@@ -2005,7 +1976,7 @@ test "checkSlice_index_state_limit_returns_incomplete_resource_result" {
     try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
 }
 
-test "checkReader_legacy_wrapper_rejects_unreported_oom" {
+test "reader wrapper: reports an allocation failure" {
     const io = std.testing.io;
 
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
@@ -2020,22 +1991,19 @@ test "checkReader_legacy_wrapper_rejects_unreported_oom" {
     }, null));
 }
 
-test "checkReader_broken_attribute_quote_reports_malformed_xml_diagnostic" {
+test "reader check: reports a broken attribute quote" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>" ++
         "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\"><run id=\"broken></run></mzML>";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-broken-quote.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2043,7 +2011,7 @@ test "checkReader_broken_attribute_quote_reports_malformed_xml_diagnostic" {
     );
 }
 
-test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
+test "reader check: reports a mismatched end tag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml(
@@ -2054,15 +2022,12 @@ test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
             "</spectrumList>",
     );
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-mismatched-end-tag.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2070,7 +2035,7 @@ test "checkReader_mismatched_end_tag_reports_malformed_xml_diagnostic" {
     );
 }
 
-test "checkReader_invalid_utf8_reports_exact_structure_xml_diagnostic" {
+test "reader check: reports invalid UTF-8" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml(
@@ -2085,15 +2050,12 @@ test "checkReader_invalid_utf8_reports_exact_structure_xml_diagnostic" {
             "</spectrumList>",
     );
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-invalid-utf8.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2101,7 +2063,7 @@ test "checkReader_invalid_utf8_reports_exact_structure_xml_diagnostic" {
     );
 }
 
-test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
+test "reader check: reports the wrong root namespace" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -2112,15 +2074,12 @@ test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
         "  </run>\n" ++
         "</mzML>\n";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-wrong-namespace.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_root,
@@ -2128,7 +2087,7 @@ test "checkReader_wrong_namespace_reports_root_rule_not_generic_xml_failure" {
     );
 }
 
-test "checkReader_text_before_root_reports_structure_xml_diagnostic" {
+test "reader check: reports text before the root" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -2158,7 +2117,7 @@ test "checkReader_text_before_root_reports_structure_xml_diagnostic" {
     try std.testing.expect(found);
 }
 
-test "checkReader_prefixed_psi_namespace_root_runs_clean_when_skipping_binary" {
+test "reader check: accepts a prefixed PSI namespace" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -2174,23 +2133,19 @@ test "checkReader_prefixed_psi_namespace_root_runs_clean_when_skipping_binary" {
         "  </ms:run>\n" ++
         "</ms:mzML>\n";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-prefixed-root.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkPath_chromatogram_binary_error_reports_exact_rule_without_spectrum_index" {
+test "path check: reports chromatogram binary errors without a spectrum index" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = chromatogramMzmlWithPayloads("%%%%", "AAAAAA==");
 
     var temp_dir = std.testing.tmpDir(.{});
@@ -2201,10 +2156,8 @@ test "checkPath_chromatogram_binary_error_reports_exact_rule_without_spectrum_in
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_binary_base64,
@@ -2237,7 +2190,7 @@ fn mapThenTruncate(
     return mm;
 }
 
-test "checkReader_repeated_clean_runs_do_not_accumulate_state" {
+test "reader check: repeated clean runs do not accumulate state" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -2251,39 +2204,33 @@ test "checkReader_repeated_clean_runs_do_not_accumulate_state" {
         "  <run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\"><spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\"><spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"1\"><scanList count=\"1\"><scan/></scanList><binaryDataArrayList count=\"2\"><binaryDataArray encodedLength=\"8\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000514\" name=\"m/z array\" unitCvRef=\"MS\" unitAccession=\"MS:1000040\" unitName=\"m/z\"/><binary>AAAAAA==</binary></binaryDataArray><binaryDataArray encodedLength=\"8\"><cvParam cvRef=\"MS\" accession=\"MS:1000521\" name=\"32-bit float\"/><cvParam cvRef=\"MS\" accession=\"MS:1000576\" name=\"no compression\"/><cvParam cvRef=\"MS\" accession=\"MS:1000515\" name=\"intensity array\" unitCvRef=\"MS\" unitAccession=\"MS:1000131\" unitName=\"number of counts\"/><binary>AAAAAA==</binary></binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run>\n" ++
         "</mzML>\n";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     for (0..32) |_| {
         diagnostics.clearRetainingCapacity();
         var reader = std.Io.Reader.fixed(xml);
         try checkReader(allocator, io, &reader, &diagnostics, "inline-repeated-clean.mzML", .{ .skip_semantic = true }, null);
 
-        // Assert.
         try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
     }
 }
 
-test "checkReader_empty_spectrum_list_is_clean_when_skipping_binary" {
+test "reader check: accepts an empty spectrum list" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-spectrum-list.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkReader_multiple_spectra_are_clean_when_structure_is_valid" {
+test "reader check: accepts multiple valid spectra" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml(
@@ -2293,19 +2240,16 @@ test "checkReader_multiple_spectra_are_clean_when_structure_is_valid" {
             "</spectrumList>",
     );
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-multiple-spectra.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkReader_missing_binary_data_array_list_reports_exact_structure_rule" {
+test "reader check: reports a missing binary array list" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml(
@@ -2316,15 +2260,12 @@ test "checkReader_missing_binary_data_array_list_reports_exact_structure_rule" {
             "</spectrumList>",
     );
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-missing-binary-list.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_missing_child,
@@ -2332,7 +2273,7 @@ test "checkReader_missing_binary_data_array_list_reports_exact_structure_rule" {
     );
 }
 
-test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
+test "reader check: reports an out-of-order top-level child" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml =
@@ -2346,15 +2287,12 @@ test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
         "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\"><spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/></run>" ++
         "</mzML>";
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-out-of-order-top-level.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_nesting,
@@ -2362,21 +2300,18 @@ test "checkReader_out_of_order_top_level_child_reports_exact_nesting_rule" {
     );
 }
 
-test "checkReader_oversized_attribute_maps_parser_limit_to_structure_xml_diagnostic" {
+test "reader check: reports an oversized attribute" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const xml = try oversizedAttributeValueMzml(allocator, max_validation_token_bytes + 1);
     defer allocator.free(xml);
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-oversized-text.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2384,21 +2319,18 @@ test "checkReader_oversized_attribute_maps_parser_limit_to_structure_xml_diagnos
     );
 }
 
-test "checkReader_excessive_attribute_count_maps_parser_limit_to_structure_xml_diagnostic" {
+test "reader check: reports too many attributes" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const xml = try tooManyAttributesXml(allocator, 65);
     defer allocator.free(xml);
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-attributes.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2406,21 +2338,18 @@ test "checkReader_excessive_attribute_count_maps_parser_limit_to_structure_xml_d
     );
 }
 
-test "checkReader_excessive_namespace_bindings_map_parser_limit_to_structure_xml_diagnostic" {
+test "reader check: reports too many namespace bindings" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const xml = try tooManyNamespacesXml(allocator, 33);
     defer allocator.free(xml);
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-too-many-namespaces.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
@@ -2428,7 +2357,7 @@ test "checkReader_excessive_namespace_bindings_map_parser_limit_to_structure_xml
     );
 }
 
-test "checkReader_excessive_element_name_storage_maps_parser_limit_to_structure_xml_diagnostic" {
+test "reader check: reports excessive element-name storage" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2447,11 +2376,10 @@ test "checkReader_excessive_element_name_storage_maps_parser_limit_to_structure_
     );
 }
 
-test "checkPath_existingFile_reportsStructuralErrorWithoutBinaryNoise" {
+test "path check: reports a structural error without binary noise" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/wrong-namespace.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -2464,20 +2392,17 @@ test "checkPath_existingFile_reportsStructuralErrorWithoutBinaryNoise" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.@"error", diagnostics.items[0].severity);
     try std.testing.expectEqualStrings(RuleId.mzml_structure_root, diagnostics.items[0].rule);
 }
 
-test "checkPath_existingFile_skips_binary_warning_when_structure_is_broken_and_skip_binary_is_enabled" {
+test "path check: skips binary checks after a structural failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/wrong-namespace.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -2490,22 +2415,17 @@ test "checkPath_existingFile_skips_binary_warning_when_structure_is_broken_and_s
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqual(diagnostic.Severity.@"error", diagnostics.items[0].severity);
     try std.testing.expectEqualStrings(RuleId.mzml_structure_root, diagnostics.items[0].rule);
 }
 
-// Tests: binary failure handling.
-
-test "checkPath_corruptBinary_reportsBinaryDiagnostic" {
+test "path check: reports corrupt binary data" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -2517,19 +2437,16 @@ test "checkPath_corruptBinary_reportsBinaryDiagnostic" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_base64, diagnostics.items[0].rule);
 }
 
-test "checkPath_corruptBinary_is_clean_when_skip_binary_is_enabled" {
+test "path check: is clean when corrupt binary checks are disabled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
 
@@ -2541,27 +2458,22 @@ test "checkPath_corruptBinary_is_clean_when_skip_binary_is_enabled" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "checkReader_empty_binary_payload_reports_exact_length_mismatch" {
+test "reader check: reports an empty binary length mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = binarySpectrumListMzml("", "AAAAAA==", 1, "MS:1000576");
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-empty-binary.mzML", .{ .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_binary_length_mismatch,
@@ -2569,20 +2481,17 @@ test "checkReader_empty_binary_payload_reports_exact_length_mismatch" {
     );
 }
 
-test "checkReader_valid_zlib_payload_with_wrong_declared_length_reports_exact_length_mismatch" {
+test "reader check: reports a zlib length mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = binarySpectrumListMzml("eJxjYGBgAAAABAAB", "AAAAAAAAAAA=", 2, "MS:1000574");
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     var reader = std.Io.Reader.fixed(xml);
 
-    // Act.
     try checkReader(allocator, io, &reader, &diagnostics, "inline-zlib-length-mismatch.mzML", .{ .skip_semantic = true }, null);
 
-    // Assert.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_binary_length_mismatch,
@@ -2590,35 +2499,30 @@ test "checkReader_valid_zlib_payload_with_wrong_declared_length_reports_exact_le
     );
 }
 
-test "checkPath_reports_conflictingCompression_fixture" {
+test "path check: reports conflicting compression terms" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/conflicting-compression.mzML", .{ .skip_semantic = true });
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
 }
 
-test "checkPath_reports_unsupportedCompression_fixture" {
+test "path check: reports unsupported compression" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/invalid/unsupported-compression.mzML", .{ .skip_semantic = true });
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
 }
 
-// Tests: invalid fixture corpus behavior.
-
-test "checkPath_invalidMzMLBinaryCorpus_reportsExactRulePerFixture" {
+test "path check: reports the expected rule for each invalid binary fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const expectations = [_]InvalidBinaryExpectation{
@@ -2629,23 +2533,20 @@ test "checkPath_invalidMzMLBinaryCorpus_reportsExactRulePerFixture" {
         .{ .sub_path = "fixtures/mzml/invalid/unsupported-compression.mzML", .rule = RuleId.mzml_binary_compression, .message = "binaryDataArray declares unsupported compression terms" },
     };
 
-    // Act.
     for (expectations) |expectation| {
         var diagnostics: DiagnosticSink = .empty;
         defer diagnostics.deinit(allocator);
         try checkPath(allocator, io, &diagnostics, expectation.sub_path, .{ .skip_semantic = true });
 
-        // Assert.
         try expectSingleDiagnostic(diagnostics.items, expectation.rule, expectation.message);
     }
 }
 
-test "checkPath_invalidMzMLBinaryCorpus_is_clean_when_skip_binary_is_enabled" {
+test "path check: invalid binary fixtures are clean when binary checks are disabled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const root = "fixtures/mzml/invalid";
 
-    // Act.
     const fixture_count = try expectCorpusDiagnostics(
         allocator,
         io,
@@ -2654,15 +2555,13 @@ test "checkPath_invalidMzMLBinaryCorpus_is_clean_when_skip_binary_is_enabled" {
         .clean,
     );
 
-    // Assert.
     try std.testing.expect(fixture_count > 0);
 }
 
-test "checkPath_repeated_clean_and_corrupt_runs_reset_diagnostics_between_invocations" {
+test "path check: repeated clean and corrupt runs reset diagnostics" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // Arrange.
     const clean_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(clean_fixture);
     const corrupt_fixture = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/invalid/invalid-base64.mzML", allocator, .limited(64 * 1024));
@@ -2678,13 +2577,11 @@ test "checkPath_repeated_clean_and_corrupt_runs_reset_diagnostics_between_invoca
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    // Act.
     for (0..24) |index| {
         const path = if (index % 2 == 0) clean_path else corrupt_path;
         diagnostics.clearRetainingCapacity();
         try checkPath(allocator, io, &diagnostics, path, .{ .skip_semantic = true });
 
-        // Assert.
         if (index % 2 == 0) {
             try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
         } else {
@@ -2697,7 +2594,7 @@ test "checkPath_repeated_clean_and_corrupt_runs_reset_diagnostics_between_invoca
     }
 }
 
-// --- Test helpers ---
+// --- Test Helpers ---
 
 const CorpusExpectation = enum {
     clean,
@@ -2721,8 +2618,6 @@ fn stageFixtureInTempDir(
     return tempFixturePath(allocator, temp_dir.sub_path[0..], file_name);
 }
 
-// Builds bytes of a minimal indexed mzML whose fileChecksum is correct
-// for the content before the `<fileChecksum>` element.
 fn indexedMzmlWithSha(allocator: std.mem.Allocator, sha_hex: []const u8) ![]u8 {
     return indexedMzmlWithShaTag(allocator, "<fileChecksum>", sha_hex);
 }

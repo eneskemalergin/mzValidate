@@ -1,9 +1,27 @@
+//! Build graph for the mzValidate executable, tests, contracts, and developer tools.
+
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    const target = b.standardTargetOptions(.{});
+    const target = b.standardTargetOptions(.{
+        .default_target = .{ .cpu_model = .baseline },
+    });
     const optimize = b.standardOptimizeOption(.{});
-    const enable_libdeflate = b.option(bool, "enable-libdeflate", "Use vendored libdeflate for zlib decompression (default: true)") orelse true;
+    const enable_libdeflate = b.option(
+        bool,
+        "enable-libdeflate",
+        "Use vendored libdeflate for zlib decompression (default: true)",
+    ) orelse true;
+    const enable_lto = b.option(
+        bool,
+        "lto",
+        "Use full LTO for mzValidate (default: true outside Debug)",
+    ) orelse (optimize != .Debug);
+    const single_threaded = b.option(
+        bool,
+        "single-threaded",
+        "Compile CLI executables for a single-threaded runtime (default: true)",
+    ) orelse true;
 
     const mzvalidate_mod = b.addModule("mzvalidate", .{
         .root_source_file = b.path("src/root.zig"),
@@ -25,21 +43,37 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .single_threaded = true,
+            .single_threaded = single_threaded,
             .imports = &.{
                 .{ .name = "mzvalidate", .module = mzvalidate_mod },
             },
         }),
     });
 
-    if (optimize != .Debug) {
+    if (enable_lto) {
         exe.lto = .full;
     }
     b.installArtifact(exe);
 
     const mutation_tools_step = b.step("mutation-tools", "Build development mutation checkers");
-    const xml_mutation_tool = addMutationTool(b, target, optimize, "xml-mutation-check", "tools/xml-mutation-check.zig", mzvalidate_mod);
-    const obo_mutation_tool = addMutationTool(b, target, optimize, "obo-mutation-check", "tools/obo-mutation-check.zig", mzvalidate_mod);
+    const xml_mutation_tool = addMutationTool(
+        b,
+        target,
+        optimize,
+        single_threaded,
+        "xml-mutation-check",
+        "tools/xml-mutation-check.zig",
+        mzvalidate_mod,
+    );
+    const obo_mutation_tool = addMutationTool(
+        b,
+        target,
+        optimize,
+        single_threaded,
+        "obo-mutation-check",
+        "tools/obo-mutation-check.zig",
+        mzvalidate_mod,
+    );
     mutation_tools_step.dependOn(&b.addInstallArtifact(xml_mutation_tool, .{}).step);
     mutation_tools_step.dependOn(&b.addInstallArtifact(obo_mutation_tool, .{}).step);
 
@@ -65,8 +99,10 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    const valid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/valid") catch @panic("failed to collect valid mzML fixtures");
-    const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch @panic("failed to collect invalid mzML fixtures");
+    const valid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/valid") catch
+        @panic("failed to collect valid mzML fixtures");
+    const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch
+        @panic("failed to collect invalid mzML fixtures");
 
     const cli_valid_cmd = b.addRunArtifact(exe);
     cli_valid_cmd.step.dependOn(b.getInstallStep());
@@ -115,6 +151,7 @@ fn addMutationTool(
     b: *std.Build,
     target: std.Build.ResolvedTarget,
     optimize: std.builtin.OptimizeMode,
+    single_threaded: bool,
     name: []const u8,
     root_source: []const u8,
     mzvalidate_mod: *std.Build.Module,
@@ -125,7 +162,7 @@ fn addMutationTool(
             .root_source_file = b.path(root_source),
             .target = target,
             .optimize = optimize,
-            .single_threaded = true,
+            .single_threaded = single_threaded,
             .imports = &.{
                 .{ .name = "mzvalidate", .module = mzvalidate_mod },
             },
@@ -133,7 +170,12 @@ fn addMutationTool(
     });
 }
 
-fn addVendoredLibdeflateToModule(mod: *std.Build.Module, b: *std.Build, optimize: std.builtin.OptimizeMode, target: std.Build.ResolvedTarget) void {
+fn addVendoredLibdeflateToModule(
+    mod: *std.Build.Module,
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+) void {
     mod.linkSystemLibrary("c", .{});
     mod.addIncludePath(b.path("vendor/libdeflate"));
     mod.addIncludePath(b.path("vendor/libdeflate/lib"));
@@ -144,13 +186,11 @@ fn addVendoredLibdeflateToModule(mod: *std.Build.Module, b: *std.Build, optimize
         .ReleaseFast, .ReleaseSmall => "-O3",
     };
 
-    const march: []const u8 = switch (target.result.cpu.arch) {
-        .x86_64 => "-march=x86-64-v2",
-        .aarch64 => "-march=armv8-a",
-        else => "",
+    const common_flags: []const []const u8 = switch (target.result.cpu.arch) {
+        .x86_64 => &.{ opt, "-march=x86-64" },
+        .aarch64 => &.{ opt, "-march=armv8-a" },
+        else => &.{opt},
     };
-
-    const common_flags = &.{ opt, march };
 
     mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = common_flags });
     mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = common_flags });
@@ -158,7 +198,11 @@ fn addVendoredLibdeflateToModule(mod: *std.Build.Module, b: *std.Build, optimize
 
     switch (target.result.cpu.arch) {
         .x86_64 => {
-            const adler32_flags = &.{ opt, march, "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI" };
+            const adler32_flags = &.{
+                opt,
+                "-march=x86-64",
+                "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
+            };
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = adler32_flags });
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = common_flags });
         },
@@ -191,7 +235,10 @@ fn collectMzmlFixturePaths(b: *std.Build, root: []const u8) ![]const []const u8 
         if (!std.mem.endsWith(u8, entry.path, ".mzML")) continue;
 
         const joined = try std.fs.path.join(b.allocator, &.{ root, entry.path });
-        try paths.append(b.allocator, joined);
+        paths.append(b.allocator, joined) catch |err| {
+            b.allocator.free(joined);
+            return err;
+        };
     }
 
     std.mem.sortUnstable([]const u8, paths.items, {}, struct {

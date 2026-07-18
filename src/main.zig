@@ -1,8 +1,6 @@
-//! Executable entry point. Three lines, one job.
+//! Executable entry point.
 //!
-//! Juicy Main (`std.process.Init`) provides the allocator, I/O, and args.
-//! Everything else lives in the library so tests and downstream tools
-//! import `mzvalidate` and call `run(init)` directly.
+//! Delegates validation to the library and preserves its exit code.
 
 const std = @import("std");
 const mzvalidate = @import("mzvalidate");
@@ -12,7 +10,7 @@ pub fn main(init: std.process.Init) !void {
     std.process.exit(exit_code);
 }
 
-// --- Tests ---
+// --- Unit Tests ---
 
 test {
     _ = @import("mzvalidate");

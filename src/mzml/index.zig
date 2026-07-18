@@ -1,27 +1,19 @@
-//! Index offset verification and SHA-1 checksum validation.
+//! Indexed mzML offset and SHA-1 checksum validation.
 //!
-//! Forward pass records byte offsets of every spectrum and chromatogram,
-//! parses `<indexList>` entries, and captures `<indexListOffset>` and
-//! `<fileChecksum>`. SHA-1 and offset checks work for both contiguous and
-//! seekable stream sources without retaining the input.
-//!
-//! Tolerates both pwiz offsets (pointing at `<`) and ThermoRawFileParser
-//! offsets (pointing at the line start before whitespace).
+//! A forward pass records container and index metadata. Contiguous and seekable
+//! sources verify offsets and checksums without retaining stream input.
+//! Both pwiz element offsets and ThermoRawFileParser line offsets are accepted.
 
 const std = @import("std");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 
-const Attribute = xml_events.Attribute;
-const Diagnostic = diagnostic.Diagnostic;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
 const Text = xml_events.Text;
-const QName = xml_events.QName;
 
-const mzml_namespace = diagnostic.mzml_namespace;
 const online_sha_batch_bytes = 64 * 1024;
 
 const IndexKind = enum { spectrum, chromatogram };
@@ -41,7 +33,6 @@ pub const IndexValidator = struct {
     path: ?[]const u8,
     limits: diagnostic.ResourceLimits,
 
-    depth: usize = 0,
     mzml_depth: ?usize = null,
 
     // One key and record for every spectrum or chromatogram.
@@ -73,7 +64,6 @@ pub const IndexValidator = struct {
     // Shared text accumulator for offset values, indexListOffset, and fileChecksum.
     text_buf: std.ArrayList(u8),
 
-    // Set true when any index-related element is encountered.
     saw_index_elements: bool = false,
 
     index_state_current_bytes: usize = 0,
@@ -89,7 +79,6 @@ pub const IndexValidator = struct {
     sha_complete: bool = false,
     sha_computed: [20]u8 = undefined,
 
-    /// True after we see any index-related elements.
     pub fn isIndexed(validator: *const IndexValidator) bool {
         return validator.saw_index_elements;
     }
@@ -237,7 +226,14 @@ pub const IndexValidator = struct {
                     if (std.fmt.parseUnsigned(u64, c, 10)) |count| blk: {
                         _ = try validator.boundedCount(count, start.byte_offset, "indexList count exceeds the configured index-entry limit");
                         break :blk count;
-                    } else |_| null
+                    } else |_| blk: {
+                        try validator.appendDiagnostic(
+                            start.byte_offset,
+                            RuleId.mzml_index_offset_list,
+                            "indexList count must be a non-negative integer",
+                        );
+                        break :blk null;
+                    }
                 else
                     null;
             },
@@ -331,6 +327,11 @@ pub const IndexValidator = struct {
                     validator.allocator.free(id_ref);
                 }
                 const offset = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
+                    try validator.appendDiagnostic(
+                        end.byte_offset,
+                        RuleId.mzml_index_offset,
+                        "offset value is not a valid integer",
+                    );
                     return;
                 };
                 try validator.checkIndexEntry(id_ref, offset, end.byte_offset);
@@ -341,16 +342,14 @@ pub const IndexValidator = struct {
                 validator.index_list_offset_value = null;
             },
             .indexListOffset => {
-                const parsed = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10);
-                validator.index_list_offset_value = parsed catch |err| blk: {
-                    if (err == error.InvalidCharacter) {
-                        validator.appendDiagnostic(
-                            validator.index_list_offset_byte_offset orelse 0,
-                            RuleId.mzml_index_offset_list,
-                            "indexListOffset value is not a valid integer",
-                        ) catch |append_err| return append_err;
-                    }
-                    break :blk null;
+                validator.index_list_offset_value = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
+                    try validator.appendDiagnostic(
+                        validator.index_list_offset_byte_offset orelse 0,
+                        RuleId.mzml_index_offset_list,
+                        "indexListOffset value is not a valid integer",
+                    );
+                    validator.index_list_offset_depth = null;
+                    return;
                 };
                 validator.index_list_offset_depth = null;
             },
@@ -404,7 +403,6 @@ pub const IndexValidator = struct {
         try validator.text_buf.appendSlice(validator.allocator, text.value);
     }
 
-    /// True when accumulating offset, indexListOffset, or fileChecksum text.
     pub fn wantsText(validator: *const IndexValidator) bool {
         if (validator.mzml_depth == null) return false;
         return validator.offset_id_ref != null or
@@ -470,7 +468,6 @@ pub const IndexValidator = struct {
             });
         }
 
-        // Verify indexList declared count matches actual children.
         if (validator.index_list_declared_count) |declared| {
             if (declared != validator.index_list_actual_count) {
                 try validator.appendDiagnostic(
@@ -481,7 +478,6 @@ pub const IndexValidator = struct {
             }
         }
 
-        // --- indexListOffset verification ---
         if (validator.index_list_offset_value) |declared| {
             if (validator.index_list_actual_offset) |actual| {
                 if (declared != actual) {
@@ -496,7 +492,6 @@ pub const IndexValidator = struct {
             }
         }
 
-        // --- SHA-1 checksum verification ---
         if (file_bytes == null) try validator.completeStreamChecksum();
         if (file_bytes) |bytes| {
             if (validator.file_checksum_ok) {
@@ -553,7 +548,7 @@ pub const IndexValidator = struct {
         }
     }
 
-    // --- Private helpers ---
+    // --- Private Helpers ---
 
     fn maxIndexEntries(validator: *const IndexValidator) usize {
         if (validator.input_size) |size| {
@@ -744,7 +739,7 @@ pub const IndexValidator = struct {
     }
 };
 
-// --- Module-level helpers ---
+// --- Module-Level Helpers ---
 
 fn recordContainerOffset(
     validator: *IndexValidator,
@@ -864,14 +859,11 @@ fn offsetsMatchWithBytes(file_bytes: ?[]const u8, declared: u64, actual: u64) bo
     return true;
 }
 
-// --- Unit tests ---
+fn hexChar(nibble: u4) u8 {
+    return if (nibble < 10) @as(u8, '0') + nibble else @as(u8, 'a') + nibble - 10;
+}
 
-const test_events = @import("test_events.zig");
-const testing = std.testing;
-const expect = testing.expect;
-const expectEqual = testing.expectEqual;
-const expectEqualStrings = testing.expectEqualStrings;
-const expectError = testing.expectError;
+// --- Unit Tests ---
 
 test "IndexValidator: non-indexed file produces no diagnostics" {
     const allocator = testing.allocator;
@@ -881,7 +873,6 @@ test "IndexValidator: non-indexed file produces no diagnostics" {
     var v = IndexValidator.init(allocator, &diagnostics, null);
     defer v.deinit();
 
-    // Parse a simple non-indexed mzML structure.
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
     try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "run1")}, 10), 1);
     try v.consumeEnd(test_events.endUnknown("run"), 1);
@@ -995,7 +986,6 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
     try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
     try v.consumeEnd(test_events.endUnknown("run"), 1);
 
-    // Index list
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
@@ -1015,7 +1005,7 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
 }
 
-test "IndexValidator: bad offset value produces diagnostic" {
+test "IndexValidator: mismatched offset value produces diagnostic" {
     const allocator = testing.allocator;
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
@@ -1043,6 +1033,27 @@ test "IndexValidator: bad offset value produces diagnostic" {
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
+}
+
+test "IndexValidator: invalid offset values produce diagnostics" {
+    for ([_][]const u8{ "not-an-offset", "18446744073709551616" }) |value| {
+        const allocator = testing.allocator;
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+
+        var v = IndexValidator.init(allocator, &diagnostics, null);
+        defer v.deinit();
+
+        try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+        try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 10), 1);
+        try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 20), 2);
+        try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 30), 3);
+        try v.consumeText(test_events.text(value));
+        try v.consumeEnd(test_events.endUnknown("offset"), 3);
+
+        try expectEqual(@as(usize, 1), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    }
 }
 
 test "IndexValidator: reference to non-existent element produces diagnostic" {
@@ -1101,6 +1112,25 @@ test "IndexValidator: indexListOffset mismatch produces diagnostic" {
     try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[1].rule);
 }
 
+test "IndexValidator: invalid indexListOffset values produce diagnostics" {
+    for ([_][]const u8{ "not-an-offset", "18446744073709551616" }) |value| {
+        const allocator = testing.allocator;
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+
+        var v = IndexValidator.init(allocator, &diagnostics, null);
+        defer v.deinit();
+
+        try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+        try v.consumeStart(test_events.startUnknown("indexListOffset", &.{}, 10), 1);
+        try v.consumeText(test_events.text(value));
+        try v.consumeEnd(test_events.endUnknown("indexListOffset"), 1);
+
+        try expectEqual(@as(usize, 1), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+    }
+}
+
 test "IndexValidator: truncated offset produces diagnostic" {
     const allocator = testing.allocator;
     var diagnostics: DiagnosticSink = .empty;
@@ -1127,7 +1157,6 @@ test "IndexValidator: truncated offset produces diagnostic" {
     try v.consumeEnd(test_events.endUnknown("indexList"), 1);
     try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 
-    // file_bytes shorter than 999999
     try v.finish(file_bytes);
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
@@ -1284,7 +1313,6 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
     }
     const hex_str = hex_buf[0..];
 
-    // fileChecksum with leading and trailing whitespace (valid XML).
     const file_bytes = prefix ++ "<fileChecksum>\n  " ++ hex_str ++ "\n</fileChecksum>";
 
     try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
@@ -1318,7 +1346,6 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
     try v.consumeEnd(test_events.endUnknown("spectrum"), 2);
     try v.consumeEnd(test_events.endUnknown("run"), 1);
 
-    // index with duplicate entries for s1
     try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 500), 1);
     try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 510), 2);
     try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 520), 3);
@@ -1354,6 +1381,23 @@ test "IndexValidator: count limit rejects before reservation" {
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+}
+
+test "IndexValidator: invalid indexList counts produce diagnostics" {
+    for ([_][]const u8{ "not-a-count", "18446744073709551616" }) |value| {
+        const allocator = testing.allocator;
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+
+        var v = IndexValidator.init(allocator, &diagnostics, null);
+        defer v.deinit();
+
+        try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+        try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", value)}, 10), 1);
+
+        try expectEqual(@as(usize, 1), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_index_offset_list, diagnostics.items[0].rule);
+    }
 }
 
 test "IndexValidator: count boundaries stay within the configured limit" {
@@ -1415,6 +1459,9 @@ test "IndexValidator: index scalar fields use separate limits" {
     try expectEqual(@as(usize, 2), diagnostics.items.len);
 }
 
-fn hexChar(nibble: u4) u8 {
-    return if (nibble < 10) @as(u8, '0') + nibble else @as(u8, 'a') + nibble - 10;
-}
+const test_events = @import("test_events.zig");
+const testing = std.testing;
+const expect = testing.expect;
+const expectEqual = testing.expectEqual;
+const expectEqualStrings = testing.expectEqualStrings;
+const expectError = testing.expectError;

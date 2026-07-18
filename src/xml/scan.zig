@@ -1,15 +1,13 @@
-//! SIMD-assisted byte scanning for the XML parser slice path and raw start tags.
-//!
-//! Raw attribute views borrow the supplied tag bytes and never decode values.
-//! Scalar tail handling keeps behavior identical at chunk boundaries.
-//! Raw-tag helpers operate on any supplied contiguous tag slice.
+//! SIMD and scalar scanning helpers for the XML slice parser.
+//! Raw attribute views borrow contiguous tag bytes and do not decode values.
 
 const std = @import("std");
 
 const chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
-const V = @Vector(chunk_len, u8);
+const ByteVector = @Vector(chunk_len, u8);
+const BoolVector = @Vector(chunk_len, bool);
 
-fn isWhitespaceByte(byte: u8) bool {
+fn isXmlWhitespaceByte(byte: u8) bool {
     return switch (byte) {
         ' ', '\t', '\r', '\n' => true,
         else => false,
@@ -21,7 +19,7 @@ pub const RawAttributeError = error{
     InvalidUtf8,
 };
 
-/// Raw start-tag boundary; `end` excludes the unquoted `>` delimiter.
+/// Raw start-tag boundary; `end` excludes the `>` delimiter outside quotes.
 pub const RawTagInfo = struct {
     end: usize,
     self_closing: bool,
@@ -48,7 +46,7 @@ pub const RawAttributeScanner = struct {
 
     /// Returns the next borrowed attribute, or null after the tag body.
     pub fn next(scanner: *RawAttributeScanner) RawAttributeError!?RawAttribute {
-        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        while (scanner.pos < scanner.bytes.len and isXmlWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
         if (scanner.pos == scanner.bytes.len) return null;
 
         if (scanner.bytes[scanner.pos] == '/') {
@@ -64,10 +62,10 @@ pub const RawAttributeScanner = struct {
         if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
         const local_name = try rawLocalName(name);
 
-        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        while (scanner.pos < scanner.bytes.len and isXmlWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
         if (scanner.pos == scanner.bytes.len or scanner.bytes[scanner.pos] != '=') return error.Malformed;
         scanner.pos += 1;
-        while (scanner.pos < scanner.bytes.len and isWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
+        while (scanner.pos < scanner.bytes.len and isXmlWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
         if (scanner.pos == scanner.bytes.len) return error.Malformed;
 
         const quote = scanner.bytes[scanner.pos];
@@ -80,6 +78,7 @@ pub const RawAttributeScanner = struct {
         }
         if (scanner.pos == scanner.bytes.len) return error.Malformed;
         const value = scanner.bytes[value_start..scanner.pos];
+        // Entity-bearing values are validated after decoding by the eager parser path.
         if (!has_entity and !std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
         scanner.pos += 1;
 
@@ -107,14 +106,14 @@ pub fn rawStartTagInfo(bytes: []const u8) ?RawTagInfo {
         }
         if (byte == '=') {
             after_equals = true;
-        } else if (after_equals and isWhitespaceByte(byte)) {
+        } else if (after_equals and isXmlWhitespaceByte(byte)) {
             continue;
         } else if (after_equals and (byte == '"' or byte == '\'')) {
             quote = byte;
             after_equals = false;
         } else if (byte == '>') {
             var last = index;
-            while (last > 0 and isWhitespaceByte(bytes[last - 1])) : (last -= 1) {}
+            while (last > 0 and isXmlWhitespaceByte(bytes[last - 1])) : (last -= 1) {}
             return .{ .end = index, .self_closing = last > 0 and bytes[last - 1] == '/' };
         } else {
             after_equals = false;
@@ -140,15 +139,13 @@ fn isRawNameTerminator(byte: u8) bool {
     };
 }
 
-// Returns the first occurrence of any needle byte in `bytes`, or null.
-// Uses direct vector loads + firstTrue (movemask + tzcnt equivalent).
 fn firstIndexOfAny(bytes: []const u8, needles: []const u8) ?usize {
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        var combined: @Vector(chunk_len, bool) = @splat(false);
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        var combined: BoolVector = @splat(false);
         for (needles) |needle| {
-            combined = combined | (chunk == @as(V, @splat(needle)));
+            combined = combined | (chunk == @as(ByteVector, @splat(needle)));
         }
         if (std.simd.firstTrue(combined)) |pos| return offset + pos;
         offset += chunk_len;
@@ -161,20 +158,20 @@ fn firstIndexOfAny(bytes: []const u8, needles: []const u8) ?usize {
     return null;
 }
 
-/// Leading ASCII whitespace run length. Uses firstTrue (movemask + tzcnt equivalent).
+/// Returns the leading XML whitespace run length.
 pub fn skipWhitespaceRun(bytes: []const u8) usize {
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        const is_ws = (chunk == @as(V, @splat(' '))) |
-            (chunk == @as(V, @splat('\t'))) |
-            (chunk == @as(V, @splat('\r'))) |
-            (chunk == @as(V, @splat('\n')));
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const is_ws = (chunk == @as(ByteVector, @splat(' '))) |
+            (chunk == @as(ByteVector, @splat('\t'))) |
+            (chunk == @as(ByteVector, @splat('\r'))) |
+            (chunk == @as(ByteVector, @splat('\n')));
         if (std.simd.firstTrue(!is_ws)) |pos| return offset + pos;
         offset += chunk_len;
     }
     for (bytes[offset..], 0..) |b, i| {
-        if (!isWhitespaceByte(b)) return offset + i;
+        if (!isXmlWhitespaceByte(b)) return offset + i;
     }
     return bytes.len;
 }
@@ -183,12 +180,12 @@ pub fn skipWhitespaceRun(bytes: []const u8) usize {
 pub fn nameCharRunLen(bytes: []const u8) usize {
     const spec = comptime [_]u8{ '/', '>', '=', '?', '"', '\'' };
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        const is_whitespace_or_ctrl = chunk < @as(V, @splat('!'));
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const is_whitespace_or_ctrl = chunk < @as(ByteVector, @splat('!'));
         var combined = is_whitespace_or_ctrl;
         inline for (spec) |c| {
-            combined = combined | (chunk == @as(V, @splat(c)));
+            combined = combined | (chunk == @as(ByteVector, @splat(c)));
         }
         if (std.simd.firstTrue(combined)) |pos| return offset + pos;
         offset += chunk_len;
@@ -210,12 +207,12 @@ pub fn textPlainRunLen(bytes: []const u8) usize {
 /// CDATA payload length before `]]>`, or `null` if unterminated.
 pub fn cdataContentLen(bytes: []const u8) ?usize {
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        const is_bracket = chunk == @as(V, @splat(']'));
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const is_bracket = chunk == @as(ByteVector, @splat(']'));
         if (std.simd.firstTrue(is_bracket)) |pos| {
             const abs_pos = offset + pos;
-            if (abs_pos + 2 < bytes.len and bytes[abs_pos + 1] == ']' and bytes[abs_pos + 2] == '>') {
+            if (bytes.len - abs_pos > 2 and bytes[abs_pos + 1] == ']' and bytes[abs_pos + 2] == '>') {
                 return abs_pos;
             }
             offset = abs_pos + 1;
@@ -224,7 +221,8 @@ pub fn cdataContentLen(bytes: []const u8) ?usize {
         }
     }
     for (bytes[offset..], 0..) |b, i| {
-        if (b == ']' and offset + i + 2 < bytes.len and bytes[offset + i + 1] == ']' and bytes[offset + i + 2] == '>') {
+        const pos = offset + i;
+        if (b == ']' and bytes.len - pos > 2 and bytes[pos + 1] == ']' and bytes[pos + 2] == '>') {
             return offset + i;
         }
     }
@@ -235,12 +233,12 @@ pub fn cdataContentLen(bytes: []const u8) ?usize {
 /// Returns the index of the first `-` in the terminating `-->`.
 pub fn commentEndLen(bytes: []const u8) ?usize {
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        const is_dash = chunk == @as(V, @splat('-'));
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const is_dash = chunk == @as(ByteVector, @splat('-'));
         if (std.simd.firstTrue(is_dash)) |pos| {
             const abs_pos = offset + pos;
-            if (abs_pos + 2 < bytes.len and bytes[abs_pos + 1] == '-' and bytes[abs_pos + 2] == '>') {
+            if (bytes.len - abs_pos > 2 and bytes[abs_pos + 1] == '-' and bytes[abs_pos + 2] == '>') {
                 return abs_pos;
             }
             offset = abs_pos + 1;
@@ -249,7 +247,8 @@ pub fn commentEndLen(bytes: []const u8) ?usize {
         }
     }
     for (bytes[offset..], 0..) |b, i| {
-        if (b == '-' and offset + i + 2 < bytes.len and bytes[offset + i + 1] == '-' and bytes[offset + i + 2] == '>') {
+        const pos = offset + i;
+        if (b == '-' and bytes.len - pos > 2 and bytes[pos + 1] == '-' and bytes[pos + 2] == '>') {
             return offset + i;
         }
     }
@@ -260,12 +259,12 @@ pub fn commentEndLen(bytes: []const u8) ?usize {
 /// Returns the index of `?` in the terminating `?>`.
 pub fn piEndLen(bytes: []const u8) ?usize {
     var offset: usize = 0;
-    while (offset + chunk_len <= bytes.len) {
-        const chunk: V = bytes[offset..][0..chunk_len].*;
-        const is_qmark = chunk == @as(V, @splat('?'));
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const is_qmark = chunk == @as(ByteVector, @splat('?'));
         if (std.simd.firstTrue(is_qmark)) |pos| {
             const abs_pos = offset + pos;
-            if (abs_pos + 1 < bytes.len and bytes[abs_pos + 1] == '>') {
+            if (bytes.len - abs_pos > 1 and bytes[abs_pos + 1] == '>') {
                 return abs_pos;
             }
             offset = abs_pos + 1;
@@ -274,7 +273,8 @@ pub fn piEndLen(bytes: []const u8) ?usize {
         }
     }
     for (bytes[offset..], 0..) |b, i| {
-        if (b == '?' and offset + i + 1 < bytes.len and bytes[offset + i + 1] == '>') {
+        const pos = offset + i;
+        if (b == '?' and bytes.len - pos > 1 and bytes[pos + 1] == '>') {
             return offset + i;
         }
     }
@@ -287,64 +287,84 @@ pub fn attrValuePlainRunLen(bytes: []const u8, quote: u8) usize {
     return firstIndexOfAny(bytes, &stops) orelse bytes.len;
 }
 
-// --- Tests ---
+// --- Unit Tests ---
 
-test "skipWhitespaceRun counts spaces tabs and newlines" {
-    // Arrange.
+test "scanner skips XML whitespace" {
     const input = "  \t\n\rhello";
 
-    // Act.
     const n = skipWhitespaceRun(input);
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 5), n);
 }
 
-test "nameCharRunLen stops at whitespace and markup" {
-    // Arrange.
+test "scanner stops names at whitespace and markup" {
     const input = "spectrum id";
 
-    // Act.
     const n = nameCharRunLen(input);
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 8), n);
 }
 
-test "textPlainRunLen stops at lt or ampersand" {
-    // Arrange.
+test "scanner stops plain text at markup" {
     const plain = "AAAA";
     const at_lt = "AAA<";
     const at_amp = "AA&";
 
-    // Act.
-    // Assert.
     try std.testing.expectEqual(@as(usize, 4), textPlainRunLen(plain));
     try std.testing.expectEqual(@as(usize, 3), textPlainRunLen(at_lt));
     try std.testing.expectEqual(@as(usize, 2), textPlainRunLen(at_amp));
 }
 
-test "cdataContentLen finds terminator" {
-    // Arrange.
+test "scanner finds CDATA terminators" {
     const terminated = "abcd]]>more";
     const with_fake = "a]]b]]>rest";
 
-    // Act.
-    // Assert.
     try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(terminated));
     try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(with_fake));
     try std.testing.expectEqual(@as(?usize, null), cdataContentLen("no end"));
 }
 
-test "attrValuePlainRunLen stops at quote or entity" {
-    // Arrange.
+test "scanner stops attribute values at quote or entity" {
     const input = "value&amp;more\"rest";
 
-    // Act.
     const n = attrValuePlainRunLen(input, '"');
 
-    // Assert.
     try std.testing.expectEqual(@as(usize, 5), n);
+}
+
+test "scanner handles delimiters at SIMD boundaries" {
+    var whitespace: [chunk_len + 2]u8 = @splat(' ');
+    whitespace[chunk_len - 1] = 'x';
+    try std.testing.expectEqual(chunk_len - 1, skipWhitespaceRun(&whitespace));
+
+    var name: [chunk_len + 2]u8 = @splat('a');
+    name[chunk_len - 1] = '>';
+    try std.testing.expectEqual(chunk_len - 1, nameCharRunLen(&name));
+
+    var text: [chunk_len + 2]u8 = @splat('a');
+    text[chunk_len - 1] = '&';
+    try std.testing.expectEqual(chunk_len - 1, textPlainRunLen(&text));
+
+    var attribute: [chunk_len + 2]u8 = @splat('a');
+    attribute[chunk_len - 1] = '"';
+    try std.testing.expectEqual(chunk_len - 1, attrValuePlainRunLen(&attribute, '"'));
+
+    var cdata: [chunk_len + 3]u8 = @splat('x');
+    cdata[chunk_len - 1] = ']';
+    cdata[chunk_len] = ']';
+    cdata[chunk_len + 1] = '>';
+    try std.testing.expectEqual(@as(?usize, chunk_len - 1), cdataContentLen(&cdata));
+
+    var comment: [chunk_len + 3]u8 = @splat('x');
+    comment[chunk_len - 1] = '-';
+    comment[chunk_len] = '-';
+    comment[chunk_len + 1] = '>';
+    try std.testing.expectEqual(@as(?usize, chunk_len - 1), commentEndLen(&comment));
+
+    var pi: [chunk_len + 2]u8 = @splat('x');
+    pi[chunk_len - 1] = '?';
+    pi[chunk_len] = '>';
+    try std.testing.expectEqual(@as(?usize, chunk_len - 1), piEndLen(&pi));
 }
 
 test "raw start tag scanner keeps quoted greater-than bytes inside values" {
@@ -382,9 +402,12 @@ test "raw start tag scanner rejects an unterminated quoted value" {
     try std.testing.expectEqual(@as(?RawTagInfo, null), rawStartTagInfo(" value=\"unfinished"));
 }
 
-test "cdataContentLen uses SIMD for large content" {
-    const buf = "abcd]]>" ++ "x";
-    try std.testing.expectEqual(@as(?usize, 4), cdataContentLen(buf));
+test "CDATA scanner handles large input" {
+    var buf: [chunk_len + 8]u8 = @splat('x');
+    buf[chunk_len + 1] = ']';
+    buf[chunk_len + 2] = ']';
+    buf[chunk_len + 3] = '>';
+    try std.testing.expectEqual(@as(?usize, chunk_len + 1), cdataContentLen(&buf));
 
     const unterminated = "no end marker here";
     try std.testing.expectEqual(@as(?usize, null), cdataContentLen(unterminated));
@@ -394,11 +417,9 @@ test "cdataContentLen uses SIMD for large content" {
 }
 
 test "commentEndLen finds terminator" {
-    // "comment text " = 13 chars, then "-->"
     const terminated = "comment text -->more";
     try std.testing.expectEqual(@as(?usize, 13), commentEndLen(terminated));
 
-    // stray `--` before the real `-->`: "a - b -- c " = 11 chars, then "-->"
     const with_stray = "a - b -- c -->end";
     try std.testing.expectEqual(@as(?usize, 11), commentEndLen(with_stray));
 
@@ -410,11 +431,9 @@ test "commentEndLen finds terminator" {
 }
 
 test "piEndLen finds terminator" {
-    // "processing instruction" = 22 chars, then "?>"
     const terminated = "processing instruction?>more";
     try std.testing.expectEqual(@as(?usize, 22), piEndLen(terminated));
 
-    // "version=\"1.0\" encoding=\"UTF-8\"" = 30 chars, then "?>"
     const with_stray = "version=\"1.0\" encoding=\"UTF-8\"?>";
     try std.testing.expectEqual(@as(?usize, 30), piEndLen(with_stray));
 

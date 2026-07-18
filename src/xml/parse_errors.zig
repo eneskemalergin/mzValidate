@@ -32,6 +32,8 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
     };
 }
 
+// --- Unit Tests ---
+
 test "parse errors preserve limit details" {
     try std.testing.expectEqualStrings(
         "XML start tag exceeds the configured start-tag limit",
