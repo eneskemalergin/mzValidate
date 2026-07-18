@@ -37,7 +37,6 @@ pub const ElementId = enum(u7) {
     isolationWindow,
     mzML,
     offset,
-    paramGroupRef,
     precursor,
     precursorList,
     processingMethod,
@@ -135,7 +134,7 @@ fn comptimeMask(index: bool, semantic: bool) IndexSemanticMask {
 fn startMaskFor(comptime tag: ElementId) IndexSemanticMask {
     return switch (tag) {
         .unknown => .none,
-        .activation, .contact, .isolationWindow, .paramGroupRef, .sourceFileRef, .sourceFileRefList, .target, .targetList => comptimeMask(false, true),
+        .activation, .contact, .isolationWindow, .sourceFileRef, .sourceFileRefList, .target, .targetList => comptimeMask(false, true),
         .cvParam, .userParam, .binary => comptimeMask(false, true),
         .indexedmzML, .mzML, .spectrumList, .chromatogramList, .spectrum, .chromatogram => comptimeMask(true, true),
         .indexList, .indexListOffset, .fileChecksum, .index, .offset => comptimeMask(true, true),

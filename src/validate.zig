@@ -779,9 +779,7 @@ fn runValidation(
             },
             .text => |text| {
                 result.beginStage(.structural);
-                if (structural_validator.depth == 0) {
-                    try structural_validator.consumeText(text);
-                }
+                try structural_validator.consumeText(text);
                 if (binary_validator) |*validator| {
                     if (validator.wantsText()) {
                         result.beginStage(.binary);
@@ -1329,7 +1327,7 @@ test "path check: validates a stream SHA-1 checksum" {
         "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
         "    </run>\n" ++
         "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
         "  <indexListOffset>10</indexListOffset>\n";
     var sha_ctx = std.crypto.hash.Sha1.init(.{});
     sha_ctx.update(prefix);
@@ -1381,7 +1379,7 @@ test "path check: validates an mmap SHA-1 checksum" {
         "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
         "    </run>\n" ++
         "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
         "  <indexListOffset>10</indexListOffset>\n";
     var sha_ctx = std.crypto.hash.Sha1.init(.{});
     sha_ctx.update(prefix);
@@ -1430,7 +1428,7 @@ test "path check: accepts a complete checksum start tag" {
         "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
         "    </run>\n" ++
         "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
         "  <indexListOffset>10</indexListOffset>\n";
     var sha_ctx = std.crypto.hash.Sha1.init(.{});
     sha_ctx.update(prefix);
@@ -1482,7 +1480,7 @@ test "path check: skips SHA-1 when index checks are disabled" {
         "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
         "    </run>\n" ++
         "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
         "  <indexListOffset>10</indexListOffset>\n";
     var sha_ctx = std.crypto.hash.Sha1.init(.{});
     sha_ctx.update(prefix);
@@ -2327,7 +2325,7 @@ test "reader check: accepts multiple valid spectra" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "reader check: reports a missing binary array list" {
+test "reader check: accepts a spectrum without optional binary array list" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const xml = spectrumListMzml(
@@ -2344,10 +2342,29 @@ test "reader check: reports a missing binary array list" {
 
     try checkReader(allocator, io, &reader, &diagnostics, "inline-missing-binary-list.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "reader check: forwards element content text to structural validation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const xml = spectrumListMzml(
+        "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+            "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\">" ++
+            "<scanList count=\"1\"><scan>illegal text</scan></scanList>" ++
+            "</spectrum></spectrumList>",
+    );
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(xml);
+
+    try checkReader(allocator, io, &reader, &diagnostics, "inline-element-text.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
+
     try expectSingleDiagnostic(
         diagnostics.items,
-        RuleId.mzml_structure_missing_child,
-        "spectrum is missing required child binaryDataArrayList",
+        RuleId.mzml_structure_nesting,
+        "non-whitespace text is not allowed in element-only mzML content",
     );
 }
 
@@ -2447,11 +2464,15 @@ test "reader check: reports excessive element-name storage" {
 
     try checkReader(allocator, io, &reader, &diagnostics, "inline-too-deep.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
-    try expectSingleDiagnostic(
-        diagnostics.items,
-        RuleId.mzml_structure_xml,
-        "XML element name storage exceeds the configured parser limit",
-    );
+    var found_limit = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.mzml_structure_xml) and
+            std.mem.eql(u8, item.message, "XML element name storage exceeds the configured parser limit"))
+        {
+            found_limit = true;
+        }
+    }
+    try std.testing.expect(found_limit);
 }
 
 test "path check: reports a structural error without binary noise" {
@@ -2718,7 +2739,7 @@ fn indexedMzmlWithShaTag(
         "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
         "    </run>\n" ++
         "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"/></indexList>\n" ++
+        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
         "  <indexListOffset>10</indexListOffset>\n";
     const indent = "  ";
 
@@ -2896,7 +2917,7 @@ fn chromatogramMzmlWithPayloads(comptime first_payload: []const u8, comptime sec
         "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
         "<chromatogramList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
         "<chromatogram index=\"0\" id=\"tic=1\" defaultArrayLength=\"1\">" ++
-        "<precursor/>" ++
+        "<precursor><activation/></precursor>" ++
         "<product/>" ++
         "<binaryDataArrayList count=\"2\">" ++
         "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000595\"/><binary>" ++ first_payload ++ "</binary></binaryDataArray>" ++

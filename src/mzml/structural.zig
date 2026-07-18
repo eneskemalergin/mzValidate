@@ -17,9 +17,16 @@ const DiagnosticSink = diagnostic.DiagnosticSink;
 const EndElement = xml_events.EndElement;
 const RuleId = diagnostic.RuleId;
 const StartElement = xml_events.StartElement;
+const ElementId = elements.ElementId;
 
 pub const mzml_namespace = diagnostic.mzml_namespace;
 const max_structural_token_bytes = 1024 * 1024;
+const max_structural_depth = 128;
+
+const ElementFrame = struct {
+    tag: ElementId = .unknown,
+    param_phase: u8 = 0,
+};
 
 const TopLevelSlot = enum(u8) {
     cv_list = 1,
@@ -42,13 +49,6 @@ const IndexedChildSlot = enum(u8) {
 const ContainerKind = enum {
     spectrum,
     chromatogram,
-
-    fn label(kind: ContainerKind) []const u8 {
-        return switch (kind) {
-            .spectrum => "spectrum",
-            .chromatogram => "chromatogram",
-        };
-    }
 };
 
 const RunChildSlot = enum(u8) {
@@ -78,8 +78,6 @@ const ComponentChildSlot = enum(u8) {
 const ContainerState = struct {
     byte_offset: u64,
     depth: usize,
-    kind: ContainerKind,
-    has_binary_data_array_list: bool = false,
     last_child_slot: u8 = 0,
     scan_list_seen: bool = false,
     precursor_list_seen: bool = false,
@@ -102,6 +100,7 @@ const FileDescriptionState = struct {
     depth: usize,
     has_file_content: bool = false,
     source_file_list_seen: bool = false,
+    contact_seen: bool = false,
 };
 
 const DataProcessingState = struct {
@@ -125,6 +124,40 @@ const ComponentListState = struct {
     last_child_slot: u8 = 0,
 };
 
+const ScanSettingsState = struct {
+    source_file_ref_list_seen: bool = false,
+    target_list_seen: bool = false,
+};
+
+const ScanState = struct {
+    scan_window_list_seen: bool = false,
+};
+
+const PrecursorState = struct {
+    byte_offset: u64,
+    depth: usize,
+    isolation_window_seen: bool = false,
+    selected_ion_list_seen: bool = false,
+    activation_seen: bool = false,
+    last_child_slot: u8 = 0,
+};
+
+const ProductState = struct {
+    isolation_window_seen: bool = false,
+};
+
+const BinaryDataArrayState = struct {
+    byte_offset: u64,
+    depth: usize,
+    binary_seen: bool = false,
+};
+
+const IndexState = struct {
+    byte_offset: u64,
+    depth: usize,
+    offset_count: usize = 0,
+};
+
 /// Incremental validator whose retained state is independent of document length.
 pub const StructuralValidator = struct {
     allocator: std.mem.Allocator,
@@ -133,10 +166,12 @@ pub const StructuralValidator = struct {
 
     // Container state is replaced at its end tag, independent of spectrum count.
     depth: usize = 0,
+    frames: [max_structural_depth]ElementFrame = @splat(.{}),
     root_seen: bool = false,
     root_valid: bool = false,
     root_byte_offset: u64 = 0,
     indexed_mzml_depth: ?usize = null,
+    indexed_mzml_seen: bool = false,
     mzml_depth: ?usize = null,
     cv_list_seen: bool = false,
     file_description_seen: bool = false,
@@ -152,7 +187,6 @@ pub const StructuralValidator = struct {
 
     run_seen: bool = false,
     run_depth: ?usize = null,
-    run_byte_offset: ?u64 = null,
     run_has_spectrum_list: bool = false,
     run_has_chromatogram_list: bool = false,
     run_last_child_slot: u8 = 0,
@@ -172,10 +206,19 @@ pub const StructuralValidator = struct {
     instrument_configuration_list: ?ListCountState = null,
     data_processing_list: ?ListCountState = null,
     source_file_list: ?ListCountState = null,
+    source_file_ref_list: ?ListCountState = null,
+    target_list: ?ListCountState = null,
+    index_list: ?ListCountState = null,
     component_list: ?ComponentListState = null,
 
     instrument_configuration: ?InstrumentConfigurationState = null,
     data_processing: ?DataProcessingState = null,
+    scan_settings: ?ScanSettingsState = null,
+    scan: ?ScanState = null,
+    precursor: ?PrecursorState = null,
+    product: ?ProductState = null,
+    binary_data_array: ?BinaryDataArrayState = null,
+    index: ?IndexState = null,
 
     spectrum_list_depth: ?usize = null,
     chromatogram_list_depth: ?usize = null,
@@ -238,14 +281,38 @@ pub const StructuralValidator = struct {
     }
 
     pub fn consumeStart(validator: *StructuralValidator, start: StartElement) !void {
+        if (validator.depth == max_structural_depth) return error.ResourceLimitExceeded;
         const element_depth = validator.depth + 1;
+        const tag = start.resolvedId();
+
+        var accepted = true;
+        if (validator.depth > 0) {
+            const parent = &validator.frames[validator.depth - 1];
+            if (parent.tag == .unknown) {
+                accepted = false;
+            } else if (!isAllowedParent(tag, parent.tag)) {
+                try validator.nestingError(start.byte_offset, invalidParentMessage(tag, parent.tag));
+                accepted = false;
+            } else if (!try validator.noteParamGroupOrder(parent, tag, start.byte_offset)) {
+                accepted = false;
+            }
+        }
+
+        validator.frames[validator.depth] = .{ .tag = if (accepted) tag else .unknown };
+        if (!accepted) {
+            validator.depth += 1;
+            return;
+        }
         try validator.handleStart(start, element_depth);
         validator.depth += 1;
     }
 
     pub fn consumeEnd(validator: *StructuralValidator, end: EndElement) !void {
+        if (validator.depth == 0) return error.ResourceLimitExceeded;
         const element_depth = validator.depth;
-        try validator.handleEnd(end, element_depth);
+        const frame = validator.frames[validator.depth - 1];
+        if (frame.tag != .unknown) try validator.handleEnd(end, element_depth);
+        validator.frames[validator.depth - 1] = .{};
         validator.depth -= 1;
     }
 
@@ -368,11 +435,15 @@ pub const StructuralValidator = struct {
             return;
         }
 
-        if (!validator.root_valid and validator.indexed_mzml_depth != null and tag == .mzML) {
-            if (element_depth != validator.indexed_mzml_depth.? + 1) {
-                try validator.nestingError(start.byte_offset, "mzML must be a direct child of indexedmzML");
+        if (validator.indexed_mzml_depth != null and
+            element_depth == validator.indexed_mzml_depth.? + 1 and
+            tag == .mzML)
+        {
+            if (validator.indexed_mzml_seen) {
+                try validator.nestingError(start.byte_offset, "indexedmzML must not contain more than one mzML element");
                 return;
             }
+            validator.indexed_mzml_seen = true;
             validator.root_valid = true;
             validator.root_byte_offset = start.byte_offset;
             validator.mzml_depth = element_depth;
@@ -388,6 +459,7 @@ pub const StructuralValidator = struct {
                 .indexList => {
                     try validator.noteIndexedChild(start.byte_offset, &validator.index_list_seen, .index_list);
                     try validator.requireAttribute(start, "count", "indexList is missing required attribute count");
+                    validator.index_list = try validator.initListCountState(start, element_depth, "indexList", "index", 1);
                     return;
                 },
                 .indexListOffset => {
@@ -402,6 +474,21 @@ pub const StructuralValidator = struct {
                     try validator.nestingError(start.byte_offset, "element is not allowed as a direct child of indexedmzML");
                     return;
                 },
+            }
+        }
+
+        if (validator.indexed_mzml_depth != null and validator.mzml_depth == null) {
+            switch (tag) {
+                .index => {
+                    validator.bumpListItemCount(&validator.index_list, element_depth);
+                    validator.index = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+                    return;
+                },
+                .offset => {
+                    if (validator.index) |*state| state.offset_count += 1;
+                    return;
+                },
+                else => {},
             }
         }
 
@@ -455,7 +542,6 @@ pub const StructuralValidator = struct {
                 try validator.recordTopLevelElement(start.byte_offset, element_depth, &validator.run_seen, "run", .run);
                 validator.run_seen = true;
                 validator.run_depth = element_depth;
-                validator.run_byte_offset = start.byte_offset;
                 validator.run_has_spectrum_list = false;
                 validator.run_has_chromatogram_list = false;
                 validator.run_last_child_slot = 0;
@@ -472,7 +558,7 @@ pub const StructuralValidator = struct {
                             try validator.nestingError(start.byte_offset, "fileDescription must not contain more than one fileContent");
                             return;
                         }
-                        if (state.source_file_list_seen) {
+                        if (state.source_file_list_seen or state.contact_seen) {
                             try validator.nestingError(start.byte_offset, "fileContent appears out of order under fileDescription");
                             return;
                         }
@@ -490,6 +576,9 @@ pub const StructuralValidator = struct {
                         }
                         state.source_file_list_seen = true;
                         if (!state.has_file_content) {
+                            try validator.nestingError(start.byte_offset, "sourceFileList appears out of order under fileDescription");
+                        }
+                        if (state.contact_seen) {
                             try validator.nestingError(start.byte_offset, "sourceFileList appears out of order under fileDescription");
                         }
                     }
@@ -532,7 +621,7 @@ pub const StructuralValidator = struct {
                 if (validator.spectrum_list_depth != element_depth - 1) {
                     try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
                 }
-                validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .spectrum };
+                validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth };
                 try validator.requireSpectrumLikeAttributes(start, .spectrum);
             },
             .chromatogram => {
@@ -540,7 +629,7 @@ pub const StructuralValidator = struct {
                 if (validator.chromatogram_list_depth != element_depth - 1) {
                     try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
                 }
-                validator.chromatogram = .{ .byte_offset = start.byte_offset, .depth = element_depth, .kind = .chromatogram };
+                validator.chromatogram = .{ .byte_offset = start.byte_offset, .depth = element_depth };
                 try validator.requireSpectrumLikeAttributes(start, .chromatogram);
             },
             .cv => {
@@ -568,6 +657,7 @@ pub const StructuralValidator = struct {
             .scanSettings => {
                 validator.bumpListItemCount(&validator.scan_settings_list, element_depth);
                 try validator.requireAttribute(start, "id", "scanSettings is missing required attribute id");
+                validator.scan_settings = .{};
             },
             .instrumentConfiguration => {
                 validator.bumpListItemCount(&validator.instrument_configuration_list, element_depth);
@@ -610,6 +700,7 @@ pub const StructuralValidator = struct {
                 try validator.requireReferenceAttribute(start, "ref", "softwareRef is missing required attribute ref");
             },
             .sourceFileRef => {
+                validator.bumpListItemCount(&validator.source_file_ref_list, element_depth);
                 try validator.requireReferenceAttribute(start, "ref", "sourceFileRef is missing required attribute ref");
             },
             .source => {
@@ -658,7 +749,7 @@ pub const StructuralValidator = struct {
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .precursor_list);
                 try validator.requireAttribute(start, "count", "precursorList is missing required attribute count");
-                validator.precursor_list = try validator.initListCountState(start, element_depth, "precursorList", "precursor", 0);
+                validator.precursor_list = try validator.initListCountState(start, element_depth, "precursorList", "precursor", 1);
             },
             .productList => {
                 if (validator.spectrum == null) {
@@ -666,47 +757,55 @@ pub const StructuralValidator = struct {
                 }
                 try validator.noteSpectrumChild(start.byte_offset, .product_list);
                 try validator.requireAttribute(start, "count", "productList is missing required attribute count");
-                validator.product_list = try validator.initListCountState(start, element_depth, "productList", "product", 0);
+                validator.product_list = try validator.initListCountState(start, element_depth, "productList", "product", 1);
             },
             .precursor => {
                 if (validator.chromatogram) |state| {
                     if (state.depth + 1 == element_depth) {
                         try validator.noteChromatogramChild(start.byte_offset, .precursor);
                     }
-                    return;
-                }
-                if (validator.spectrum != null) {
+                } else if (validator.spectrum != null) {
                     validator.bumpListItemCount(&validator.precursor_list, element_depth);
-                    return;
+                } else {
+                    try validator.nestingError(start.byte_offset, "precursor must be a child of chromatogram");
                 }
-                try validator.nestingError(start.byte_offset, "precursor must be a child of chromatogram");
+                validator.precursor = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             },
             .product => {
                 if (validator.chromatogram) |state| {
                     if (state.depth + 1 == element_depth) {
                         try validator.noteChromatogramChild(start.byte_offset, .product);
                     }
-                    return;
-                }
-                if (validator.spectrum != null) {
+                } else if (validator.spectrum != null) {
                     validator.bumpListItemCount(&validator.product_list, element_depth);
-                    return;
+                } else {
+                    try validator.nestingError(start.byte_offset, "product must be a child of chromatogram");
                 }
-                try validator.nestingError(start.byte_offset, "product must be a child of chromatogram");
+                validator.product = .{};
             },
             .scan => {
                 validator.bumpListItemCount(&validator.scan_list, element_depth);
+                validator.scan = .{};
             },
             .scanWindowList => {
+                if (validator.scan) |*state| {
+                    if (state.scan_window_list_seen) {
+                        try validator.nestingError(start.byte_offset, "scan must not contain more than one scanWindowList");
+                    }
+                    state.scan_window_list_seen = true;
+                }
                 try validator.requireAttribute(start, "count", "scanWindowList is missing required attribute count");
-                validator.scan_window_list = try validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 0);
+                validator.scan_window_list = try validator.initListCountState(start, element_depth, "scanWindowList", "scanWindow", 1);
             },
             .scanWindow => {
                 validator.bumpListItemCount(&validator.scan_window_list, element_depth);
             },
             .selectedIonList => {
+                if (validator.precursor) |*state| {
+                    try validator.notePrecursorChild(state, start.byte_offset, 2);
+                }
                 try validator.requireAttribute(start, "count", "selectedIonList is missing required attribute count");
-                validator.selected_ion_list = try validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 0);
+                validator.selected_ion_list = try validator.initListCountState(start, element_depth, "selectedIonList", "selectedIon", 1);
             },
             .selectedIon => {
                 validator.bumpListItemCount(&validator.selected_ion_list, element_depth);
@@ -715,20 +814,67 @@ pub const StructuralValidator = struct {
                 try validator.noteBinaryDataArrayListChild(start.byte_offset);
                 try validator.requireAttribute(start, "count", "binaryDataArrayList is missing required attribute count");
                 validator.binary_data_array_list = try validator.initListCountState(start, element_depth, "binaryDataArrayList", "binaryDataArray", 2);
-
-                if (validator.spectrum != null and validator.spectrum_list_depth != null and validator.spectrum_list_depth.? < element_depth) {
-                    validator.spectrum.?.has_binary_data_array_list = true;
-                    return;
-                }
-                if (validator.chromatogram != null and validator.chromatogram_list_depth != null and validator.chromatogram_list_depth.? < element_depth) {
-                    validator.chromatogram.?.has_binary_data_array_list = true;
-                    return;
-                }
-
-                try validator.nestingError(start.byte_offset, "binaryDataArrayList must be a child of spectrum or chromatogram");
             },
             .binaryDataArray => {
                 validator.bumpListItemCount(&validator.binary_data_array_list, element_depth);
+                validator.binary_data_array = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+            },
+            .binary => {
+                if (validator.binary_data_array) |*state| {
+                    if (state.binary_seen) {
+                        try validator.nestingError(start.byte_offset, "binaryDataArray must not contain more than one binary element");
+                    }
+                    state.binary_seen = true;
+                }
+            },
+            .sourceFileRefList => {
+                if (validator.scan_settings) |*state| {
+                    if (state.source_file_ref_list_seen) {
+                        try validator.nestingError(start.byte_offset, "scanSettings must not contain more than one sourceFileRefList");
+                    }
+                    if (state.target_list_seen) {
+                        try validator.nestingError(start.byte_offset, "sourceFileRefList appears out of order under scanSettings");
+                    }
+                    state.source_file_ref_list_seen = true;
+                }
+                try validator.requireAttribute(start, "count", "sourceFileRefList is missing required attribute count");
+                validator.source_file_ref_list = try validator.initListCountState(start, element_depth, "sourceFileRefList", "sourceFileRef", 0);
+            },
+            .targetList => {
+                if (validator.scan_settings) |*state| {
+                    if (state.target_list_seen) {
+                        try validator.nestingError(start.byte_offset, "scanSettings must not contain more than one targetList");
+                    }
+                    state.target_list_seen = true;
+                }
+                try validator.requireAttribute(start, "count", "targetList is missing required attribute count");
+                validator.target_list = try validator.initListCountState(start, element_depth, "targetList", "target", 1);
+            },
+            .target => validator.bumpListItemCount(&validator.target_list, element_depth),
+            .index => {
+                validator.bumpListItemCount(&validator.index_list, element_depth);
+                validator.index = .{ .byte_offset = start.byte_offset, .depth = element_depth };
+            },
+            .offset => {
+                if (validator.index) |*state| state.offset_count += 1;
+            },
+            .contact => {
+                if (validator.file_description) |*state| state.contact_seen = true;
+            },
+            .isolationWindow => {
+                if (validator.precursor) |*state| {
+                    try validator.notePrecursorChild(state, start.byte_offset, 1);
+                } else if (validator.product) |*state| {
+                    if (state.isolation_window_seen) {
+                        try validator.nestingError(start.byte_offset, "product must not contain more than one isolationWindow");
+                    }
+                    state.isolation_window_seen = true;
+                }
+            },
+            .activation => {
+                if (validator.precursor) |*state| {
+                    try validator.notePrecursorChild(state, start.byte_offset, 3);
+                }
             },
             // SemanticValidator owns CV terms, including unknown intern IDs.
             .cvParam, .userParam => return,
@@ -751,9 +897,35 @@ pub const StructuralValidator = struct {
     }
 
     fn handleEnd(validator: *StructuralValidator, end: EndElement, element_depth: usize) !void {
-        if (!validator.isWithinMzmlEndScope(element_depth)) return;
-
         const tag = end.resolvedId();
+
+        if (validator.indexed_mzml_depth != null) {
+            switch (tag) {
+                .indexList => {
+                    try validator.finishListCount(&validator.index_list, element_depth);
+                    return;
+                },
+                .index => {
+                    if (validator.index) |state| {
+                        if (state.depth == element_depth and state.offset_count == 0) {
+                            try validator.appendDiagnostic(.{
+                                .severity = .@"error",
+                                .rule = RuleId.mzml_structure_missing_child,
+                                .location = .{ .byte_offset = state.byte_offset },
+                                .path = validator.path,
+                                .message = "index must contain at least 1 offset element",
+                            });
+                        }
+                    }
+                    validator.index = null;
+                    return;
+                },
+                .offset, .indexListOffset, .fileChecksum, .indexedmzML => return,
+                else => {},
+            }
+        }
+
+        if (!validator.isWithinMzmlEndScope(element_depth)) return;
 
         switch (tag) {
             .cv, .cvParam, .userParam => return,
@@ -763,17 +935,7 @@ pub const StructuralValidator = struct {
                 }
             },
             .run => {
-                if (!validator.run_has_spectrum_list and !validator.run_has_chromatogram_list) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_structure_missing_child,
-                        .location = .{ .byte_offset = validator.run_byte_offset },
-                        .path = validator.path,
-                        .message = "run must contain spectrumList or chromatogramList",
-                    });
-                }
                 validator.run_depth = null;
-                validator.run_byte_offset = null;
             },
             .fileDescription => {
                 if (validator.file_description) |state| {
@@ -791,6 +953,8 @@ pub const StructuralValidator = struct {
             },
             .cvList => try validator.finishListCount(&validator.cv_list, element_depth),
             .sourceFileList => try validator.finishListCount(&validator.source_file_list, element_depth),
+            .sourceFileRefList => try validator.finishListCount(&validator.source_file_ref_list, element_depth),
+            .targetList => try validator.finishListCount(&validator.target_list, element_depth),
             .referenceableParamGroupList => try validator.finishListCount(&validator.referenceable_param_group_list, element_depth),
             .sampleList => try validator.finishListCount(&validator.sample_list, element_depth),
             .softwareList => try validator.finishListCount(&validator.software_list, element_depth),
@@ -798,6 +962,7 @@ pub const StructuralValidator = struct {
             .instrumentConfigurationList => try validator.finishListCount(&validator.instrument_configuration_list, element_depth),
             .componentList => try validator.finishComponentList(element_depth),
             .instrumentConfiguration => validator.instrument_configuration = null,
+            .scanSettings => validator.scan_settings = null,
             .dataProcessingList => try validator.finishListCount(&validator.data_processing_list, element_depth),
             .dataProcessing => {
                 if (validator.data_processing) |state| {
@@ -831,23 +996,42 @@ pub const StructuralValidator = struct {
             .productList => try validator.finishListCount(&validator.product_list, element_depth),
             .scanWindowList => try validator.finishListCount(&validator.scan_window_list, element_depth),
             .selectedIonList => try validator.finishListCount(&validator.selected_ion_list, element_depth),
-            .spectrum => {
-                if (validator.spectrum) |state| {
-                    if (!state.has_binary_data_array_list) {
+            .scan => validator.scan = null,
+            .precursor => {
+                if (validator.precursor) |state| {
+                    if (state.depth == element_depth and !state.activation_seen) {
                         try validator.appendDiagnostic(.{
                             .severity = .@"error",
                             .rule = RuleId.mzml_structure_missing_child,
                             .location = .{ .byte_offset = state.byte_offset },
                             .path = validator.path,
-                            .message = "spectrum is missing required child binaryDataArrayList",
+                            .message = "precursor is missing required child activation",
                         });
                     }
                 }
+                validator.precursor = null;
+            },
+            .product => validator.product = null,
+            .binaryDataArray => {
+                if (validator.binary_data_array) |state| {
+                    if (state.depth == element_depth and !state.binary_seen) {
+                        try validator.appendDiagnostic(.{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_structure_missing_child,
+                            .location = .{ .byte_offset = state.byte_offset },
+                            .path = validator.path,
+                            .message = "binaryDataArray is missing required child binary",
+                        });
+                    }
+                }
+                validator.binary_data_array = null;
+            },
+            .spectrum => {
                 validator.spectrum = null;
             },
             .chromatogram => {
                 if (validator.chromatogram) |state| {
-                    if (!state.has_binary_data_array_list) {
+                    if (!state.binary_list_seen) {
                         try validator.appendDiagnostic(.{
                             .severity = .@"error",
                             .rule = RuleId.mzml_structure_missing_child,
@@ -863,7 +1047,7 @@ pub const StructuralValidator = struct {
         }
     }
     fn handleText(validator: *StructuralValidator, value: []const u8, byte_offset: u64) !void {
-        if (std.mem.trim(u8, value, &std.ascii.whitespace).len == 0) return;
+        if (std.mem.trim(u8, value, " \t\r\n").len == 0) return;
         if (validator.depth == 0) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
@@ -872,7 +1056,56 @@ pub const StructuralValidator = struct {
                 .path = validator.path,
                 .message = "text outside the mzML root element is not allowed",
             });
+            return;
         }
+
+        const tag = validator.frames[validator.depth - 1].tag;
+        if (tag == .unknown) return;
+        switch (tag) {
+            .binary, .offset, .indexListOffset, .fileChecksum => return,
+            else => try validator.nestingError(byte_offset, "non-whitespace text is not allowed in element-only mzML content"),
+        }
+    }
+
+    fn noteParamGroupOrder(validator: *StructuralValidator, parent: *ElementFrame, child: ElementId, byte_offset: u64) !bool {
+        const phase = paramGroupChildPhase(parent.tag, child) orelse return true;
+        if (phase < parent.param_phase) {
+            try validator.nestingError(byte_offset, "parameter element appears out of order in mzML content");
+            return false;
+        }
+        parent.param_phase = phase;
+        return true;
+    }
+
+    fn notePrecursorChild(validator: *StructuralValidator, state: *PrecursorState, byte_offset: u64, slot: u8) !void {
+        const seen = switch (slot) {
+            1 => &state.isolation_window_seen,
+            2 => &state.selected_ion_list_seen,
+            3 => &state.activation_seen,
+            else => unreachable,
+        };
+        if (seen.*) {
+            const message = switch (slot) {
+                1 => "precursor must not contain more than one isolationWindow",
+                2 => "precursor must not contain more than one selectedIonList",
+                3 => "precursor must not contain more than one activation",
+                else => unreachable,
+            };
+            try validator.nestingError(byte_offset, message);
+            return;
+        }
+        seen.* = true;
+        if (slot < state.last_child_slot) {
+            const message = switch (slot) {
+                1 => "isolationWindow appears out of order under precursor",
+                2 => "selectedIonList appears out of order under precursor",
+                3 => unreachable,
+                else => unreachable,
+            };
+            try validator.nestingError(byte_offset, message);
+            return;
+        }
+        state.last_child_slot = slot;
     }
 
     fn noteRunChild(validator: *StructuralValidator, byte_offset: u64, slot: RunChildSlot) !void {
@@ -996,12 +1229,10 @@ pub const StructuralValidator = struct {
     fn noteBinaryDataArrayListChild(validator: *StructuralValidator, byte_offset: u64) !void {
         if (validator.spectrum != null) {
             try validator.noteSpectrumChild(byte_offset, .binary_data_array_list);
-            validator.spectrum.?.has_binary_data_array_list = true;
             return;
         }
         if (validator.chromatogram != null) {
             try validator.noteChromatogramChild(byte_offset, .binary_data_array_list);
-            validator.chromatogram.?.has_binary_data_array_list = true;
         }
     }
 
@@ -1009,18 +1240,18 @@ pub const StructuralValidator = struct {
         if (validator.component_list) |*state| {
             if (state.count_state.depth + 1 != validator.depth + 1) return;
 
-            if (state.last_child_slot > @intFromEnum(slot)) {
-                try validator.nestingError(byte_offset, componentChildOutOfOrderMessage(slot));
-                return;
-            }
-            state.last_child_slot = @intFromEnum(slot);
             state.count_state.actual_count += 1;
-
             switch (slot) {
                 .source => state.source_count += 1,
                 .analyzer => state.analyzer_count += 1,
                 .detector => state.detector_count += 1,
             }
+
+            if (state.last_child_slot > @intFromEnum(slot)) {
+                try validator.nestingError(byte_offset, componentChildOutOfOrderMessage(slot));
+                return;
+            }
+            state.last_child_slot = @intFromEnum(slot);
         }
     }
 
@@ -1255,6 +1486,103 @@ pub const StructuralValidator = struct {
     }
 };
 
+fn isAllowedParent(child: ElementId, parent: ElementId) bool {
+    return switch (child) {
+        .unknown, .indexedmzML => false,
+        .mzML => parent == .indexedmzML,
+        .cvList, .fileDescription, .referenceableParamGroupList, .sampleList, .softwareList, .scanSettingsList, .instrumentConfigurationList, .dataProcessingList, .run => parent == .mzML,
+        .cv => parent == .cvList,
+        .fileContent, .sourceFileList, .contact => parent == .fileDescription,
+        .sourceFile => parent == .sourceFileList,
+        .referenceableParamGroup => parent == .referenceableParamGroupList,
+        .sample => parent == .sampleList,
+        .software => parent == .softwareList,
+        .scanSettings => parent == .scanSettingsList,
+        .sourceFileRefList, .targetList => parent == .scanSettings,
+        .sourceFileRef => parent == .sourceFileRefList,
+        .target => parent == .targetList,
+        .instrumentConfiguration => parent == .instrumentConfigurationList,
+        .componentList, .softwareRef => parent == .instrumentConfiguration,
+        .source, .analyzer, .detector => parent == .componentList,
+        .dataProcessing => parent == .dataProcessingList,
+        .processingMethod => parent == .dataProcessing,
+        .spectrumList, .chromatogramList => parent == .run,
+        .spectrum => parent == .spectrumList,
+        .chromatogram => parent == .chromatogramList,
+        .scanList, .precursorList, .productList, .binaryDataArrayList => parent == .spectrum or
+            (child == .binaryDataArrayList and parent == .chromatogram),
+        .scan => parent == .scanList,
+        .scanWindowList => parent == .scan,
+        .scanWindow => parent == .scanWindowList,
+        .precursor => parent == .precursorList or parent == .chromatogram,
+        .isolationWindow => parent == .precursor or parent == .product,
+        .selectedIonList, .activation => parent == .precursor,
+        .selectedIon => parent == .selectedIonList,
+        .product => parent == .productList or parent == .chromatogram,
+        .binaryDataArray => parent == .binaryDataArrayList,
+        .binary => parent == .binaryDataArray,
+        .referenceableParamGroupRef => isParamGroupParent(parent),
+        .cvParam, .userParam => isParamGroupParent(parent) or parent == .referenceableParamGroup,
+        .indexList, .indexListOffset, .fileChecksum => parent == .indexedmzML,
+        .index => parent == .indexList,
+        .offset => parent == .index,
+    };
+}
+
+fn isParamGroupParent(tag: ElementId) bool {
+    return switch (tag) {
+        .fileContent,
+        .contact,
+        .sourceFile,
+        .sample,
+        .software,
+        .scanSettings,
+        .instrumentConfiguration,
+        .source,
+        .analyzer,
+        .detector,
+        .processingMethod,
+        .run,
+        .target,
+        .scanList,
+        .scan,
+        .scanWindow,
+        .spectrum,
+        .isolationWindow,
+        .selectedIon,
+        .activation,
+        .binaryDataArray,
+        .chromatogram,
+        => true,
+        else => false,
+    };
+}
+
+fn paramGroupChildPhase(parent: ElementId, child: ElementId) ?u8 {
+    if (parent == .referenceableParamGroup) {
+        return switch (child) {
+            .cvParam => 1,
+            .userParam => 2,
+            else => null,
+        };
+    }
+    if (!isParamGroupParent(parent)) return null;
+    return switch (child) {
+        .referenceableParamGroupRef => 1,
+        .cvParam => 2,
+        .userParam => 3,
+        else => 4,
+    };
+}
+
+fn invalidParentMessage(child: ElementId, parent: ElementId) []const u8 {
+    if (parent == .indexedmzML) return "element is not allowed as a direct child of indexedmzML";
+    if (child == .unknown) return "unrecognized element in mzML scope";
+    if (child == .binaryDataArrayList) return "binaryDataArrayList must be a child of spectrum or chromatogram";
+    if (child == .indexList or child == .indexListOffset or child == .fileChecksum) return "index metadata must be a direct child of indexedmzML";
+    return "mzML element is not allowed under its parent";
+}
+
 fn hasAttribute(attributes: []const Attribute, local_name: []const u8) bool {
     return xml_events.attributeByLocalName(attributes, local_name) != null;
 }
@@ -1298,6 +1626,9 @@ fn outOfOrderTopLevelMessage(element_name: []const u8) []const u8 {
 fn invalidCountMessage(label: []const u8) []const u8 {
     if (std.mem.eql(u8, label, "cvList")) return "cvList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "sourceFileList")) return "sourceFileList count attribute must be a non-negative integer";
+    if (std.mem.eql(u8, label, "sourceFileRefList")) return "sourceFileRefList count attribute must be a non-negative integer";
+    if (std.mem.eql(u8, label, "targetList")) return "targetList count attribute must be a non-negative integer";
+    if (std.mem.eql(u8, label, "indexList")) return "indexList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "referenceableParamGroupList")) return "referenceableParamGroupList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "sampleList")) return "sampleList count attribute must be a non-negative integer";
     if (std.mem.eql(u8, label, "softwareList")) return "softwareList count attribute must be a non-negative integer";
@@ -1318,6 +1649,9 @@ fn invalidCountMessage(label: []const u8) []const u8 {
 fn countMismatchMessage(active: ListCountState) []const u8 {
     if (std.mem.eql(u8, active.label, "cvList")) return "cvList count does not match actual cv elements";
     if (std.mem.eql(u8, active.label, "sourceFileList")) return "sourceFileList count does not match actual sourceFile elements";
+    if (std.mem.eql(u8, active.label, "sourceFileRefList")) return "sourceFileRefList count does not match actual sourceFileRef elements";
+    if (std.mem.eql(u8, active.label, "targetList")) return "targetList count does not match actual target elements";
+    if (std.mem.eql(u8, active.label, "indexList")) return "indexList count does not match actual index elements";
     if (std.mem.eql(u8, active.label, "referenceableParamGroupList")) return "referenceableParamGroupList count does not match actual referenceableParamGroup elements";
     if (std.mem.eql(u8, active.label, "sampleList")) return "sampleList count does not match actual sample elements";
     if (std.mem.eql(u8, active.label, "softwareList")) return "softwareList count does not match actual software elements";
@@ -1337,6 +1671,8 @@ fn countMismatchMessage(active: ListCountState) []const u8 {
 fn minimumCountMessage(active: ListCountState) []const u8 {
     if (std.mem.eql(u8, active.label, "cvList")) return "cvList must contain at least 1 cv element";
     if (std.mem.eql(u8, active.label, "sourceFileList")) return "sourceFileList must contain at least 1 sourceFile element";
+    if (std.mem.eql(u8, active.label, "targetList")) return "targetList must contain at least 1 target element";
+    if (std.mem.eql(u8, active.label, "indexList")) return "indexList must contain at least 1 index element";
     if (std.mem.eql(u8, active.label, "referenceableParamGroupList")) return "referenceableParamGroupList must contain at least 1 referenceableParamGroup element";
     if (std.mem.eql(u8, active.label, "sampleList")) return "sampleList must contain at least 1 sample element";
     if (std.mem.eql(u8, active.label, "softwareList")) return "softwareList must contain at least 1 software element";
@@ -1345,6 +1681,10 @@ fn minimumCountMessage(active: ListCountState) []const u8 {
     if (std.mem.eql(u8, active.label, "dataProcessingList")) return "dataProcessingList must contain at least 1 dataProcessing element";
     if (std.mem.eql(u8, active.label, "chromatogramList")) return "chromatogramList must contain at least 1 chromatogram element";
     if (std.mem.eql(u8, active.label, "scanList")) return "scanList must contain at least 1 scan element";
+    if (std.mem.eql(u8, active.label, "precursorList")) return "precursorList must contain at least 1 precursor element";
+    if (std.mem.eql(u8, active.label, "productList")) return "productList must contain at least 1 product element";
+    if (std.mem.eql(u8, active.label, "scanWindowList")) return "scanWindowList must contain at least 1 scanWindow element";
+    if (std.mem.eql(u8, active.label, "selectedIonList")) return "selectedIonList must contain at least 1 selectedIon element";
     return "binaryDataArrayList must contain at least 2 binaryDataArray elements";
 }
 
@@ -1437,6 +1777,17 @@ fn minimalChromatogramMzml(comptime chromatogram_inner: []const u8) []const u8 {
         "</mzML>";
 }
 
+fn minimalMzml(comptime file_content_inner: []const u8, comptime run_inner: []const u8) []const u8 {
+    return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"https://example.invalid/psi-ms.obo\"/></cvList>" ++
+        "<fileDescription><fileContent>" ++ file_content_inner ++ "</fileContent></fileDescription>" ++
+        "<softwareList count=\"1\"><software id=\"SW1\" version=\"1.0\"/></softwareList>" ++
+        "<instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"IC1\"/></instrumentConfigurationList>" ++
+        "<dataProcessingList count=\"1\"><dataProcessing id=\"DP1\"><processingMethod order=\"0\" softwareRef=\"SW1\"/></dataProcessing></dataProcessingList>" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++ run_inner ++ "</run>" ++
+        "</mzML>";
+}
+
 // --- Unit Tests ---
 
 // --- Valid Fixtures ---
@@ -1473,7 +1824,7 @@ test "structural validator accepts valid chromatogram fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = minimalChromatogramMzml(
-        "<precursor/>" ++
+        "<precursor><activation/></precursor>" ++
             "<product/>" ++
             "<binaryDataArrayList count=\"2\">" ++
             "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
@@ -1577,8 +1928,12 @@ test "structural validator reports missing required reference element attributes
     defer validator.deinit();
 
     try validator.consumeStart(test_events.startUnknown("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
-    try validator.consumeStart(test_events.startUnknown("sourceFileRef", &.{}, 10));
-    try validator.consumeStart(test_events.startUnknown("referenceableParamGroupRef", &.{}, 20));
+    try validator.consumeStart(test_events.startUnknown("scanSettingsList", &.{test_events.attr("count", "1")}, 10));
+    try validator.consumeStart(test_events.startUnknown("scanSettings", &.{test_events.attr("id", "SS1")}, 20));
+    try validator.consumeStart(test_events.startUnknown("referenceableParamGroupRef", &.{}, 30));
+    try validator.consumeEnd(test_events.endUnknown("referenceableParamGroupRef"));
+    try validator.consumeStart(test_events.startUnknown("sourceFileRefList", &.{test_events.attr("count", "1")}, 40));
+    try validator.consumeStart(test_events.startUnknown("sourceFileRef", &.{}, 50));
 
     var source_file_missing = false;
     var param_group_missing = false;
@@ -1869,7 +2224,7 @@ test "structural validator does not accept a foreign required attribute" {
     );
 }
 
-test "structural validator reports missing binaryDataArrayList" {
+test "structural validator: accepts spectrum without optional binaryDataArrayList" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = try readFixtureAlloc(allocator, io, "fixtures/examples/mzml/missing-binary-data-array-list.mzML");
@@ -1880,8 +2235,7 @@ test "structural validator reports missing binaryDataArrayList" {
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings(RuleId.mzml_structure_missing_child, diagnostics.items[0].rule);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "structural validator reports mzml missing run child" {
@@ -1929,11 +2283,9 @@ test "structural validator reports binaryDataArrayList nested directly under run
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
-    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_structure_nesting, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("binaryDataArrayList must be a child of spectrum or chromatogram", diagnostics.items[0].message);
-    try std.testing.expectEqualStrings(RuleId.mzml_structure_missing_child, diagnostics.items[1].rule);
-    try std.testing.expectEqualStrings("run must contain spectrumList or chromatogramList", diagnostics.items[1].message);
 }
 
 test "structural validator reports chromatogram child ordering violations" {
@@ -1941,7 +2293,7 @@ test "structural validator reports chromatogram child ordering violations" {
     const io = std.testing.io;
     const fixture = minimalChromatogramMzml(
         "<product/>" ++
-            "<precursor/>" ++
+            "<precursor><activation/></precursor>" ++
             "<binaryDataArrayList count=\"2\">" ++
             "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
             "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
@@ -2035,6 +2387,314 @@ test "structural validator rejects unexpected indexed wrapper children" {
         diagnostics.items,
         RuleId.mzml_structure_nesting,
         "element is not allowed as a direct child of indexedmzML",
+    );
+}
+
+test "structural validator: rejects duplicate mzML in indexed wrapper" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
+    try validator.consumeEnd(test_events.endInterned("mzML", 20));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 30));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "indexedmzML must not contain more than one mzML element",
+    );
+}
+
+test "structural parent inventory: covers every shared content rule" {
+    const allowed = [_]struct { child: ElementId, parent: ElementId }{
+        .{ .child = .cv, .parent = .cvList },
+        .{ .child = .fileContent, .parent = .fileDescription },
+        .{ .child = .sourceFile, .parent = .sourceFileList },
+        .{ .child = .referenceableParamGroup, .parent = .referenceableParamGroupList },
+        .{ .child = .cvParam, .parent = .referenceableParamGroup },
+        .{ .child = .referenceableParamGroupRef, .parent = .run },
+        .{ .child = .sourceFileRef, .parent = .sourceFileRefList },
+        .{ .child = .target, .parent = .targetList },
+        .{ .child = .source, .parent = .componentList },
+        .{ .child = .processingMethod, .parent = .dataProcessing },
+        .{ .child = .spectrum, .parent = .spectrumList },
+        .{ .child = .chromatogram, .parent = .chromatogramList },
+        .{ .child = .scan, .parent = .scanList },
+        .{ .child = .scanWindow, .parent = .scanWindowList },
+        .{ .child = .precursor, .parent = .precursorList },
+        .{ .child = .activation, .parent = .precursor },
+        .{ .child = .product, .parent = .productList },
+        .{ .child = .binaryDataArrayList, .parent = .chromatogram },
+        .{ .child = .binary, .parent = .binaryDataArray },
+        .{ .child = .index, .parent = .indexList },
+        .{ .child = .offset, .parent = .index },
+    };
+
+    for (allowed) |pair| try std.testing.expect(isAllowedParent(pair.child, pair.parent));
+    try std.testing.expect(!isAllowedParent(.cv, .mzML));
+    try std.testing.expect(!isAllowedParent(.scan, .spectrum));
+    try std.testing.expect(!isAllowedParent(.activation, .chromatogram));
+    try std.testing.expect(!isAllowedParent(.binaryDataArray, .spectrum));
+    try std.testing.expect(!isAllowedParent(.offset, .indexList));
+}
+
+test "structural parent inventory: gives every schema element a placement" {
+    for (std.enums.values(ElementId)) |child| {
+        if (child == .unknown or child == .indexedmzML) continue;
+
+        var has_parent = false;
+        for (std.enums.values(ElementId)) |parent| {
+            has_parent = has_parent or isAllowedParent(child, parent);
+        }
+        try std.testing.expect(has_parent);
+    }
+}
+
+test "structural validator: quarantines invalid subtrees from active list counts" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
+        "<cvList count=\"1\"><fileDescription><cv id=\"bad\" fullName=\"bad\" URI=\"bad\"/></fileDescription><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"valid\"/></cvList>" ++
+        "<fileDescription><fileContent/></fileDescription>" ++
+        "<softwareList count=\"1\"><software id=\"SW1\" version=\"1.0\"/></softwareList>" ++
+        "<instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"IC1\"/></instrumentConfigurationList>" ++
+        "<dataProcessingList count=\"1\"><dataProcessing id=\"DP1\"><processingMethod order=\"0\" softwareRef=\"SW1\"/></dataProcessing></dataProcessingList>" ++
+        "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\"/>" ++
+        "</mzML>";
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "mzML element is not allowed under its parent");
+}
+
+test "structural validator: rejects foreign extension elements" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("<ext:foreign xmlns:ext=\"urn:extension\"/>", "");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "unrecognized element in mzML scope");
+}
+
+test "structural validator: enforces inherited parameter ordering" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("<userParam name=\"first\"/><cvParam cvRef=\"MS\" accession=\"MS:1\" name=\"late\"/>", "");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "parameter element appears out of order in mzML content");
+}
+
+test "structural validator: rejects text in element-only content" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("illegal text", "");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "non-whitespace text is not allowed in element-only mzML content");
+}
+
+test "structural validator: allows text in indexed scalar content nodes" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
+    try validator.consumeEnd(test_events.endInterned("mzML", 20));
+    try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "1")}, 30));
+    try validator.consumeStart(test_events.startInterned("index", &.{test_events.attr("name", "spectrum")}, 40));
+    try validator.consumeStart(test_events.startInterned("offset", &.{test_events.attr("idRef", "scan=1")}, 50));
+    try validator.consumeText(test_events.text("123"));
+    try validator.consumeEnd(test_events.endInterned("offset", 60));
+    try validator.consumeEnd(test_events.endInterned("index", 70));
+    try validator.consumeEnd(test_events.endInterned("indexList", 80));
+    try validator.consumeStart(test_events.startInterned("indexListOffset", &.{}, 90));
+    try validator.consumeText(test_events.text("456"));
+    try validator.consumeEnd(test_events.endInterned("indexListOffset", 100));
+    try validator.consumeStart(test_events.startInterned("fileChecksum", &.{}, 110));
+    try validator.consumeText(test_events.text("abc"));
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "structural validator: requires precursor activation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalChromatogramMzml(
+        "<precursor/>" ++
+            "<binaryDataArrayList count=\"2\">" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+            "</binaryDataArrayList>",
+    );
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_missing_child, "precursor is missing required child activation");
+}
+
+test "structural validator: requires one binary child per binaryDataArray" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("", "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList count=\"2\">" ++
+        "<binaryDataArray encodedLength=\"0\"/>" ++
+        "<binaryDataArray encodedLength=\"8\"><binary>AAAAAA==</binary></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList>");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_missing_child, "binaryDataArray is missing required child binary");
+}
+
+test "structural validator: enforces nonempty precursor lists" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("", "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\"><precursorList count=\"0\"/></spectrum>" ++
+        "</spectrumList>");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_count, "precursorList must contain at least 1 precursor element");
+}
+
+test "structural validator: rejects duplicate scan window lists" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("", "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\">" ++
+        "<scanList count=\"1\"><scan><scanWindowList count=\"1\"><scanWindow/></scanWindowList><scanWindowList count=\"1\"><scanWindow/></scanWindowList></scan></scanList>" ++
+        "</spectrum></spectrumList>");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "scan must not contain more than one scanWindowList");
+}
+
+test "structural validator: rejects precursor child order" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = minimalMzml("", "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
+        "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\">" ++
+        "<precursorList count=\"1\"><precursor><activation/><selectedIonList count=\"1\"><selectedIon/></selectedIonList></precursor></precursorList>" ++
+        "</spectrum></spectrumList>");
+
+    var reader = std.Io.Reader.fixed(fixture);
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_nesting, "selectedIonList appears out of order under precursor");
+}
+
+test "structural validator: out-of-order precursor children remain seen" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
+    try validator.consumeStart(test_events.startInterned("run", &.{ test_events.attr("id", "run-1"), test_events.attr("defaultInstrumentConfigurationRef", "IC1") }, 10));
+    try validator.consumeStart(test_events.startInterned("spectrumList", &.{ test_events.attr("count", "1"), test_events.attr("defaultDataProcessingRef", "DP1") }, 20));
+    try validator.consumeStart(test_events.startInterned("spectrum", &.{ test_events.attr("index", "0"), test_events.attr("id", "scan=1"), test_events.attr("defaultArrayLength", "0") }, 30));
+    try validator.consumeStart(test_events.startInterned("precursorList", &.{test_events.attr("count", "1")}, 40));
+    try validator.consumeStart(test_events.startInterned("precursor", &.{}, 50));
+    try validator.consumeStart(test_events.startInterned("activation", &.{}, 60));
+    try validator.consumeEnd(test_events.endInterned("activation", 70));
+    try validator.consumeStart(test_events.startInterned("selectedIonList", &.{test_events.attr("count", "1")}, 80));
+    try validator.consumeStart(test_events.startInterned("selectedIon", &.{}, 90));
+    try validator.consumeEnd(test_events.endInterned("selectedIon", 100));
+    try validator.consumeEnd(test_events.endInterned("selectedIonList", 110));
+    try validator.consumeStart(test_events.startInterned("selectedIonList", &.{test_events.attr("count", "1")}, 120));
+
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings("selectedIonList appears out of order under precursor", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings("precursor must not contain more than one selectedIonList", diagnostics.items[1].message);
+}
+
+test "structural validator: enforces index list count and offset minimum" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("indexedmzML", &.{}, 0));
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 10));
+    try validator.consumeEnd(test_events.endInterned("mzML", 20));
+    try validator.consumeStart(test_events.startInterned("indexList", &.{test_events.attr("count", "1")}, 30));
+    try validator.consumeStart(test_events.startInterned("index", &.{}, 40));
+    try validator.consumeEnd(test_events.endInterned("index", 50));
+    try validator.consumeEnd(test_events.endInterned("indexList", 60));
+
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_missing_child, "index must contain at least 1 offset element");
+}
+
+test "structural validator: out-of-order components remain counted" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startInterned("mzML", &.{test_events.attr("version", "1.1.0")}, 0));
+    try validator.consumeStart(test_events.startInterned("instrumentConfigurationList", &.{test_events.attr("count", "1")}, 10));
+    try validator.consumeStart(test_events.startInterned("instrumentConfiguration", &.{test_events.attr("id", "IC1")}, 20));
+    try validator.consumeStart(test_events.startInterned("componentList", &.{test_events.attr("count", "3")}, 30));
+    try validator.consumeStart(test_events.startInterned("source", &.{test_events.attr("order", "1")}, 40));
+    try validator.consumeEnd(test_events.endInterned("source", 50));
+    try validator.consumeStart(test_events.startInterned("detector", &.{test_events.attr("order", "3")}, 60));
+    try validator.consumeEnd(test_events.endInterned("detector", 70));
+    try validator.consumeStart(test_events.startInterned("analyzer", &.{test_events.attr("order", "2")}, 80));
+    try validator.consumeEnd(test_events.endInterned("analyzer", 90));
+    try validator.consumeEnd(test_events.endInterned("componentList", 100));
+
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_nesting,
+        "analyzer appears out of order under componentList",
     );
 }
 

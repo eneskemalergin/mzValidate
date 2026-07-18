@@ -1138,7 +1138,7 @@ fn extractAccessionPrefix(accession: []const u8) []const u8 {
 }
 
 fn isRefAttr(name: []const u8) bool {
-    // paramGroupRef uses attribute name "ref" instead of *Ref suffix.
+    // Reference elements use attribute name "ref" instead of a *Ref suffix.
     if (std.mem.eql(u8, name, "ref")) return true;
     return name.len >= 3 and std.mem.eql(u8, name[name.len - 3 ..], "Ref");
 }
@@ -1154,7 +1154,7 @@ fn expectedReferenceTarget(tag: ElementId, ref_attr: []const u8) ?ElementId {
     if (std.mem.eql(u8, ref_attr, "softwareRef")) return .software;
     if (std.mem.eql(u8, ref_attr, "ref")) {
         return switch (tag) {
-            .referenceableParamGroupRef, .paramGroupRef => .referenceableParamGroup,
+            .referenceableParamGroupRef => .referenceableParamGroup,
             .softwareRef => .software,
             .sourceFileRef => .sourceFile,
             else => null,
