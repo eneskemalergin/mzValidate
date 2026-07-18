@@ -34,11 +34,15 @@ pub const obo = struct {
 
 pub const Diagnostic = diagnostic.Diagnostic;
 pub const DiagnosticSink = diagnostic.DiagnosticSink;
+pub const FirstFailure = diagnostic.FirstFailure;
 pub const FileResult = diagnostic.FileResult;
 pub const CompletionState = diagnostic.CompletionState;
 pub const Severity = diagnostic.Severity;
+pub const ResourceLimits = diagnostic.ResourceLimits;
 pub const OutputMode = output.OutputMode;
 pub const CheckOptions = validate.CheckOptions;
+pub const InputMode = validate.InputMode;
+pub const InvocationContext = validate.InvocationContext;
 pub const json_schema_version = version.json_schema;
 
 /// Runs the CLI and returns its process exit code.

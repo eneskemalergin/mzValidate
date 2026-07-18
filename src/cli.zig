@@ -17,7 +17,6 @@ pub const CheckCommand = struct {
     skip_index: bool = false,
     skip_semantic: bool = false,
     input_mode: validate.InputMode = .stream,
-    mmap: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
     inputs: []const []const u8,
@@ -71,13 +70,22 @@ pub fn run(init: std.process.Init) !u8 {
 
     const exit_code = runArgs(gpa, init.io, stdout, stderr, args) catch |err| {
         // Preserve the original failure; output after a failed run is best effort.
-        stdout.flush() catch {};
-        stderr.flush() catch {};
+        flushWriters(stdout, stderr) catch {};
         return err;
     };
-    try stdout.flush();
-    try stderr.flush();
+    try flushWriters(stdout, stderr);
     return exit_code;
+}
+
+fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) std.Io.Writer.Error!void {
+    var first_error: ?std.Io.Writer.Error = null;
+    stdout.flush() catch |err| {
+        first_error = err;
+    };
+    stderr.flush() catch |err| {
+        if (first_error == null) first_error = err;
+    };
+    if (first_error) |err| return err;
 }
 
 /// Runs borrowed argv through caller-provided writers, returning a CLI exit code.
@@ -144,7 +152,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var skip_index = false;
     var skip_semantic = false;
     var input_mode: validate.InputMode = .stream;
-    var mmap = false;
     var max_binary_size: ?usize = null;
     var obo_path: ?[]const u8 = null;
 
@@ -173,12 +180,10 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
             i += 1;
             if (i >= args.len) return error.MissingInputMode;
             input_mode = parseInputMode(args[i]) catch return error.InvalidInputMode;
-            mmap = input_mode == .mmap;
             continue;
         }
         if (std.mem.eql(u8, arg, "-mmap")) {
             input_mode = .mmap;
-            mmap = true;
             continue;
         }
         if (std.mem.eql(u8, arg, "-obo")) {
@@ -218,7 +223,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         .skip_index = skip_index,
         .skip_semantic = skip_semantic,
         .input_mode = input_mode,
-        .mmap = mmap,
         .max_binary_size = max_binary_size,
         .obo_path = obo_path,
         .inputs = try input_paths.toOwnedSlice(allocator),
@@ -268,7 +272,6 @@ fn runCheck(
         .skip_index = check.skip_index,
         .skip_semantic = check.skip_semantic,
         .input_mode = check.input_mode,
-        .mmap = check.mmap,
         .max_binary_size = check.max_binary_size,
         .obo_path = check.obo_path,
     };
@@ -307,7 +310,7 @@ fn runCheck(
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
-        "mzValidate validates mzML inputs in one forward pass without building an XML tree.\n\n" ++
+        "mzValidate validates mzML inputs in one primary forward pass without building an XML tree.\n\n" ++
             "Usage\n" ++
             "  mzValidate check <input.mzML> [more files...] [options]\n" ++
             "  mzValidate --help\n\n" ++
@@ -478,7 +481,41 @@ fn expectJsonGolden(args: []const []const u8, expected_exit_code: u8, golden_pat
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
+fn testFlushDrain(writer: *std.Io.Writer, data: []const []const u8, splat: usize) std.Io.Writer.Error!usize {
+    _ = data;
+    _ = splat;
+    if (writer.buffer[0] == 'F') return error.WriteFailed;
+    writer.end = 0;
+    return 0;
+}
+
+const test_flush_vtable: std.Io.Writer.VTable = .{ .drain = testFlushDrain };
+
 // --- Unit Tests ---
+
+test "output write failures propagate" {
+    const argv = [_][]const u8{ "mzValidate", "--help" };
+    var stdout: std.Io.Writer = .failing;
+    var stderr_buffer: [64]u8 = undefined;
+    var stderr = std.Io.Writer.fixed(&stderr_buffer);
+
+    try std.testing.expectError(
+        error.WriteFailed,
+        runArgs(std.testing.allocator, std.testing.io, &stdout, &stderr, &argv),
+    );
+}
+
+test "flush attempts stderr after stdout failure" {
+    var stdout_buffer: [1]u8 = undefined;
+    var stdout: std.Io.Writer = .{ .vtable = &test_flush_vtable, .buffer = &stdout_buffer };
+    var stderr_buffer: [1]u8 = undefined;
+    var stderr: std.Io.Writer = .{ .vtable = &test_flush_vtable, .buffer = &stderr_buffer };
+    try stdout.writeByte('F');
+    try stderr.writeByte('S');
+
+    try std.testing.expectError(error.WriteFailed, flushWriters(&stdout, &stderr));
+    try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
 
 test "parses flags and input paths" {
     const allocator = std.testing.allocator;
@@ -499,7 +536,6 @@ test "parses flags and input paths" {
         .check => |check| {
             try std.testing.expectEqual(output.OutputMode.json, check.output_mode);
             try std.testing.expect(check.skip_binary);
-            try std.testing.expect(check.mmap);
             try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
             try std.testing.expectEqual(@as(usize, 2), check.inputs.len);
             try std.testing.expectEqualStrings("sample-a.mzML", check.inputs[0]);
@@ -523,7 +559,6 @@ test "records explicit stream input mode" {
     switch (command) {
         .check => |check| {
             try std.testing.expectEqual(validate.InputMode.stream, check.input_mode);
-            try std.testing.expect(!check.mmap);
         },
     }
 }
@@ -541,7 +576,6 @@ test "defaults to stream input" {
     switch (command) {
         .check => |check| {
             try std.testing.expectEqual(validate.InputMode.stream, check.input_mode);
-            try std.testing.expect(!check.mmap);
         },
     }
 }
@@ -561,7 +595,6 @@ test "records explicit mmap input mode" {
     switch (command) {
         .check => |check| {
             try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
-            try std.testing.expect(check.mmap);
         },
     }
 }
@@ -753,7 +786,7 @@ test "parses the mmap compatibility flag" {
 
     switch (command) {
         .check => |check| {
-            try std.testing.expect(check.mmap);
+            try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
             try std.testing.expect(!check.skip_binary);
             try std.testing.expectEqual(@as(usize, 1), check.inputs.len);
         },

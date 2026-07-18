@@ -76,6 +76,9 @@ pub const RuleId = struct {
 };
 
 const emergency_failure_message = "validation stopped before all enabled stages completed";
+pub const first_failure_rule_capacity = 64;
+pub const first_failure_message_capacity = 512;
+pub const first_failure_path_capacity = std.Io.Dir.max_path_bytes;
 
 /// Shared input-derived limits used by validators in one check.
 pub const ResourceLimits = struct {
@@ -189,7 +192,7 @@ pub const DiagnosticSink = struct {
         };
         try sink.ensureTotalCapacity(allocator, requested);
         const index = sink.items.len;
-        sink.items.len += 1;
+        sink.items.len = requested;
         sink.items[index] = item;
         sink.retained_bytes = next_bytes;
         sink.addTotal(item.severity);
@@ -386,20 +389,84 @@ pub const ResourceUsage = struct {
     semantic_param_group_peak_bytes: usize = 0,
 };
 
+fn BoundedFailureText(comptime capacity: usize) type {
+    return struct {
+        bytes: [capacity]u8 = undefined,
+        len: usize = 0,
+        truncated: bool = false,
+
+        fn init(value: []const u8) @This() {
+            var text: @This() = .{};
+            text.len = @min(value.len, capacity);
+            @memcpy(text.bytes[0..text.len], value[0..text.len]);
+            text.truncated = value.len > capacity;
+            if (text.truncated and capacity >= 3) @memcpy(text.bytes[capacity - 3 ..], "...");
+            return text;
+        }
+
+        fn slice(text: *const @This()) []const u8 {
+            return text.bytes[0..text.len];
+        }
+    };
+}
+
+const FailureRule = BoundedFailureText(first_failure_rule_capacity);
+const FailureMessage = BoundedFailureText(first_failure_message_capacity);
+const FailurePath = BoundedFailureText(first_failure_path_capacity);
+
 /// Fixed, allocation-free metadata for the first failure that stopped a file.
-/// Rule, message, and path slices borrow storage owned by the caller.
+/// Text accessors borrow this record; the record itself owns each copied value.
 pub const FirstFailure = struct {
     stage: ValidationStage,
     reason: FailureReason,
-    rule: []const u8,
-    message: []const u8,
+    rule_text: FailureRule,
+    message_text: FailureMessage,
     location: Location = .{},
-    /// Borrowed input path, valid for the caller's path lifetime.
-    path: ?[]const u8 = null,
+    path_text: ?FailurePath = null,
+
+    fn init(
+        stage: ValidationStage,
+        reason: FailureReason,
+        rule_value: []const u8,
+        message_value: []const u8,
+        location: Location,
+        path_value: ?[]const u8,
+    ) FirstFailure {
+        return .{
+            .stage = stage,
+            .reason = reason,
+            .rule_text = .init(rule_value),
+            .message_text = .init(message_value),
+            .location = location,
+            .path_text = if (path_value) |value| .init(value) else null,
+        };
+    }
+
+    /// Returns a slice owned by this failure record.
+    pub fn rule(failure: *const FirstFailure) []const u8 {
+        return failure.rule_text.slice();
+    }
+
+    /// Returns a slice owned by this failure record.
+    pub fn message(failure: *const FirstFailure) []const u8 {
+        return failure.message_text.slice();
+    }
+
+    /// Returns an optional slice owned by this failure record.
+    pub fn path(failure: *const FirstFailure) ?[]const u8 {
+        if (failure.path_text) |*text| return text.slice();
+        return null;
+    }
+
+    /// Reports whether a source value exceeded the fixed emergency storage.
+    pub fn metadataTruncated(failure: *const FirstFailure) bool {
+        return failure.rule_text.truncated or
+            failure.message_text.truncated or
+            if (failure.path_text) |path_text| path_text.truncated else false;
+    }
 };
 
-/// Per-file result independent of the normal diagnostic-list allocator.
-/// Its failure metadata borrows the rule, message, and path supplied by the caller.
+/// Owned per-file values independent of parser, input, and diagnostic lifetimes.
 pub const FileResult = struct {
     completion: CompletionState = .incomplete,
     enabled_stages: StageMask = 0,
@@ -439,14 +506,7 @@ pub const FileResult = struct {
     ) void {
         if (!diagnostic_emitted) result.diagnostics_truncated = true;
         if (result.first_failure != null) return;
-        result.first_failure = .{
-            .stage = stage,
-            .reason = reason,
-            .rule = rule,
-            .message = message,
-            .location = location,
-            .path = path,
-        };
+        result.first_failure = .init(stage, reason, rule, message, location, path);
         result.failure_diagnostic_emitted = diagnostic_emitted;
         result.failure_diagnostic_counted = diagnostic_emitted;
     }
@@ -512,7 +572,6 @@ pub const ResultStatus = enum {
 };
 
 /// Aggregates fixed result metadata without retaining diagnostic detail.
-/// A first failure, when present, borrows the source metadata from its results.
 pub const Summary = struct {
     totals: Totals = .{},
     completion: CompletionState = .complete,
@@ -643,7 +702,8 @@ test "result summary aggregates file and truncation metadata" {
     try std.testing.expectEqual(Totals{ .info = 2, .warnings = 1, .errors = 1 }, summary.totals);
     try std.testing.expectEqual(Totals{ .warnings = 1 }, summary.dropped_diagnostics);
     try std.testing.expect(summary.diagnostics_truncated);
-    try std.testing.expectEqualStrings(RuleId.mzml_structure_xml, summary.first_failure.?.rule);
+    const failure = summary.first_failure.?;
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_xml, failure.rule());
 }
 
 test "file result stays incomplete until every enabled stage completes" {
@@ -677,7 +737,50 @@ test "file result marks the fixed emergency failure path" {
 
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expect(result.needsEmergencyDiagnostic());
-    try std.testing.expectEqualStrings(emergency_failure_message, result.first_failure.?.message);
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings(emergency_failure_message, failure.message());
+}
+
+test "file result owns first failure metadata" {
+    var rule = [_]u8{ 't', 'e', 's', 't', '.', 'r', 'u', 'l', 'e' };
+    var message = [_]u8{ 's', 't', 'o', 'p', 'p', 'e', 'd' };
+    var path = [_]u8{ 'i', 'n', 'p', 'u', 't', '.', 'm', 'z', 'M', 'L' };
+    var result = FileResult.init(stageBit(.parser));
+    result.recordFailure(.parser, .parser, &rule, &message, .{}, &path, false);
+
+    @memset(&rule, 'x');
+    @memset(&message, 'x');
+    @memset(&path, 'x');
+
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings("test.rule", failure.rule());
+    try std.testing.expectEqualStrings("stopped", failure.message());
+    try std.testing.expectEqualStrings("input.mzML", failure.path().?);
+    try std.testing.expect(!failure.metadataTruncated());
+}
+
+test "first failure reports bounded metadata truncation" {
+    var long_path: [first_failure_path_capacity + 1]u8 = @splat('a');
+    var result = FileResult.init(stageBit(.input));
+    result.recordFailure(.input, .input, RuleId.runtime_file_open, "open failed", .{}, &long_path, true);
+
+    const failure = result.first_failure.?;
+    const path = failure.path().?;
+    try std.testing.expect(failure.metadataTruncated());
+    try std.testing.expectEqual(first_failure_path_capacity, path.len);
+    try std.testing.expectEqualStrings("...", path[path.len - 3 ..]);
+}
+
+test "diagnostic sink handles maximal configured capacity without arithmetic overflow" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
+    var sink = DiagnosticSink.init(.{ .max_diagnostics = std.math.maxInt(usize) });
+    defer sink.deinit(failing_allocator.allocator());
+
+    try std.testing.expectError(
+        error.OutOfMemory,
+        sink.ensureTotalCapacity(failing_allocator.allocator(), std.math.maxInt(usize)),
+    );
+    try std.testing.expectEqual(@as(usize, 0), sink.capacity);
 }
 
 test "diagnostic sink bounds detail while retaining complete totals" {

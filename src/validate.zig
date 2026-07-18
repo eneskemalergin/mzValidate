@@ -2,7 +2,7 @@
 //!
 //! Coordinates slice, reader, and regular-file validation.
 //!
-//! Parser and validators share one event pass. Regular files use bounded stream
+//! Parser and validators share one primary event pass. Regular files use bounded stream
 //! input by default; explicit mmap keeps the same parser and validation flow.
 
 const std = @import("std");
@@ -37,13 +37,12 @@ pub const InputMode = enum {
 };
 
 /// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
-/// The legacy `mmap` flag takes precedence over `input_mode` when enabled.
+/// `obo_path` is borrowed only while an invocation context is initialized.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
     input_mode: InputMode = .stream,
-    mmap: bool = false,
     max_binary_size: ?usize = null,
     resource_limits: diagnostic.ResourceLimits = .{},
     obo_path: ?[]const u8 = null,
@@ -66,6 +65,7 @@ const SemanticCatalog = struct {
 };
 
 /// Invocation-owned immutable options and semantic resources.
+/// The allocator and I/O handle must outlive the context; returned file results do not.
 pub const InvocationContext = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -76,15 +76,13 @@ pub const InvocationContext = struct {
     /// Builds the semantic catalog once. A catalog failure is retained as fixed
     /// metadata so file validation can stop before opening an input.
     pub fn init(allocator: std.mem.Allocator, io: std.Io, options: CheckOptions) InvocationContext {
-        var effective_options = options;
-        if (effective_options.mmap) effective_options.input_mode = .mmap;
-
         var context = InvocationContext{
             .allocator = allocator,
             .io = io,
-            .options = effective_options,
+            .options = options,
         };
-        if (!effective_options.skip_semantic) context.buildCatalog();
+        if (!options.skip_semantic) context.buildCatalog();
+        context.options.obo_path = null;
         return context;
     }
 
@@ -94,6 +92,7 @@ pub const InvocationContext = struct {
     }
 
     /// Validates one path using this invocation's immutable resources.
+    /// Diagnostics borrow their string fields; the returned result owns its metadata.
     pub fn validateOne(
         context: *InvocationContext,
         diagnostics: *DiagnosticSink,
@@ -705,7 +704,25 @@ fn runValidation(
             }
             if (index_validator) |*iv| {
                 result.beginStage(.index);
-                try iv.finish(file_bytes);
+                iv.finish(file_bytes) catch |err| {
+                    if (err == error.InputIntegrityUnavailable) {
+                        try appendFailureDiagnostic(
+                            context.allocator,
+                            diagnostics,
+                            result,
+                            .index,
+                            .input,
+                            .{
+                                .severity = .@"error",
+                                .rule = RuleId.mzml_index_checksum,
+                                .path = path,
+                                .message = "file bytes unavailable; SHA-1 and truncation checks cannot be verified",
+                            },
+                        );
+                        return;
+                    }
+                    return err;
+                };
                 result.completeStage(.index);
             }
             break;
@@ -929,17 +946,40 @@ test "path check: uses bounded stream input" {
 test "check options: default to stream input" {
     const options = CheckOptions{};
     try std.testing.expectEqual(InputMode.stream, options.input_mode);
-    try std.testing.expect(!options.mmap);
 }
 
-test "check options: legacy mmap flag selects mmap input" {
+test "check options: explicit mmap input has one source of truth" {
     var context = InvocationContext.init(std.testing.allocator, std.testing.io, .{
         .skip_semantic = true,
-        .mmap = true,
+        .input_mode = .mmap,
     });
     defer context.deinit();
 
     try std.testing.expectEqual(InputMode.mmap, context.options.input_mode);
+}
+
+test "slice result owns failure metadata after borrowed inputs expire" {
+    var bytes = [_]u8{ '<', 'm', 'z', 'M', 'L' };
+    var path = [_]u8{ 'b', 'o', 'r', 'r', 'o', 'w', 'e', 'd', '.', 'm', 'z', 'M', 'L' };
+    var diagnostics = DiagnosticSink.init(.{ .retain_details = false });
+    defer diagnostics.deinit(std.testing.allocator);
+
+    const result = checkSliceResult(
+        std.testing.allocator,
+        std.testing.io,
+        &bytes,
+        &diagnostics,
+        &path,
+        .{ .skip_binary = true, .skip_index = true, .skip_semantic = true },
+        null,
+    );
+    @memset(&bytes, 'x');
+    @memset(&path, 'x');
+
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_xml, failure.rule());
+    try std.testing.expectEqualStrings("borrowed.mzML", failure.path().?);
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
 }
 
 test "path check: reports mmap failure without fallback" {
@@ -1363,7 +1403,7 @@ test "path check: validates an mmap SHA-1 checksum" {
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
-        .mmap = true,
+        .input_mode = .mmap,
     });
 
     for (diagnostics.items) |d| {
@@ -1604,7 +1644,7 @@ test "path check: reports a missing file before mmap selection" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .mmap = true });
+    try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .input_mode = .mmap });
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
@@ -1753,6 +1793,41 @@ test "reader result: marks clean input complete" {
     try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_peak_bytes);
 }
 
+test "reader result: indexed input without integrity source is incomplete" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        allocator,
+        .limited(256 * 1024),
+    );
+    defer allocator.free(fixture);
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var reader = std.Io.Reader.fixed(fixture);
+
+    const result = checkReaderResult(allocator, io, &reader, &diagnostics, "indexed-reader.mzML", .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    }, null);
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.index, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.input, result.first_failure.?.reason);
+    try std.testing.expect((result.completed_stages & diagnostic.stageBit(.index)) == 0);
+
+    var found_integrity_failure = false;
+    for (diagnostics.items) |item| {
+        if (std.mem.eql(u8, item.rule, RuleId.mzml_index_checksum)) {
+            found_integrity_failure = true;
+            try std.testing.expectEqual(diagnostic.Severity.@"error", item.severity);
+        }
+    }
+    try std.testing.expect(found_integrity_failure);
+}
+
 test "reader result: marks allocation failure incomplete" {
     const io = std.testing.io;
 
@@ -1816,7 +1891,8 @@ test "failure diagnostics: allocation failure uses emergency metadata" {
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expect(result.first_failure.?.stage == .parser or result.first_failure.?.stage == .structural);
     try std.testing.expectEqual(diagnostic.FailureReason.allocation, result.first_failure.?.reason);
-    try std.testing.expectEqualStrings(diagnostic.RuleId.runtime_incomplete, result.first_failure.?.rule);
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings(diagnostic.RuleId.runtime_incomplete, failure.rule());
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expect(result.needsEmergencyDiagnostic());
 }
@@ -1889,7 +1965,8 @@ test "path check: rejects an incompatible custom vocabulary" {
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expectEqual(diagnostic.ValidationStage.semantic, result.first_failure.?.stage);
     try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
-    try std.testing.expectEqualStrings(RuleId.runtime_catalog, result.first_failure.?.rule);
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog, failure.rule());
 }
 
 test "path check: reports a malformed custom vocabulary as a catalog failure" {
@@ -1907,7 +1984,8 @@ test "path check: reports a malformed custom vocabulary as a catalog failure" {
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
-    try std.testing.expectEqualStrings(RuleId.runtime_catalog, result.first_failure.?.rule);
+    const failure = result.first_failure.?;
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog, failure.rule());
 }
 
 test "path result: invalid zlib is complete with an error" {

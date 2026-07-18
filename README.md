@@ -22,7 +22,7 @@
 Validates mzML files in a single forward validation pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree or DOM is built, and no JVM or Python stack is required. The default native build embeds libdeflate and links the host C runtime; use `-Denable-libdeflate=false` when that dependency is not wanted.
 
 - No JVM, no Python, no .NET, no libxml2
-- Streaming XML parser in one forward pass
+- Streaming XML parser in one primary forward pass
 - Regular files use bounded stream input by default. Explicit mmap is available for stable files when speed matters and the host has enough memory for file-backed pages.
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
 - Zlib arrays validated through bounded compressed and decompressed workspaces
@@ -125,6 +125,16 @@ JSON schema version 1 records the selected input mode, every file result in inpu
 
 Rule IDs are the stable machine contract. Human-readable `message` text is separate and may improve without changing the rule ID. A JSON schema version changes only when consumers must handle an incompatible shape or meaning change.
 
+### Library ownership contract
+
+`CheckOptions` contains values except for `obo_path`. `InvocationContext.init` borrows that optional path only while it builds the catalog, then owns the parsed catalog until `deinit`. The allocator and `std.Io` handle must remain valid for the context lifetime. `input_mode` is the only library mode selector; the `-mmap` compatibility spelling exists only in CLI parsing and sets `input_mode` to `mmap`.
+
+`InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array, but each retained diagnostic string still borrows its original storage and must be rendered or cleared before that storage expires. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
+
+`FileResult` is a self-contained value. It does not reference parser buffers, mapped bytes, file-local validation state, the semantic catalog, or diagnostic storage. Its `FirstFailure` owns bounded copies of the rule, message, and path; the accessor slices borrow the `FirstFailure` value itself. The fixed capacities are 64 bytes for a rule ID, 512 bytes for a message, and `std.Io.Dir.max_path_bytes` for a path. An overlong value is copied as a prefix ending in `...`, and `FirstFailure.metadataTruncated()` reports that condition.
+
+The CLI is the reference caller. It creates one invocation context, validates explicit paths serially in input order, releases each file's diagnostic sink before the next file completes, and retains only fixed `FileResult` values for final aggregation.
+
 Validation phases (each flag disables one phase). By default all phases run:
 
 - `-skip-binary`: skip base64 decoding, zlib decompression, array length cross-checks, and precision validation
@@ -143,7 +153,7 @@ Informational:
 
 ## Performance
 
-ReleaseFast, one Linux host, warm file cache, July 2026. These are development measurements, not release gates. Explicit mmap is nearly twice as fast on the large validation workloads, but its file-backed pages make peak RSS much higher.
+ReleaseFast, one Linux host, warm file cache, July 2026. This table is a historical development comparison, not the current profile gate. Explicit mmap is nearly twice as fast on the large validation workloads, but its file-backed pages make peak RSS much higher. Current stream references and gate policy are recorded in `plan/BENCHMARKS.md`.
 
 | File                   |    Size | Stream full / RSS  | Mmap full / RSS       | Mmap speedup |
 | ---------------------- | ------: | -----------------: | --------------------: | -----------: |
@@ -166,7 +176,7 @@ On Fusion, most of the mmap RSS is the mapped input rather than validator-owned 
 
 ### Memory
 
-The default path reads through a bounded `std.Io.Reader`. The parser walks the same event model for stream and mmap sources. Explicit mmap creates a read-only, lazily populated mapping and reports a mode failure if mapping is unavailable.
+The default path reads through a bounded `std.Io.Reader`. The parser walks the same event model for stream and mmap sources. Explicit mmap creates a read-only, lazily populated mapping, performs a final stability check, and reports a mode failure if mapping is unavailable.
 
 One 2 GiB file is fine if the machine has the RAM. Many large files in parallel is a different story. Each process can hold most of its input resident, and Linux does not always reclaim those pages quickly under load. Do not multiply single-file wall time by core count and assume a cohort will finish in that time.
 
@@ -190,7 +200,7 @@ Each format validated against its published specification. No XSD embedded or re
 
 ## Validation
 
-Every file is checked in one forward pass over parser events. The default regular-file source is bounded stream input; explicit mmap uses the same parser and validators over a read-only slice. Both paths produce the same diagnostic contract.
+Every file is checked in one primary forward pass over parser events. Indexed stream checksum verification may add a bounded positional pass. The default regular-file source is bounded stream input; explicit mmap uses the same parser and validators over a read-only slice. Both paths produce the same diagnostic contract where the source provides the required integrity information.
 
 ### Structural
 

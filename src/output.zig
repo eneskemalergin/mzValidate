@@ -194,15 +194,20 @@ pub const BriefGroups = struct {
                 return;
             }
         }
-        if (groups.length == max_groups) {
+        if (groups.length >= max_groups) {
             groups.dropped = std.math.add(usize, groups.dropped, 1) catch std.math.maxInt(usize);
             return;
         }
-        groups.severity[groups.length] = item.severity;
-        groups.rule[groups.length] = item.rule;
-        groups.message[groups.length] = item.message;
-        groups.count[groups.length] = 1;
-        groups.length += 1;
+        const next_length = std.math.add(usize, groups.length, 1) catch {
+            groups.dropped = std.math.maxInt(usize);
+            return;
+        };
+        const index = groups.length;
+        groups.severity[index] = item.severity;
+        groups.rule[index] = item.rule;
+        groups.message[index] = item.message;
+        groups.count[index] = 1;
+        groups.length = next_length;
     }
 
     /// Sorts groups by severity and count, then writes the aligned table.
@@ -386,10 +391,10 @@ fn writeJsonDiagnostics(
         if (!first) try writer.writeAll(",\n");
         try writeJsonDiagnostic(writer, .{
             .severity = .@"error",
-            .rule = failure.rule,
+            .rule = failure.rule(),
             .location = failure.location,
-            .path = failure.path,
-            .message = failure.message,
+            .path = failure.path(),
+            .message = failure.message(),
         }, 8);
         first = false;
     }
@@ -501,15 +506,15 @@ fn writeJsonFirstFailure(
     try writer.writeAll(",\n");
     try writeIndent(writer, indent);
     try writer.writeAll("\"rule\": ");
-    try writeJsonString(writer, failure.rule);
+    try writeJsonString(writer, failure.rule());
     try writer.writeAll(",\n");
     try writeIndent(writer, indent);
     try writer.writeAll("\"message\": ");
-    try writeJsonString(writer, failure.message);
+    try writeJsonString(writer, failure.message());
     try writer.writeAll(",\n");
     try writeIndent(writer, indent);
     try writer.writeAll("\"path\": ");
-    if (failure.path) |path| {
+    if (failure.path()) |path| {
         try writeJsonString(writer, path);
     } else {
         try writer.writeAll("null");
@@ -621,8 +626,8 @@ fn writeResultBlock(
         summary.totals.errors,
     });
     if (summary.first_failure) |failure| {
-        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule });
-        if (failure.path) |path| try writer.print(" input={s}", .{path});
+        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
+        if (failure.path()) |path| try writer.print(" input={s}", .{path});
         try writer.writeByte('\n');
     }
     try writeConfigLine(writer, requested_input_mode);
@@ -647,10 +652,10 @@ fn writeConfigLine(
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
-    if (failure.path) |path| try writer.print("input: {s}\n", .{path});
+    if (failure.path()) |path| try writer.print("input: {s}\n", .{path});
     try writer.print(
         "  error [{s}] {s} (stage={s} reason={s})\n",
-        .{ failure.rule, failure.message, failure.stage.label(), failure.reason.label() },
+        .{ failure.rule(), failure.message(), failure.stage.label(), failure.reason.label() },
     );
 }
 

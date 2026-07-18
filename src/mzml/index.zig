@@ -451,7 +451,8 @@ pub const IndexValidator = struct {
     /// After the document is fully parsed, cross-check all collected data.
     /// `file_bytes` is the complete contiguous input when available.
     /// Call beginOnlineSha or setStreamSource before parsing when input-size
-    /// and truncation checks are required.
+    /// and truncation checks are required. Returns `error.InputIntegrityUnavailable`
+    /// when a declared checksum cannot be verified from the available source.
     pub fn finish(
         validator: *IndexValidator,
         file_bytes: ?[]const u8,
@@ -459,6 +460,7 @@ pub const IndexValidator = struct {
         if (!validator.saw_index_elements) return;
 
         if (file_bytes == null and validator.stream_file == null) {
+            if (validator.file_checksum_ok) return error.InputIntegrityUnavailable;
             _ = try validator.diagnostics.append(validator.allocator, .{
                 .severity = .info,
                 .rule = RuleId.mzml_index_checksum,
@@ -946,8 +948,10 @@ test "IndexValidator: finish propagates diagnostic allocation failure" {
     var v = IndexValidator.init(failing_allocator.allocator(), &diagnostics, null);
     defer v.deinit();
     v.saw_index_elements = true;
+    v.index_list_declared_count = 1;
 
-    try expectError(error.OutOfMemory, v.finish(null));
+    const file_bytes = [_]u8{};
+    try expectError(error.OutOfMemory, v.finish(&file_bytes));
 }
 
 test "IndexValidator: spectrum with unknown intern id still records offsets" {
