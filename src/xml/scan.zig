@@ -2,21 +2,20 @@
 //! Raw attribute views borrow contiguous tag bytes and do not decode values.
 
 const std = @import("std");
+const characters = @import("characters.zig");
 
 const chunk_len: comptime_int = std.simd.suggestVectorLength(u8) orelse 32;
 const ByteVector = @Vector(chunk_len, u8);
 const BoolVector = @Vector(chunk_len, bool);
 
 fn isXmlWhitespaceByte(byte: u8) bool {
-    return switch (byte) {
-        ' ', '\t', '\r', '\n' => true,
-        else => false,
-    };
+    return characters.isWhitespaceByte(byte);
 }
 
 pub const RawAttributeError = error{
     Malformed,
     InvalidUtf8,
+    InvalidCharacter,
 };
 
 /// Raw start-tag boundary; `end` excludes the `>` delimiter outside quotes.
@@ -38,10 +37,15 @@ pub const RawAttribute = struct {
 /// Iterates one raw start tag without allocating or decoding values.
 pub const RawAttributeScanner = struct {
     bytes: []const u8,
+    version: characters.Version = .xml_1_0,
     pos: usize = 0,
 
     pub fn init(bytes: []const u8) RawAttributeScanner {
         return .{ .bytes = bytes };
+    }
+
+    pub fn initVersion(bytes: []const u8, version: characters.Version) RawAttributeScanner {
+        return .{ .bytes = bytes, .version = version };
     }
 
     /// Returns the next borrowed attribute, or null after the tag body.
@@ -59,7 +63,12 @@ pub const RawAttributeScanner = struct {
         while (scanner.pos < scanner.bytes.len and !isRawNameTerminator(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
         if (scanner.pos == name_start) return error.Malformed;
         const name = scanner.bytes[name_start..scanner.pos];
-        if (!std.unicode.utf8ValidateSlice(name)) return error.InvalidUtf8;
+        characters.validateQName(name) catch |err| {
+            return switch (err) {
+                error.InvalidUtf8 => error.InvalidUtf8,
+                error.InvalidName => error.Malformed,
+            };
+        };
         const local_name = try rawLocalName(name);
 
         while (scanner.pos < scanner.bytes.len and isXmlWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
@@ -79,7 +88,19 @@ pub const RawAttributeScanner = struct {
         if (scanner.pos == scanner.bytes.len) return error.Malformed;
         const value = scanner.bytes[value_start..scanner.pos];
         // Entity-bearing values are validated after decoding by the eager parser path.
-        if (!has_entity and !std.unicode.utf8ValidateSlice(value)) return error.InvalidUtf8;
+        if (!has_entity) {
+            const less_than = std.mem.indexOfScalar(u8, value, '<');
+            const literal_failure = characters.firstLiteralFailure(value, scanner.version);
+            if (literal_failure) |failure| {
+                if (less_than == null or failure.index < less_than.?) {
+                    return switch (failure.kind) {
+                        .invalid_utf8 => error.InvalidUtf8,
+                        .invalid_character => error.InvalidCharacter,
+                    };
+                }
+            }
+            if (less_than != null) return error.InvalidCharacter;
+        }
         scanner.pos += 1;
 
         const colon = std.mem.indexOfScalar(u8, name, ':');
@@ -133,7 +154,7 @@ fn rawLocalName(name: []const u8) RawAttributeError![]const u8 {
 }
 
 fn isRawNameTerminator(byte: u8) bool {
-    return std.ascii.isWhitespace(byte) or switch (byte) {
+    return isXmlWhitespaceByte(byte) or switch (byte) {
         '/', '>', '=', '?', '"', '\'' => true,
         else => false,
     };
@@ -182,8 +203,10 @@ pub fn nameCharRunLen(bytes: []const u8) usize {
     var offset: usize = 0;
     while (bytes.len - offset >= chunk_len) {
         const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
-        const is_whitespace_or_ctrl = chunk < @as(ByteVector, @splat('!'));
-        var combined = is_whitespace_or_ctrl;
+        var combined = (chunk == @as(ByteVector, @splat(' '))) |
+            (chunk == @as(ByteVector, @splat('\t'))) |
+            (chunk == @as(ByteVector, @splat('\r'))) |
+            (chunk == @as(ByteVector, @splat('\n')));
         inline for (spec) |c| {
             combined = combined | (chunk == @as(ByteVector, @splat(c)));
         }
@@ -191,7 +214,7 @@ pub fn nameCharRunLen(bytes: []const u8) usize {
         offset += chunk_len;
     }
     for (bytes[offset..], 0..) |b, i| {
-        if (b <= ' ' or b == '/' or b == '>' or b == '=' or b == '?' or b == '"' or b == '\'')
+        if (isXmlWhitespaceByte(b) or b == '/' or b == '>' or b == '=' or b == '?' or b == '"' or b == '\'')
             return offset + i;
     }
     return bytes.len;
@@ -305,6 +328,14 @@ test "scanner stops names at whitespace and markup" {
     try std.testing.expectEqual(@as(usize, 8), n);
 }
 
+test "scanner leaves non-XML control bytes for name validation" {
+    const input = "root\x0Battr";
+
+    const n = nameCharRunLen(input);
+
+    try std.testing.expectEqual(input.len, n);
+}
+
 test "scanner stops plain text at markup" {
     const plain = "AAAA";
     const at_lt = "AAA<";
@@ -400,6 +431,17 @@ test "raw start tag scanner rejects an unterminated quoted value" {
 
     try std.testing.expectError(error.Malformed, scanner.next());
     try std.testing.expectEqual(@as(?RawTagInfo, null), rawStartTagInfo(" value=\"unfinished"));
+}
+
+test "raw attribute scanner rejects invalid names and literal characters" {
+    var invalid_name = RawAttributeScanner.init(" bad$name=\"value\"");
+    try std.testing.expectError(error.Malformed, invalid_name.next());
+
+    var invalid_value = RawAttributeScanner.init(" unitName=\"literal < value\"");
+    try std.testing.expectError(error.InvalidCharacter, invalid_value.next());
+
+    var xml11_restricted = RawAttributeScanner.initVersion(" unitName=\"\x7F\"", .xml_1_1);
+    try std.testing.expectError(error.InvalidCharacter, xml11_restricted.next());
 }
 
 test "CDATA scanner handles large input" {

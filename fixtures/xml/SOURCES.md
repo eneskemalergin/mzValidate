@@ -32,6 +32,19 @@ Curated sourced fixtures added in this pass:
 
 Adversarial invalid fixtures added in this pass:
 
+- `invalid/invalid-name-start.xml`
+  Source: W3C XML `NameStartChar` production reduced to an ASCII boundary case.
+  Purpose: reject an element name that starts with a digit.
+- `invalid/invalid-attribute-value.xml`
+  Source: W3C XML `AttValue` production reduced to a forbidden literal less-than sign.
+  Purpose: reject `<` when it appears literally inside an attribute value.
+- `invalid/invalid-character-reference.xml`
+  Source: W3C XML `CharRef` legal-character constraint reduced to the NUL boundary.
+  Purpose: reject a numeric reference to a character forbidden in every XML version.
+- `invalid/forbidden-text-close.xml`
+  Source: W3C XML `CharData` production reduced to its forbidden closing sequence.
+  Purpose: reject `]]>` outside CDATA.
+
 - `invalid/namespace-empty-prefix-declaration.xml`
   Source: namespace declaration syntax reduced to a misuse case.
   Purpose: reject an empty namespace prefix declaration name like `xmlns:`.

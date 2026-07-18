@@ -2117,7 +2117,7 @@ test "binary validator rejects short and mutated invalid base64 payload matrix" 
     }
 }
 
-test "binary validator rejects non-XML whitespace payload" {
+test "binary validator reports non-XML payload characters as parser errors" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const payloads = [_][]const u8{ "\x0b", "\x0c" };
@@ -2129,8 +2129,8 @@ test "binary validator rejects non-XML whitespace payload" {
 
         try expectSingleBinaryDiagnostic(
             diagnostics.items,
-            RuleId.mzml_binary_base64,
-            "binary payload is not valid base64",
+            RuleId.mzml_structure_xml,
+            "character is not permitted by the XML version",
         );
     }
 }

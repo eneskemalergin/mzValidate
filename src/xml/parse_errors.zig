@@ -27,6 +27,8 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.ElementNestingTooDeep => "XML element nesting exceeds the configured parser limit",
         error.ElementStorageExceeded => "XML element name storage exceeds the configured parser limit",
         error.InvalidCharacterReference => "invalid XML character reference",
+        error.InvalidXmlCharacter => "character is not permitted by the XML version",
+        error.UnsupportedXmlVersion => "unsupported XML version declaration",
         error.ReadFailed => "failed while reading XML input",
         error.MalformedXml => "malformed XML input",
     };
@@ -66,5 +68,13 @@ test "parse errors preserve limit details" {
     try std.testing.expectEqualStrings(
         "XML element name storage exceeds the configured parser limit",
         parseErrorMessage(error.ElementStorageExceeded),
+    );
+    try std.testing.expectEqualStrings(
+        "character is not permitted by the XML version",
+        parseErrorMessage(error.InvalidXmlCharacter),
+    );
+    try std.testing.expectEqualStrings(
+        "unsupported XML version declaration",
+        parseErrorMessage(error.UnsupportedXmlVersion),
     );
 }

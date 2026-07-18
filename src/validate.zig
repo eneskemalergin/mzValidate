@@ -2085,7 +2085,7 @@ test "reader check: reports a broken attribute quote" {
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "unexpected end of XML input",
+        "character is not permitted by the XML version",
     );
 }
 
