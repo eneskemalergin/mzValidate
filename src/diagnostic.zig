@@ -511,13 +511,41 @@ pub const ResultStatus = enum {
     }
 };
 
-/// Bundles severity totals with the derived result status.
+/// Aggregates fixed result metadata without retaining diagnostic detail.
 /// A first failure, when present, borrows the source metadata from its results.
 pub const Summary = struct {
-    totals: Totals,
+    totals: Totals = .{},
     completion: CompletionState = .complete,
+    files: usize = 0,
     incomplete_files: usize = 0,
+    diagnostics_truncated: bool = false,
+    dropped_diagnostics: Totals = .{},
     first_failure: ?FirstFailure = null,
+
+    pub fn addResult(summary: *Summary, result: FileResult) void {
+        summary.files = saturatingAdd(summary.files, 1);
+        summary.totals.info = saturatingAdd(summary.totals.info, result.totals.info);
+        summary.totals.warnings = saturatingAdd(summary.totals.warnings, result.totals.warnings);
+        summary.totals.errors = saturatingAdd(summary.totals.errors, result.totals.errors);
+        summary.dropped_diagnostics.info = saturatingAdd(
+            summary.dropped_diagnostics.info,
+            result.dropped_diagnostics.info,
+        );
+        summary.dropped_diagnostics.warnings = saturatingAdd(
+            summary.dropped_diagnostics.warnings,
+            result.dropped_diagnostics.warnings,
+        );
+        summary.dropped_diagnostics.errors = saturatingAdd(
+            summary.dropped_diagnostics.errors,
+            result.dropped_diagnostics.errors,
+        );
+        summary.diagnostics_truncated = summary.diagnostics_truncated or result.diagnostics_truncated;
+        if (result.completion == .incomplete) {
+            summary.completion = .incomplete;
+            summary.incomplete_files = saturatingAdd(summary.incomplete_files, 1);
+            if (summary.first_failure == null) summary.first_failure = result.first_failure;
+        }
+    }
 
     pub fn status(summary: Summary) ResultStatus {
         if (summary.completion == .incomplete) return .errors_present;
@@ -546,17 +574,8 @@ pub fn summarize(diagnostics: []const Diagnostic) Summary {
 }
 
 pub fn summarizeResults(results: []const FileResult) Summary {
-    var summary: Summary = .{ .totals = .{} };
-    for (results) |result| {
-        summary.totals.info = std.math.add(usize, summary.totals.info, result.totals.info) catch std.math.maxInt(usize);
-        summary.totals.warnings = std.math.add(usize, summary.totals.warnings, result.totals.warnings) catch std.math.maxInt(usize);
-        summary.totals.errors = std.math.add(usize, summary.totals.errors, result.totals.errors) catch std.math.maxInt(usize);
-        if (result.completion == .incomplete) {
-            summary.completion = .incomplete;
-            summary.incomplete_files = std.math.add(usize, summary.incomplete_files, 1) catch std.math.maxInt(usize);
-            if (summary.first_failure == null) summary.first_failure = result.first_failure;
-        }
-    }
+    var summary: Summary = .{};
+    for (results) |result| summary.addResult(result);
     return summary;
 }
 
@@ -605,6 +624,26 @@ test "summary status follows diagnostic severity" {
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
     try std.testing.expectEqual(ResultStatus.errors_present, summarize(&error_diagnostics).status());
+}
+
+test "result summary aggregates file and truncation metadata" {
+    var clean = FileResult.init(0);
+    clean.finalize(&.{});
+    var incomplete = FileResult.init(stageBit(.parser));
+    incomplete.recordFailure(.parser, .parser, RuleId.mzml_structure_xml, "parser stopped", .{}, "bad.mzML", true);
+    incomplete.totals = .{ .info = 2, .warnings = 1, .errors = 1 };
+    incomplete.dropped_diagnostics = .{ .warnings = 1 };
+    incomplete.diagnostics_truncated = true;
+    incomplete.finish();
+
+    const summary = summarizeResults(&.{ clean, incomplete });
+
+    try std.testing.expectEqual(@as(usize, 2), summary.files);
+    try std.testing.expectEqual(@as(usize, 1), summary.incomplete_files);
+    try std.testing.expectEqual(Totals{ .info = 2, .warnings = 1, .errors = 1 }, summary.totals);
+    try std.testing.expectEqual(Totals{ .warnings = 1 }, summary.dropped_diagnostics);
+    try std.testing.expect(summary.diagnostics_truncated);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_xml, summary.first_failure.?.rule);
 }
 
 test "file result stays incomplete until every enabled stage completes" {
@@ -672,5 +711,7 @@ test "diagnostic sink can count without retaining detail" {
         .message = "counted",
     }));
     try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqual(@as(usize, 0), sink.capacity);
+    try std.testing.expectEqual(@as(usize, 0), sink.retained_bytes);
     try std.testing.expectEqual(Totals{ .warnings = 1 }, sink.totals);
 }

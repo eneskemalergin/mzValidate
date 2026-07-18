@@ -39,6 +39,7 @@ pub const CompletionState = diagnostic.CompletionState;
 pub const Severity = diagnostic.Severity;
 pub const OutputMode = output.OutputMode;
 pub const CheckOptions = validate.CheckOptions;
+pub const json_schema_version = version.json_schema;
 
 /// Runs the CLI and returns its process exit code.
 pub fn run(init: std.process.Init) !u8 {

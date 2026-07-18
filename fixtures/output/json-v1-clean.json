@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "input_mode": "stream",
+  "files": [
+    {
+      "path": "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+      "completion": "complete",
+      "status": "clean",
+      "totals": {"info": 0, "warnings": 0, "errors": 0},
+      "diagnostics_truncated": false,
+      "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+      "first_failure": null,
+      "diagnostics": []
+    }
+  ],
+  "summary": {
+    "completion": "complete",
+    "status": "clean",
+    "files": 1,
+    "incomplete_files": 0,
+    "totals": {"info": 0, "warnings": 0, "errors": 0},
+    "diagnostics_truncated": false,
+    "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+    "first_failure": null
+  }
+}

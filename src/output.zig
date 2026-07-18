@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
+const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
 const Severity = diagnostic.Severity;
@@ -294,151 +295,261 @@ pub fn renderBriefGroupsResult(
     }
 }
 
-/// Renders diagnostics in a stable JSON shape for automation.
-pub fn renderJson(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    try writer.writeAll("[\n");
-    try renderJsonItems(writer, diagnostics, null);
-    try writer.writeAll("\n]\n");
-}
-
-/// Writes diagnostics and result-level failures as one stable JSON array.
+/// Writes one complete JSON report using the current schema version.
 pub fn renderJsonResult(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
-    results: []const diagnostic.FileResult,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
+    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
-    try writer.writeAll("[\n");
-    try renderJsonItems(writer, diagnostics, results);
-    try writer.writeAll("\n]\n");
+    var stream = try JsonStream.init(writer, requested_input_mode);
+    try stream.writeFile(diagnostics, result, path);
+    try stream.finish();
 }
 
-/// Incrementally writes one JSON array; call finish exactly once after writeFile.
+/// Incrementally writes one versioned report without retaining file diagnostics.
 pub const JsonStream = struct {
     writer: *std.Io.Writer,
-    first: bool = true,
+    first_file: bool = true,
+    summary: diagnostic.Summary = .{},
 
-    /// Writes the opening array and borrows the supplied writer.
-    pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
-        try writer.writeAll("[\n");
+    /// Writes the report header and borrows the supplied writer.
+    pub fn init(writer: *std.Io.Writer, requested_input_mode: []const u8) std.Io.Writer.Error!JsonStream {
+        try writer.print("{{\n  \"schema_version\": {d},\n  \"input_mode\": ", .{version.json_schema});
+        try writeJsonString(writer, requested_input_mode);
+        try writer.writeAll(",\n  \"files\": [");
         return .{ .writer = writer };
     }
 
-    /// Appends one file's diagnostics, failure metadata, and truncation record.
+    /// Appends one file result and its bounded diagnostic detail.
     pub fn writeFile(
         stream: *JsonStream,
         diagnostics: []const Diagnostic,
         result: *const diagnostic.FileResult,
         path: []const u8,
     ) std.Io.Writer.Error!void {
-        for (diagnostics) |item| try stream.writeDiagnostic(item);
-        if (result.needsEmergencyDiagnostic()) {
-            try stream.writeDiagnostic(.{
-                .severity = .@"error",
-                .rule = result.first_failure.?.rule,
-                .location = result.first_failure.?.location,
-                .path = result.first_failure.?.path,
-                .message = result.first_failure.?.message,
-            });
-        }
-        if (hasDroppedDiagnostics(result.*)) {
-            try stream.writeTruncation(result.dropped_diagnostics, path);
-        }
+        stream.summary.addResult(result.*);
+        if (!stream.first_file) try stream.writer.writeByte(',');
+        try stream.writer.writeAll("\n    {\n      \"path\": ");
+        try writeJsonString(stream.writer, path);
+        try stream.writer.writeAll(",\n      \"completion\": ");
+        try writeJsonString(stream.writer, result.completion.label());
+        try stream.writer.writeAll(",\n      \"status\": ");
+        try writeJsonString(stream.writer, result.status().label());
+        try stream.writer.writeAll(",\n      \"totals\": ");
+        try writeJsonTotals(stream.writer, result.totals);
+        try stream.writer.print(
+            ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
+            .{result.diagnostics_truncated},
+        );
+        try writeJsonTotals(stream.writer, result.dropped_diagnostics);
+        try stream.writer.writeAll(",\n      \"first_failure\": ");
+        try writeJsonFirstFailure(stream.writer, result.first_failure, 8);
+        try stream.writer.writeAll(",\n      \"diagnostics\": ");
+        try writeJsonDiagnostics(stream.writer, diagnostics, result, path);
+        try stream.writer.writeAll("\n    }");
+        stream.first_file = false;
     }
 
-    /// Writes the closing array delimiter.
+    /// Writes the aggregate summary and closes the report.
     pub fn finish(stream: *JsonStream) std.Io.Writer.Error!void {
-        try stream.writer.writeAll("\n]\n");
-    }
-
-    fn writeDiagnostic(stream: *JsonStream, item: Diagnostic) std.Io.Writer.Error!void {
-        if (!stream.first) try stream.writer.writeAll(",\n");
-        try writeJsonDiagnostic(stream.writer, item);
-        stream.first = false;
-    }
-
-    fn writeTruncation(stream: *JsonStream, dropped: diagnostic.Totals, path: []const u8) std.Io.Writer.Error!void {
-        if (!stream.first) try stream.writer.writeAll(",\n");
-        try writeJsonTruncation(stream.writer, dropped, path);
-        stream.first = false;
+        if (!stream.first_file) try stream.writer.writeByte('\n');
+        try stream.writer.writeAll("  ],\n  \"summary\": ");
+        try writeJsonSummary(stream.writer, stream.summary);
+        try stream.writer.writeAll("\n}\n");
     }
 };
 
-fn renderJsonItems(
+fn writeJsonDiagnostics(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
-    results: ?[]const diagnostic.FileResult,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
 ) std.Io.Writer.Error!void {
+    const emergency = result.needsEmergencyDiagnostic();
+    const truncated = hasDroppedDiagnostics(result.*);
+    if (diagnostics.len == 0 and !emergency and !truncated) {
+        try writer.writeAll("[]");
+        return;
+    }
+
+    try writer.writeAll("[\n");
     var first = true;
     for (diagnostics) |item| {
         if (!first) try writer.writeAll(",\n");
-        try writeJsonDiagnostic(writer, item);
+        try writeJsonDiagnostic(writer, item, 8);
         first = false;
     }
-    if (results) |file_results| {
-        for (file_results) |result| {
-            if (result.first_failure) |failure| {
-                if (!result.failure_diagnostic_emitted) {
-                    if (!first) try writer.writeAll(",\n");
-                    try writeJsonDiagnostic(writer, .{
-                        .severity = .@"error",
-                        .rule = failure.rule,
-                        .location = failure.location,
-                        .path = failure.path,
-                        .message = failure.message,
-                    });
-                    first = false;
-                }
-            }
-            if (hasDroppedDiagnostics(result)) {
-                if (!first) try writer.writeAll(",\n");
-                const path = if (result.first_failure) |failure| failure.path orelse "" else "";
-                try writeJsonTruncation(writer, result.dropped_diagnostics, path);
-                first = false;
-            }
-        }
+    if (emergency) {
+        const failure = result.first_failure.?;
+        if (!first) try writer.writeAll(",\n");
+        try writeJsonDiagnostic(writer, .{
+            .severity = .@"error",
+            .rule = failure.rule,
+            .location = failure.location,
+            .path = failure.path,
+            .message = failure.message,
+        }, 8);
+        first = false;
     }
+    if (truncated) {
+        if (!first) try writer.writeAll(",\n");
+        try writeJsonTruncation(writer, result.dropped_diagnostics, path, 8);
+    }
+    try writer.writeAll("\n      ]");
 }
 
-fn writeJsonDiagnostic(writer: *std.Io.Writer, item: Diagnostic) std.Io.Writer.Error!void {
-    try writer.writeAll("  {\n");
-    try writer.writeAll("    \"severity\": ");
+fn writeJsonDiagnostic(writer: *std.Io.Writer, item: Diagnostic, indent: usize) std.Io.Writer.Error!void {
+    try writeIndent(writer, indent);
+    try writer.writeAll("{\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"severity\": ");
     try writeJsonString(writer, item.severity.label());
-    try writer.writeAll(",\n    \"rule\": ");
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"rule\": ");
     try writeJsonString(writer, item.rule);
     if (item.path) |path| {
-        try writer.writeAll(",\n    \"path\": ");
+        try writer.writeAll(",\n");
+        try writeIndent(writer, indent + 2);
+        try writer.writeAll("\"path\": ");
         try writeJsonString(writer, path);
     }
-    try writer.writeAll(",\n    \"location\": {\n");
-    try writer.writeAll("      \"byte_offset\": ");
-    if (item.location.byte_offset) |byte_offset| {
-        try writer.print("{d}", .{byte_offset});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll(",\n      \"spectrum_index\": ");
-    if (item.location.spectrum_index) |spectrum_index| {
-        try writer.print("{d}", .{spectrum_index});
-    } else {
-        try writer.writeAll("null");
-    }
-    try writer.writeAll("\n    },\n    \"message\": ");
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"location\": ");
+    try writeJsonLocation(writer, item.location);
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"message\": ");
     try writeJsonString(writer, item.message);
-    try writer.writeAll("\n  }");
+    try writer.writeByte('\n');
+    try writeIndent(writer, indent);
+    try writer.writeByte('}');
 }
 
-fn writeJsonTruncation(writer: *std.Io.Writer, dropped: diagnostic.Totals, path: []const u8) std.Io.Writer.Error!void {
-    try writer.writeAll("  {\n    \"severity\": \"warning\",\n    \"rule\": ");
+fn writeJsonTruncation(
+    writer: *std.Io.Writer,
+    dropped: diagnostic.Totals,
+    path: []const u8,
+    indent: usize,
+) std.Io.Writer.Error!void {
+    try writeIndent(writer, indent);
+    try writer.writeAll("{\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"severity\": \"warning\",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"rule\": ");
     try writeJsonString(writer, diagnostic.RuleId.runtime_diagnostics_truncated);
-    try writer.writeAll(",\n    \"path\": ");
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"path\": ");
     try writeJsonString(writer, path);
-    try writer.writeAll(",\n    \"location\": {\n      \"byte_offset\": null,\n      \"spectrum_index\": null\n    },\n    \"message\": \"diagnostic detail truncated (dropped info=");
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"location\": {\"byte_offset\": null, \"spectrum_index\": null},\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"message\": \"diagnostic detail truncated (dropped info=");
     try writer.print("{d}", .{dropped.info});
     try writer.writeAll(" warnings=");
     try writer.print("{d}", .{dropped.warnings});
     try writer.writeAll(" errors=");
     try writer.print("{d}", .{dropped.errors});
-    try writer.writeAll(")\"\n  }");
+    try writer.writeAll(")\"\n");
+    try writeIndent(writer, indent);
+    try writer.writeByte('}');
+}
+
+fn writeJsonSummary(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
+    try writer.writeAll("{\n    \"completion\": ");
+    try writeJsonString(writer, summary.completion.label());
+    try writer.writeAll(",\n    \"status\": ");
+    try writeJsonString(writer, summary.status().label());
+    try writer.print(",\n    \"files\": {d},\n    \"incomplete_files\": {d},\n    \"totals\": ", .{
+        summary.files,
+        summary.incomplete_files,
+    });
+    try writeJsonTotals(writer, summary.totals);
+    try writer.print(
+        ",\n    \"diagnostics_truncated\": {},\n    \"dropped_diagnostics\": ",
+        .{summary.diagnostics_truncated},
+    );
+    try writeJsonTotals(writer, summary.dropped_diagnostics);
+    try writer.writeAll(",\n    \"first_failure\": ");
+    try writeJsonFirstFailure(writer, summary.first_failure, 6);
+    try writer.writeAll("\n  }");
+}
+
+fn writeJsonFirstFailure(
+    writer: *std.Io.Writer,
+    maybe_failure: ?diagnostic.FirstFailure,
+    indent: usize,
+) std.Io.Writer.Error!void {
+    const failure = maybe_failure orelse {
+        try writer.writeAll("null");
+        return;
+    };
+    try writer.writeAll("{\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"stage\": ");
+    try writeJsonString(writer, failure.stage.label());
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"reason\": ");
+    try writeJsonString(writer, failure.reason.label());
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"rule\": ");
+    try writeJsonString(writer, failure.rule);
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"message\": ");
+    try writeJsonString(writer, failure.message);
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"path\": ");
+    if (failure.path) |path| {
+        try writeJsonString(writer, path);
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(",\n");
+    try writeIndent(writer, indent);
+    try writer.writeAll("\"location\": ");
+    try writeJsonLocation(writer, failure.location);
+    try writer.writeByte('\n');
+    try writeIndent(writer, indent - 2);
+    try writer.writeByte('}');
+}
+
+fn writeJsonTotals(writer: *std.Io.Writer, totals: diagnostic.Totals) std.Io.Writer.Error!void {
+    try writer.print("{{\"info\": {d}, \"warnings\": {d}, \"errors\": {d}}}", .{
+        totals.info,
+        totals.warnings,
+        totals.errors,
+    });
+}
+
+fn writeJsonLocation(writer: *std.Io.Writer, location: diagnostic.Location) std.Io.Writer.Error!void {
+    try writer.writeAll("{\"byte_offset\": ");
+    if (location.byte_offset) |byte_offset| {
+        try writer.print("{d}", .{byte_offset});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeAll(", \"spectrum_index\": ");
+    if (location.spectrum_index) |spectrum_index| {
+        try writer.print("{d}", .{spectrum_index});
+    } else {
+        try writer.writeAll("null");
+    }
+    try writer.writeByte('}');
+}
+
+fn writeIndent(writer: *std.Io.Writer, count: usize) std.Io.Writer.Error!void {
+    const spaces = "                ";
+    try writer.writeAll(spaces[0..count]);
 }
 
 fn writeJsonString(writer: *std.Io.Writer, value: []const u8) std.Io.Writer.Error!void {
@@ -699,13 +810,13 @@ test "json result emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderJsonResult(&allocating_writer.writer, &.{}, &.{result});
+    try renderJsonResult(&allocating_writer.writer, &.{}, &result, "sample.mzML", "stream");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"rule\": \"runtime.incomplete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"path\": \"sample.mzML\"") != null);
 }
 
-test "json output keeps stable keys" {
+test "json output keeps rule IDs separate from messages" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
@@ -716,23 +827,14 @@ test "json output keeps stable keys" {
         .path = "sample.mzML",
         .message = "decoded array length does not match defaultArrayLength",
     }};
-    const expected_json =
-        "[\n" ++
-        "  {\n" ++
-        "    \"severity\": \"error\",\n" ++
-        "    \"rule\": \"mzml.binary.length-mismatch\",\n" ++
-        "    \"path\": \"sample.mzML\",\n" ++
-        "    \"location\": {\n" ++
-        "      \"byte_offset\": 99,\n" ++
-        "      \"spectrum_index\": 7\n" ++
-        "    },\n" ++
-        "    \"message\": \"decoded array length does not match defaultArrayLength\"\n" ++
-        "  }\n" ++
-        "]\n";
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
 
-    try renderJson(&allocating_writer.writer, &diagnostics);
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "sample.mzML", "stream");
 
-    try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"schema_version\": 1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"rule\": \"mzml.binary.length-mismatch\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"decoded array length does not match defaultArrayLength\"") != null);
 }
 
 test "text output groups diagnostics by input" {
@@ -821,23 +923,12 @@ test "json output escapes control characters" {
         .rule = "runtime.escape-test",
         .message = "quote=\" slash=\\ line=\n tab=\t raw=\x01",
     }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
 
-    const expected_json =
-        "[\n" ++
-        "  {\n" ++
-        "    \"severity\": \"warning\",\n" ++
-        "    \"rule\": \"runtime.escape-test\",\n" ++
-        "    \"location\": {\n" ++
-        "      \"byte_offset\": null,\n" ++
-        "      \"spectrum_index\": null\n" ++
-        "    },\n" ++
-        "    \"message\": \"quote=\\\" slash=\\\\ line=\\n tab=\\t raw=\\u0001\"\n" ++
-        "  }\n" ++
-        "]\n";
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "escape.mzML", "stream");
 
-    try renderJson(&allocating_writer.writer, &diagnostics);
-
-    try std.testing.expectEqualStrings(expected_json, allocating_writer.written());
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"quote=\\\" slash=\\\\ line=\\n tab=\\t raw=\\u0001\"") != null);
 }
 
 test "json output replaces invalid UTF-8" {
@@ -849,8 +940,10 @@ test "json output replaces invalid UTF-8" {
         .rule = "runtime.invalid-utf8",
         .message = "bad\xffvalue",
     }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
 
-    try renderJson(&allocating_writer.writer, &diagnostics);
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "invalid-utf8.mzML", "stream");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"bad\\uFFFDvalue\"") != null);
 }
@@ -892,8 +985,49 @@ test "bounded output reports dropped severity totals" {
 
     var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer json_writer.deinit();
-    var stream = try JsonStream.init(&json_writer.writer);
+    var stream = try JsonStream.init(&json_writer.writer, "stream");
     try stream.writeFile(&.{}, &result, "sample.mzML");
     try stream.finish();
     try std.testing.expect(std.mem.indexOf(u8, json_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
+}
+
+test "json contract: truncated result matches golden" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var sink = diagnostic.DiagnosticSink.init(.{ .max_diagnostics = 1 });
+    defer sink.deinit(allocator);
+    const mark = sink.mark();
+    _ = try sink.append(allocator, .{
+        .severity = .info,
+        .rule = "test.retained",
+        .path = "truncated.mzML",
+        .message = "retained detail",
+    });
+    _ = try sink.append(allocator, .{
+        .severity = .warning,
+        .rule = "test.dropped-warning",
+        .path = "truncated.mzML",
+        .message = "dropped warning detail",
+    });
+    _ = try sink.append(allocator, .{
+        .severity = .@"error",
+        .rule = "test.dropped-error",
+        .path = "truncated.mzML",
+        .message = "dropped error detail",
+    });
+    var result = diagnostic.FileResult.init(0);
+    result.finalizeSink(&sink, mark);
+    var allocating_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer allocating_writer.deinit();
+
+    try renderJsonResult(&allocating_writer.writer, sink.items, &result, "truncated.mzML", "stream");
+    const expected = try std.Io.Dir.cwd().readFileAlloc(
+        io,
+        "fixtures/output/json-v1-truncated.json",
+        allocator,
+        .limited(128 * 1024),
+    );
+    defer allocator.free(expected);
+
+    try std.testing.expectEqualStrings(expected, allocating_writer.written());
 }

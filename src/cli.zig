@@ -258,7 +258,10 @@ fn runCheck(
 
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     var brief_groups: output.BriefGroups = .{};
-    var json_stream: ?output.JsonStream = if (check.output_mode == .json) try output.JsonStream.init(writer) else null;
+    var json_stream: ?output.JsonStream = if (check.output_mode == .json)
+        try output.JsonStream.init(writer, @tagName(check.input_mode))
+    else
+        null;
 
     const options = validate.CheckOptions{
         .skip_binary = check.skip_binary,
@@ -311,7 +314,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Commands\n" ++
             "  check        Validate one or more mzML inputs in a single run.\n\n" ++
             "Options\n" ++
-            "  -json        Emit stable JSON diagnostics for CI and pipelines.\n" ++
+            "  -json        Emit a versioned JSON result report for CI and pipelines.\n" ++
             "  -summary     Emit only aggregate status and severity counts.\n" ++
             "  -brief       Group diagnostics by rule with occurrence counts.\n" ++
             "  -skip-binary Skip binary payload checks.\n" ++
@@ -334,7 +337,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  Human result lines show completion, status, and severity counts.\n" ++
             "  A config line appears only when the input mode differs from the default.\n" ++
             "  Text mode groups diagnostics by input path and ends with the result.\n" ++
-            "  JSON mode emits one diagnostic object per finding and keeps keys stable.\n" ++
+            "  JSON mode records input mode, file results, diagnostics, and one summary.\n" ++
             "  Summary mode reports the aggregate result for the whole invocation.\n" ++
             "  Brief mode groups identical diagnostics by severity, rule, and message\n" ++
             "  with occurrence counts. Ideal for spotting patterns in large files.\n\n" ++
@@ -456,6 +459,23 @@ fn parseSize(value: []const u8) error{ Overflow, InvalidValue }!usize {
         return error.InvalidValue;
 
     return std.math.mul(usize, number, multiplier) catch error.Overflow;
+}
+
+fn expectJsonGolden(args: []const []const u8, expected_exit_code: u8, golden_path: []const u8) !void {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, args);
+    const expected = try std.Io.Dir.cwd().readFileAlloc(io, golden_path, allocator, .limited(128 * 1024));
+    defer allocator.free(expected);
+
+    try std.testing.expectEqual(expected_exit_code, exit_code);
+    try std.testing.expectEqualStrings(expected, stdout_writer.written());
+    try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
 // --- Unit Tests ---
@@ -970,16 +990,69 @@ test "summary aggregates clean and corrupt inputs" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "json output renders a corrupt input diagnostic" {
+test "json contract: clean result matches golden" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        "-skip-semantic",
+        "-skip-index",
+        "-json",
+    };
+
+    try expectJsonGolden(&argv, 0, "fixtures/output/json-v1-clean.json");
+}
+
+test "json contract: findings result matches golden" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "-skip-semantic",
+        "-json",
+    };
+
+    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
+}
+
+test "json contract: incomplete result matches golden" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "missing-p51.mzML",
+        "-json",
+    };
+
+    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-incomplete.json");
+}
+
+test "json contract: multi-file result matches golden" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "-skip-semantic",
+        "-skip-index",
+        "-json",
+    };
+
+    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-multi-file.json");
+}
+
+test "json contract: explicit mmap mode is recorded" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        "-skip-semantic",
+        "-skip-index",
+        "-input-mode",
+        "mmap",
         "-json",
     };
-
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
     var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -987,12 +1060,8 @@ test "json output renders a corrupt input diagnostic" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expect(std.mem.startsWith(u8, stdout_writer.written(), "[\n  {\n"));
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"rule\": \"mzml.binary.base64\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"path\": \"fixtures/mzml/invalid/invalid-base64.mzML\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"spectrum_index\": 7") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"message\": \"binary payload is not valid base64\"") != null);
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"input_mode\": \"mmap\"") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1088,7 +1157,8 @@ test "summary reports each missing input failure" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "complete: errors (info=0 warnings=0 errors=2)\n",
+        "incomplete: errors (info=0 warnings=0 errors=2)\n" ++
+            "failure: stage=input reason=input rule=runtime.file-open input=missing-a.mzML\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());

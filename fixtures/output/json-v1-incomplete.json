@@ -1,0 +1,48 @@
+{
+  "schema_version": 1,
+  "input_mode": "stream",
+  "files": [
+    {
+      "path": "missing-p51.mzML",
+      "completion": "incomplete",
+      "status": "errors-present",
+      "totals": {"info": 0, "warnings": 0, "errors": 1},
+      "diagnostics_truncated": false,
+      "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+      "first_failure": {
+        "stage": "input",
+        "reason": "input",
+        "rule": "runtime.file-open",
+        "message": "unable to stat input file",
+        "path": "missing-p51.mzML",
+        "location": {"byte_offset": null, "spectrum_index": null}
+      },
+      "diagnostics": [
+        {
+          "severity": "error",
+          "rule": "runtime.file-open",
+          "path": "missing-p51.mzML",
+          "location": {"byte_offset": null, "spectrum_index": null},
+          "message": "unable to stat input file"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "completion": "incomplete",
+    "status": "errors-present",
+    "files": 1,
+    "incomplete_files": 1,
+    "totals": {"info": 0, "warnings": 0, "errors": 1},
+    "diagnostics_truncated": false,
+    "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+    "first_failure": {
+      "stage": "input",
+      "reason": "input",
+      "rule": "runtime.file-open",
+      "message": "unable to stat input file",
+      "path": "missing-p51.mzML",
+      "location": {"byte_offset": null, "spectrum_index": null}
+    }
+  }
+}

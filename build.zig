@@ -133,10 +133,20 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.expectExitCode(2);
     cli_incomplete_cmd.expectStdOutMatch("incomplete: errors (info=0 warnings=0 errors=");
 
+    const cli_json_cmd = b.addRunArtifact(exe);
+    cli_json_cmd.step.dependOn(b.getInstallStep());
+    cli_json_cmd.addArg("check");
+    cli_json_cmd.addArg("fixtures/mzml/invalid/invalid-base64.mzML");
+    cli_json_cmd.addArg("-skip-semantic");
+    cli_json_cmd.addArg("-json");
+    cli_json_cmd.expectExitCode(2);
+    cli_json_cmd.expectStdOutMatch("\"schema_version\": 1");
+
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
     cli_contract_step.dependOn(&cli_invalid_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);
+    cli_contract_step.dependOn(&cli_json_cmd.step);
 
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);

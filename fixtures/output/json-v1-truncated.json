@@ -1,0 +1,41 @@
+{
+  "schema_version": 1,
+  "input_mode": "stream",
+  "files": [
+    {
+      "path": "truncated.mzML",
+      "completion": "complete",
+      "status": "errors-present",
+      "totals": {"info": 1, "warnings": 1, "errors": 1},
+      "diagnostics_truncated": true,
+      "dropped_diagnostics": {"info": 0, "warnings": 1, "errors": 1},
+      "first_failure": null,
+      "diagnostics": [
+        {
+          "severity": "info",
+          "rule": "test.retained",
+          "path": "truncated.mzML",
+          "location": {"byte_offset": null, "spectrum_index": null},
+          "message": "retained detail"
+        },
+        {
+          "severity": "warning",
+          "rule": "runtime.diagnostics-truncated",
+          "path": "truncated.mzML",
+          "location": {"byte_offset": null, "spectrum_index": null},
+          "message": "diagnostic detail truncated (dropped info=0 warnings=1 errors=1)"
+        }
+      ]
+    }
+  ],
+  "summary": {
+    "completion": "complete",
+    "status": "errors-present",
+    "files": 1,
+    "incomplete_files": 0,
+    "totals": {"info": 1, "warnings": 1, "errors": 1},
+    "diagnostics_truncated": true,
+    "dropped_diagnostics": {"info": 0, "warnings": 1, "errors": 1},
+    "first_failure": null
+  }
+}

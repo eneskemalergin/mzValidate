@@ -86,7 +86,44 @@ Output modes (pick one). The default format prints one line per diagnostic with 
 
 - `-summary`: single-line aggregate status (clean/warnings-only/errors-present with counts)
 - `-brief`: groups identical diagnostics by rule with occurrence counts; useful for spotting patterns in files with thousands of findings
-- `-json`: emits a stable JSON array of all diagnostics; designed for CI pipelines and programmatic consumption; keys are ordered and will not change between versions
+- `-json`: emits the versioned result report described below; designed for CI pipelines and programmatic consumption
+
+### JSON result contract
+
+JSON schema version 1 records the selected input mode, every file result in input order, and one invocation summary. Clean files remain visible with an empty `diagnostics` array.
+
+```json
+{
+  "schema_version": 1,
+  "input_mode": "stream",
+  "files": [
+    {
+      "path": "sample.mzML",
+      "completion": "complete",
+      "status": "clean",
+      "totals": {"info": 0, "warnings": 0, "errors": 0},
+      "diagnostics_truncated": false,
+      "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+      "first_failure": null,
+      "diagnostics": []
+    }
+  ],
+  "summary": {
+    "completion": "complete",
+    "status": "clean",
+    "files": 1,
+    "incomplete_files": 0,
+    "totals": {"info": 0, "warnings": 0, "errors": 0},
+    "diagnostics_truncated": false,
+    "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+    "first_failure": null
+  }
+}
+```
+
+`completion` is `complete` only when every enabled stage finishes. `status` is `clean`, `warnings-only`, or `errors-present`; an incomplete result is always `errors-present`. Severity totals count every finding, including details omitted after a retention limit. `diagnostics_truncated` and `dropped_diagnostics` report that omission explicitly. When detail is dropped, `diagnostics` ends with a `runtime.diagnostics-truncated` renderer notice; that notice is not an additional finding and is not added to the totals. `first_failure` is either `null` or an object containing `stage`, `reason`, `rule`, `message`, `path`, and `location`.
+
+Rule IDs are the stable machine contract. Human-readable `message` text is separate and may improve without changing the rule ID. A JSON schema version changes only when consumers must handle an incompatible shape or meaning change.
 
 Validation phases (each flag disables one phase). By default all phases run:
 
@@ -223,7 +260,7 @@ Events are dispatched to four validators in one pass. Structural and binary vali
 
 ### Output modes
 
-Four renderers from the same diagnostic list. Text mode for interactive use. JSON mode for pipeline consumption with stable key ordering. Summary mode for quick pass/fail. Brief mode groups identical diagnostics by rule with occurrence counts.
+Four renderers consume the same bounded result state. Text mode is for interactive use. JSON schema 1 carries file and invocation results for pipelines. Summary mode keeps only fixed counters. Brief mode groups identical diagnostics by rule with occurrence counts.
 
 ### Memory model
 
