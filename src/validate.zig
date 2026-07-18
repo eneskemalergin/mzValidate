@@ -1872,6 +1872,49 @@ test "required state: allocation failures stay incomplete and leak-free" {
     }, null, true);
 }
 
+test "[unit]: forward-reference allocation failures remain incomplete" {
+    const xml = spectrumListMzml(
+        "<spectrumList count=\"2\" defaultDataProcessingRef=\"DP1\">" ++
+            "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\">" ++
+            "<scanList count=\"1\"><scan spectrumRef=\"scan=2\"/></scanList></spectrum>" ++
+            "<spectrum index=\"1\" id=\"scan=2\" defaultArrayLength=\"0\"/>" ++
+            "</spectrumList>",
+    );
+    var context = InvocationContext.init(std.testing.allocator, std.testing.io, .{
+        .skip_binary = true,
+        .skip_index = true,
+    });
+    defer context.deinit();
+
+    var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var baseline_diagnostics: DiagnosticSink = .empty;
+    context.allocator = baseline_allocator.allocator();
+    const baseline = context.checkSliceResult(xml, &baseline_diagnostics, "forward-allocation.mzML", null);
+    context.allocator = std.testing.allocator;
+    baseline_diagnostics.deinit(baseline_allocator.allocator());
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, baseline.completion);
+    try std.testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..baseline_allocator.alloc_index) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
+        var diagnostics: DiagnosticSink = .empty;
+        context.allocator = failing_allocator.allocator();
+        const result = context.checkSliceResult(xml, &diagnostics, "forward-allocation.mzML", null);
+        context.allocator = std.testing.allocator;
+        const induced = failing_allocator.has_induced_failure;
+        diagnostics.deinit(failing_allocator.allocator());
+
+        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+        if (induced) {
+            try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+            try std.testing.expectEqual(diagnostic.FailureReason.allocation, result.first_failure.?.reason);
+            try std.testing.expect(result.status() != .clean);
+        } else {
+            try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+        }
+    }
+}
+
 test "failure diagnostics: allocation failure uses emergency metadata" {
     const xml = "<?xml version=\"1.0\"?><mzML><run";
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });

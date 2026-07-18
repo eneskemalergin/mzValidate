@@ -5,6 +5,7 @@
 //! per-file semantic owner.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const diagnostic = @import("../diagnostic.zig");
 const obo = @import("../obo/parser.zig");
 const rule_engine = @import("../obo/rule_engine.zig");
@@ -174,21 +175,30 @@ const ScopeFrame = struct {
 };
 
 const UnresolvedRef = struct {
-    ref_value: []const u8,
     expected_element: ?ElementId = null,
     byte_offset: u64,
+    next_same_id: ?usize = null,
+    resolved: bool = false,
+};
+
+const UnresolvedGroup = struct {
+    head: usize,
+    tail: usize,
 };
 
 const RefTable = struct {
     allocator: std.mem.Allocator,
     declarations: std.StringHashMap(Declaration),
     unresolved: std.ArrayList(UnresolvedRef),
+    unresolved_by_id: std.StringHashMap(UnresolvedGroup),
+    resolution_operations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
 
     fn init(allocator: std.mem.Allocator) RefTable {
         return .{
             .allocator = allocator,
             .declarations = std.StringHashMap(Declaration).init(allocator),
             .unresolved = std.ArrayList(UnresolvedRef).empty,
+            .unresolved_by_id = std.StringHashMap(UnresolvedGroup).init(allocator),
         };
     }
 
@@ -198,9 +208,11 @@ const RefTable = struct {
             table.allocator.free(entry.key_ptr.*);
         }
         table.declarations.deinit();
-        for (table.unresolved.items) |r| {
-            table.allocator.free(r.ref_value);
+        var unresolved_it = table.unresolved_by_id.iterator();
+        while (unresolved_it.next()) |entry| {
+            table.allocator.free(entry.key_ptr.*);
         }
+        table.unresolved_by_id.deinit();
         table.unresolved.deinit(table.allocator);
     }
 
@@ -257,14 +269,28 @@ const RefTable = struct {
             return;
         }
 
+        try ensureListAppendCapacity(&table.unresolved, budget, .unresolved, byte_offset);
+        const reference_index = table.unresolved.items.len;
+        if (table.unresolved_by_id.getPtr(ref_value)) |group| {
+            table.unresolved.items[group.tail].next_same_id = reference_index;
+            group.tail = reference_index;
+            table.unresolved.appendAssumeCapacity(.{
+                .expected_element = expected_element,
+                .byte_offset = byte_offset,
+            });
+            return;
+        }
+
+        try table.ensureUnresolvedMapCapacity(budget, byte_offset);
         try budget.reserve(.unresolved, ref_value.len, byte_offset);
         errdefer budget.release(.unresolved, ref_value.len);
-
         const owned_value = try table.allocator.dupe(u8, ref_value);
         errdefer table.allocator.free(owned_value);
-        try ensureListAppendCapacity(&table.unresolved, budget, .unresolved, byte_offset);
-        try table.unresolved.append(table.allocator, .{
-            .ref_value = owned_value,
+        table.unresolved_by_id.putAssumeCapacityNoClobber(owned_value, .{
+            .head = reference_index,
+            .tail = reference_index,
+        });
+        table.unresolved.appendAssumeCapacity(.{
             .expected_element = expected_element,
             .byte_offset = byte_offset,
         });
@@ -272,17 +298,15 @@ const RefTable = struct {
 
     fn resolveAll(table: *RefTable, diagnostics: *DiagnosticSink, path: ?[]const u8) !void {
         for (table.unresolved.items) |r| {
-            const declaration = table.declarations.get(r.ref_value) orelse {
-                _ = try diagnostics.append(table.allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_ref_unresolved,
-                    .location = .{ .byte_offset = r.byte_offset },
-                    .path = path,
-                    .message = "unresolved reference",
-                });
-                continue;
-            };
-            try table.checkResolved(diagnostics, path, r.expected_element, declaration, r.byte_offset);
+            table.recordResolutionOperations(1);
+            if (r.resolved) continue;
+            _ = try diagnostics.append(table.allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.mzml_ref_unresolved,
+                .location = .{ .byte_offset = r.byte_offset },
+                .path = path,
+                .message = "unresolved reference",
+            });
         }
     }
 
@@ -294,17 +318,18 @@ const RefTable = struct {
         id: []const u8,
         element_id: ElementId,
     ) !void {
-        var i: usize = 0;
-        while (i < table.unresolved.items.len) {
-            if (!std.mem.eql(u8, table.unresolved.items[i].ref_value, id)) {
-                i += 1;
-                continue;
-            }
-            const reference = table.unresolved.orderedRemove(i);
-            defer {
-                budget.release(.unresolved, reference.ref_value.len);
-                table.allocator.free(reference.ref_value);
-            }
+        const removed = table.unresolved_by_id.fetchRemove(id) orelse return;
+        defer {
+            budget.release(.unresolved, removed.key.len);
+            table.allocator.free(removed.key);
+        }
+
+        var current: ?usize = removed.value.head;
+        while (current) |index| {
+            table.recordResolutionOperations(1);
+            const reference = &table.unresolved.items[index];
+            reference.resolved = true;
+            current = reference.next_same_id;
             try table.checkResolved(
                 diagnostics,
                 path,
@@ -313,6 +338,41 @@ const RefTable = struct {
                 reference.byte_offset,
             );
         }
+    }
+
+    fn ensureUnresolvedMapCapacity(table: *RefTable, budget: *SemanticBudget, byte_offset: u64) !void {
+        const required = std.math.add(u32, table.unresolved_by_id.count(), 1) catch {
+            try budget.limitDiagnostic(byte_offset);
+            return error.ResourceLimitExceeded;
+        };
+        const old_capacity = table.unresolved_by_id.capacity();
+        if (old_capacity != 0) {
+            const load_limit = std.math.mul(u64, old_capacity, 80) catch unreachable;
+            if (@as(u64, required) <= load_limit / 100) return;
+        }
+
+        const target_without_minimum = mapCapacityForCount(required) catch {
+            try budget.limitDiagnostic(byte_offset);
+            return error.ResourceLimitExceeded;
+        };
+        const target = @max(target_without_minimum, @as(u32, 8));
+        if (target <= old_capacity) return;
+        const old_bytes = unresolvedMapStorageBytes(old_capacity) catch {
+            try budget.limitDiagnostic(byte_offset);
+            return error.ResourceLimitExceeded;
+        };
+        const new_bytes = unresolvedMapStorageBytes(target) catch {
+            try budget.limitDiagnostic(byte_offset);
+            return error.ResourceLimitExceeded;
+        };
+        try budget.reserve(.unresolved, new_bytes, byte_offset);
+        errdefer budget.release(.unresolved, new_bytes);
+        try table.unresolved_by_id.ensureTotalCapacity(required);
+        budget.release(.unresolved, old_bytes);
+    }
+
+    fn recordResolutionOperations(table: *RefTable, operations: usize) void {
+        if (comptime builtin.is_test) table.resolution_operations += operations;
     }
 
     fn checkResolved(
@@ -336,6 +396,21 @@ const RefTable = struct {
         }
     }
 };
+
+fn mapCapacityForCount(required: u32) !u32 {
+    const scaled = try std.math.mul(u64, required, 100);
+    const needed = try std.math.add(u64, scaled / 80, 1);
+    const bounded = std.math.cast(u32, needed) orelse return error.Overflow;
+    return std.math.ceilPowerOfTwo(u32, bounded) catch return error.Overflow;
+}
+
+fn unresolvedMapStorageBytes(capacity: u32) !usize {
+    if (capacity == 0) return 0;
+    const per_slot = @sizeOf([]const u8) + @sizeOf(UnresolvedGroup) +
+        @alignOf([]const u8) + @alignOf(UnresolvedGroup) + @sizeOf(u8);
+    const slots = try std.math.mul(usize, @intCast(capacity), per_slot);
+    return std.math.add(usize, slots, 128);
+}
 
 /// CV terms, scope rules, contradictions, and id/*Ref resolution.
 pub const SemanticValidator = struct {
@@ -2092,13 +2167,13 @@ test "SemanticValidator: wrong ref target produces distinct diagnostic" {
     try expectEqualStrings(RuleId.mzml_ref_wrong_target, diagnostics.items[0].rule);
 }
 
-test "RefTable: unresolved diagnostic allocation failure propagates" {
+test "[unit]: unresolved diagnostic allocation failure propagates" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
 
     var table = RefTable.init(failing_allocator.allocator());
-    var unresolved = [_]UnresolvedRef{.{ .ref_value = "missing", .byte_offset = 0 }};
+    var unresolved = [_]UnresolvedRef{.{ .byte_offset = 0 }};
     table.unresolved = .{ .items = &unresolved, .capacity = unresolved.len };
     defer {
         table.unresolved = .empty;
@@ -2108,19 +2183,114 @@ test "RefTable: unresolved diagnostic allocation failure propagates" {
     try expectError(error.OutOfMemory, table.resolveAll(&diagnostics, null));
 }
 
-test "RefTable: addRef cleans each allocation failure" {
-    for (0..2) |fail_index| {
+test "[unit]: addRef cleans every allocation failure" {
+    const reference_count = 8;
+
+    var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var baseline_diagnostics: DiagnosticSink = .empty;
+    var baseline_budget = SemanticBudget.init(baseline_allocator.allocator(), &baseline_diagnostics, null, .{});
+    var baseline_table = RefTable.init(baseline_allocator.allocator());
+    for (0..reference_count) |index| {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "missing-{d}", .{index});
+        try baseline_table.addRef(&baseline_budget, &baseline_diagnostics, null, id, null, index);
+    }
+    try testing.expect(baseline_table.unresolved_by_id.capacity() > 8);
+    baseline_table.deinit();
+    baseline_diagnostics.deinit(baseline_allocator.allocator());
+    try testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..baseline_allocator.alloc_index) |fail_index| {
         var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
         var table = RefTable.init(failing_allocator.allocator());
         var diagnostics: DiagnosticSink = .empty;
-        defer diagnostics.deinit(std.testing.allocator);
+        defer diagnostics.deinit(failing_allocator.allocator());
         var budget = SemanticBudget.init(failing_allocator.allocator(), &diagnostics, null, .{});
 
-        try std.testing.expectError(error.OutOfMemory, table.addRef(&budget, &diagnostics, null, "missing", null, 0));
+        var failed = false;
+        add_refs: for (0..reference_count) |index| {
+            var id_buffer: [32]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "missing-{d}", .{index});
+            table.addRef(&budget, &diagnostics, null, id, null, index) catch |err| {
+                try testing.expect(err == error.OutOfMemory);
+                failed = true;
+                break :add_refs;
+            };
+        }
         table.deinit();
 
-        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+        try testing.expect(failed);
+        try testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
     }
+}
+
+test "[unit]: unresolved-reference index storage obeys the semantic budget" {
+    const allocator = testing.allocator;
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var budget = SemanticBudget.init(allocator, &diagnostics, null, .{ .max_semantic_bytes = @sizeOf(UnresolvedRef) });
+    var table = RefTable.init(allocator);
+    defer table.deinit();
+
+    try testing.expectError(error.ResourceLimitExceeded, table.addRef(&budget, &diagnostics, null, "missing", null, 7));
+
+    try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try testing.expectEqualStrings(RuleId.runtime_semantic_limit, diagnostics.items[0].rule);
+    try testing.expectEqual(@as(u64, 7), diagnostics.items[0].location.byte_offset);
+}
+
+test "[unit]: reference diagnostics retain deterministic order and offsets" {
+    const allocator = testing.allocator;
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var budget = SemanticBudget.init(allocator, &diagnostics, null, .{});
+    var table = RefTable.init(allocator);
+    defer table.deinit();
+
+    try table.addRef(&budget, &diagnostics, null, "missing-first", .software, 30);
+    try table.addRef(&budget, &diagnostics, null, "wrong", .software, 10);
+    try table.addRef(&budget, &diagnostics, null, "missing-second", .sourceFile, 20);
+    try table.addRef(&budget, &diagnostics, null, "wrong", .sourceFile, 40);
+    try testing.expect(try table.declare(&budget, &diagnostics, null, "wrong", .instrumentConfiguration, 50));
+    try table.resolveAll(&diagnostics, null);
+
+    try testing.expectEqual(@as(usize, 4), diagnostics.items.len);
+    try testing.expectEqualStrings(RuleId.mzml_ref_wrong_target, diagnostics.items[0].rule);
+    try testing.expectEqual(@as(u64, 10), diagnostics.items[0].location.byte_offset);
+    try testing.expectEqualStrings(RuleId.mzml_ref_wrong_target, diagnostics.items[1].rule);
+    try testing.expectEqual(@as(u64, 40), diagnostics.items[1].location.byte_offset);
+    try testing.expectEqualStrings(RuleId.mzml_ref_unresolved, diagnostics.items[2].rule);
+    try testing.expectEqual(@as(u64, 30), diagnostics.items[2].location.byte_offset);
+    try testing.expectEqualStrings(RuleId.mzml_ref_unresolved, diagnostics.items[3].rule);
+    try testing.expectEqual(@as(u64, 20), diagnostics.items[3].location.byte_offset);
+}
+
+test "[unit]: forward-reference resolution work stays near-linear" {
+    const allocator = testing.allocator;
+    const reference_count = 64;
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var budget = SemanticBudget.init(allocator, &diagnostics, null, .{});
+    var table = RefTable.init(allocator);
+    defer table.deinit();
+
+    for (0..reference_count) |index| {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "SW-{d}", .{index});
+        try table.addRef(&budget, &diagnostics, null, id, .software, index);
+    }
+    for (0..reference_count) |index| {
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "SW-{d}", .{index});
+        try testing.expect(try table.declare(&budget, &diagnostics, null, id, .software, index));
+    }
+    try table.resolveAll(&diagnostics, null);
+
+    try testing.expect(table.resolution_operations <= reference_count * 2);
+    try testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "SemanticValidator: duplicate id produces error" {
