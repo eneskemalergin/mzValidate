@@ -3,13 +3,10 @@
 <h1 align="center">mzValidate</h1>
 
 <p align="center">
-  Validates mzML files in a single forward validation pass. No JVM, no managed runtime, no setup.
+  Validates mzML files with one primary streaming parser pass. No JVM or managed runtime.
 </p>
 
 <p align="center">
-  <a href="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml">
-    <img src="https://github.com/eneskemalergin/mzValidate/actions/workflows/ci.yml/badge.svg?style=flat-square" alt="CI">
-  </a>
   <img src="https://img.shields.io/badge/version-0.1.4-blue?style=flat-square" alt="version 0.1.4">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-development-green?style=flat-square" alt="status: development">
@@ -19,7 +16,7 @@
 
 ---
 
-Validates mzML files in a single forward validation pass. Structural conformance, binary integrity, index offsets, SHA-1 checksums, CV term semantics, and link validation. No XML tree or DOM is built, and no JVM or Python stack is required. The default native build embeds libdeflate and links the host C runtime; use `-Denable-libdeflate=false` when that dependency is not wanted.
+I built mzValidate as a focused native validator for mzML. It checks XML syntax, mzML structure, binary integrity, index metadata, CV semantics, and references without building an XML tree or DOM. Most work happens in one primary pass over streaming XML events; indexed regular files can require bounded positional reads for offsets and a declared SHA-1 checksum. The default native build embeds libdeflate and links the host C runtime; use `-Denable-libdeflate=false` when you do not want that dependency.
 
 - No JVM, no Python, no .NET, no libxml2
 - Streaming XML parser in one primary forward pass
@@ -27,7 +24,7 @@ Validates mzML files in a single forward validation pass. Structural conformance
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
 - Zlib arrays validated through bounded compressed and decompressed workspaces
 - Uses CPU vector instructions for faster base64 scanning
-- Unit tests, CLI contract tests, adversarial edge cases, and randomly generated inputs
+- Unit tests, CLI contract fixtures, and focused adversarial boundary cases
 
 ## Quick start
 
@@ -64,7 +61,7 @@ cd mzValidate
 
 The binary is at `zig-out/bin/mzValidate`. The default build bundles libdeflate and links the host C runtime. Use `-Denable-libdeflate=false` for a build with no system C dependency.
 
-If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. (This is how I work with Zig on my projects. Keeps many copies but at least I know which one I am using and I can change it easily.)
+If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. This is how I work on Zig projects. It leaves a few compiler copies around, but I always know which version a project uses and can change it without touching the rest of my system.
 
 **Linux x86_64 local-copy example:**
 
@@ -80,7 +77,7 @@ rm zig-x86_64-linux-0.16.0.tar.xz
 
 mzValidate requires targets with 64-bit pointers. The build rejects 32-bit targets during configuration, before compiling Zig or vendored C sources.
 
-The verified Debug build matrix is:
+The Debug build matrix I currently verify is:
 
 - `x86_64-linux`: native build and runtime tests
 - `x86_64-windows`: cross-build only
@@ -165,8 +162,8 @@ Validation phases (each flag disables one phase). By default all phases run:
 I/O and limits:
 
 - `-input-mode stream|mmap`: select bounded stream input or request the retained mmap compatibility mode. Stream is the supported default. `mmap` is refused before a mapping is created and returns an incomplete `runtime.input-mode` result. `-mmap` remains a compatibility alias and never falls back to stream input.
-- `-max-binary-size N`: reject any binary array larger than N; accepts K, M, G, T suffixes (1024-based)
-- `-obo <path>`: override the embedded psi-ms.obo with a custom file; useful for testing against bleeding-edge CV terms
+- `-max-binary-size N`: reject any binary array whose `encodedLength` exceeds N; accepts K, M, G, T suffixes (1024-based)
+- `-obo <path>`: replace the embedded OBO catalog with a custom file; useful for testing a deliberate catalog snapshot
 
 Informational:
 
@@ -174,26 +171,7 @@ Informational:
 
 ## Performance
 
-ReleaseFast, one Linux host, warm file cache, July 2026. This table is a historical development comparison from before path-based mmap was refused, not a current selectable-mode comparison or profile gate. Mmap was nearly twice as fast on the large validation workloads, but its file-backed pages made peak RSS much higher.
-
-| File                   |    Size | Stream full / RSS  | Mmap full / RSS       | Mmap speedup |
-| ---------------------- | ------: | -----------------: | --------------------: | -----------: |
-| Fusion (indexed, zlib) | 642 MiB | 9.00 s / 24.9 MiB  | 5.38 s / 666.1 MiB    |    1.7x      |
-| Astral (plain, zlib)   | 2.1 GiB | 22.96 s / 15.4 MiB | 10.89 s / 2,153.6 MiB |    2.1x      |
-
-The historical speed and memory tradeoff was workload- and cache-dependent. Stream keeps validator-owned input storage bounded and is now the only supported path mode. The mmap figures include resident file-backed pages and are not the same as anonymous validator state.
-
-Historical one-shot Fusion stage breakdown (separate runs on the same file; not directly comparable with the repeated profiles above):
-
-| Stage                     | Wall time |
-| ------------------------- | --------: |
-| Structural (XML + schema) |     1.1 s |
-| + Binary (base64 + zlib)  |     2.1 s |
-| + Index (offsets + SHA-1) |     2.2 s |
-| + Semantic (CV + refs)    |     1.8 s |
-| **Full** (all stages)     | **4.1 s** |
-
-In those historical measurements, most of the Fusion mmap RSS was the mapped input rather than validator-owned heap. On Astral, mmap RSS approached the 2.1 GiB file size while stream stayed near its bounded input working set. These are historical single-process observations, not safe parallelism limits.
+I am not publishing a current throughput or RSS table yet. The earlier mmap numbers are still useful historical context, but they measured a path the current build refuses, so I do not want to present them as current performance. When I publish new numbers, I want them to come from matched ReleaseFast builds with the same fixtures, flags, cache state, and repeated-sample policy. Debug remains the routine development mode.
 
 ### Memory
 
@@ -203,11 +181,11 @@ Large files and parallel validation still require capacity planning for semantic
 
 ## Current limitations
 
-The stream path targets a bounded validator working set, but semantic state, index maps, binary workspaces, and retained diagnostic details still have independent limits and can terminate validation as incomplete when those limits are reached. Path-based mmap is currently refused due to concurrent truncation safety. File stability, checksum behavior, and owner-specific resource limits remain part of the validation contract.
+The stream path targets a bounded validator working set. Semantic state, index maps, and binary workspaces have independent limits that make validation incomplete when reached. Diagnostic retention limits omit excess detail while preserving totals, truncation metadata, and the first failure. Path-based mmap is currently refused due to concurrent truncation safety. File stability, checksum behavior, and owner-specific resource limits remain part of the validation contract.
 
 ## Format support
 
-Each format validated against its published specification. No XSD embedded or required.
+For now, mzML 1.1.0 is the only format I support. I want to add the other formats below later; they are roadmap entries, not partial implementations. The current mzML structural checks are implemented directly in Zig, so the validator does not need an XSD engine at runtime.
 
 | Format                    | Status  | Structural | Binary  | Index   | Semantic |
 | ------------------------- | ------- | ---------- | ------- | ------- | -------- |
@@ -223,19 +201,23 @@ Every file is checked in one primary forward pass over parser events. Indexed st
 
 ### Structural
 
-XML well-formedness and mzML 1.1 schema conformance. Catches missing elements, wrong nesting, invalid attributes, and list count mismatches. Namespace-aware. No XSD required.
+The XML parser enforces supported XML 1.0 and 1.1 syntax, legal names and characters, matching tags, namespace bindings, and unique expanded attribute names. It rejects DTD and external-entity declarations. The structural validator requires the mzML namespace, recognizes the mzML and indexed mzML element set, and checks implemented parent, child-order, cardinality, required-child, list-count, required-attribute, unqualified-attribute, and selected attribute-datatype rules.
+
+This is not a general XSD engine and is not a claim of exhaustive mzML schema conformance. String and URI lexical spaces are not exhaustively validated, and foreign namespaced attributes are generally outside the mzML attribute contract.
 
 ### Binary integrity
 
-Each `binaryDataArray` is checked for base64 validity, zlib decompression, length against `defaultArrayLength`, precision (32/64-bit) against the declared CV term, and duplicate array types within a `binaryDataArrayList`. Uncompressed arrays use a streaming base64 counter that avoids decoding the full payload. Zlib arrays use reusable compressed scratch and a bounded decoded workspace. Other compression schemes (MS-Numpress, truncation) are recognized and reported as unsupported rather than ignored.
+Each `binaryDataArray` is checked for canonical base64, `encodedLength`, applicable decoded length against `defaultArrayLength`, declared 32-bit or 64-bit precision, and duplicate array types within a `binaryDataArrayList`. Zlib payloads are decompressed and checked for corrupt, truncated, or trailing compressed input. Uncompressed arrays use a streaming base64 counter that avoids materializing the full decoded payload. Zlib arrays use reusable compressed scratch and a bounded decoded workspace. Recognized unsupported compression schemes are reported rather than ignored.
 
 ### Index and checksum
 
-For indexed mzML files, validation checks every index offset against the recorded byte position, recomputes SHA-1, and detects truncation. Stream file validation uses the file size and a bounded positional pass for the checksum. A non-seekable caller-provided reader must provide the required source information or receive an incomplete result rather than silently skipping required integrity work.
+For indexed mzML files, validation checks the index list count and position, spectrum and chromatogram index entries, duplicate indexed IDs, offset bounds, and offsets against positions recorded independently during parsing. A present `fileChecksum` is validated and recomputed. Regular-file stream validation uses bounded positional reads for checksum and whitespace-tolerant offset verification. A caller-provided reader with a declared checksum but no complete or seekable source returns an incomplete result instead of silently claiming that integrity work completed.
 
 ### Semantic
 
-Every `cvParam` accession is checked against the embedded psi-ms.obo ontology (version 4.1.248). Unit terms are validated against the Unit Ontology. Mutually exclusive OR terms (centroid + profile, positive + negative) are flagged. Non-repeatable CV terms are checked for duplicates. MUST and SHOULD rules from the official PSI mapping file are enforced per element. All `*Ref` attributes are checked against declared `id` values. IM-MS and DIA CV terms are handled without false positives.
+The embedded catalog contains PSI-MS 4.1.248 and Unit Ontology terms. For embedded terms, validation checks accession and `cvRef` prefixes, obsolete status, namespace, known datatypes for present values, and allowed units. BTO, GO, and PATO are accepted external prefixes, but their terms are not resolved because those ontologies are not embedded. The `cvRef` still has to match the accession prefix.
+
+The embedded mapping rules (`mzML.xsd` model version 1.0.0) enforce their MUST and SHOULD term requirements, repeatability, and selected contradictions. Supported unqualified reference attributes are resolved against typed declarations with bounded forward-reference state. These checks include PSI-MS terms used by IM-MS and DIA data, but they do not establish that every external ontology term or every possible mzML semantic rule is covered.
 
 ### Rule reference
 
@@ -276,7 +258,7 @@ Category header rows align with the Validation sections above.
 | `mzml.cv.contradiction`          | warning  | Mutually exclusive CV terms on same element                                |
 | `mzml.cv.term-repeat`            | warning  | Non-repeatable CV term appears more than once                              |
 | **References**                   |          |                                                                            |
-| `mzml.ref.unresolved`            | error    | `*Ref` does not resolve to any declared `id`                               |
+| `mzml.ref.unresolved`            | error    | Supported reference attribute does not resolve to a typed declaration      |
 | `mzml.ref.duplicate-id`          | error    | Two or more elements share the same `id`                                   |
 | `mzml.ref.missing`               | error    | Required `*Ref` attribute is missing                                       |
 
@@ -296,40 +278,39 @@ Four renderers consume the same bounded result state. Text mode is for interacti
 
 ### Memory model
 
-- Parser structural scratch arrays are fixed-size and live on the call stack
+- Regular-file input uses a fixed 64 KiB stack buffer. Parser structural scratch is also fixed stack storage: 64 attributes, 32 namespace bindings, 2 KiB of namespace text, 128 element frames, and 4 KiB of element-name text.
 - The parser token buffer is an eager 1 MiB heap allocation per active file, reused across all events and reported in `ResourceUsage`
 - Compressed and libdeflate output buffers reuse capacities through 1 MiB; larger one-off capacities are freed after their binary array. The fixed 128 KiB flate workspace is reused.
 - Binary scratch telemetry covers allocator-owned compressed, flate, and libdeflate output capacities. It excludes the opaque external libdeflate decompressor allocation because the library ABI does not report its size.
-- No per-spectrum accumulation: state is discarded after each element's end event
-- Semantic ID table grows with spectrum count
-- Input files use bounded stream input; the mmap selector is retained only to return an explicit, non-fallback safety refusal
+- Transient element, scope, and binary state is released or reused, while semantic declarations, unresolved references, parameter-group state, and index entries are retained across the file within owner-specific limits.
+- Diagnostic details are retained within count and rendered-byte limits; totals and first-failure metadata remain available when detail retention is exhausted.
+- Input files use bounded stream input. The mmap selector is retained only to return an explicit safety refusal before any mapping exists, so mapped file pages are not part of current validation memory.
 
 ## Build steps
 
-- `./zig-0.16.0/zig build`: debug binary
-- `./zig-0.16.0/zig build -Doptimize=ReleaseSafe`: safety-oriented release build
-- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: release binary for measurements
-- `./zig-0.16.0/zig build test`: unit tests with leak detection
+- `./zig-0.16.0/zig build`: routine Debug binary
+- `./zig-0.16.0/zig build test`: routine Debug unit tests with leak detection
 - `./zig-0.16.0/zig build cli-contract`: CLI output and exit-code tests on known fixtures
-- `./zig-0.16.0/zig build ci`: test + cli-contract
+- `./zig-0.16.0/zig build ci`: combined `test` and `cli-contract` when both contracts are in scope
 - `./zig-0.16.0/zig build run -- check file.mzML`: build and run
+- `./zig-0.16.0/zig build -Doptimize=ReleaseSafe`: targeted safety-oriented release evidence
+- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: release build for deliberate throughput or RSS measurement
 
 ## Roadmap
 
-- Reintroduce mmap only behind process isolation or an immutable snapshot contract
-- Conformance score for CI integration (`mzValidate score`)
-- Quick summary statistics (`mzValidate stats`)
-- Auto-repair common mzML issues (`mzValidate check --fix`)
-- Profile spectrum detection and centroid requirement warning
-- Compare two mzML files (`mzValidate diff`)
-- imzML, mzIdentML, mzTab, SDRF-Proteomics validation
-- Stable release and public API
+These are the features I want to work toward:
+
+- I want a [conformance score for CI integration](https://github.com/eneskemalergin/mzValidate/issues/7), so pipelines can set a useful quality threshold instead of parsing every diagnostic.
+- I want [`--fix` for common mzML problems](https://github.com/eneskemalergin/mzValidate/issues/6), but only where a repair is predictable and does not hide damaged data.
+- I want a [`--require-centroid` check](https://github.com/eneskemalergin/mzValidate/issues/5) for search workflows that cannot use profile spectra.
+- I want [quick summary statistics](https://github.com/eneskemalergin/mzValidate/issues/4) without turning the validator into a full analysis package.
+- I want a practical [mzML diff command](https://github.com/eneskemalergin/mzValidate/issues/3) for converter and pipeline testing.
+
+Longer term, I want to bring mmap back as an optional high-RSS speed mode once its concurrent-mutation contract is settled. I also want to support more proteomics formats and settle the public API before calling the project stable.
 
 ## Ecosystem
 
-[mzBridge](https://github.com/eneskemalergin/mzbridge) writes mzML from Thermo .raw files. [mzarc](https://github.com/eneskemalergin/mzarc) encodes mzML into a compressed archive. Both run mzValidate in CI to gate on corruption before it propagates.
-
-mzValidate validates mzML from any source: ThermoRawFileParser, msconvert, mzdata-converter, mzBridge. It is format-focused, not tool-focused.
+I built [mzBridge](https://github.com/eneskemalergin/mzbridge) to write mzML from Thermo `.raw` files, and [mzarc](https://github.com/eneskemalergin/mzarc) to pack mzML into a compressed archive. They are separate tools, and mzValidate does not depend on either one. I want this validator to work on mzML from any converter, including tools I do not control.
 
 ## References
 

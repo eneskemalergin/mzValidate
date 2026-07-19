@@ -331,7 +331,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
-            "  -obo <path>  Override the embedded psi-ms.obo with a custom file.\n" ++
+            "  -obo <path>  Replace the embedded OBO catalog with a custom file.\n" ++
             "               Mapping policy remains the embedded mzML.xsd contract; see -version for its version.\n" ++
             "  -version, --version\n" ++
             "               Print the mzValidate version number and exit.\n" ++

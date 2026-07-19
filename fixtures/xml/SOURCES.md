@@ -2,13 +2,15 @@
 
 This tree intentionally vendors a hand-picked XML fixture slice instead of a full upstream corpus.
 
+These fixtures lock down the implemented parser contract. They are not evidence of exhaustive W3C XML conformance.
+
 Canonical upstream for future expansion:
 
 - W3C XML Conformance Test Suites: <https://www.w3.org/XML/Test/>
 
 Selection rules for this repo:
 
-- Prefer no-DTD well-formedness cases that match the current Phase 1 parser surface.
+- Prefer no-DTD well-formedness cases that match the current parser contract.
 - Keep fixtures small enough to review directly.
 - Add one fixture per behavior we actually want to lock down.
 
