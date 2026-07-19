@@ -1,0 +1,27 @@
+format-version: 1.2
+
+[Term]
+name: missing id with every owned field
+is_a: TEST:parent
+relationship: part_of TEST:parent
+relationship: has_value_type xsd:float
+relationship: has_units UO:0000000
+synonym: "missing id synonym" EXACT []
+xref: binary-data-type:MS\:1000521 "32-bit float"
+
+[Term]
+id: unusable
+name: colonless id
+is_a: TEST:parent
+
+[Term]
+id: TEST:valid
+name: valid term after malformed stanzas
+
+[Term]
+name: final missing id
+is_a: TEST:parent
+relationship: part_of TEST:parent
+relationship: has_units UO:0000000
+synonym: "final missing id synonym" EXACT []
+xref: binary-data-type:MS\:1000523 "64-bit float"

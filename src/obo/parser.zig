@@ -38,6 +38,7 @@ pub const CvTerm = struct {
 };
 
 /// Accession-keyed lookup table that owns data copied from an OBO text buffer.
+/// Term stanzas without a colon-qualified ID are skipped.
 pub const CvTable = struct {
     allocator: std.mem.Allocator,
     map: std.StringHashMap(CvTerm),
@@ -157,11 +158,11 @@ pub const CvTable = struct {
                     is_obsolete = false;
                     replaced_by = null;
                     xsd_type = null;
-                    is_a_list.clearRetainingCapacity();
-                    rel_list.clearRetainingCapacity();
-                    syn_list.clearRetainingCapacity();
-                    unit_list.clearRetainingCapacity();
-                    binary_type_list.clearRetainingCapacity();
+                    clearPendingStrings(table.allocator, &is_a_list);
+                    clearPendingRelationships(table.allocator, &rel_list);
+                    clearPendingStrings(table.allocator, &syn_list);
+                    clearPendingStrings(table.allocator, &unit_list);
+                    clearPendingStrings(table.allocator, &binary_type_list);
                 }
                 in_term = std.mem.eql(u8, line, "[Term]");
                 continue;
@@ -345,16 +346,26 @@ fn appendOwnedRelationship(
 }
 
 fn deinitPendingStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
-    for (list.items) |item| allocator.free(item);
+    clearPendingStrings(allocator, list);
     list.deinit(allocator);
 }
 
+fn clearPendingStrings(allocator: std.mem.Allocator, list: *std.ArrayList([]const u8)) void {
+    for (list.items) |item| allocator.free(item);
+    list.clearRetainingCapacity();
+}
+
 fn deinitPendingRelationships(allocator: std.mem.Allocator, list: *std.ArrayList(Relationship)) void {
+    clearPendingRelationships(allocator, list);
+    list.deinit(allocator);
+}
+
+fn clearPendingRelationships(allocator: std.mem.Allocator, list: *std.ArrayList(Relationship)) void {
     for (list.items) |rel| {
         allocator.free(rel.name);
         allocator.free(rel.target);
     }
-    list.deinit(allocator);
+    list.clearRetainingCapacity();
 }
 
 fn deinitTerm(allocator: std.mem.Allocator, term: *const CvTerm) void {
@@ -596,6 +607,21 @@ test "cv table rejects an overlong line before field allocation" {
         error.LineTooLong,
         CvTable.initWithLimits(allocator, obo, .{ .max_obo_line_bytes = 8 }),
     );
+}
+
+test "[unit]: malformed term stanzas release pending ownership and parsing continues" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/malformed-stanza-ownership.obo");
+    defer allocator.free(obo);
+
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+
+    const term = table.lookup("TEST:valid") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), table.map.count());
+    try std.testing.expectEqualStrings("valid term after malformed stanzas", term.name);
+    try std.testing.expect(table.lookup("unusable") == null);
 }
 
 test "cv table rejects duplicate IDs without replacing the first term" {
