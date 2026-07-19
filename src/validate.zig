@@ -176,9 +176,10 @@ pub const InvocationContext = struct {
         defer if (options.obo_path != null) context.allocator.free(text);
 
         var table = obo_parser.CvTable.initWithLimits(context.allocator, text, options.resource_limits) catch |err| {
+            const catalog_limit = err == error.ResourceLimitExceeded;
             context.catalog_failure = .{
-                .reason = if (err == error.OutOfMemory) .allocation else .catalog,
-                .rule = RuleId.runtime_catalog,
+                .reason = if (catalog_limit) .resource else if (err == error.OutOfMemory) .allocation else .catalog,
+                .rule = if (catalog_limit) RuleId.runtime_catalog_limit else RuleId.runtime_catalog,
                 .message = if (err == error.OutOfMemory) "unable to allocate OBO state" else obo_parser.parseErrorMessage(err),
             };
             return;
@@ -2027,6 +2028,30 @@ test "path check: reports a malformed custom vocabulary as a catalog failure" {
     try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
     const failure = result.first_failure.?;
     try std.testing.expectEqualStrings(RuleId.runtime_catalog, failure.rule());
+}
+
+test "[unit]: custom OBO catalog limit is an incomplete resource failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    const result = checkPathResult(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{
+        .skip_binary = true,
+        .skip_index = true,
+        .resource_limits = .{ .max_obo_catalog_bytes = 1 },
+        .obo_path = "fixtures/obo/adversarial/custom-namespace.obo",
+    });
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expect(result.status() != .clean);
+    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog_limit, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings(
+        "OBO catalog exceeds the configured memory limit",
+        diagnostics.items[0].message,
+    );
 }
 
 test "path result: invalid zlib is complete with an error" {

@@ -41,6 +41,7 @@ pub const CvTerm = struct {
 /// Term stanzas without a colon-qualified ID are skipped.
 pub const CvTable = struct {
     allocator: std.mem.Allocator,
+    budget: *CatalogBudget,
     map: std.StringHashMap(CvTerm),
     ns_prefix: std.StringHashMap(void),
     limits: diagnostic.ResourceLimits,
@@ -54,14 +55,23 @@ pub const CvTable = struct {
         obo_text: []const u8,
         limits: diagnostic.ResourceLimits,
     ) !CvTable {
+        if (limits.max_obo_catalog_bytes < @sizeOf(CatalogBudget)) return error.ResourceLimitExceeded;
+        const budget = try allocator.create(CatalogBudget);
+        budget.* = CatalogBudget.init(allocator, limits.max_obo_catalog_bytes);
+        const catalog_allocator = budget.allocator();
         var table = CvTable{
-            .allocator = allocator,
-            .map = std.StringHashMap(CvTerm).init(allocator),
-            .ns_prefix = std.StringHashMap(void).init(allocator),
+            .allocator = catalog_allocator,
+            .budget = budget,
+            .map = std.StringHashMap(CvTerm).init(catalog_allocator),
+            .ns_prefix = std.StringHashMap(void).init(catalog_allocator),
             .limits = limits,
         };
-        errdefer table.deinit();
-        try table.parse(obo_text);
+        table.parse(obo_text) catch |err| {
+            const limit_exceeded = budget.limit_exceeded;
+            table.deinit();
+            if (err == error.OutOfMemory and limit_exceeded) return error.ResourceLimitExceeded;
+            return err;
+        };
         return table;
     }
 
@@ -75,6 +85,11 @@ pub const CvTable = struct {
         var ns_it = table.ns_prefix.iterator();
         while (ns_it.next()) |entry| table.allocator.free(entry.key_ptr.*);
         table.ns_prefix.deinit();
+
+        const budget = table.budget;
+        std.debug.assert(budget.current_bytes == @sizeOf(CatalogBudget));
+        const parent_allocator = budget.parent_allocator;
+        parent_allocator.destroy(budget);
         table.* = undefined;
     }
 
@@ -305,12 +320,117 @@ pub const CvTable = struct {
 /// Returns the bounded diagnostic message for an OBO construction error.
 pub fn parseErrorMessage(err: anyerror) []const u8 {
     return switch (err) {
+        error.ResourceLimitExceeded => "OBO catalog exceeds the configured memory limit",
         error.XrefTooLong => "OBO binary-data-type xref accession exceeds its configured limit",
         error.LineTooLong => "OBO line exceeds its configured limit",
         error.DuplicateId => "OBO contains a duplicate term ID",
         else => "unable to parse OBO file",
     };
 }
+
+const CatalogBudget = struct {
+    parent_allocator: std.mem.Allocator,
+    limit: usize,
+    current_bytes: usize,
+    peak_bytes: usize,
+    limit_exceeded: bool = false,
+
+    fn init(parent_allocator: std.mem.Allocator, limit: usize) CatalogBudget {
+        return .{
+            .parent_allocator = parent_allocator,
+            .limit = limit,
+            .current_bytes = @sizeOf(CatalogBudget),
+            .peak_bytes = @sizeOf(CatalogBudget),
+        };
+    }
+
+    fn allocator(budget: *CatalogBudget) std.mem.Allocator {
+        return .{
+            .ptr = budget,
+            .vtable = &.{
+                .alloc = alloc,
+                .resize = resize,
+                .remap = remap,
+                .free = free,
+            },
+        };
+    }
+
+    fn nextBytes(budget: *CatalogBudget, extra: usize) ?usize {
+        const next = std.math.add(usize, budget.current_bytes, extra) catch {
+            budget.limit_exceeded = true;
+            return null;
+        };
+        if (next > budget.limit) {
+            budget.limit_exceeded = true;
+            return null;
+        }
+        return next;
+    }
+
+    fn recordBytes(budget: *CatalogBudget, next: usize) void {
+        budget.current_bytes = next;
+        budget.peak_bytes = @max(budget.peak_bytes, next);
+    }
+
+    fn alloc(
+        context: *anyopaque,
+        len: usize,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) ?[*]u8 {
+        const budget: *CatalogBudget = @ptrCast(@alignCast(context));
+        const next = budget.nextBytes(len) orelse return null;
+        const result = budget.parent_allocator.rawAlloc(len, alignment, return_address) orelse return null;
+        budget.recordBytes(next);
+        return result;
+    }
+
+    fn resize(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) bool {
+        const budget: *CatalogBudget = @ptrCast(@alignCast(context));
+        const next = if (new_len > memory.len)
+            budget.nextBytes(new_len - memory.len) orelse return false
+        else
+            budget.current_bytes - (memory.len - new_len);
+        if (!budget.parent_allocator.rawResize(memory, alignment, new_len, return_address)) return false;
+        budget.recordBytes(next);
+        return true;
+    }
+
+    fn remap(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        new_len: usize,
+        return_address: usize,
+    ) ?[*]u8 {
+        const budget: *CatalogBudget = @ptrCast(@alignCast(context));
+        const next = if (new_len > memory.len)
+            budget.nextBytes(new_len - memory.len) orelse return null
+        else
+            budget.current_bytes - (memory.len - new_len);
+        const result = budget.parent_allocator.rawRemap(memory, alignment, new_len, return_address) orelse return null;
+        budget.recordBytes(next);
+        return result;
+    }
+
+    fn free(
+        context: *anyopaque,
+        memory: []u8,
+        alignment: std.mem.Alignment,
+        return_address: usize,
+    ) void {
+        const budget: *CatalogBudget = @ptrCast(@alignCast(context));
+        budget.parent_allocator.rawFree(memory, alignment, return_address);
+        budget.current_bytes -= memory.len;
+    }
+};
 
 fn queueDescendant(
     stack: *[max_descendant_nodes][]const u8,
@@ -648,6 +768,61 @@ test "cv table owns term data after the source is freed" {
     try std.testing.expect(table.ns_prefix.contains("CUSTOM"));
     try std.testing.expectEqualStrings("CUSTOM", term.namespace);
     try std.testing.expectEqualStrings("term with custom namespace storage", term.name);
+}
+
+test "[unit]: OBO catalog budget charges all owned allocator bytes" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/allocation-failure.obo");
+    defer allocator.free(obo);
+    var counting_allocator = std.testing.FailingAllocator.init(allocator, .{});
+    var table = try CvTable.init(counting_allocator.allocator(), obo);
+    var table_live = true;
+    defer if (table_live) table.deinit();
+
+    const live_allocator_bytes = counting_allocator.allocated_bytes - counting_allocator.freed_bytes;
+
+    try std.testing.expectEqual(live_allocator_bytes, table.budget.current_bytes);
+    try std.testing.expect(table.budget.peak_bytes >= table.budget.current_bytes);
+    table.deinit();
+    table_live = false;
+    try std.testing.expectEqual(counting_allocator.allocated_bytes, counting_allocator.freed_bytes);
+}
+
+test "[unit]: OBO catalog accepts its exact peak limit and rejects one byte less" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/allocation-failure.obo");
+    defer allocator.free(obo);
+    var baseline_allocator = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    var baseline = try CvTable.init(baseline_allocator.allocator(), obo);
+    const required_peak_bytes = baseline.budget.peak_bytes;
+    baseline.deinit();
+
+    var exact_allocator = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    var exact = try CvTable.initWithLimits(exact_allocator.allocator(), obo, .{
+        .max_obo_catalog_bytes = required_peak_bytes,
+    });
+    defer exact.deinit();
+
+    try std.testing.expectEqual(required_peak_bytes, exact.budget.peak_bytes);
+    var over_allocator = std.testing.FailingAllocator.init(allocator, .{ .resize_fail_index = 0 });
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        CvTable.initWithLimits(over_allocator.allocator(), obo, .{
+            .max_obo_catalog_bytes = required_peak_bytes - 1,
+        }),
+    );
+    try std.testing.expectEqual(over_allocator.allocated_bytes, over_allocator.freed_bytes);
+
+    var too_small_allocator = std.testing.FailingAllocator.init(allocator, .{});
+    try std.testing.expectError(
+        error.ResourceLimitExceeded,
+        CvTable.initWithLimits(too_small_allocator.allocator(), obo, .{
+            .max_obo_catalog_bytes = @sizeOf(CatalogBudget) - 1,
+        }),
+    );
+    try std.testing.expectEqual(@as(usize, 0), too_small_allocator.allocated_bytes);
 }
 
 test "cv table cleans every field on allocation failure" {
