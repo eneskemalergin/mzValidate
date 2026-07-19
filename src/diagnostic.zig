@@ -176,12 +176,13 @@ pub const DiagnosticSink = struct {
         sink.configured = true;
     }
 
-    /// Counts every item and retains detail until a configured limit is reached.
-    /// Returns false when a retention limit drops detail; allocation failures propagate.
+    /// Counts every item and retains detail when configured to do so and within limits.
+    /// Returns true only when the item is retained. Intentional non-retention does
+    /// not increment `dropped`; allocation failures propagate.
     pub fn append(sink: *DiagnosticSink, allocator: std.mem.Allocator, item: Diagnostic) !bool {
         if (!sink.limits.retain_details) {
             sink.addTotal(item.severity);
-            return true;
+            return false;
         }
         const item_bytes = diagnosticBytes(item);
         const count_limit = sink.items.len >= sink.limits.max_diagnostics;
@@ -378,6 +379,10 @@ pub const Totals = struct {
 };
 
 /// Per-file owner measurements captured before validation state is released.
+/// Parser bytes cover the eager caller-owned token buffer. Binary scratch bytes
+/// cover allocator-owned compressed, flate, and libdeflate output capacities;
+/// the opaque allocation owned by libdeflate's decompressor is external and
+/// excluded because its ABI does not expose an allocation size.
 pub const ResourceUsage = struct {
     parser_current_bytes: usize = 0,
     parser_peak_bytes: usize = 0,
@@ -813,10 +818,11 @@ test "diagnostic sink bounds detail while retaining complete totals" {
 }
 
 test "diagnostic sink can count without retaining detail" {
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var sink = DiagnosticSink.init(.{ .retain_details = false });
-    defer sink.deinit(std.testing.allocator);
+    defer sink.deinit(failing_allocator.allocator());
 
-    try std.testing.expect(try sink.append(std.testing.allocator, .{
+    try std.testing.expect(!try sink.append(failing_allocator.allocator(), .{
         .severity = .warning,
         .rule = "test.warning",
         .message = "counted",
@@ -825,4 +831,6 @@ test "diagnostic sink can count without retaining detail" {
     try std.testing.expectEqual(@as(usize, 0), sink.capacity);
     try std.testing.expectEqual(@as(usize, 0), sink.retained_bytes);
     try std.testing.expectEqual(Totals{ .warnings = 1 }, sink.totals);
+    try std.testing.expectEqual(Totals{}, sink.dropped);
+    try std.testing.expect(!failing_allocator.has_induced_failure);
 }

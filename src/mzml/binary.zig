@@ -49,6 +49,10 @@ const base64_scalar_short_len = 64;
 // Keep one extra decoder window beyond Zig's required 64 KiB minimum so ordinary
 // arrays need fewer output toss cycles without retaining the former 1 MiB.
 const flate_buffer_len = 2 * std.compress.flate.max_window_len;
+// Capacities at or below this bound are useful across ordinary arrays. Larger
+// compressed inputs and materialized outputs are one-off allocations and are
+// released when their binaryDataArray ends.
+const max_retained_binary_buffer_bytes = 1024 * 1024;
 const scratch_capacity_classes = [_]usize{
     4 * 1024,
     16 * 1024,
@@ -448,7 +452,8 @@ pub const BinaryValidator = struct {
     seen_array_kinds: u3 = 0,
 
     /// Compressed zlib bytes decoded from base64 as text chunks arrive.
-    /// Cleared with `clearRetainingCapacity` at the start of each binary element.
+    /// Ordinary capacity is reused; one-off capacity above the retention bound
+    /// is released after the owning binaryDataArray is validated.
     compressed_payload: std.ArrayList(u8) = .empty,
     flate_buffer: std.ArrayList(u8) = .empty,
     libdeflate_output: std.ArrayList(u8) = .empty,
@@ -504,6 +509,20 @@ pub const BinaryValidator = struct {
         if (current > validator.limits.max_binary_scratch_bytes) return error.ResourceLimitExceeded;
         validator.scratch_current_bytes = current;
         validator.scratch_peak_bytes = @max(validator.scratch_peak_bytes, current);
+    }
+
+    fn releaseOneOffScratch(validator: *BinaryValidator) void {
+        if (validator.compressed_payload.capacity > max_retained_binary_buffer_bytes) {
+            validator.compressed_payload.clearAndFree(validator.allocator);
+        }
+        if (validator.libdeflate_output.capacity > max_retained_binary_buffer_bytes) {
+            validator.libdeflate_output.clearAndFree(validator.allocator);
+        }
+
+        // Capacity only decreases here, so the configured upper bound cannot
+        // be crossed and arithmetic overflow is impossible after a prior
+        // successful accounting update.
+        validator.scratch_current_bytes = validator.scratchCapacity() catch unreachable;
     }
 
     pub fn validateReader(
@@ -777,6 +796,7 @@ pub const BinaryValidator = struct {
             .binaryDataArray => {
                 if (validator.binary_array) |*state| {
                     if (state.depth == element_depth) {
+                        defer validator.releaseOneOffScratch();
                         try validator.validateBinaryArray(state);
 
                         if (state.array_kind != .unknown) {
@@ -1893,6 +1913,64 @@ test "binary scratch uses bounded capacity classes and reuses them" {
     try std.testing.expectEqual(@as(usize, 64 * 1024 + 1), validator.compressed_payload.capacity);
     try std.testing.expectEqual(validator.compressed_payload.capacity, validator.scratch_current_bytes);
     try std.testing.expectEqual(validator.scratch_current_bytes, validator.scratch_peak_bytes);
+}
+
+test "[unit]: ending a binary array releases only capacities above the reuse bound" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = BinaryValidator.init(allocator, &diagnostics, "fixture");
+    defer validator.deinit();
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, max_retained_binary_buffer_bytes);
+    validator.mzml_depth = 1;
+    validator.binary_array = .{
+        .byte_offset = 0,
+        .depth = 2,
+        .owner_spectrum_index = null,
+        .default_array_length = null,
+        .default_array_length_invalid = false,
+        .skipped = true,
+    };
+
+    try validator.handleEnd(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "binaryDataArray", .namespace_uri = mzml_namespace },
+        .element_id = .binaryDataArray,
+    }, 2);
+
+    try std.testing.expectEqual(max_retained_binary_buffer_bytes, validator.compressed_payload.capacity);
+    try std.testing.expectEqual(max_retained_binary_buffer_bytes, validator.scratch_current_bytes);
+
+    try validator.ensureScratchCapacity(&validator.compressed_payload, max_retained_binary_buffer_bytes + 1);
+    try validator.ensureScratchCapacity(&validator.libdeflate_output, max_retained_binary_buffer_bytes + 1);
+    try validator.ensureScratchCapacity(&validator.flate_buffer, flate_buffer_len);
+    const peak = validator.scratch_peak_bytes;
+    validator.binary_array = .{
+        .byte_offset = 0,
+        .depth = 2,
+        .owner_spectrum_index = null,
+        .default_array_length = null,
+        .default_array_length_invalid = false,
+        .skipped = true,
+    };
+
+    try validator.handleEnd(.{
+        .byte_offset = 0,
+        .name = .{ .local_name = "binaryDataArray", .namespace_uri = mzml_namespace },
+        .element_id = .binaryDataArray,
+    }, 2);
+
+    try std.testing.expect(validator.binary_array == null);
+    try std.testing.expectEqual(@as(usize, 0), validator.compressed_payload.capacity);
+    try std.testing.expectEqual(@as(usize, 0), validator.libdeflate_output.capacity);
+    try std.testing.expectEqual(flate_buffer_len, validator.flate_buffer.capacity);
+    try std.testing.expectEqual(flate_buffer_len, validator.scratch_current_bytes);
+    try std.testing.expectEqual(
+        (max_retained_binary_buffer_bytes + 1) * 2 + flate_buffer_len,
+        peak,
+    );
 }
 
 test "binary scratch limit applies to selected capacity class" {

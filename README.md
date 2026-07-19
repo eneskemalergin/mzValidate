@@ -129,7 +129,7 @@ Rule IDs are the stable machine contract. Human-readable `message` text is separ
 
 `CheckOptions` contains values except for `obo_path`. `InvocationContext.init` borrows that optional path only while it builds the catalog, then owns the parsed catalog until `deinit`. The allocator and `std.Io` handle must remain valid for the context lifetime. `input_mode` is the only library mode selector; the `-mmap` compatibility spelling exists only in CLI parsing and sets `input_mode` to `mmap`. Path validation refuses that mode with an incomplete `runtime.input-mode` result and never falls back to stream input.
 
-`InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array, but each retained diagnostic string still borrows its original storage and must be rendered or cleared before that storage expires. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
+`InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array, but each retained diagnostic string still borrows its original storage and must be rendered or cleared before that storage expires. `DiagnosticSink.append` counts every item and returns `true` only when it retained that item's detail. A sink configured with `retain_details = false` returns `false` without incrementing its dropped-detail totals. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
 
 `FileResult` is a self-contained value. It does not reference parser buffers, mapped bytes, file-local validation state, the semantic catalog, or diagnostic storage. Its `FirstFailure` owns bounded copies of the rule, message, and path; the accessor slices borrow the `FirstFailure` value itself. The fixed capacities are 64 bytes for a rule ID, 512 bytes for a message, and `std.Io.Dir.max_path_bytes` for a path. An overlong value is copied as a prefix ending in `...`, and `FirstFailure.metadataTruncated()` reports that condition.
 
@@ -275,9 +275,10 @@ Four renderers consume the same bounded result state. Text mode is for interacti
 
 ### Memory model
 
-- Parser scratch space is fixed-size and lives on the call stack
-- Text token buffer is 1 MiB, reused across all events
-- Binary scratch buffers are cleared between arrays without reallocating
+- Parser structural scratch arrays are fixed-size and live on the call stack
+- The parser token buffer is an eager 1 MiB heap allocation per active file, reused across all events and reported in `ResourceUsage`
+- Compressed and libdeflate output buffers reuse capacities through 1 MiB; larger one-off capacities are freed after their binary array. The fixed 128 KiB flate workspace is reused.
+- Binary scratch telemetry covers allocator-owned compressed, flate, and libdeflate output capacities. It excludes the opaque external libdeflate decompressor allocation because the library ABI does not report its size.
 - No per-spectrum accumulation: state is discarded after each element's end event
 - Semantic ID table grows with spectrum count
 - Input files use bounded stream input; the mmap selector is retained only to return an explicit, non-fallback safety refusal

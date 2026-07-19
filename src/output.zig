@@ -791,6 +791,42 @@ test "text result reports explicit input mode" {
     );
 }
 
+test "[unit]: text result emits emergency failure" {
+    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "stream");
+
+    try std.testing.expectEqualStrings(
+        "input: sample.mzML\n" ++
+            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n" ++
+            "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: per-file text renderer emits emergency failure" {
+    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "sample.mzML");
+
+    try std.testing.expectEqualStrings(
+        "input: sample.mzML\n" ++
+            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
+        allocating_writer.written(),
+    );
+}
+
 test "brief result reports explicit input mode" {
     var result = diagnostic.FileResult.init(0);
     result.finalize(&.{});
@@ -975,6 +1011,26 @@ test "brief result emits emergency failure" {
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "runtime.incomplete") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "stage=parser reason=allocation") != null);
+}
+
+test "[unit]: pre-grouped brief renderer emits emergency failure" {
+    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
+    result.finalize(&.{});
+    var groups: BriefGroups = .{};
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderBriefGroupsResult(&allocating_writer.writer, &groups, &.{result}, "stream");
+
+    try std.testing.expectEqualStrings(
+        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n" ++
+            "input: sample.mzML\n" ++
+            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
+        allocating_writer.written(),
+    );
 }
 
 test "bounded output reports dropped severity totals" {

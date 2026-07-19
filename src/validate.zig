@@ -527,6 +527,9 @@ fn runValidation(
     stream_size: ?u64,
 ) !void {
     result.beginStage(.parser);
+    // Parser token slices borrow caller-owned storage until the next event.
+    // Allocate the fixed bound once per file so every event reuses it without
+    // event-level allocation or parser API complexity.
     const token_buffer = try context.allocator.alloc(u8, max_validation_token_bytes);
     defer {
         result.resource_usage.parser_current_bytes = token_buffer.len;
@@ -937,6 +940,64 @@ test "slice result owns failure metadata after borrowed inputs expire" {
     try std.testing.expectEqualStrings(RuleId.mzml_structure_xml, failure.rule());
     try std.testing.expectEqualStrings("borrowed.mzML", failure.path().?);
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expect(result.needsEmergencyDiagnostic());
+    try std.testing.expect(!result.failure_diagnostic_emitted);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(diagnostic.Totals{ .errors = 1 }, diagnostics.totals);
+    try std.testing.expectEqual(diagnostic.Totals{}, diagnostics.dropped);
+}
+
+test "[unit]: legacy slice wrapper reports intentionally non-retained failure detail" {
+    var diagnostics = DiagnosticSink.init(.{ .retain_details = false });
+    defer diagnostics.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.ValidationIncomplete, checkSlice(
+        std.testing.allocator,
+        std.testing.io,
+        "<mzML",
+        &diagnostics,
+        "non-retaining-slice.mzML",
+        .{ .skip_binary = true, .skip_index = true, .skip_semantic = true },
+        null,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(diagnostic.Totals{ .errors = 1 }, diagnostics.totals);
+}
+
+test "[unit]: legacy reader wrapper reports intentionally non-retained failure detail" {
+    var diagnostics = DiagnosticSink.init(.{ .retain_details = false });
+    defer diagnostics.deinit(std.testing.allocator);
+    var reader = std.Io.Reader.fixed("<mzML");
+
+    try std.testing.expectError(error.ValidationIncomplete, checkReader(
+        std.testing.allocator,
+        std.testing.io,
+        &reader,
+        &diagnostics,
+        "non-retaining-reader.mzML",
+        .{ .skip_binary = true, .skip_index = true, .skip_semantic = true },
+        null,
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(diagnostic.Totals{ .errors = 1 }, diagnostics.totals);
+}
+
+test "[unit]: legacy path wrapper reports intentionally non-retained failure detail" {
+    var diagnostics = DiagnosticSink.init(.{ .retain_details = false });
+    defer diagnostics.deinit(std.testing.allocator);
+
+    try std.testing.expectError(error.ValidationIncomplete, checkPath(
+        std.testing.allocator,
+        std.testing.io,
+        &diagnostics,
+        "fixtures/mzml/does-not-exist-aud15.mzML",
+        .{ .skip_binary = true, .skip_index = true, .skip_semantic = true },
+    ));
+
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(diagnostic.Totals{ .errors = 1 }, diagnostics.totals);
 }
 
 test "path check: refuses mmap without falling back to stream" {
