@@ -217,8 +217,8 @@ pub const Parser = struct {
         return parser.last_byte_offset;
     }
 
-    fn textField(parser: *const Parser, from_cdata: bool) LimitField {
-        if (!from_cdata and parser.element_count > 0 and parser.topElementFrame().element_id == .binary) {
+    fn textField(parser: *const Parser) LimitField {
+        if (parser.element_count > 0 and parser.topElementFrame().element_id == .binary) {
             return .binary_text;
         }
         return .scalar_text;
@@ -263,7 +263,7 @@ pub const Parser = struct {
     }
 
     fn parseText(parser: *Parser, byte_offset: u64, first_byte: u8, from_cdata: bool) ParseError!?Event {
-        const field = parser.textField(from_cdata);
+        const field = parser.textField();
         parser.literal_validator.reset();
         parser.plain_text_brackets = 0;
         if (parser.lookahead == null and parser.input == .slice and first_byte != '&') {
@@ -344,7 +344,7 @@ pub const Parser = struct {
 
     fn continueText(parser: *Parser) ParseError!?Event {
         if (parser.text_state.?.from_cdata) return @as(?Event, try parser.continueCdata());
-        const field = parser.textField(false);
+        const field = parser.textField();
 
         while (true) {
             const state = &parser.text_state.?;
@@ -378,7 +378,7 @@ pub const Parser = struct {
     }
 
     fn continueCdata(parser: *Parser) ParseError!Event {
-        const field = LimitField.scalar_text;
+        const field = parser.textField();
         while (true) {
             const state = &parser.text_state.?;
             const byte = try parser.peekOptionalByte() orelse return error.UnexpectedEof;
@@ -440,7 +440,7 @@ pub const Parser = struct {
         const state = parser.text_state orelse return error.MalformedXml;
         const value = parser.currentToken();
         try finishLiteral(&parser.literal_validator);
-        const field = if (state.from_cdata) LimitField.scalar_text else parser.textField(false);
+        const field = parser.textField();
         const total = std.math.add(usize, parser.text_bytes, value.len) catch return errorForField(field);
         if (total > parser.limitForField(field)) return errorForField(field);
         if (is_final) {
@@ -734,21 +734,23 @@ pub const Parser = struct {
     }
 
     fn parseCdata(parser: *Parser, byte_offset: u64) ParseError!Event {
+        const field = parser.textField();
         if (parser.lookahead == null and parser.input == .slice) {
             const slice = &parser.input.slice;
             const start = slice.pos;
             const tail = slice.bytes[start..];
             const content_len = scan.cdataContentLen(tail) orelse return error.UnexpectedEof;
             const value = slice.bytes[start..][0..content_len];
+            const limit = parser.limitForField(field);
             const literal_failure = characters.firstLiteralFailure(value, parser.xml_version);
             if (literal_failure) |failure| {
-                if (content_len <= parser.limits.max_scalar_text_bytes or failure.index <= parser.limits.max_scalar_text_bytes) {
+                if (content_len <= limit or failure.index <= limit) {
                     return parser.sliceLiteralError(failure, 0);
                 }
             }
-            if (content_len > parser.limits.max_scalar_text_bytes) {
-                parser.consumeSliceBytes(parser.limits.max_scalar_text_bytes + 1);
-                return error.ScalarTextTooLong;
+            if (content_len > limit) {
+                parser.consumeSliceBytes(limit + 1);
+                return errorForField(field);
             }
             const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
             parser.consumeSliceBytes(consumed_len);
@@ -759,7 +761,7 @@ pub const Parser = struct {
             } };
         }
 
-        if (parser.token_buffer.len <= 4) return error.ScalarTextTooLong;
+        if (parser.token_buffer.len <= 4) return errorForField(field);
         parser.text_state = .{
             .byte_offset = byte_offset,
             .from_cdata = true,
@@ -1615,6 +1617,23 @@ const InlineSliceParserHarness = struct {
         });
     }
 };
+
+const binary_cdata_prefix = "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><binary><![CDATA[";
+const binary_cdata_suffix = "]]></binary></mzML>";
+
+fn binaryCdataXml(comptime payload: []const u8) []const u8 {
+    return binary_cdata_prefix ++ payload ++ binary_cdata_suffix;
+}
+
+fn allocBinaryCdataXml(allocator: std.mem.Allocator, payload_len: usize) ![]u8 {
+    const content_end = try std.math.add(usize, binary_cdata_prefix.len, payload_len);
+    const total_len = try std.math.add(usize, content_end, binary_cdata_suffix.len);
+    const xml = try allocator.alloc(u8, total_len);
+    @memcpy(xml[0..binary_cdata_prefix.len], binary_cdata_prefix);
+    @memset(xml[binary_cdata_prefix.len..content_end], 'A');
+    @memcpy(xml[content_end..], binary_cdata_suffix);
+    return xml;
+}
 
 fn expectFixtureParses(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8) !void {
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
@@ -2725,6 +2744,137 @@ test "parser enforces limits by field" {
     var eager_attribute: InlineParserHarness = undefined;
     eager_attribute.initWithLimits("<cvParam unitName=\"abcde\"/>", .{ .max_attribute_bytes = 12 });
     try std.testing.expectError(error.AttributeTooLong, eager_attribute.parser.next());
+}
+
+test "[unit]: binary CDATA uses binary text boundaries for reader and slice input" {
+    const limits = Limits{
+        .max_scalar_text_bytes = 4,
+        .max_binary_text_bytes = 12,
+    };
+    const cases = [_]struct {
+        payload: []const u8,
+        expected_error: ?ParseError,
+    }{
+        .{ .payload = "123", .expected_error = null },
+        .{ .payload = "1234", .expected_error = null },
+        .{ .payload = "12345", .expected_error = null },
+        .{ .payload = "12345678901", .expected_error = null },
+        .{ .payload = "123456789012", .expected_error = null },
+        .{ .payload = "1234567890123", .expected_error = error.BinaryTextTooLong },
+    };
+
+    inline for (cases) |case| {
+        const xml = binaryCdataXml(case.payload);
+        var reader: InlineParserHarness = undefined;
+        reader.initWithLimits(xml, limits);
+        _ = (try reader.parser.next()).?.start_element;
+        _ = (try reader.parser.next()).?.start_element;
+
+        var slice: InlineSliceParserHarness = undefined;
+        slice.initWithLimits(xml, limits);
+        _ = (try slice.parser.next()).?.start_element;
+        _ = (try slice.parser.next()).?.start_element;
+
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, reader.parser.next());
+            try std.testing.expectError(expected, slice.parser.next());
+        } else {
+            const reader_text = (try reader.parser.next()).?.text;
+            const slice_text = (try slice.parser.next()).?.text;
+            try std.testing.expectEqualStrings(case.payload, reader_text.value);
+            try std.testing.expectEqualStrings(case.payload, slice_text.value);
+            try std.testing.expect(reader_text.from_cdata);
+            try std.testing.expect(slice_text.from_cdata);
+        }
+    }
+}
+
+test "[unit]: scalar CDATA remains bounded by the scalar text limit" {
+    const limits = Limits{ .max_scalar_text_bytes = 4 };
+    const cases = [_]struct {
+        xml: []const u8,
+        expected_error: ?ParseError,
+    }{
+        .{ .xml = "<root><![CDATA[123]]></root>", .expected_error = null },
+        .{ .xml = "<root><![CDATA[1234]]></root>", .expected_error = null },
+        .{ .xml = "<root><![CDATA[12345]]></root>", .expected_error = error.ScalarTextTooLong },
+    };
+
+    inline for (cases) |case| {
+        var reader: InlineParserHarness = undefined;
+        reader.initWithLimits(case.xml, limits);
+        _ = (try reader.parser.next()).?.start_element;
+
+        var slice: InlineSliceParserHarness = undefined;
+        slice.initWithLimits(case.xml, limits);
+        _ = (try slice.parser.next()).?.start_element;
+
+        if (case.expected_error) |expected| {
+            try std.testing.expectError(expected, reader.parser.next());
+            try std.testing.expectError(expected, slice.parser.next());
+        } else {
+            try std.testing.expect((try reader.parser.next()).?.text.from_cdata);
+            try std.testing.expect((try slice.parser.next()).?.text.from_cdata);
+        }
+    }
+}
+
+test "[unit]: reader binary CDATA above the scalar limit stays scratch-bounded" {
+    const allocator = std.testing.allocator;
+    const payload_len = (Limits{}).max_scalar_text_bytes + 4;
+    const xml = try allocBinaryCdataXml(allocator, payload_len);
+    defer allocator.free(xml);
+
+    var reader = std.Io.Reader.fixed(xml);
+    var token_buffer: [64]u8 = undefined;
+    var attributes: [4]Attribute = undefined;
+    var namespace_bindings: [4]NamespaceBinding = undefined;
+    var namespace_bytes: [128]u8 = undefined;
+    var element_stack: [4]ElementFrame = undefined;
+    var element_bytes: [128]u8 = undefined;
+    var parser = Parser.init(&reader, .{
+        .token = &token_buffer,
+        .attributes = &attributes,
+        .namespace_bindings = &namespace_bindings,
+        .namespace_bytes = &namespace_bytes,
+        .element_stack = &element_stack,
+        .element_bytes = &element_bytes,
+    });
+    _ = (try parser.next()).?.start_element;
+    _ = (try parser.next()).?.start_element;
+
+    var total: usize = 0;
+    var chunks: usize = 0;
+    while (true) {
+        const text = (try parser.next()).?.text;
+        try std.testing.expect(text.from_cdata);
+        try std.testing.expect(text.value.len <= token_buffer.len - 4);
+        total += text.value.len;
+        chunks += 1;
+        if (text.is_final) break;
+    }
+
+    try std.testing.expectEqual(payload_len, total);
+    try std.testing.expect(chunks > 1);
+}
+
+test "[unit]: slice binary CDATA above the scalar limit remains zero-copy" {
+    const allocator = std.testing.allocator;
+    const payload_len = (Limits{}).max_scalar_text_bytes + 4;
+    const xml = try allocBinaryCdataXml(allocator, payload_len);
+    defer allocator.free(xml);
+
+    var parser: InlineSliceParserHarness = undefined;
+    parser.init(xml);
+    _ = (try parser.parser.next()).?.start_element;
+    _ = (try parser.parser.next()).?.start_element;
+
+    const text = (try parser.parser.next()).?.text;
+
+    try std.testing.expectEqual(payload_len, text.value.len);
+    try std.testing.expectEqual(@intFromPtr(xml.ptr + binary_cdata_prefix.len), @intFromPtr(text.value.ptr));
+    try std.testing.expect(text.from_cdata);
+    try std.testing.expect(text.is_final);
 }
 
 test "parser keeps slice and reader parity across refill boundaries" {

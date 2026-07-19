@@ -1687,6 +1687,22 @@ test "[unit]: binary validator excludes XML whitespace from encodedLength" {
     }
 }
 
+test "[unit]: binary validator accepts mixed ordinary and CDATA Base64 text" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = [_][]const u8{
+        minimalSpectrumMzmlWithEncodedLength("AA<![CDATA[CA]]>Pw==", 1, "MS:1000576", 8),
+        minimalSpectrumMzmlWithEncodedLength("eJxz<![CDATA[dIQA]]>AAksAgk=", 2, "MS:1000574", 16),
+    };
+
+    for (fixtures) |fixture| {
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
 test "[unit]: binary validator preserves final Base64 checks across reader chunks" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
