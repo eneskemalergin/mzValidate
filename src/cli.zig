@@ -1,6 +1,7 @@
 //! CLI parsing, validation dispatch, and output selection.
 //!
-//! Regular-file validation defaults to bounded stream input; mmap is explicit.
+//! Regular-file validation uses bounded stream input. The explicit mmap selector is
+//! retained for compatibility and returns an incomplete result without fallback.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -325,7 +326,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
             "  -input-mode stream|mmap\n" ++
-            "               Use bounded stream input (default) or explicit read-only mmap.\n" ++
+            "               Use bounded stream input (default). mmap is refused safely.\n" ++
             "  -mmap        Compatibility alias for -input-mode mmap.\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
@@ -807,6 +808,7 @@ test "help writes usage to stdout" {
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-input-mode stream|mmap") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "mmap is refused safely") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
@@ -848,7 +850,7 @@ test "check help writes usage to stdout" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "summary reports the requested input mode" {
+test "summary reports explicit mmap refusal" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -870,9 +872,10 @@ test "summary reports the requested input mode" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "complete: clean (info=0 warnings=0 errors=0)\n" ++
+        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "failure: stage=input reason=input rule=runtime.input-mode input=fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML\n" ++
             "config: input=mmap behavior=explicit\n",
         stdout_writer.written(),
     );
@@ -1073,7 +1076,7 @@ test "json contract: multi-file result matches golden" {
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-multi-file.json");
 }
 
-test "json contract: explicit mmap mode is recorded" {
+test "json contract: explicit mmap refusal is recorded" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -1093,8 +1096,11 @@ test "json contract: explicit mmap mode is recorded" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"input_mode\": \"mmap\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"completion\": \"incomplete\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"rule\": \"runtime.input-mode\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"reason\": \"input\"") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 

@@ -156,12 +156,28 @@ pub fn build(b: *std.Build) void {
     cli_json_cmd.expectStdOutMatch("\"completion\": \"incomplete\"");
     cli_json_cmd.expectStdOutMatch("\"reason\": \"resource\"");
 
+    const cli_mmap_refusal_cmd = b.addRunArtifact(exe);
+    cli_mmap_refusal_cmd.step.dependOn(b.getInstallStep());
+    cli_mmap_refusal_cmd.addArg("check");
+    cli_mmap_refusal_cmd.addArg("fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
+    cli_mmap_refusal_cmd.addArg("-skip-binary");
+    cli_mmap_refusal_cmd.addArg("-skip-index");
+    cli_mmap_refusal_cmd.addArg("-skip-semantic");
+    cli_mmap_refusal_cmd.addArg("-input-mode");
+    cli_mmap_refusal_cmd.addArg("mmap");
+    cli_mmap_refusal_cmd.addArg("-summary");
+    cli_mmap_refusal_cmd.expectExitCode(2);
+    cli_mmap_refusal_cmd.expectStdOutMatch("incomplete: errors");
+    cli_mmap_refusal_cmd.expectStdOutMatch("failure: stage=input reason=input rule=runtime.input-mode");
+    cli_mmap_refusal_cmd.expectStdOutMatch("config: input=mmap behavior=explicit");
+
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
     cli_contract_step.dependOn(&cli_invalid_cmd.step);
     cli_contract_step.dependOn(&cli_schema_finding_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);
     cli_contract_step.dependOn(&cli_json_cmd.step);
+    cli_contract_step.dependOn(&cli_mmap_refusal_cmd.step);
 
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);

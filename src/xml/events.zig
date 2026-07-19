@@ -2,7 +2,7 @@
 //!
 //! Slice fields reference parser input or caller scratch and remain valid only
 //! until the next `Parser.next()` call. Reader text may span multiple events;
-//! mmap text may point directly into mapped bytes.
+//! slice text may point directly into caller-provided bytes.
 
 const std = @import("std");
 const elements = @import("../mzml/elements.zig");

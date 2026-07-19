@@ -23,7 +23,7 @@ Validates mzML files in a single forward validation pass. Structural conformance
 
 - No JVM, no Python, no .NET, no libxml2
 - Streaming XML parser in one primary forward pass
-- Regular files use bounded stream input by default. Explicit mmap is available for stable files when speed matters and the host has enough memory for file-backed pages.
+- Regular files use bounded stream input. The explicit mmap selector is retained for compatibility but is refused before validation because another process can truncate a mapped file and terminate the validator.
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
 - Zlib arrays validated through bounded compressed and decompressed workspaces
 - Uses CPU vector instructions for faster base64 scanning
@@ -127,7 +127,7 @@ Rule IDs are the stable machine contract. Human-readable `message` text is separ
 
 ### Library ownership contract
 
-`CheckOptions` contains values except for `obo_path`. `InvocationContext.init` borrows that optional path only while it builds the catalog, then owns the parsed catalog until `deinit`. The allocator and `std.Io` handle must remain valid for the context lifetime. `input_mode` is the only library mode selector; the `-mmap` compatibility spelling exists only in CLI parsing and sets `input_mode` to `mmap`.
+`CheckOptions` contains values except for `obo_path`. `InvocationContext.init` borrows that optional path only while it builds the catalog, then owns the parsed catalog until `deinit`. The allocator and `std.Io` handle must remain valid for the context lifetime. `input_mode` is the only library mode selector; the `-mmap` compatibility spelling exists only in CLI parsing and sets `input_mode` to `mmap`. Path validation refuses that mode with an incomplete `runtime.input-mode` result and never falls back to stream input.
 
 `InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array, but each retained diagnostic string still borrows its original storage and must be rendered or cleared before that storage expires. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
 
@@ -143,7 +143,7 @@ Validation phases (each flag disables one phase). By default all phases run:
 
 I/O and limits:
 
-- `-input-mode stream|mmap`: select the bounded reader or explicit read-only mmap path. Stream is the default; `-mmap` remains a compatibility alias for `-input-mode mmap`. An mmap failure is reported as non-clean and never becomes a whole-file heap fallback.
+- `-input-mode stream|mmap`: select bounded stream input or request the retained mmap compatibility mode. Stream is the supported default. `mmap` is refused before a mapping is created and returns an incomplete `runtime.input-mode` result. `-mmap` remains a compatibility alias and never falls back to stream input.
 - `-max-binary-size N`: reject any binary array larger than N; accepts K, M, G, T suffixes (1024-based)
 - `-obo <path>`: override the embedded psi-ms.obo with a custom file; useful for testing against bleeding-edge CV terms
 
@@ -153,14 +153,14 @@ Informational:
 
 ## Performance
 
-ReleaseFast, one Linux host, warm file cache, July 2026. This table is a historical development comparison, not the current profile gate. Explicit mmap is nearly twice as fast on the large validation workloads, but its file-backed pages make peak RSS much higher. Current stream references and gate policy are recorded in `plan/BENCHMARKS.md`.
+ReleaseFast, one Linux host, warm file cache, July 2026. This table is a historical development comparison from before path-based mmap was refused, not a current selectable-mode comparison or profile gate. Mmap was nearly twice as fast on the large validation workloads, but its file-backed pages made peak RSS much higher.
 
 | File                   |    Size | Stream full / RSS  | Mmap full / RSS       | Mmap speedup |
 | ---------------------- | ------: | -----------------: | --------------------: | -----------: |
 | Fusion (indexed, zlib) | 642 MiB | 9.00 s / 24.9 MiB  | 5.38 s / 666.1 MiB    |    1.7x      |
 | Astral (plain, zlib)   | 2.1 GiB | 22.96 s / 15.4 MiB | 10.89 s / 2,153.6 MiB |    2.1x      |
 
-The speed and memory tradeoff is workload- and cache-dependent. Stream keeps validator-owned input storage bounded and is the safer default for large files or concurrent jobs. Mmap is the explicit single-file performance mode; total RSS includes resident file-backed pages and is not the same as anonymous validator state.
+The historical speed and memory tradeoff was workload- and cache-dependent. Stream keeps validator-owned input storage bounded and is now the only supported path mode. The mmap figures include resident file-backed pages and are not the same as anonymous validator state.
 
 Historical one-shot Fusion stage breakdown (separate runs on the same file; not directly comparable with the repeated profiles above):
 
@@ -172,19 +172,17 @@ Historical one-shot Fusion stage breakdown (separate runs on the same file; not 
 | + Semantic (CV + refs)    |     1.8 s |
 | **Full** (all stages)     | **4.1 s** |
 
-On Fusion, most of the mmap RSS is the mapped input rather than validator-owned heap. On Astral, mmap RSS approaches the 2.1 GiB file size while stream stays near its bounded input working set. These are single-process observations, not safe parallelism limits.
+In those historical measurements, most of the Fusion mmap RSS was the mapped input rather than validator-owned heap. On Astral, mmap RSS approached the 2.1 GiB file size while stream stayed near its bounded input working set. These are historical single-process observations, not safe parallelism limits.
 
 ### Memory
 
-The default path reads through a bounded `std.Io.Reader`. The parser walks the same event model for stream and mmap sources. Explicit mmap creates a read-only, lazily populated mapping, performs a final stability check, and reports a mode failure if mapping is unavailable.
+Path validation reads through a bounded `std.Io.Reader` and performs file identity checks before validation plus a final stability check. Explicit mmap is refused before mapping because a read-only mapping can still terminate the process if another process truncates the backing file. A final stat cannot protect an earlier mapped-page access.
 
-One 2 GiB file is fine if the machine has the RAM. Many large files in parallel is a different story. Each process can hold most of its input resident, and Linux does not always reclaim those pages quickly under load. Do not multiply single-file wall time by core count and assume a cohort will finish in that time.
-
-> Choose explicit mmap when single-file throughput matters more than file-backed RSS. Choose the default stream path when memory predictability or concurrent processing matters more.
+Large files and parallel validation still require capacity planning for semantic state, index maps, binary workspaces, diagnostics, and the bounded stream working set. Do not multiply single-file wall time by core count and assume a cohort will finish in that time.
 
 ## Current limitations
 
-The stream path targets a bounded validator working set, but semantic state, index maps, binary workspaces, and retained diagnostic details still have independent limits and can terminate validation as incomplete when those limits are reached. Mmap can be faster, but input pages can dominate total RSS. File stability, checksum behavior, and owner-specific resource limits remain part of the validation contract.
+The stream path targets a bounded validator working set, but semantic state, index maps, binary workspaces, and retained diagnostic details still have independent limits and can terminate validation as incomplete when those limits are reached. Path-based mmap is currently refused due to concurrent truncation safety. File stability, checksum behavior, and owner-specific resource limits remain part of the validation contract.
 
 ## Format support
 
@@ -200,7 +198,7 @@ Each format validated against its published specification. No XSD embedded or re
 
 ## Validation
 
-Every file is checked in one primary forward pass over parser events. Indexed stream checksum verification may add a bounded positional pass. The default regular-file source is bounded stream input; explicit mmap uses the same parser and validators over a read-only slice. Both paths produce the same diagnostic contract where the source provides the required integrity information.
+Every file is checked in one primary forward pass over parser events. Indexed stream checksum verification may add a bounded positional pass. The regular-file source is bounded stream input. A caller that requests mmap receives a documented incomplete mode refusal before parsing.
 
 ### Structural
 
@@ -212,7 +210,7 @@ Each `binaryDataArray` is checked for base64 validity, zlib decompression, lengt
 
 ### Index and checksum
 
-For indexed mzML files, validation checks every index offset against the recorded byte position, recomputes SHA-1, and detects truncation. Stream file validation uses the file size and a bounded positional pass for the checksum; mmap hashes contiguous mapped bytes. A non-seekable caller-provided reader must provide the required source information or receive an incomplete result rather than silently skipping required integrity work.
+For indexed mzML files, validation checks every index offset against the recorded byte position, recomputes SHA-1, and detects truncation. Stream file validation uses the file size and a bounded positional pass for the checksum. A non-seekable caller-provided reader must provide the required source information or receive an incomplete result rather than silently skipping required integrity work.
 
 ### Semantic
 
@@ -264,7 +262,7 @@ Category header rows align with the Validation sections above.
 
 ### Streaming XML parser
 
-Hand-rolled in Zig. No external XML libraries. Reads from a stream or a memory-mapped byte slice and emits events into caller-provided storage. Comments and processing instructions are skipped. CDATA surfaces as text. Built-in entities and numeric character references are decoded. Namespace-aware with proper prefix cleanup on scope exit.
+Hand-rolled in Zig. No external XML libraries. Reads from a stream or a caller-provided byte slice and emits events into caller-provided storage. Comments and processing instructions are skipped. CDATA surfaces as text. Built-in entities and numeric character references are decoded. Namespace-aware with proper prefix cleanup on scope exit.
 
 ### Validation engine
 
@@ -281,7 +279,7 @@ Four renderers consume the same bounded result state. Text mode is for interacti
 - Binary scratch buffers are cleared between arrays without reallocating
 - No per-spectrum accumulation: state is discarded after each element's end event
 - Semantic ID table grows with spectrum count
-- Input file uses bounded stream input by default; explicit mmap is retained for measured single-file speed
+- Input files use bounded stream input; the mmap selector is retained only to return an explicit, non-fallback safety refusal
 
 ## Build steps
 
@@ -295,7 +293,7 @@ Four renderers consume the same bounded result state. Text mode is for interacti
 
 ## Roadmap
 
-- Continue reducing the stream/mmap performance gap while preserving stream memory bounds
+- Reintroduce mmap only behind process isolation or an immutable snapshot contract
 - Conformance score for CI integration (`mzValidate score`)
 - Quick summary statistics (`mzValidate stats`)
 - Auto-repair common mzML issues (`mzValidate check --fix`)

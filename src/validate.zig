@@ -3,9 +3,11 @@
 //! Coordinates slice, reader, and regular-file validation.
 //!
 //! Parser and validators share one primary event pass. Regular files use bounded stream
-//! input by default; explicit mmap keeps the same parser and validation flow.
+//! input. The explicit mmap selector is refused because mutable mappings are not safe to
+//! access in process after concurrent file truncation.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
 const elements = @import("mzml/elements.zig");
@@ -30,7 +32,8 @@ const stream_input_buffer_bytes = 64 * 1024;
 
 // --- Public entry points ---
 
-/// Requested input source mode. Mmap requires a stable regular file.
+/// Requested input source mode. Mmap is retained as an explicit, non-fallback selector,
+/// but path validation refuses it before mapping mutable file storage.
 pub const InputMode = enum {
     stream,
     mmap,
@@ -346,60 +349,15 @@ fn checkPathInternal(
     }
 
     switch (context.options.input_mode) {
-        .mmap => try checkPathMapped(context, file, opened_stat, diagnostics, path, result, std.Io.File.MemoryMap.create),
-        .stream => try checkPathStream(context, file, opened_stat, diagnostics, path, result),
-    }
-}
-
-fn checkPathMapped(
-    context: *InvocationContext,
-    file: std.Io.File,
-    initial_stat: std.Io.File.Stat,
-    diagnostics: *DiagnosticSink,
-    path: []const u8,
-    result: *FileResult,
-    comptime map_create: anytype,
-) !void {
-    const len = std.math.cast(usize, initial_stat.size) orelse {
-        try appendFailureDiagnostic(
-            context.allocator,
+        .mmap => try appendModeFailureDiagnostic(
+            context,
             diagnostics,
             result,
-            .input,
-            .resource,
-            .{
-                .severity = .@"error",
-                .rule = RuleId.runtime_file_open,
-                .path = path,
-                .message = "input file is too large for this platform",
-            },
-        );
-        return;
-    };
-
-    var mm = map_create(context.io, file, .{
-        .len = len,
-        .protection = .{ .read = true },
-        .populate = false,
-    }) catch {
-        try appendModeFailureDiagnostic(context, diagnostics, result, path, "requested mmap input mode is unavailable");
-        return;
-    };
-    if (mm.section == null) {
-        mm.destroy(context.io);
-        try appendModeFailureDiagnostic(context, diagnostics, result, path, "requested mmap input mode is unavailable");
-        return;
+            path,
+            "requested mmap input mode is refused because mutable file mappings cannot be validated safely in process",
+        ),
+        .stream => try checkPathStream(context, file, opened_stat, diagnostics, path, result),
     }
-
-    var map_destroyed = false;
-    defer if (!map_destroyed) mm.destroy(context.io);
-
-    const index_bytes = if (context.options.skip_index) null else mm.memory;
-    result.completeStage(.input);
-    try runValidation(context, diagnostics, path, index_bytes, .{ .slice = mm.memory }, result, null, null);
-    mm.destroy(context.io);
-    map_destroyed = true;
-    try checkFileStability(context, file, initial_stat, diagnostics, path, result);
 }
 
 fn checkPathStream(
@@ -981,46 +939,26 @@ test "slice result owns failure metadata after borrowed inputs expire" {
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
 }
 
-test "path check: reports mmap failure without fallback" {
+test "path check: refuses mmap without falling back to stream" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    var temp_dir = std.testing.tmpDir(.{});
-    defer temp_dir.cleanup();
-    try temp_dir.dir.writeFile(io, .{ .sub_path = "mmap-failure.mzML", .data = "<mzML/>" });
-    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "mmap-failure.mzML");
-    defer allocator.free(path);
+    const path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML";
 
-    var context = InvocationContext.init(allocator, io, .{
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    const result = checkPathResult(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_index = true,
         .skip_semantic = true,
         .input_mode = .mmap,
     });
-    defer context.deinit();
-
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
-    defer file.close(io);
-    const initial_stat = try file.stat(io);
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-    var result = FileResult.init(enabledStages(context.options));
-    result.beginStage(.input);
-
-    try checkPathMapped(
-        &context,
-        file,
-        initial_stat,
-        &diagnostics,
-        path,
-        &result,
-        forcedMemoryMapFailure,
-    );
-    result.finalize(diagnostics.items);
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(@as(u16, 0), result.completed_stages);
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.runtime_input_mode, diagnostics.items[0].rule);
+    try std.testing.expectEqual(FailureReason.input, result.first_failure.?.reason);
 }
 
 test "path check: rejects a changed file" {
@@ -1051,51 +989,47 @@ test "path check: rejects a changed file" {
     try std.testing.expectEqualStrings(RuleId.runtime_file_stability, diagnostics.items[0].rule);
 }
 
-test "mmap validation: detects truncation after mapping" {
-    const allocator = std.testing.allocator;
+test "mmap host behavior: multi-page truncation faults only the child process" {
+    if (builtin.os.tag != .linux) return error.SkipZigTest;
+
     const io = std.testing.io;
-    const xml = "<?xml version=\"1.0\"?><mzML xmlns=\"http://psi.hupo.org/ms/mzml\"/>";
+    const linux = std.os.linux;
+    const page_size = std.heap.pageSize();
+    const mapped_len = page_size * 3;
 
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();
-    try temp_dir.dir.writeFile(io, .{ .sub_path = "mapped-truncated.mzML", .data = xml });
-    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "mapped-truncated.mzML");
-    defer allocator.free(path);
-
-    var context = InvocationContext.init(allocator, io, .{
-        .skip_binary = true,
-        .skip_index = true,
-        .skip_semantic = true,
-    });
-    defer context.deinit();
-    var file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    var file = try temp_dir.dir.createFile(io, "mapped-truncated.mzML", .{ .read = true });
     defer file.close(io);
-    const initial_stat = try file.stat(io);
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-    var result = FileResult.init(enabledStages(context.options));
-    result.beginStage(.input);
+    try file.setLength(io, mapped_len);
 
-    try checkPathMapped(
-        &context,
-        file,
-        initial_stat,
-        &diagnostics,
-        path,
-        &result,
-        mapThenTruncate,
-    );
-    result.finalize(diagnostics.items);
+    var mm = try std.Io.File.MemoryMap.create(io, file, .{
+        .len = mapped_len,
+        .protection = .{ .read = true },
+        .populate = false,
+    });
+    defer mm.destroy(io);
 
-    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
-    var found_stability_failure = false;
-    for (diagnostics.items) |item| {
-        if (std.mem.eql(u8, item.rule, RuleId.runtime_file_stability)) {
-            found_stability_failure = true;
-            break;
-        }
+    const fork_result = linux.fork();
+    if (linux.errno(fork_result) != .SUCCESS) return error.ForkFailed;
+    if (fork_result == 0) {
+        if (linux.errno(linux.ftruncate(file.handle, 1)) != .SUCCESS) linux.exit(120);
+        const default_bus_action: linux.Sigaction = .{
+            .handler = .{ .handler = null },
+            .mask = std.mem.zeroes(linux.sigset_t),
+            .flags = 0,
+        };
+        if (linux.errno(linux.sigaction(.BUS, &default_bus_action, null)) != .SUCCESS) linux.exit(121);
+        const beyond_eof: *const volatile u8 = @ptrCast(&mm.memory[page_size * 2]);
+        _ = beyond_eof.*;
+        linux.exit(0);
     }
-    try std.testing.expect(found_stability_failure);
+
+    var status: u32 = 0;
+    const wait_result = linux.waitpid(@intCast(fork_result), &status, 0);
+    if (linux.errno(wait_result) != .SUCCESS) return error.WaitFailed;
+    try std.testing.expect(linux.W.IFSIGNALED(status));
+    try std.testing.expectEqual(linux.SIG.BUS, linux.W.TERMSIG(status));
 }
 
 test "path check: validates structure when binary checks are skipped" {
@@ -1371,55 +1305,6 @@ test "path check: validates a stream SHA-1 checksum" {
     try std.testing.expect(result.resource_usage.index_peak_bytes > 0);
 }
 
-test "path check: validates an mmap SHA-1 checksum" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    const prefix =
-        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
-        "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
-        "  <mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">\n" ++
-        "    <cvList count=\"1\"><cv id=\"MS\" fullName=\"PSI-MS\" URI=\"\"/></cvList>\n" ++
-        "    <fileDescription><fileContent/></fileDescription>\n" ++
-        "    <softwareList count=\"1\"><software id=\"sw\" version=\"1.0\"/></softwareList>\n" ++
-        "    <instrumentConfigurationList count=\"1\"><instrumentConfiguration id=\"ic\"/></instrumentConfigurationList>\n" ++
-        "    <dataProcessingList count=\"1\"><dataProcessing id=\"dp\"><processingMethod order=\"0\" softwareRef=\"sw\"/></dataProcessing></dataProcessingList>\n" ++
-        "    <run id=\"r\" defaultInstrumentConfigurationRef=\"ic\">\n" ++
-        "      <spectrumList count=\"0\" defaultDataProcessingRef=\"dp\"/>\n" ++
-        "    </run>\n" ++
-        "  </mzML>\n" ++
-        "  <indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">0</offset></index></indexList>\n" ++
-        "  <indexListOffset>10</indexListOffset>\n";
-    var sha_ctx = std.crypto.hash.Sha1.init(.{});
-    sha_ctx.update(prefix);
-    sha_ctx.update("  <fileChecksum>");
-    var raw: [20]u8 = undefined;
-    sha_ctx.final(&raw);
-    const hex = std.fmt.bytesToHex(raw, .lower);
-    const xml = try indexedMzmlWithSha(allocator, &hex);
-    defer allocator.free(xml);
-
-    var temp_dir = std.testing.tmpDir(.{});
-    defer temp_dir.cleanup();
-    try temp_dir.dir.writeFile(io, .{ .sub_path = "valid-sha-mmap.mzML", .data = xml });
-    const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "valid-sha-mmap.mzML");
-    defer allocator.free(path);
-
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-    try checkPath(allocator, io, &diagnostics, path, .{
-        .skip_binary = true,
-        .skip_semantic = true,
-        .input_mode = .mmap,
-    });
-
-    for (diagnostics.items) |d| {
-        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
-            return error.TestUnexpectedChecksumError;
-        }
-    }
-}
-
 test "path check: accepts a complete checksum start tag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1455,19 +1340,16 @@ test "path check: accepts a complete checksum start tag" {
     const path = try tempFixturePath(allocator, temp_dir.sub_path[0..], "complete-start-tag-sha.mzML");
     defer allocator.free(path);
 
-    for ([_]InputMode{ .mmap, .stream }) |input_mode| {
-        var diagnostics: DiagnosticSink = .empty;
-        defer diagnostics.deinit(allocator);
-        try checkPath(allocator, io, &diagnostics, path, .{
-            .skip_binary = true,
-            .skip_semantic = true,
-            .input_mode = input_mode,
-        });
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    try checkPath(allocator, io, &diagnostics, path, .{
+        .skip_binary = true,
+        .skip_semantic = true,
+    });
 
-        for (diagnostics.items) |d| {
-            if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
-                return error.TestUnexpectedChecksumError;
-            }
+    for (diagnostics.items) |d| {
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
+            return error.TestUnexpectedChecksumError;
         }
     }
 }
@@ -2380,30 +2262,6 @@ test "path check: reports chromatogram binary errors without a spectrum index" {
         "binary payload is not valid base64",
     );
     try std.testing.expectEqual(@as(?usize, null), diagnostics.items[0].location.spectrum_index);
-}
-
-fn forcedMemoryMapFailure(
-    io: std.Io,
-    file: std.Io.File,
-    options: std.Io.File.MemoryMap.CreateOptions,
-) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
-    _ = io;
-    _ = file;
-    _ = options;
-    return error.AccessDenied;
-}
-
-fn mapThenTruncate(
-    io: std.Io,
-    file: std.Io.File,
-    options: std.Io.File.MemoryMap.CreateOptions,
-) std.Io.File.MemoryMap.CreateError!std.Io.File.MemoryMap {
-    var mm = try std.Io.File.MemoryMap.create(io, file, options);
-    file.setLength(io, 1) catch {
-        mm.destroy(io);
-        return error.AccessDenied;
-    };
-    return mm;
 }
 
 test "reader check: repeated clean runs do not accumulate state" {

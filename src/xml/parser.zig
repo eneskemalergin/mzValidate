@@ -76,7 +76,7 @@ pub const Limits = struct {
     max_binary_text_bytes: usize = 256 * 1024 * 1024,
 };
 
-/// Reader-backed or mmap slice input for `Parser`.
+/// Reader-backed or contiguous slice input for `Parser`.
 pub const Input = union(enum) {
     reader: *std.Io.Reader,
     slice: SliceInput,
@@ -139,8 +139,8 @@ pub const Parser = struct {
         };
     }
 
-    /// Like `init`, but reads directly from a contiguous byte slice with no
-    /// `std.Io.Reader` per-byte overhead. Used for mmap'd mzML files.
+    /// Like `init`, but reads directly from a caller-provided contiguous byte slice
+    /// with no `std.Io.Reader` per-byte overhead.
     pub fn initSlice(bytes: []const u8, buffers: Buffers) Parser {
         return .{
             .input = .{ .slice = .{ .bytes = bytes, .pos = 0 } },

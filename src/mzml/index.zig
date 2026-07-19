@@ -90,8 +90,8 @@ pub const IndexValidator = struct {
         return validator.file_checksum_raw;
     }
 
-    /// Start incremental SHA-1 over mmap bytes. Call once before the parse loop
-    /// when `file_bytes` is available (checkPath / checkSlice).
+    /// Start incremental SHA-1 over contiguous input bytes. Call once before the
+    /// parse loop when `file_bytes` is available.
     pub fn beginOnlineSha(validator: *IndexValidator, bytes: []const u8) void {
         validator.sha_file_bytes = bytes;
         validator.input_size = bytes.len;
