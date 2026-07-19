@@ -1405,8 +1405,8 @@ pub const StructuralValidator = struct {
             .id, .id_ref => isNcName(value),
             .non_negative_integer => parseNonNegativeInteger(value) != null,
             .int => parseSchemaInt(value) != null,
-            .date_time => isDateTime(value),
-            .double => isDouble(value),
+            .date_time => isSchemaDateTime(value),
+            .double => isSchemaDouble(value),
             .spectrum_id => isSpectrumId(value),
         };
         if (valid) return;
@@ -1766,7 +1766,7 @@ fn isSpectrumIdToken(token: []const u8) bool {
     return equals > 0 and equals + 1 < token.len;
 }
 
-fn isDouble(value: []const u8) bool {
+pub fn isSchemaDouble(value: []const u8) bool {
     const token = trimSchemaWhitespace(value);
     if (std.mem.eql(u8, token, "INF") or
         std.mem.eql(u8, token, "-INF") or
@@ -1792,7 +1792,7 @@ fn isDouble(value: []const u8) bool {
     return index == token.len;
 }
 
-fn isDateTime(value: []const u8) bool {
+pub fn isSchemaDateTime(value: []const u8) bool {
     const token = trimSchemaWhitespace(value);
     var index: usize = 0;
     if (index < token.len and token[index] == '-') index += 1;
@@ -3194,23 +3194,23 @@ test "[unit]: structural ID reference and spectrum lexical forms are exact" {
 }
 
 test "[unit]: structural date and floating attribute lexical forms are exact" {
-    try std.testing.expect(isDouble("0"));
-    try std.testing.expect(isDouble("-.5E+2"));
-    try std.testing.expect(isDouble("INF"));
-    try std.testing.expect(isDouble("-INF"));
-    try std.testing.expect(isDouble("NaN"));
-    try std.testing.expect(!isDouble("+INF"));
-    try std.testing.expect(!isDouble("."));
-    try std.testing.expect(!isDouble("1e"));
+    try std.testing.expect(isSchemaDouble("0"));
+    try std.testing.expect(isSchemaDouble("-.5E+2"));
+    try std.testing.expect(isSchemaDouble("INF"));
+    try std.testing.expect(isSchemaDouble("-INF"));
+    try std.testing.expect(isSchemaDouble("NaN"));
+    try std.testing.expect(!isSchemaDouble("+INF"));
+    try std.testing.expect(!isSchemaDouble("."));
+    try std.testing.expect(!isSchemaDouble("1e"));
 
-    try std.testing.expect(isDateTime("2000-02-29T24:00:00Z"));
-    try std.testing.expect(isDateTime("2026-07-18T12:34:56.125-07:00"));
-    try std.testing.expect(isDateTime("-0001-01-01T00:00:00+14:00"));
-    try std.testing.expect(!isDateTime("0000-01-01T00:00:00Z"));
-    try std.testing.expect(!isDateTime("02026-01-01T00:00:00Z"));
-    try std.testing.expect(!isDateTime("2023-02-29T00:00:00Z"));
-    try std.testing.expect(!isDateTime("2026-01-01T24:00:00.1Z"));
-    try std.testing.expect(!isDateTime("2026-01-01T00:00:00+14:01"));
+    try std.testing.expect(isSchemaDateTime("2000-02-29T24:00:00Z"));
+    try std.testing.expect(isSchemaDateTime("2026-07-18T12:34:56.125-07:00"));
+    try std.testing.expect(isSchemaDateTime("-0001-01-01T00:00:00+14:00"));
+    try std.testing.expect(!isSchemaDateTime("0000-01-01T00:00:00Z"));
+    try std.testing.expect(!isSchemaDateTime("02026-01-01T00:00:00Z"));
+    try std.testing.expect(!isSchemaDateTime("2023-02-29T00:00:00Z"));
+    try std.testing.expect(!isSchemaDateTime("2026-01-01T24:00:00.1Z"));
+    try std.testing.expect(!isSchemaDateTime("2026-01-01T00:00:00+14:01"));
 }
 
 test "[unit]: structural validator accepts only XML Schema boolean nil values" {

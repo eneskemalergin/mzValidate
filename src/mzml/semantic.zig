@@ -12,6 +12,7 @@ const rule_engine = @import("../obo/rule_engine.zig");
 const xml_events = @import("../xml/events.zig");
 const xml_scan = @import("../xml/scan.zig");
 const elements = @import("elements.zig");
+const structural = @import("structural.zig");
 
 const Attribute = xml_events.Attribute;
 const CvTable = obo.CvTable;
@@ -586,18 +587,20 @@ pub const SemanticValidator = struct {
         var ua: ?[]const u8 = null;
         var ucr: ?[]const u8 = null;
         var un: ?[]const u8 = null;
+        var pn: ?[]const u8 = null;
+        var pv: ?[]const u8 = null;
         if (tag == .cvParam or tag == .userParam) {
             if (start.attributes.len > 0) {
                 for (start.attributes) |attribute| {
                     if (attribute.is_namespace_declaration or attribute.name.prefix != null or attribute.name.namespace_uri != null) continue;
-                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.name.local_name, attribute.value);
+                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, &pn, &pv, attribute.name.local_name, attribute.value);
                 }
             } else if (start.raw_tag.len > 0) {
                 var raw_scanner = xml_scan.RawAttributeScanner.init(start.raw_tag);
                 while (try raw_scanner.next()) |attribute| {
                     if (attribute.is_namespace_declaration) continue;
                     if (!std.mem.eql(u8, attribute.name, attribute.local_name)) continue;
-                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, attribute.local_name, attribute.value);
+                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, &pn, &pv, attribute.local_name, attribute.value);
                 }
             }
         }
@@ -739,16 +742,50 @@ pub const SemanticValidator = struct {
             }
         }
 
-        if (tag == .cvParam and (cvr == null or cvr.?.len == 0)) return;
+        if (tag == .cvParam) {
+            if (pn) |name| {
+                if (trimSchemaWhitespace(name).len == 0) {
+                    _ = try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_cv_name,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "CV term name must not be empty",
+                    });
+                }
+            }
+            if (cvr == null or cvr.?.len == 0) return;
+        }
 
         const accession = pa orelse return;
+        const accession_prefix = extractAccessionPrefix(accession) orelse {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.mzml_cv_accession,
+                .location = .{ .byte_offset = start.byte_offset },
+                .path = validator.path,
+                .message = "CV accession must have a non-empty prefix and local identifier",
+            });
+            return;
+        };
 
         const cv_ref = if (cvr) |ref|
             ref
-        else if (tag == .userParam) blk: {
-            const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return;
-            break :blk accession[0..colon];
-        } else return;
+        else if (tag == .userParam)
+            accession_prefix
+        else
+            return;
+
+        if (!std.mem.eql(u8, accession_prefix, cv_ref)) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.mzml_cv_namespace,
+                .location = .{ .byte_offset = start.byte_offset },
+                .path = validator.path,
+                .message = "cvRef does not match accession prefix",
+            });
+            return;
+        }
 
         const cv_declared = if (validator.ref_table.declarations.get(cv_ref)) |declaration|
             declaration.element_id == .cv
@@ -780,17 +817,29 @@ pub const SemanticValidator = struct {
                     else
                         "CV term is obsolete and has no replacement term",
                 });
-                return;
             }
             if (!std.mem.eql(u8, t.namespace, cv_ref)) {
-                if (!isKnownExternalPrefix(cv_ref)) {
-                    _ = try validator.diagnostics.append(validator.allocator, .{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_cv_namespace,
-                        .location = .{ .byte_offset = start.byte_offset },
-                        .path = validator.path,
-                        .message = "cvRef does not match term namespace",
-                    });
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_cv_namespace,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "cvRef does not match term namespace",
+                });
+            }
+            if (pv) |value| {
+                if (t.xsd_type) |xsd_type| {
+                    if (validateXsdValue(xsd_type, value)) |valid| {
+                        if (!valid) {
+                            _ = try validator.diagnostics.append(validator.allocator, .{
+                                .severity = .@"error",
+                                .rule = RuleId.mzml_cv_value,
+                                .location = .{ .byte_offset = start.byte_offset },
+                                .path = validator.path,
+                                .message = "CV value does not match the term's declared datatype",
+                            });
+                        }
+                    }
                 }
             }
             if (ua) |unit_acc| {
@@ -814,7 +863,7 @@ pub const SemanticValidator = struct {
                 }
             }
         } else {
-            if (!isKnownExternalPrefix(extractAccessionPrefix(accession))) {
+            if (!isKnownExternalPrefix(accession_prefix)) {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_accession,
@@ -1226,6 +1275,8 @@ fn setParamAttribute(
     unit_accession: *?[]const u8,
     unit_cv_ref: *?[]const u8,
     unit_name: *?[]const u8,
+    param_name: *?[]const u8,
+    param_value: *?[]const u8,
     name: []const u8,
     value: []const u8,
 ) void {
@@ -1239,7 +1290,152 @@ fn setParamAttribute(
         unit_cv_ref.* = trimSchemaWhitespace(value);
     } else if (std.mem.eql(u8, name, "unitName") and unit_name.* == null) {
         unit_name.* = value;
+    } else if (std.mem.eql(u8, name, "name") and param_name.* == null) {
+        param_name.* = value;
+    } else if (std.mem.eql(u8, name, "value") and param_value.* == null) {
+        param_value.* = value;
     }
+}
+
+fn validateXsdValue(xsd_type: []const u8, value: []const u8) ?bool {
+    if (std.mem.eql(u8, xsd_type, "xsd:string")) return true;
+    if (std.mem.eql(u8, xsd_type, "xsd:anyURI")) return isSchemaAnyUri(value);
+    if (std.mem.eql(u8, xsd_type, "xsd:boolean")) return isSchemaBoolean(value);
+    if (std.mem.eql(u8, xsd_type, "xsd:int")) return isSchemaInt(value);
+    if (std.mem.eql(u8, xsd_type, "xsd:integer")) return parseSchemaInteger(value) != null;
+    if (std.mem.eql(u8, xsd_type, "xsd:nonNegativeInteger")) {
+        const integer = parseSchemaInteger(value) orelse return false;
+        return !integer.negative or !integer.nonzero;
+    }
+    if (std.mem.eql(u8, xsd_type, "xsd:positiveInteger")) {
+        const integer = parseSchemaInteger(value) orelse return false;
+        return !integer.negative and integer.nonzero;
+    }
+    if (std.mem.eql(u8, xsd_type, "xsd:decimal")) return isSchemaDecimal(value);
+    if (std.mem.eql(u8, xsd_type, "xsd:float") or std.mem.eql(u8, xsd_type, "xsd:double")) {
+        return structural.isSchemaDouble(value);
+    }
+    if (std.mem.eql(u8, xsd_type, "xsd:dateTime")) return structural.isSchemaDateTime(value);
+    return null;
+}
+
+fn isSchemaAnyUri(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return true;
+
+    var index: usize = 0;
+    var fragment_seen = false;
+    while (index < token.len) {
+        if (token[index] == '#') {
+            if (fragment_seen) return false;
+            fragment_seen = true;
+        } else if (token[index] == '%') {
+            if (token.len - index < 3 or !std.ascii.isHex(token[index + 1]) or !std.ascii.isHex(token[index + 2])) return false;
+            index += 2;
+        }
+        index += 1;
+    }
+
+    var scheme_end: ?usize = null;
+    for (token, 0..) |byte, offset| {
+        if (byte == ':') {
+            scheme_end = offset;
+            break;
+        }
+        if (byte == '/' or byte == '?' or byte == '#') break;
+    }
+    const reference = if (scheme_end) |colon| blk: {
+        if (!isUriScheme(token[0..colon])) return false;
+        break :blk token[colon + 1 ..];
+    } else token;
+
+    if (!std.mem.startsWith(u8, reference, "//")) {
+        return std.mem.indexOfAny(u8, reference, "[]") == null;
+    }
+
+    const authority_end = std.mem.indexOfAny(u8, reference[2..], "/?#") orelse reference.len - 2;
+    const authority = reference[2..][0..authority_end];
+    if (std.mem.indexOfAny(u8, reference[2 + authority_end ..], "[]") != null) return false;
+    const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+    if (host_start > 0 and std.mem.indexOfScalar(u8, authority[0 .. host_start - 1], '@') != null) return false;
+    const host_port = authority[host_start..];
+    if (std.mem.startsWith(u8, host_port, "[")) {
+        const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return false;
+        if (std.mem.indexOfAny(u8, host_port[1..close], "[]") != null) return false;
+        if (close + 1 == host_port.len) return true;
+        if (host_port[close + 1] != ':') return false;
+        return isUriPort(host_port[close + 2 ..]);
+    }
+    if (std.mem.indexOfAny(u8, host_port, "[]") != null) return false;
+    if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, host_port[0..colon], ':') != null) return false;
+        return isUriPort(host_port[colon + 1 ..]);
+    }
+    return true;
+}
+
+fn isUriScheme(value: []const u8) bool {
+    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
+    for (value[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return false;
+    }
+    return true;
+}
+
+fn isUriPort(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
+}
+
+fn isSchemaBoolean(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    return std.mem.eql(u8, token, "true") or
+        std.mem.eql(u8, token, "false") or
+        std.mem.eql(u8, token, "1") or
+        std.mem.eql(u8, token, "0");
+}
+
+fn isSchemaInt(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return false;
+    _ = std.fmt.parseInt(i32, token, 10) catch return false;
+    return true;
+}
+
+const SchemaInteger = struct {
+    negative: bool,
+    nonzero: bool,
+};
+
+fn parseSchemaInteger(value: []const u8) ?SchemaInteger {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return null;
+    var index: usize = 0;
+    const negative = token[0] == '-';
+    if (negative or token[0] == '+') index = 1;
+    if (index == token.len) return null;
+    var nonzero = false;
+    for (token[index..]) |byte| {
+        if (!std.ascii.isDigit(byte)) return null;
+        nonzero = nonzero or byte != '0';
+    }
+    return .{ .negative = negative, .nonzero = nonzero };
+}
+
+fn isSchemaDecimal(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return false;
+    var index: usize = 0;
+    if (token[index] == '+' or token[index] == '-') index += 1;
+    var integer_digits: usize = 0;
+    while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) integer_digits += 1;
+    var fraction_digits: usize = 0;
+    if (index < token.len and token[index] == '.') {
+        index += 1;
+        while (index < token.len and std.ascii.isDigit(token[index])) : (index += 1) fraction_digits += 1;
+    }
+    return index == token.len and (integer_digits != 0 or fraction_digits != 0);
 }
 
 // Recognised external CV prefixes not defined in psi-ms.obo.
@@ -1258,8 +1454,9 @@ fn isKnownExternalPrefix(prefix: []const u8) bool {
     return false;
 }
 
-fn extractAccessionPrefix(accession: []const u8) []const u8 {
-    const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return accession;
+fn extractAccessionPrefix(accession: []const u8) ?[]const u8 {
+    const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return null;
+    if (colon == 0 or colon + 1 == accession.len) return null;
     return accession[0..colon];
 }
 
@@ -1324,6 +1521,27 @@ fn consumeCvParam(validator: *SemanticValidator, accession: []const u8, cv_ref: 
     const attributes = [_]Attribute{
         .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
         .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
+    };
+    try validator.consumeStart(.{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
+        .attributes = &attributes,
+        .self_closing = false,
+    });
+}
+
+fn consumeCvParamValue(
+    validator: *SemanticValidator,
+    accession: []const u8,
+    cv_ref: []const u8,
+    value: []const u8,
+    byte_offset: u64,
+) !void {
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
+        .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
+        .{ .byte_offset = 0, .name = .{ .local_name = "value" }, .value = value },
     };
     try validator.consumeStart(.{
         .byte_offset = byte_offset,
@@ -1683,6 +1901,122 @@ test "SemanticValidator: mismatched cvRef/namespace produces error" {
     try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
 }
 
+test "[unit]: CV external exemptions do not hide accession prefix mismatches" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParam(&sv, "MS:1000001", "GO", 10);
+    try consumeCvParam(&sv, "GO:9999999", "MS", 20);
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    for (diagnostics.items) |item| {
+        try expectEqualStrings(RuleId.mzml_cv_namespace, item.rule);
+        try expectEqualStrings("cvRef does not match accession prefix", item.message);
+    }
+}
+
+test "[unit]: matching external CV prefixes remain accepted" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try consumeCvParam(&sv, "BTO:0000001", "BTO", 10);
+    try consumeCvParam(&sv, "GO:0000001", "GO", 20);
+    try consumeCvParam(&sv, "PATO:0000001", "PATO", 30);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: external CV prefix does not hide a known term namespace mismatch" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: GO:0000001\n" ++ "name: inconsistent term\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try consumeCvParam(&sv, "GO:0000001", "GO", 10);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
+    try expectEqualStrings("cvRef does not match term namespace", diagnostics.items[0].message);
+}
+
+test "[unit]: malformed CV accession identity is rejected" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParam(&sv, "MS:", "MS", 10);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_accession, diagnostics.items[0].rule);
+}
+
+test "[unit]: empty required CV term name is rejected" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = "MS:1000001" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = "MS" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = " \t " },
+    };
+
+    try sv.consumeStart(.{
+        .byte_offset = 10,
+        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
+        .attributes = &attributes,
+        .self_closing = false,
+    });
+    var raw_start = test_events.startUnknown("cvParam", &.{}, 20);
+    raw_start.raw_tag = " accession=\"MS:1000001\" cvRef=\"MS\" name=\" \"";
+    try sv.consumeStart(raw_start);
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    for (diagnostics.items) |item| {
+        try expectEqualStrings(RuleId.mzml_cv_name, item.rule);
+        try expectEqualStrings("CV term name must not be empty", item.message);
+    }
+}
+
 test "SemanticValidator: cvRef not in cvList produces error" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
@@ -1834,6 +2168,147 @@ test "SemanticValidator: multiple diagnostics on one cvParam" {
     defer sv.deinit();
     try consumeCvParam(&sv, "MS:9999999", "NONEXISTENT", 100);
     try expectEqual(@as(usize, 1), diagnostics.items.len);
+}
+
+test "[unit]: CV string URI and boolean datatype lexical forms are enforced" {
+    try expectEqual(@as(?bool, true), validateXsdValue("xsd:string", ""));
+    for ([_][]const u8{ "", "relative path", "//", "scheme://", "a/b:c", "urn:example:test", "https://example.org/a%20b", "http://[invalid]", "http://host:99999/path" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:anyURI", value));
+    }
+    for ([_][]const u8{ "%", "%2", "%GG", "::", "1:relative", "a#b#c", "a[b", "http://[", "http://::1", "http://host:", "http://host:abc" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:anyURI", value));
+    }
+    for ([_][]const u8{ "true", "false", "1", "0", "\ttrue\n" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:boolean", value));
+    }
+    for ([_][]const u8{ "", "TRUE", "yes", "2" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:boolean", value));
+    }
+    try expectEqual(@as(?bool, null), validateXsdValue("xsd:unsupported", "anything"));
+}
+
+test "[unit]: CV bounded and arbitrary integer datatype boundaries are enforced" {
+    for ([_][]const u8{ "-2147483648", "2147483647", "+0" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:int", value));
+    }
+    for ([_][]const u8{ "", "-2147483649", "2147483648", "1.0", "+" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:int", value));
+    }
+
+    const beyond_machine_integer = "999999999999999999999999999999999999999999999999999999999999";
+    try expectEqual(@as(?bool, true), validateXsdValue("xsd:integer", beyond_machine_integer));
+    try expectEqual(@as(?bool, true), validateXsdValue("xsd:nonNegativeInteger", "-0"));
+    try expectEqual(@as(?bool, true), validateXsdValue("xsd:nonNegativeInteger", beyond_machine_integer));
+    try expectEqual(@as(?bool, false), validateXsdValue("xsd:nonNegativeInteger", "-1"));
+    try expectEqual(@as(?bool, true), validateXsdValue("xsd:positiveInteger", "+1"));
+    for ([_][]const u8{ "0", "-0", "-1", "1.0" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:positiveInteger", value));
+    }
+}
+
+test "[unit]: CV decimal float and double datatype boundaries are enforced" {
+    for ([_][]const u8{ "0", ".5", "1.", "+1.25", "999999999999999999999999999999.0" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:decimal", value));
+    }
+    for ([_][]const u8{ "", ".", "1e2", "NaN", "+" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:decimal", value));
+    }
+
+    for ([_][]const u8{ "0", "-.5E+2", "3.4028234e38", "3.5e38", "INF", "-INF", "NaN" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:float", value));
+    }
+    for ([_][]const u8{ "", ".", "1e", "+INF", "nan" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:float", value));
+    }
+
+    for ([_][]const u8{ "0", "1.7976931348623157e308", "1.8e308", "INF", "-INF", "NaN" }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:double", value));
+    }
+    for ([_][]const u8{ "", "1e", "+INF", "nan" }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:double", value));
+    }
+}
+
+test "[unit]: CV dateTime datatype boundaries are enforced" {
+    for ([_][]const u8{
+        "2000-02-29T24:00:00Z",
+        "2026-07-18T12:34:56.125-07:00",
+        "-0001-01-01T00:00:00+14:00",
+    }) |value| {
+        try expectEqual(@as(?bool, true), validateXsdValue("xsd:dateTime", value));
+    }
+    for ([_][]const u8{
+        "",
+        "0000-01-01T00:00:00Z",
+        "2023-02-29T00:00:00Z",
+        "2026-01-01T24:00:00.1Z",
+        "2026-01-01T00:00:00+14:01",
+    }) |value| {
+        try expectEqual(@as(?bool, false), validateXsdValue("xsd:dateTime", value));
+    }
+}
+
+test "[unit]: present invalid typed CV values emit stable diagnostics without semantic growth" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: integer term\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_value_type xsd:int\n" ++
+        "\n[Term]\n" ++
+        "id: MS:1000002\n" ++
+        "name: unsupported term\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_value_type xsd:unsupported\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    const semantic_bytes = sv.resourceUsage().semantic_current_bytes;
+
+    try consumeCvParam(&sv, "MS:1000001", "MS", 10);
+    try consumeCvParamValue(&sv, "MS:1000002", "MS", "not checked", 20);
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "2147483648", 30);
+    var raw_start = test_events.startUnknown("cvParam", &.{}, 40);
+    raw_start.raw_tag = " accession=\"MS:1000001\" cvRef=\"MS\" value=\"not-an-int\"";
+    try sv.consumeStart(raw_start);
+
+    try expectEqual(semantic_bytes, sv.resourceUsage().semantic_current_bytes);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    for (diagnostics.items) |item| {
+        try expectEqualStrings(RuleId.mzml_cv_value, item.rule);
+        try expectEqualStrings("CV value does not match the term's declared datatype", item.message);
+    }
+}
+
+test "[unit]: obsolete typed CV term still validates its present value" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: obsolete integer term\n" ++
+        "namespace: MS\n" ++
+        "is_obsolete: true\n" ++
+        "relationship: has_value_type xsd:int\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "not-an-int", 10);
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_obsolete, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_cv_value, diagnostics.items[1].rule);
 }
 
 test "SemanticValidator: no contradiction with single term" {

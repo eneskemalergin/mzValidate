@@ -248,7 +248,9 @@ Category header rows align with the Validation sections above.
 | `mzml.cv.accession`              | error    | Unrecognized CV accession                                                  |
 | `mzml.cv.obsolete`               | warning  | CV term is obsolete                                                        |
 | `mzml.cv.namespace`              | error    | `cvRef` does not match term namespace                                      |
+| `mzml.cv.name`                   | error    | Required CV term name is empty                                             |
 | `mzml.cv.unit`                   | error    | Unrecognized unit accession (info: unitName does not match canonical name) |
+| `mzml.cv.value`                  | error    | Present value does not match the CV term's declared datatype               |
 | `mzml.cv.required`               | error    | Missing required CV term                                                   |
 | `mzml.cv.recommended`            | warning  | Missing recommended CV term                                                |
 | `mzml.cv.contradiction`          | warning  | Mutually exclusive CV terms on same element                                |

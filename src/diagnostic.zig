@@ -52,8 +52,12 @@ pub const RuleId = struct {
     pub const mzml_cv_obsolete = "mzml.cv.obsolete";
     /// cvRef does not match the term's declared namespace.
     pub const mzml_cv_namespace = "mzml.cv.namespace";
+    /// A required CV term name is empty.
+    pub const mzml_cv_name = "mzml.cv.name";
     /// Unit term accession is not recognised.
     pub const mzml_cv_unit = "mzml.cv.unit";
+    /// A present CV value does not match the term's declared datatype.
+    pub const mzml_cv_value = "mzml.cv.value";
     /// A required CV term is missing from an element.
     pub const mzml_cv_required = "mzml.cv.required";
     /// A recommended CV term is missing from an element.
