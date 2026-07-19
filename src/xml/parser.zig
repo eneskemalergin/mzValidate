@@ -532,7 +532,7 @@ pub const Parser = struct {
                         namespace_count_before,
                         namespace_bytes_before,
                         info.self_closing,
-                        if (info.self_closing) @intCast(raw_end) else null,
+                        if (info.self_closing) @intCast(raw_end - 1) else null,
                     );
                     if (info.self_closing) parser.pending_self_closing_end = true;
                     event.start_element.raw_tag = raw_tag;
@@ -739,26 +739,27 @@ pub const Parser = struct {
             const slice = &parser.input.slice;
             const start = slice.pos;
             const tail = slice.bytes[start..];
-            const content_len = scan.cdataContentLen(tail) orelse return error.UnexpectedEof;
-            const value = slice.bytes[start..][0..content_len];
-            const limit = parser.limitForField(field);
-            const literal_failure = characters.firstLiteralFailure(value, parser.xml_version);
-            if (literal_failure) |failure| {
-                if (content_len <= limit or failure.index <= limit) {
-                    return parser.sliceLiteralError(failure, 0);
+            if (scan.cdataContentLen(tail)) |content_len| {
+                const value = slice.bytes[start..][0..content_len];
+                const limit = parser.limitForField(field);
+                const literal_failure = characters.firstLiteralFailure(value, parser.xml_version);
+                if (literal_failure) |failure| {
+                    if (content_len <= limit or failure.index <= limit) {
+                        return parser.sliceLiteralError(failure, 0);
+                    }
                 }
+                if (content_len > limit) {
+                    parser.consumeSliceBytes(limit + 1);
+                    return errorForField(field);
+                }
+                const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
+                parser.consumeSliceBytes(consumed_len);
+                return .{ .text = .{
+                    .byte_offset = byte_offset,
+                    .value = value,
+                    .from_cdata = true,
+                } };
             }
-            if (content_len > limit) {
-                parser.consumeSliceBytes(limit + 1);
-                return errorForField(field);
-            }
-            const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
-            parser.consumeSliceBytes(consumed_len);
-            return .{ .text = .{
-                .byte_offset = byte_offset,
-                .value = value,
-                .from_cdata = true,
-            } };
         }
 
         if (parser.token_buffer.len <= 4) return errorForField(field);
@@ -779,12 +780,13 @@ pub const Parser = struct {
         if (parser.lookahead == null and parser.input == .slice) {
             const slice = &parser.input.slice;
             const tail = slice.bytes[slice.pos..];
-            const end = scan.piEndLen(tail) orelse return error.UnexpectedEof;
-            if (end > parser.token_buffer.len) return error.TokenTooLong;
-            try parser.handleProcessingInstruction(tail[0..end], content_offset);
-            const consumed_len = std.math.add(usize, end, 2) catch return error.UnexpectedEof;
-            parser.consumeSliceBytes(consumed_len);
-            return;
+            if (scan.piEndLen(tail)) |end| {
+                if (end > parser.token_buffer.len) return error.TokenTooLong;
+                try parser.handleProcessingInstruction(tail[0..end], content_offset);
+                const consumed_len = std.math.add(usize, end, 2) catch return error.UnexpectedEof;
+                parser.consumeSliceBytes(consumed_len);
+                return;
+            }
         }
         while (true) {
             const byte = try parser.takeRequiredByte();
@@ -831,11 +833,12 @@ pub const Parser = struct {
         if (parser.lookahead == null and parser.input == .slice) {
             const slice = &parser.input.slice;
             const tail = slice.bytes[slice.pos..];
-            const end = scan.commentEndLen(tail) orelse return error.UnexpectedEof;
-            try parser.validateSliceLiteral(tail[0..end], 0);
-            const consumed_len = std.math.add(usize, end, 3) catch return error.UnexpectedEof;
-            parser.consumeSliceBytes(consumed_len);
-            return;
+            if (scan.commentEndLen(tail)) |end| {
+                try parser.validateSliceLiteral(tail[0..end], 0);
+                const consumed_len = std.math.add(usize, end, 3) catch return error.UnexpectedEof;
+                parser.consumeSliceBytes(consumed_len);
+                return;
+            }
         }
         var literal_validator: characters.LiteralValidator = .{};
         while (true) {
@@ -1935,6 +1938,45 @@ test "parser rejects illegal literals in PI comments and CDATA" {
     }
 }
 
+test "parser reports unterminated PI comment and CDATA failures consistently" {
+    const cases = [_]struct {
+        xml: []const u8,
+        expected: ParseError,
+    }{
+        .{ .xml = "<?broken", .expected = error.UnexpectedEof },
+        .{ .xml = "<root><!--broken", .expected = error.UnexpectedEof },
+        .{ .xml = "<root><![CDATA[broken", .expected = error.UnexpectedEof },
+        .{ .xml = "<root><!--\x01", .expected = error.InvalidXmlCharacter },
+        .{ .xml = "<root><![CDATA[\x01", .expected = error.InvalidXmlCharacter },
+    };
+
+    for (cases) |case| {
+        var reader_harness: InlineParserHarness = undefined;
+        reader_harness.init(case.xml);
+        const reader_error = firstParserError(&reader_harness.parser);
+
+        var slice_harness: InlineSliceParserHarness = undefined;
+        slice_harness.init(case.xml);
+        const slice_error = firstParserError(&slice_harness.parser);
+
+        try std.testing.expectEqual(@as(?ParseError, case.expected), reader_error);
+        try std.testing.expectEqual(reader_error, slice_error);
+        try std.testing.expectEqual(reader_harness.parser.byteOffset(), slice_harness.parser.byteOffset());
+        try std.testing.expectEqual(@as(u64, case.xml.len - 1), slice_harness.parser.byteOffset());
+    }
+
+    const limited_cdata = "<root><![CDATA[abcde";
+    const limits: Limits = .{ .max_scalar_text_bytes = 4 };
+    var limited_reader: InlineParserHarness = undefined;
+    limited_reader.initWithLimits(limited_cdata, limits);
+    var limited_slice: InlineSliceParserHarness = undefined;
+    limited_slice.initWithLimits(limited_cdata, limits);
+
+    try std.testing.expectEqual(@as(?ParseError, error.ScalarTextTooLong), firstParserError(&limited_reader.parser));
+    try std.testing.expectEqual(@as(?ParseError, error.ScalarTextTooLong), firstParserError(&limited_slice.parser));
+    try std.testing.expectEqual(limited_reader.parser.byteOffset(), limited_slice.parser.byteOffset());
+}
+
 test "parser uses only XML whitespace in markup" {
     const xml = "<root\x0Battr=\"value\"/>";
 
@@ -2119,6 +2161,11 @@ test "slice lazy attributes match eager values around quoted delimiters" {
     try std.testing.expectEqualStrings("MS:1000130", slice_start.attr("accession").?);
     try std.testing.expectEqualStrings("text > still", slice_start.attr("unitName").?);
     try std.testing.expectEqualStrings("text > still", reader_start.attr("unitName").?);
+
+    const slice_end = (try slice_harness.parser.next()).?.end_element;
+    const reader_end = (try reader_harness.parser.next()).?.end_element;
+    try std.testing.expectEqual(@as(u64, xml.len - 2), slice_end.byte_offset);
+    try std.testing.expectEqual(reader_end.byte_offset, slice_end.byte_offset);
 }
 
 test "slice lazy attributes use eager decoding for entities and namespaces" {

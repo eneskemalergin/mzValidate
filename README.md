@@ -76,6 +76,27 @@ rm zig-x86_64-linux-0.16.0.tar.xz
 ./zig-0.16.0/zig version
 ```
 
+## Supported targets
+
+mzValidate requires targets with 64-bit pointers. The build rejects 32-bit targets during configuration, before compiling Zig or vendored C sources.
+
+The verified Debug build matrix is:
+
+- `x86_64-linux`: native build and runtime tests
+- `x86_64-windows`: cross-build only
+- `aarch64-linux`: cross-build only
+
+Vendored libdeflate is enabled by default on every listed target and links that target's C runtime. `-Denable-libdeflate=false` is also supported on every listed target and removes the vendored C sources and C runtime link. Other 64-bit Zig targets may build, but they are not part of the verified matrix. Routine development runs native Debug tests only; run the cross-build smoke checks when target, pointer-width, or vendor integration changes.
+
+Focused cross-build smoke commands:
+
+```sh
+./zig-0.16.0/zig build -Dtarget=x86_64-windows -Doptimize=Debug
+./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=Debug
+```
+
+Add `-Denable-libdeflate=false` to the relevant command when changing the fallback decompression build path.
+
 ## CLI reference
 
 ```bash

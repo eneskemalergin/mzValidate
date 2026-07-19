@@ -25,6 +25,14 @@ pub fn build(b: *std.Build) void {
         "single-threaded",
         "Compile CLI executables for a single-threaded runtime (default: true)",
     ) orelse true;
+    if (target.result.ptrBitWidth() != 64) {
+        std.log.err(
+            "mzValidate supports only 64-bit targets; {s} uses {d}-bit pointers",
+            .{ @tagName(target.result.cpu.arch), target.result.ptrBitWidth() },
+        );
+        b.invalid_user_input = true;
+        return;
+    }
 
     const mzvalidate_mod = b.addModule("mzvalidate", .{
         .root_source_file = b.path("src/root.zig"),

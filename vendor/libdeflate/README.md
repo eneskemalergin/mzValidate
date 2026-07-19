@@ -1,45 +1,36 @@
-# libdeflate - vendored decompress-only subset
+# Vendored libdeflate subset
 
-## Upstream
+## Snapshot
 
-<https://github.com/ebiggers/libdeflate>
+This directory is a self-contained, decompress-only snapshot of [libdeflate](https://github.com/ebiggers/libdeflate):
 
-Version: v1.25. License: MIT. See [`COPYING`](./COPYING).
+- upstream tag: `v1.25`
+- upstream commit: `c8c56a20f8f621e6a966b716b31f1dedab6a41e3`
+- verified against upstream: 2026-07-18
+- license: MIT, preserved in [`COPYING`](./COPYING)
 
-## Why vendored
+The retained upstream C files, headers, and license match that commit byte for byte. They have no local source modifications. This README is mzValidate-specific documentation and is not an upstream file.
 
-mzValidate validates zlib-compressed binary arrays in mzML files. libdeflate's decompressor is faster than `std.compress.flate.Decompress`, especially on CPUs with BMI2 runtime dispatch.
+## Contents
 
-The vendored copy compiles directly into the binary via `addCSourceFile` in `build.zig`. This avoids depending on system `libdeflate.so` which may be missing, wrong version, or compiled without SIMD support.
+mzValidate keeps only the zlib decompression path and its dependencies:
 
-## What was stripped
+- `deflate_decompress.c` for the core DEFLATE decoder
+- `zlib_decompress.c` for the zlib wrapper
+- `adler32.c` for checksum validation
+- `utils.c` for allocator wrappers
+- x86_64 and AArch64 CPU feature sources and required headers
 
-The full libdeflate distribution comes with compression, gzip, CRC32, and matchfinder code. mzValidate only needs zlib decompression. These components were removed:
-
-- **DEFLATE compression** (not used)
-- **Gzip compression and decompression** (not used)
-- **Zlib compression** (not used)
-- **CRC-32 checksum** (gzip-only)
-- **Matchfinders** (compression-only)
-
-These were kept: `deflate_decompress.c` (core engine), `zlib_decompress.c` (zlib wrapper), `adler32.c` (checksum), `utils.c` (alloc/free wrappers), `x86/cpu_features.c` (runtime BMI2 dispatch). ARM headers (`arm/cpu_features.h`, `arm/adler32_impl.h`) are retained so the build script can add `arm/cpu_features.c` when targeting aarch64.
-
-## How it is used
-
-`binary.zig` calls `libdeflate_zlib_decompress_ex()` with the complete zlib payload. This validates the zlib header and Adler-32 checksum; the consumed-input result is also checked so trailing bytes are rejected.
-
-The decompressor handle is allocated once and reused across all binary arrays in a file.
+Compression, gzip, CRC-32, matchfinder, program, test, build-system, CI, and release-support files are intentionally omitted because mzValidate does not compile or use them.
 
 ## Build integration
 
-Compiled from `build.zig`:
+`build.zig` compiles the common decompression sources on every supported target. It adds `x86/cpu_features.c` on x86_64 and `arm/cpu_features.c` on AArch64. The default build links the target C runtime. `-Denable-libdeflate=false` omits the complete vendor integration and uses Zig's fallback decompressor.
 
-```zig
-mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = &.{ opt, march } });
-mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = &.{ opt, march } });
-mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = &.{ opt, march } });
-mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = &.{ opt, march } });
-mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = &.{ opt, march, "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI" } });
-```
+`src/mzml/binary.zig` calls `libdeflate_zlib_decompress_ex()` with the complete zlib payload. libdeflate validates the zlib header and Adler-32 checksum, and mzValidate checks the consumed input length so trailing bytes are rejected. One decompressor handle is reused across arrays in a file.
 
-The full git clone used for reference and regeneration is at [`tmp/libdeflate-git/`](../../tmp/libdeflate-git/).
+On x86_64, `adler32.c` is compiled with `LIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI`. Zig 0.16.0's bundled Clang 21 fails to compile libdeflate v1.25's AVX512VNNI implementation because its target attribute does not enable the required `evex512` feature. The flag suppresses that implementation without modifying the upstream source files; the other x86 runtime-dispatch paths remain available.
+
+The root project [`LICENSE`](../../LICENSE) and libdeflate's `COPYING` are distinct notices. Both are included in the package through `build.zig.zon`.
+
+Vendor updates are deliberate source changes, not part of routine building or testing. When the snapshot is intentionally updated, record the new upstream tag and commit here, review the retained subset, and preserve `COPYING`.
