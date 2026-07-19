@@ -21,6 +21,7 @@ const IndexKind = enum { spectrum, chromatogram };
 const IndexRecord = struct {
     offset: u64,
     index_seen: bool = false,
+    ambiguous: bool = false,
 };
 
 /// Validates index offsets, indexListOffset, fileChecksum SHA-1, and truncation.
@@ -34,6 +35,7 @@ pub const IndexValidator = struct {
     limits: diagnostic.ResourceLimits,
 
     mzml_depth: ?usize = null,
+    indexed_document: bool = false,
 
     // One key and record for every spectrum or chromatogram.
     spectrum_offsets: std.StringHashMap(IndexRecord),
@@ -183,7 +185,10 @@ pub const IndexValidator = struct {
         const tag = start.resolvedId();
 
         switch (tag) {
-            .indexedmzML => return,
+            .indexedmzML => {
+                validator.indexed_document = true;
+                return;
+            },
             .mzML => {
                 if (validator.mzml_depth == null or element_depth < validator.mzml_depth.?) {
                     validator.mzml_depth = element_depth;
@@ -197,7 +202,7 @@ pub const IndexValidator = struct {
         if (element_depth < validator.mzml_depth.?) return;
 
         switch (tag) {
-            .spectrum => try recordContainerOffset(validator, start, &validator.spectrum_offsets),
+            .spectrum => try recordContainerOffset(validator, start, .spectrum),
             .spectrumList => {
                 const count_attr = start.attr("count");
                 if (count_attr) |c| {
@@ -207,7 +212,7 @@ pub const IndexValidator = struct {
                     } else |_| {}
                 }
             },
-            .chromatogram => try recordContainerOffset(validator, start, &validator.chromatogram_offsets),
+            .chromatogram => try recordContainerOffset(validator, start, .chromatogram),
             .chromatogramList => {
                 const count_attr = start.attr("count");
                 if (count_attr) |c| {
@@ -605,23 +610,17 @@ pub const IndexValidator = struct {
             return error.ResourceLimitExceeded;
         };
 
-        var found = false;
-        var duplicate = false;
-        var recorded_offset: ?u64 = null;
-        if (validator.spectrum_offsets.getPtr(id_ref)) |record| {
-            found = true;
-            duplicate = record.index_seen;
-            record.index_seen = true;
-            recorded_offset = record.offset;
-        }
-        if (validator.chromatogram_offsets.getPtr(id_ref)) |record| {
-            found = true;
-            duplicate = duplicate or record.index_seen;
-            record.index_seen = true;
-            if (recorded_offset == null) recorded_offset = record.offset;
-        }
-        if (duplicate) {
-            try validator.appendDiagnostic(byte_offset, RuleId.mzml_index_offset, "duplicate idRef in index");
+        const map = switch (validator.current_index_kind.?) {
+            .spectrum => &validator.spectrum_offsets,
+            .chromatogram => &validator.chromatogram_offsets,
+        };
+        const record = map.getPtr(id_ref);
+        if (record) |entry| {
+            const duplicate = entry.index_seen;
+            entry.index_seen = true;
+            if (duplicate) {
+                try validator.appendDiagnostic(byte_offset, RuleId.mzml_index_offset, "duplicate idRef in index");
+            }
         }
         if (validator.previous_index_offset) |previous| {
             if (offset < previous) {
@@ -643,15 +642,16 @@ pub const IndexValidator = struct {
                 return;
             }
         }
-        if (!found) {
+        const resolved = record orelse {
             try validator.appendDiagnostic(
                 offset,
                 RuleId.mzml_index_offset,
                 "index references non-existent spectrum or chromatogram",
             );
             return;
-        }
-        if (offset != recorded_offset.? and !try validator.offsetsMatchWithWhitespace(offset, recorded_offset.?)) {
+        };
+        if (resolved.ambiguous) return;
+        if (offset != resolved.offset and !try validator.offsetsMatchWithWhitespace(offset, resolved.offset)) {
             try validator.appendDiagnostic(
                 offset,
                 RuleId.mzml_index_offset,
@@ -733,10 +733,23 @@ pub const IndexValidator = struct {
 fn recordContainerOffset(
     validator: *IndexValidator,
     start: StartElement,
-    map: *std.StringHashMap(IndexRecord),
+    kind: IndexKind,
 ) !void {
     const id = start.attr("id") orelse return;
-    if (map.contains(id)) return;
+    const map = switch (kind) {
+        .spectrum => &validator.spectrum_offsets,
+        .chromatogram => &validator.chromatogram_offsets,
+    };
+    if (map.getPtr(id)) |record| {
+        record.ambiguous = true;
+        if (!validator.indexed_document) return;
+        const message = switch (kind) {
+            .spectrum => "duplicate spectrum id makes index resolution ambiguous",
+            .chromatogram => "duplicate chromatogram id makes index resolution ambiguous",
+        };
+        try validator.appendDiagnostic(start.byte_offset, RuleId.mzml_index_duplicate_id, message);
+        return;
+    }
     if (id.len > validator.limits.max_index_id_ref_bytes) {
         try validator.limitDiagnostic(start.byte_offset, "indexable element id exceeds the configured field limit");
         return error.ResourceLimitExceeded;
@@ -892,6 +905,83 @@ test "IndexValidator: records spectrum and chromatogram offsets" {
 
     try expectEqual(@as(u64, 100), v.spectrum_offsets.get("s1").?.offset);
     try expectEqual(@as(u64, 200), v.chromatogram_offsets.get("c1").?.offset);
+}
+
+test "[unit]: duplicate spectrum id makes index identity ambiguous" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("indexedmzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 10), 1);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 2);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 200), 2);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 300), 1);
+    try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 310), 2);
+    try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "s1")}, 320), 3);
+    try v.consumeText(test_events.text("200"));
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_duplicate_id, diagnostics.items[0].rule);
+    try expectEqualStrings("duplicate spectrum id makes index resolution ambiguous", diagnostics.items[0].message);
+    try expect(v.spectrum_offsets.get("s1").?.ambiguous);
+}
+
+test "[unit]: non-indexed duplicate id has no index diagnostic" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 1);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 200), 1);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expect(v.spectrum_offsets.get("s1").?.ambiguous);
+}
+
+test "[unit]: duplicate chromatogram id makes index identity ambiguous" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("indexedmzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 10), 1);
+    try v.consumeStart(test_events.startUnknown("chromatogram", &.{test_events.attr("id", "c1")}, 100), 2);
+    try v.consumeStart(test_events.startUnknown("chromatogram", &.{test_events.attr("id", "c1")}, 200), 2);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_duplicate_id, diagnostics.items[0].rule);
+    try expectEqualStrings("duplicate chromatogram id makes index resolution ambiguous", diagnostics.items[0].message);
+    try expect(v.chromatogram_offsets.get("c1").?.ambiguous);
+}
+
+test "[unit]: spectrum and chromatogram ids remain kind-specific" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("indexedmzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 10), 1);
+    try v.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "shared")}, 100), 2);
+    try v.consumeStart(test_events.startUnknown("chromatogram", &.{test_events.attr("id", "shared")}, 200), 2);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expect(!v.spectrum_offsets.get("shared").?.ambiguous);
+    try expect(!v.chromatogram_offsets.get("shared").?.ambiguous);
 }
 
 test "IndexValidator: index state tracks one key copy per record" {
@@ -1073,6 +1163,28 @@ test "IndexValidator: reference to non-existent element produces diagnostic" {
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
+}
+
+test "[unit]: spectrum index does not resolve a chromatogram id" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    try v.consumeStart(test_events.startUnknown("indexedmzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 10), 1);
+    try v.consumeStart(test_events.startUnknown("chromatogram", &.{test_events.attr("id", "c1")}, 100), 2);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "1")}, 200), 1);
+    try v.consumeStart(test_events.startUnknown("index", &.{test_events.attr("name", "spectrum")}, 210), 2);
+    try v.consumeStart(test_events.startUnknown("offset", &.{test_events.attr("idRef", "c1")}, 220), 3);
+    try v.consumeText(test_events.text("100"));
+    try v.consumeEnd(test_events.endUnknown("offset"), 3);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqualStrings("index references non-existent spectrum or chromatogram", diagnostics.items[0].message);
 }
 
 test "IndexValidator: indexListOffset mismatch produces diagnostic" {
@@ -1353,6 +1465,7 @@ test "IndexValidator: duplicate index entries produce diagnostic" {
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_index_offset, diagnostics.items[0].rule);
+    try expectEqualStrings("duplicate idRef in index", diagnostics.items[0].message);
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[1].rule);
 }
 

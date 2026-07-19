@@ -2323,6 +2323,60 @@ test "reader check: accepts multiple valid spectra" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "[unit]: indexed duplicate ids remain errors when semantic validation is skipped" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const mzml = spectrumListMzml(
+        "<spectrumList count=\"2\" defaultDataProcessingRef=\"DP1\">" ++
+            "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"0\"><scanList count=\"1\"><scan/></scanList></spectrum>" ++
+            "<spectrum index=\"1\" id=\"scan=1\" defaultArrayLength=\"0\"><scanList count=\"1\"><scan/></scanList></spectrum>" ++
+            "</spectrumList>",
+    );
+    const mzml_start = std.mem.indexOfScalar(u8, mzml, '\n').? + 1;
+    var xml: std.ArrayList(u8) = .empty;
+    defer xml.deinit(allocator);
+    try xml.appendSlice(allocator, "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">");
+    try xml.appendSlice(allocator, mzml[mzml_start..]);
+    const spectrum_offset = std.mem.indexOf(u8, xml.items, "<spectrum index=\"0\"").?;
+    const index_list_offset = xml.items.len;
+    const index_xml = try std.fmt.allocPrint(
+        allocator,
+        "<indexList count=\"1\"><index name=\"spectrum\"><offset idRef=\"scan=1\">{d}</offset></index></indexList>" ++
+            "<indexListOffset>{d}</indexListOffset><fileChecksum>",
+        .{ spectrum_offset, index_list_offset },
+    );
+    defer allocator.free(index_xml);
+    try xml.appendSlice(allocator, index_xml);
+    var sha = std.crypto.hash.Sha1.init(.{});
+    sha.update(xml.items);
+    var digest: [20]u8 = undefined;
+    sha.final(&digest);
+    const checksum = std.fmt.bytesToHex(digest, .lower);
+    try xml.appendSlice(allocator, &checksum);
+    try xml.appendSlice(allocator, "</fileChecksum></indexedmzML>");
+
+    for ([_]bool{ true, false }) |skip_semantic| {
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+
+        const result = checkSliceResult(allocator, io, xml.items, &diagnostics, "duplicate-indexable-id.mzML", .{
+            .skip_binary = true,
+            .skip_semantic = skip_semantic,
+        }, xml.items);
+
+        var index_duplicate_count: usize = 0;
+        var semantic_duplicate_count: usize = 0;
+        for (diagnostics.items) |item| {
+            if (std.mem.eql(u8, item.rule, RuleId.mzml_index_duplicate_id)) index_duplicate_count += 1;
+            if (std.mem.eql(u8, item.rule, RuleId.mzml_ref_duplicate_id)) semantic_duplicate_count += 1;
+        }
+        try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+        try std.testing.expectEqual(@as(usize, 1), index_duplicate_count);
+        try std.testing.expectEqual(@as(usize, if (skip_semantic) 0 else 1), semantic_duplicate_count);
+        if (skip_semantic) try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+    }
+}
+
 test "reader check: accepts a spectrum without optional binary array list" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;

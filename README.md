@@ -240,6 +240,7 @@ Category header rows align with the Validation sections above.
 | **Index**                        |          |                                                                            |
 | `mzml.index.offset-list`         | error    | `indexListOffset` does not match actual offset                             |
 | `mzml.index.offset`              | error    | Index offset does not match recorded position                              |
+| `mzml.index.duplicate-id`        | error    | Indexed ID repeats within its spectrum or chromatogram kind                 |
 | `mzml.index.truncated`           | error    | Index offset points past end of file                                       |
 | `mzml.index.checksum`            | error    | SHA-1 mismatch or invalid hex format                                       |
 | **Semantic**                     |          |                                                                            |

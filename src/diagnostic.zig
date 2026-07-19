@@ -41,6 +41,8 @@ pub const RuleId = struct {
     /// Index offset does not match the recorded spectrum/chromatogram position,
     /// or references a non-existent element.
     pub const mzml_index_offset = "mzml.index.offset";
+    /// An indexed spectrum or chromatogram ID repeats within its element kind.
+    pub const mzml_index_duplicate_id = "mzml.index.duplicate-id";
     /// Index offset points past the end of the file (truncated file).
     pub const mzml_index_truncated = "mzml.index.truncated";
     /// fileChecksum SHA-1 digest does not match the recomputed value.
