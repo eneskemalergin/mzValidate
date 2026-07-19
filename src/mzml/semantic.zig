@@ -186,6 +186,71 @@ const UnresolvedGroup = struct {
     tail: usize,
 };
 
+fn stringMapStorageBytes(comptime Value: type, capacity: u32) !usize {
+    if (capacity == 0) return 0;
+
+    // Mirror the bundled HashMap allocation so the budget includes its alignment padding.
+    const Header = struct {
+        values: [*]Value,
+        keys: [*][]const u8,
+        capacity: u32,
+    };
+    const key_type = []const u8;
+    const map_alignment = @max(@alignOf(Header), @alignOf(key_type), @alignOf(Value));
+    const metadata_end = try std.math.add(usize, @sizeOf(Header), @intCast(capacity));
+    const keys_start = try alignForward(metadata_end, @alignOf(key_type));
+    const keys_bytes = try std.math.mul(usize, @intCast(capacity), @sizeOf(key_type));
+    const keys_end = try std.math.add(usize, keys_start, keys_bytes);
+    const values_start = try alignForward(keys_end, @alignOf(Value));
+    const values_bytes = try std.math.mul(usize, @intCast(capacity), @sizeOf(Value));
+    const values_end = try std.math.add(usize, values_start, values_bytes);
+    return alignForward(values_end, map_alignment);
+}
+
+fn alignForward(value: usize, alignment: usize) !usize {
+    const with_padding = try std.math.add(usize, value, alignment - 1);
+    return with_padding & ~(alignment - 1);
+}
+
+fn ensureStringMapAppendCapacity(
+    comptime Value: type,
+    map: *std.StringHashMap(Value),
+    budget: *SemanticBudget,
+    owner: SemanticOwner,
+    byte_offset: u64,
+) !void {
+    const required = std.math.add(u32, map.count(), 1) catch {
+        try budget.limitDiagnostic(byte_offset);
+        return error.ResourceLimitExceeded;
+    };
+    const old_capacity = map.capacity();
+    if (old_capacity != 0) {
+        const load_limit = std.math.mul(u64, old_capacity, std.hash_map.default_max_load_percentage) catch unreachable;
+        if (@as(u64, required) <= load_limit / 100) return;
+    }
+
+    const target_without_minimum = mapCapacityForCount(required) catch {
+        try budget.limitDiagnostic(byte_offset);
+        return error.ResourceLimitExceeded;
+    };
+    const target = @max(target_without_minimum, @as(u32, 8));
+    if (target <= old_capacity) return;
+
+    const old_bytes = stringMapStorageBytes(Value, old_capacity) catch {
+        try budget.limitDiagnostic(byte_offset);
+        return error.ResourceLimitExceeded;
+    };
+    const new_bytes = stringMapStorageBytes(Value, target) catch {
+        try budget.limitDiagnostic(byte_offset);
+        return error.ResourceLimitExceeded;
+    };
+    try budget.reserve(owner, new_bytes, byte_offset);
+    errdefer budget.release(owner, new_bytes);
+    try map.ensureTotalCapacity(required);
+    std.debug.assert(map.capacity() == target);
+    budget.release(owner, old_bytes);
+}
+
 const RefTable = struct {
     allocator: std.mem.Allocator,
     declarations: std.StringHashMap(Declaration),
@@ -202,17 +267,31 @@ const RefTable = struct {
         };
     }
 
-    fn deinit(table: *RefTable) void {
+    fn deinit(table: *RefTable, budget: *SemanticBudget) void {
         var it = table.declarations.iterator();
         while (it.next()) |entry| {
+            budget.release(.declaration, entry.key_ptr.*.len);
             table.allocator.free(entry.key_ptr.*);
         }
+        budget.release(
+            .declaration,
+            stringMapStorageBytes(Declaration, table.declarations.capacity()) catch unreachable,
+        );
         table.declarations.deinit();
         var unresolved_it = table.unresolved_by_id.iterator();
         while (unresolved_it.next()) |entry| {
+            budget.release(.unresolved, entry.key_ptr.*.len);
             table.allocator.free(entry.key_ptr.*);
         }
+        budget.release(
+            .unresolved,
+            stringMapStorageBytes(UnresolvedGroup, table.unresolved_by_id.capacity()) catch unreachable,
+        );
         table.unresolved_by_id.deinit();
+        budget.release(
+            .unresolved,
+            std.math.mul(usize, table.unresolved.capacity, @sizeOf(UnresolvedRef)) catch unreachable,
+        );
         table.unresolved.deinit(table.allocator);
     }
 
@@ -228,27 +307,19 @@ const RefTable = struct {
         if (id.len == 0) return true;
         if (table.declarations.contains(id)) return false;
 
-        const bytes = std.math.add(usize, @sizeOf(Declaration), id.len) catch {
-            try budget.limitDiagnostic(byte_offset);
-            return error.ResourceLimitExceeded;
-        };
-        try budget.reserve(.declaration, bytes, byte_offset);
+        try budget.reserve(.declaration, id.len, byte_offset);
         var budget_owned = true;
-        defer if (budget_owned) budget.release(.declaration, bytes);
+        defer if (budget_owned) budget.release(.declaration, id.len);
         const owned_id = try table.allocator.dupe(u8, id);
         var id_owned = true;
         defer if (id_owned) table.allocator.free(owned_id);
 
-        const result = try table.declarations.getOrPut(owned_id);
-        if (result.found_existing) {
-            return false;
-        }
-        result.key_ptr.* = owned_id;
+        try ensureStringMapAppendCapacity(Declaration, &table.declarations, budget, .declaration, byte_offset);
+        table.declarations.putAssumeCapacityNoClobber(owned_id, .{
+            .element_id = element_id,
+        });
         id_owned = false;
         budget_owned = false;
-        result.value_ptr.* = .{
-            .element_id = element_id,
-        };
         try table.resolveDeclared(budget, diagnostics, path, id, element_id);
         return true;
     }
@@ -281,7 +352,13 @@ const RefTable = struct {
             return;
         }
 
-        try table.ensureUnresolvedMapCapacity(budget, byte_offset);
+        try ensureStringMapAppendCapacity(
+            UnresolvedGroup,
+            &table.unresolved_by_id,
+            budget,
+            .unresolved,
+            byte_offset,
+        );
         try budget.reserve(.unresolved, ref_value.len, byte_offset);
         errdefer budget.release(.unresolved, ref_value.len);
         const owned_value = try table.allocator.dupe(u8, ref_value);
@@ -340,37 +417,6 @@ const RefTable = struct {
         }
     }
 
-    fn ensureUnresolvedMapCapacity(table: *RefTable, budget: *SemanticBudget, byte_offset: u64) !void {
-        const required = std.math.add(u32, table.unresolved_by_id.count(), 1) catch {
-            try budget.limitDiagnostic(byte_offset);
-            return error.ResourceLimitExceeded;
-        };
-        const old_capacity = table.unresolved_by_id.capacity();
-        if (old_capacity != 0) {
-            const load_limit = std.math.mul(u64, old_capacity, 80) catch unreachable;
-            if (@as(u64, required) <= load_limit / 100) return;
-        }
-
-        const target_without_minimum = mapCapacityForCount(required) catch {
-            try budget.limitDiagnostic(byte_offset);
-            return error.ResourceLimitExceeded;
-        };
-        const target = @max(target_without_minimum, @as(u32, 8));
-        if (target <= old_capacity) return;
-        const old_bytes = unresolvedMapStorageBytes(old_capacity) catch {
-            try budget.limitDiagnostic(byte_offset);
-            return error.ResourceLimitExceeded;
-        };
-        const new_bytes = unresolvedMapStorageBytes(target) catch {
-            try budget.limitDiagnostic(byte_offset);
-            return error.ResourceLimitExceeded;
-        };
-        try budget.reserve(.unresolved, new_bytes, byte_offset);
-        errdefer budget.release(.unresolved, new_bytes);
-        try table.unresolved_by_id.ensureTotalCapacity(required);
-        budget.release(.unresolved, old_bytes);
-    }
-
     fn recordResolutionOperations(table: *RefTable, operations: usize) void {
         if (comptime builtin.is_test) table.resolution_operations += operations;
     }
@@ -399,17 +445,9 @@ const RefTable = struct {
 
 fn mapCapacityForCount(required: u32) !u32 {
     const scaled = try std.math.mul(u64, required, 100);
-    const needed = try std.math.add(u64, scaled / 80, 1);
+    const needed = try std.math.add(u64, scaled / std.hash_map.default_max_load_percentage, 1);
     const bounded = std.math.cast(u32, needed) orelse return error.Overflow;
     return std.math.ceilPowerOfTwo(u32, bounded) catch return error.Overflow;
-}
-
-fn unresolvedMapStorageBytes(capacity: u32) !usize {
-    if (capacity == 0) return 0;
-    const per_slot = @sizeOf([]const u8) + @sizeOf(UnresolvedGroup) +
-        @alignOf([]const u8) + @alignOf(UnresolvedGroup) + @sizeOf(u8);
-    const slots = try std.math.mul(usize, @intCast(capacity), per_slot);
-    return std.math.add(usize, slots, 128);
 }
 
 /// CV terms, scope rules, contradictions, and id/*Ref resolution.
@@ -481,22 +519,49 @@ pub const SemanticValidator = struct {
     }
 
     pub fn deinit(validator: *SemanticValidator) void {
+        validator.budget.release(
+            .scope,
+            std.math.mul(usize, validator.scope_frames.capacity, @sizeOf(ScopeFrame)) catch unreachable,
+        );
         validator.scope_frames.deinit(validator.allocator);
         for (validator.scope_items.items) |item| {
-            if (item.owned) validator.allocator.free(item.accession);
+            if (item.owned) {
+                validator.budget.release(.scope, item.accession.len);
+                validator.allocator.free(item.accession);
+            }
         }
+        validator.budget.release(
+            .scope,
+            std.math.mul(usize, validator.scope_items.capacity, @sizeOf(ScopeItem)) catch unreachable,
+        );
         validator.scope_items.deinit(validator.allocator);
-        if (validator.current_group_id) |id| validator.allocator.free(id);
+        if (validator.current_group_id) |id| {
+            validator.budget.release(.param_group, id.len);
+            validator.allocator.free(id);
+        }
         {
             var pg_it = validator.param_groups.iterator();
             while (pg_it.next()) |entry| {
+                validator.budget.release(.param_group, entry.key_ptr.*.len);
                 validator.allocator.free(entry.key_ptr.*);
-                for (entry.value_ptr.items) |acc| validator.allocator.free(acc);
+                for (entry.value_ptr.items) |acc| {
+                    validator.budget.release(.param_group, acc.len);
+                    validator.allocator.free(acc);
+                }
+                validator.budget.release(
+                    .param_group,
+                    std.math.mul(usize, entry.value_ptr.capacity, @sizeOf([]const u8)) catch unreachable,
+                );
                 entry.value_ptr.deinit(validator.allocator);
             }
         }
+        validator.budget.release(
+            .param_group,
+            stringMapStorageBytes(std.ArrayList([]const u8), validator.param_groups.capacity()) catch unreachable,
+        );
         validator.param_groups.deinit();
-        validator.ref_table.deinit();
+        validator.ref_table.deinit(&validator.budget);
+        std.debug.assert(validator.budget.current_bytes == 0);
     }
 
     fn appendScopeItem(validator: *SemanticValidator, accession: []const u8, owned: bool, byte_offset: u64) !void {
@@ -870,7 +935,14 @@ pub const SemanticValidator = struct {
                             try term_list.append(validator.allocator, owned);
                             term_owned = false;
                         }
-                        try validator.param_groups.put(owned_id, term_list);
+                        try ensureStringMapAppendCapacity(
+                            std.ArrayList([]const u8),
+                            &validator.param_groups,
+                            &validator.budget,
+                            .param_group,
+                            end.byte_offset,
+                        );
+                        validator.param_groups.putAssumeCapacityNoClobber(owned_id, term_list);
                         id_owned = false;
                         key_budget_owned = false;
                         list_owned = false;
@@ -1348,6 +1420,16 @@ fn consumeUserParam(validator: *SemanticValidator, byte_offset: u64, accession: 
         .attributes = &attributes,
         .self_closing = false,
     });
+}
+
+fn consumeParamGroup(validator: *SemanticValidator, id: []const u8, accession: []const u8, byte_offset: u64) !void {
+    try validator.consumeStart(test_events.startInterned("referenceableParamGroup", &.{
+        test_events.attr("id", id),
+    }, byte_offset));
+    try validator.consumeStart(test_events.startInterned("cvParam", &.{
+        test_events.attr("accession", accession),
+    }, byte_offset + 1));
+    try validator.consumeEnd(test_events.endInterned("referenceableParamGroup", byte_offset + 2));
 }
 
 fn testEngine(allocator: std.mem.Allocator) !RuleEngine {
@@ -2010,6 +2092,112 @@ test "SemanticValidator: semantic owner limit is a fatal resource error" {
     try expectEqualStrings(RuleId.runtime_semantic_limit, diagnostics.items[0].rule);
 }
 
+test "[unit]: semantic maps charge all reference-table allocator bytes" {
+    var counting_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(counting_allocator.allocator());
+    var budget = SemanticBudget.init(counting_allocator.allocator(), &diagnostics, null, .{});
+
+    {
+        var table = RefTable.init(counting_allocator.allocator());
+        defer table.deinit(&budget);
+
+        try table.addRef(&budget, &diagnostics, null, "r", null, 1);
+        try testing.expect(try table.declare(&budget, &diagnostics, null, "d", .software, 2));
+
+        const live_allocator_bytes = counting_allocator.allocated_bytes - counting_allocator.freed_bytes;
+        const owner_bytes = budget.declaration_bytes + budget.unresolved_bytes +
+            budget.scope_bytes + budget.param_group_bytes;
+        try testing.expectEqual(live_allocator_bytes, budget.current_bytes);
+        try testing.expectEqual(owner_bytes, budget.current_bytes);
+        try testing.expect(budget.declaration_bytes > 1);
+        try testing.expect(budget.unresolved_bytes > 1);
+        try testing.expect(budget.peak_bytes >= budget.current_bytes);
+    }
+
+    try testing.expectEqual(@as(usize, 0), budget.current_bytes);
+    try testing.expectEqual(counting_allocator.allocated_bytes, counting_allocator.freed_bytes);
+}
+
+test "[unit]: semantic map declaration growth accepts its exact limit and rejects one byte less" {
+    const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g" };
+    const initial_map_bytes = try stringMapStorageBytes(Declaration, 8);
+    const replacement_map_bytes = try stringMapStorageBytes(Declaration, 16);
+    const required_peak_bytes = initial_map_bytes + 7 + replacement_map_bytes;
+    const allocator = testing.allocator;
+
+    var exact_diagnostics: DiagnosticSink = .empty;
+    defer exact_diagnostics.deinit(allocator);
+    var exact_budget = SemanticBudget.init(allocator, &exact_diagnostics, null, .{
+        .max_semantic_bytes = required_peak_bytes,
+    });
+    var exact_table = RefTable.init(allocator);
+    defer exact_table.deinit(&exact_budget);
+    for (ids[0..6]) |id| {
+        try testing.expect(try exact_table.declare(&exact_budget, &exact_diagnostics, null, id, .software, 3));
+    }
+
+    try testing.expect(try exact_table.declare(&exact_budget, &exact_diagnostics, null, ids[6], .software, 4));
+
+    try testing.expectEqual(replacement_map_bytes + ids.len, exact_budget.current_bytes);
+    try testing.expectEqual(required_peak_bytes, exact_budget.peak_bytes);
+    try testing.expectEqual(@as(usize, 0), exact_diagnostics.items.len);
+
+    var over_diagnostics: DiagnosticSink = .empty;
+    defer over_diagnostics.deinit(allocator);
+    var over_budget = SemanticBudget.init(allocator, &over_diagnostics, null, .{
+        .max_semantic_bytes = required_peak_bytes - 1,
+    });
+    var over_table = RefTable.init(allocator);
+    defer over_table.deinit(&over_budget);
+    for (ids[0..6]) |id| {
+        try testing.expect(try over_table.declare(&over_budget, &over_diagnostics, null, id, .software, 3));
+    }
+
+    try testing.expectError(
+        error.ResourceLimitExceeded,
+        over_table.declare(&over_budget, &over_diagnostics, null, ids[6], .software, 5),
+    );
+
+    try testing.expectEqual(initial_map_bytes + 6, over_budget.current_bytes);
+    try testing.expectEqual(@as(usize, 1), over_diagnostics.items.len);
+    try testing.expectEqualStrings(RuleId.runtime_semantic_limit, over_diagnostics.items[0].rule);
+    try testing.expectEqual(@as(u64, 5), over_diagnostics.items[0].location.byte_offset);
+}
+
+test "[unit]: semantic map parameter-group storage charges all allocator bytes" {
+    const catalog_allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(catalog_allocator, obo_text);
+    defer cv_table.deinit();
+    var engine = try testEngine(catalog_allocator);
+    defer engine.deinit();
+
+    var counting_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(counting_allocator.allocator());
+    var sv = SemanticValidator.init(counting_allocator.allocator(), &cv_table, &engine, &diagnostics, null);
+    var sv_live = true;
+    defer if (sv_live) sv.deinit();
+
+    try consumeParamGroup(&sv, "g", "a", 10);
+
+    const usage = sv.resourceUsage();
+    const live_allocator_bytes = counting_allocator.allocated_bytes - counting_allocator.freed_bytes;
+    const owner_bytes = usage.semantic_declaration_bytes + usage.semantic_unresolved_bytes +
+        usage.semantic_scope_bytes + usage.semantic_param_group_bytes;
+    try testing.expectEqual(live_allocator_bytes, usage.semantic_current_bytes);
+    try testing.expectEqual(owner_bytes, usage.semantic_current_bytes);
+    try testing.expect(usage.semantic_param_group_bytes > 2);
+    try testing.expect(usage.semantic_param_group_peak_bytes >= usage.semantic_param_group_bytes);
+
+    sv.deinit();
+    sv_live = false;
+
+    try testing.expectEqual(@as(usize, 0), sv.budget.current_bytes);
+    try testing.expectEqual(counting_allocator.allocated_bytes, counting_allocator.freed_bytes);
+}
+
 test "SemanticValidator: unresolved ref produces error" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
@@ -2171,13 +2359,14 @@ test "[unit]: unresolved diagnostic allocation failure propagates" {
     var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
+    var budget = SemanticBudget.init(failing_allocator.allocator(), &diagnostics, null, .{});
 
     var table = RefTable.init(failing_allocator.allocator());
     var unresolved = [_]UnresolvedRef{.{ .byte_offset = 0 }};
     table.unresolved = .{ .items = &unresolved, .capacity = unresolved.len };
     defer {
         table.unresolved = .empty;
-        table.deinit();
+        table.deinit(&budget);
     }
 
     try expectError(error.OutOfMemory, table.resolveAll(&diagnostics, null));
@@ -2188,16 +2377,23 @@ test "[unit]: addRef cleans every allocation failure" {
 
     var baseline_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     var baseline_diagnostics: DiagnosticSink = .empty;
+    var baseline_diagnostics_live = true;
+    defer if (baseline_diagnostics_live) baseline_diagnostics.deinit(baseline_allocator.allocator());
     var baseline_budget = SemanticBudget.init(baseline_allocator.allocator(), &baseline_diagnostics, null, .{});
     var baseline_table = RefTable.init(baseline_allocator.allocator());
+    var baseline_table_live = true;
+    defer if (baseline_table_live) baseline_table.deinit(&baseline_budget);
     for (0..reference_count) |index| {
         var id_buffer: [32]u8 = undefined;
         const id = try std.fmt.bufPrint(&id_buffer, "missing-{d}", .{index});
         try baseline_table.addRef(&baseline_budget, &baseline_diagnostics, null, id, null, index);
     }
     try testing.expect(baseline_table.unresolved_by_id.capacity() > 8);
-    baseline_table.deinit();
+    baseline_table.deinit(&baseline_budget);
+    baseline_table_live = false;
     baseline_diagnostics.deinit(baseline_allocator.allocator());
+    baseline_diagnostics_live = false;
+    try testing.expectEqual(@as(usize, 0), baseline_budget.current_bytes);
     try testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
 
     for (0..baseline_allocator.alloc_index) |fail_index| {
@@ -2206,6 +2402,8 @@ test "[unit]: addRef cleans every allocation failure" {
         var diagnostics: DiagnosticSink = .empty;
         defer diagnostics.deinit(failing_allocator.allocator());
         var budget = SemanticBudget.init(failing_allocator.allocator(), &diagnostics, null, .{});
+        var table_live = true;
+        defer if (table_live) table.deinit(&budget);
 
         var failed = false;
         add_refs: for (0..reference_count) |index| {
@@ -2217,9 +2415,144 @@ test "[unit]: addRef cleans every allocation failure" {
                 break :add_refs;
             };
         }
-        table.deinit();
+        table.deinit(&budget);
+        table_live = false;
 
         try testing.expect(failed);
+        try testing.expectEqual(@as(usize, 0), budget.current_bytes);
+        try testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    }
+}
+
+test "[unit]: semantic map declaration growth cleans every allocation failure" {
+    const declaration_count = 8;
+
+    var baseline_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var baseline_diagnostics: DiagnosticSink = .empty;
+    var baseline_diagnostics_live = true;
+    defer if (baseline_diagnostics_live) baseline_diagnostics.deinit(baseline_allocator.allocator());
+    var baseline_budget = SemanticBudget.init(baseline_allocator.allocator(), &baseline_diagnostics, null, .{});
+    var baseline_table = RefTable.init(baseline_allocator.allocator());
+    var baseline_table_live = true;
+    defer if (baseline_table_live) baseline_table.deinit(&baseline_budget);
+    for (0..declaration_count) |index| {
+        var id_buffer: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "d{d}", .{index});
+        try testing.expect(try baseline_table.declare(
+            &baseline_budget,
+            &baseline_diagnostics,
+            null,
+            id,
+            .software,
+            index,
+        ));
+    }
+    try testing.expect(baseline_table.declarations.capacity() > 8);
+    baseline_table.deinit(&baseline_budget);
+    baseline_table_live = false;
+    baseline_diagnostics.deinit(baseline_allocator.allocator());
+    baseline_diagnostics_live = false;
+    try testing.expectEqual(@as(usize, 0), baseline_budget.current_bytes);
+    try testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..baseline_allocator.alloc_index) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var diagnostics: DiagnosticSink = .empty;
+        var diagnostics_live = true;
+        defer if (diagnostics_live) diagnostics.deinit(failing_allocator.allocator());
+        var budget = SemanticBudget.init(failing_allocator.allocator(), &diagnostics, null, .{});
+        var table = RefTable.init(failing_allocator.allocator());
+        var table_live = true;
+        defer if (table_live) table.deinit(&budget);
+
+        var failed = false;
+        declarations: for (0..declaration_count) |index| {
+            var id_buffer: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "d{d}", .{index});
+            _ = table.declare(&budget, &diagnostics, null, id, .software, index) catch |err| {
+                try testing.expect(err == error.OutOfMemory);
+                failed = true;
+                break :declarations;
+            };
+        }
+        table.deinit(&budget);
+        table_live = false;
+        diagnostics.deinit(failing_allocator.allocator());
+        diagnostics_live = false;
+
+        try testing.expect(failed);
+        try testing.expectEqual(@as(usize, 0), budget.current_bytes);
+        try testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+    }
+}
+
+test "[unit]: semantic map parameter-group growth cleans every allocation failure" {
+    const group_count = 8;
+    const catalog_allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: test\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(catalog_allocator, obo_text);
+    defer cv_table.deinit();
+    var engine = try testEngine(catalog_allocator);
+    defer engine.deinit();
+
+    var baseline_allocator = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var baseline_diagnostics: DiagnosticSink = .empty;
+    var baseline_diagnostics_live = true;
+    defer if (baseline_diagnostics_live) baseline_diagnostics.deinit(baseline_allocator.allocator());
+    var baseline_sv = SemanticValidator.init(
+        baseline_allocator.allocator(),
+        &cv_table,
+        &engine,
+        &baseline_diagnostics,
+        null,
+    );
+    var baseline_sv_live = true;
+    defer if (baseline_sv_live) baseline_sv.deinit();
+    for (0..group_count) |index| {
+        var id_buffer: [16]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "g{d}", .{index});
+        try consumeParamGroup(&baseline_sv, id, "a", index * 3);
+    }
+    try testing.expect(baseline_sv.param_groups.capacity() > 8);
+    baseline_sv.deinit();
+    baseline_sv_live = false;
+    baseline_diagnostics.deinit(baseline_allocator.allocator());
+    baseline_diagnostics_live = false;
+    try testing.expectEqual(@as(usize, 0), baseline_sv.budget.current_bytes);
+    try testing.expectEqual(baseline_allocator.allocated_bytes, baseline_allocator.freed_bytes);
+
+    for (0..baseline_allocator.alloc_index) |fail_index| {
+        var failing_allocator = std.testing.FailingAllocator.init(testing.allocator, .{ .fail_index = fail_index });
+        var diagnostics: DiagnosticSink = .empty;
+        var diagnostics_live = true;
+        defer if (diagnostics_live) diagnostics.deinit(failing_allocator.allocator());
+        var sv = SemanticValidator.init(
+            failing_allocator.allocator(),
+            &cv_table,
+            &engine,
+            &diagnostics,
+            null,
+        );
+        var sv_live = true;
+        defer if (sv_live) sv.deinit();
+
+        var failed = false;
+        groups: for (0..group_count) |index| {
+            var id_buffer: [16]u8 = undefined;
+            const id = try std.fmt.bufPrint(&id_buffer, "g{d}", .{index});
+            consumeParamGroup(&sv, id, "a", index * 3) catch |err| {
+                try testing.expect(err == error.OutOfMemory);
+                failed = true;
+                break :groups;
+            };
+        }
+        sv.deinit();
+        sv_live = false;
+        diagnostics.deinit(failing_allocator.allocator());
+        diagnostics_live = false;
+
+        try testing.expect(failed);
+        try testing.expectEqual(@as(usize, 0), sv.budget.current_bytes);
         try testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
     }
 }
@@ -2231,7 +2564,7 @@ test "[unit]: unresolved-reference index storage obeys the semantic budget" {
     defer diagnostics.deinit(allocator);
     var budget = SemanticBudget.init(allocator, &diagnostics, null, .{ .max_semantic_bytes = @sizeOf(UnresolvedRef) });
     var table = RefTable.init(allocator);
-    defer table.deinit();
+    defer table.deinit(&budget);
 
     try testing.expectError(error.ResourceLimitExceeded, table.addRef(&budget, &diagnostics, null, "missing", null, 7));
 
@@ -2247,7 +2580,7 @@ test "[unit]: reference diagnostics retain deterministic order and offsets" {
     defer diagnostics.deinit(allocator);
     var budget = SemanticBudget.init(allocator, &diagnostics, null, .{});
     var table = RefTable.init(allocator);
-    defer table.deinit();
+    defer table.deinit(&budget);
 
     try table.addRef(&budget, &diagnostics, null, "missing-first", .software, 30);
     try table.addRef(&budget, &diagnostics, null, "wrong", .software, 10);
@@ -2275,7 +2608,7 @@ test "[unit]: forward-reference resolution work stays near-linear" {
     defer diagnostics.deinit(allocator);
     var budget = SemanticBudget.init(allocator, &diagnostics, null, .{});
     var table = RefTable.init(allocator);
-    defer table.deinit();
+    defer table.deinit(&budget);
 
     for (0..reference_count) |index| {
         var id_buffer: [32]u8 = undefined;
