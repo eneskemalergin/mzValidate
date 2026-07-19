@@ -1,8 +1,11 @@
-//! Build graph for the mzValidate executable, tests, contracts, and developer tools.
+//! Build graph for the mzValidate executable, tests, and CLI contracts.
 
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
+    // Zig 0.16 exposes an unimplemented uninstall step that panics when invoked.
+    _ = b.top_level_steps.orderedRemove("uninstall");
+
     const target = b.standardTargetOptions(.{
         .default_target = .{ .cpu_model = .baseline },
     });
@@ -54,28 +57,6 @@ pub fn build(b: *std.Build) void {
         exe.lto = .full;
     }
     b.installArtifact(exe);
-
-    const mutation_tools_step = b.step("mutation-tools", "Build development mutation checkers");
-    const xml_mutation_tool = addMutationTool(
-        b,
-        target,
-        optimize,
-        single_threaded,
-        "xml-mutation-check",
-        "tools/xml-mutation-check.zig",
-        mzvalidate_mod,
-    );
-    const obo_mutation_tool = addMutationTool(
-        b,
-        target,
-        optimize,
-        single_threaded,
-        "obo-mutation-check",
-        "tools/obo-mutation-check.zig",
-        mzvalidate_mod,
-    );
-    mutation_tools_step.dependOn(&b.addInstallArtifact(xml_mutation_tool, .{}).step);
-    mutation_tools_step.dependOn(&b.addInstallArtifact(obo_mutation_tool, .{}).step);
 
     const mod_tests = b.addTest(.{
         .root_module = mzvalidate_mod,
@@ -186,29 +167,6 @@ pub fn build(b: *std.Build) void {
 
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
     for (fixtures) |fixture| run.addArg(fixture);
-}
-
-fn addMutationTool(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    single_threaded: bool,
-    name: []const u8,
-    root_source: []const u8,
-    mzvalidate_mod: *std.Build.Module,
-) *std.Build.Step.Compile {
-    return b.addExecutable(.{
-        .name = name,
-        .root_module = b.createModule(.{
-            .root_source_file = b.path(root_source),
-            .target = target,
-            .optimize = optimize,
-            .single_threaded = single_threaded,
-            .imports = &.{
-                .{ .name = "mzvalidate", .module = mzvalidate_mod },
-            },
-        }),
-    });
 }
 
 fn addVendoredLibdeflateToModule(

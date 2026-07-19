@@ -8,8 +8,9 @@
         "build.zig",
         "build.zig.zon",
         "fixtures",
+        "LICENSE",
+        "README.md",
         "src",
-        "src/data",
         "vendor",
     },
 }
