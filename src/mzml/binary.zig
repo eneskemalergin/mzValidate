@@ -99,9 +99,33 @@ const ArrayKind = enum {
 
 // --- Base64 streaming codec ---
 
+fn base64Value(c: u8) u8 {
+    return switch (c) {
+        'A'...'Z' => c - 'A',
+        'a'...'z' => c - 'a' + 26,
+        '0'...'9' => c - '0' + 52,
+        '+' => 62,
+        '/' => 63,
+        else => unreachable,
+    };
+}
+
+fn base64DecodedSize(sig_len: usize, padding: usize, last_value: u8, errored: bool) error{InvalidBase64}!usize {
+    if (errored or sig_len % 4 != 0) return error.InvalidBase64;
+    if (sig_len == 0) return 0;
+    if ((padding == 1 and last_value & 0x03 != 0) or
+        (padding == 2 and last_value & 0x0f != 0))
+    {
+        return error.InvalidBase64;
+    }
+    const decoded = std.math.mul(usize, sig_len / 4, 3) catch return error.InvalidBase64;
+    return std.math.sub(usize, decoded, padding) catch error.InvalidBase64;
+}
+
 const StreamingBase64Counter = struct {
     sig_len: usize = 0,
     padding: usize = 0,
+    last_value: u8 = 0,
     saw_pad: bool = false,
     errored: bool = false,
 
@@ -124,6 +148,7 @@ const StreamingBase64Counter = struct {
                     self.errored = true;
                     return;
                 };
+                self.last_value = base64Value(chunk[offset + base64_simd_chunk_len - 1]);
                 offset += base64_simd_chunk_len;
                 continue;
             }
@@ -133,6 +158,15 @@ const StreamingBase64Counter = struct {
                     self.errored = true;
                     return;
                 };
+                var reverse = offset + base64_simd_chunk_len;
+                while (reverse > offset) {
+                    reverse -= 1;
+                    const byte = chunk[reverse];
+                    if (base64ValueOrNull(byte)) |value| {
+                        self.last_value = value;
+                        break;
+                    }
+                }
                 offset += base64_simd_chunk_len;
                 continue;
             }
@@ -163,6 +197,7 @@ const StreamingBase64Counter = struct {
                     self.errored = true;
                     return;
                 };
+                self.last_value = base64Value(c);
             },
             '=' => {
                 self.padding = std.math.add(usize, self.padding, 1) catch {
@@ -216,11 +251,7 @@ const StreamingBase64Counter = struct {
     }
 
     fn result(self: *const @This()) error{InvalidBase64}!usize {
-        if (self.errored) return error.InvalidBase64;
-        if (self.sig_len % 4 != 0) return error.InvalidBase64;
-        if (self.sig_len == 0) return 0;
-        const decoded = std.math.mul(usize, self.sig_len / 4, 3) catch return error.InvalidBase64;
-        return std.math.sub(usize, decoded, self.padding) catch error.InvalidBase64;
+        return base64DecodedSize(self.sig_len, self.padding, self.last_value, self.errored);
     }
 };
 
@@ -228,6 +259,7 @@ const StreamingBase64Counter = struct {
 const StreamingBase64Decoder = struct {
     sig_len: usize = 0,
     padding: usize = 0,
+    last_value: u8 = 0,
     saw_pad: bool = false,
     errored: bool = false,
     quad: [4]u8 = undefined,
@@ -263,7 +295,8 @@ const StreamingBase64Decoder = struct {
                     return;
                 }
                 self.sig_len = std.math.add(usize, self.sig_len, 1) catch return error.ResourceLimitExceeded;
-                try self.pushSextet(allocator, out, base64Value(c));
+                self.last_value = base64Value(c);
+                try self.pushSextet(allocator, out, self.last_value);
             },
             '=' => {
                 self.padding = std.math.add(usize, self.padding, 1) catch return error.ResourceLimitExceeded;
@@ -283,8 +316,7 @@ const StreamingBase64Decoder = struct {
     }
 
     fn finish(self: *const @This()) error{InvalidBase64}!void {
-        if (self.errored) return error.InvalidBase64;
-        if (self.sig_len % 4 != 0) return error.InvalidBase64;
+        _ = try base64DecodedSize(self.sig_len, self.padding, self.last_value, self.errored);
         if (self.quad_len != 0) return error.InvalidBase64;
     }
 
@@ -317,6 +349,7 @@ const StreamingBase64Decoder = struct {
             return;
         };
         self.sig_len = std.math.add(usize, self.sig_len, encoded.len) catch return error.ResourceLimitExceeded;
+        self.last_value = base64Value(encoded[encoded.len - 1]);
     }
 
     fn cleanBase64DataPrefixLen(bytes: []const u8) usize {
@@ -335,18 +368,14 @@ const StreamingBase64Decoder = struct {
         }
         return offset;
     }
-
-    fn base64Value(c: u8) u8 {
-        return switch (c) {
-            'A'...'Z' => c - 'A',
-            'a'...'z' => c - 'a' + 26,
-            '0'...'9' => c - '0' + 52,
-            '+' => 62,
-            '/' => 63,
-            else => unreachable,
-        };
-    }
 };
+
+fn base64ValueOrNull(c: u8) ?u8 {
+    return switch (c) {
+        'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => base64Value(c),
+        else => null,
+    };
+}
 
 // --- mzML element state ---
 
@@ -376,10 +405,7 @@ const BinaryArrayState = struct {
     binary_byte_offset: ?u64 = null,
     base64_stream: StreamingBase64Counter = .{},
     zlib_base64_stream: StreamingBase64Decoder = .{},
-    zlib_encoded_len: usize = 0,
     encoded_text_len: usize = 0,
-    pending_text_whitespace: usize = 0,
-    text_node_has_non_whitespace: bool = false,
     skipped: bool = false,
 
     fn init(
@@ -808,27 +834,10 @@ pub const BinaryValidator = struct {
     fn handleText(validator: *BinaryValidator, text: xml_events.Text) !void {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
-                const whitespace_only = isWhitespaceOnly(text.value);
-                if (whitespace_only and !state.text_node_has_non_whitespace) {
-                    state.pending_text_whitespace = std.math.add(usize, state.pending_text_whitespace, text.value.len) catch {
-                        try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
-                        state.skipped = true;
-                        state.binary_depth = null;
-                        return error.ResourceLimitExceeded;
-                    };
-                    if (text.is_final) state.pending_text_whitespace = 0;
-                    return;
-                }
-
                 const text_len = std.math.add(
                     usize,
                     state.encoded_text_len,
-                    std.math.add(usize, state.pending_text_whitespace, text.value.len) catch {
-                        try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
-                        state.skipped = true;
-                        state.binary_depth = null;
-                        return error.ResourceLimitExceeded;
-                    },
+                    countBase64Significant(text.value),
                 ) catch {
                     try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
                     state.skipped = true;
@@ -842,8 +851,6 @@ pub const BinaryValidator = struct {
                     return error.ResourceLimitExceeded;
                 }
                 state.encoded_text_len = text_len;
-                state.pending_text_whitespace = 0;
-                if (!whitespace_only) state.text_node_has_non_whitespace = true;
                 if (state.saw_zlib_compression) {
                     const capacity = base64SizeUpperBound(text_len) catch {
                         try validator.appendBinaryLimitDiagnostic(state, "binary payload encoded-size arithmetic overflow");
@@ -852,7 +859,6 @@ pub const BinaryValidator = struct {
                         return error.ResourceLimitExceeded;
                     };
                     try validator.ensureCompressedCapacity(state, capacity);
-                    state.zlib_encoded_len = text_len;
                     state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, text.value) catch |err| switch (err) {
                         error.ResourceLimitExceeded => {
                             try validator.appendBinaryLimitDiagnostic(state, "binary payload decoded-size arithmetic overflow");
@@ -865,8 +871,6 @@ pub const BinaryValidator = struct {
                 } else {
                     state.base64_stream.feed(text.value);
                 }
-
-                if (text.is_final) state.text_node_has_non_whitespace = false;
             }
         }
     }
@@ -874,12 +878,13 @@ pub const BinaryValidator = struct {
     fn validateBinaryArray(validator: *BinaryValidator, state: *const BinaryArrayState) !void {
         if (state.skipped) return;
 
+        const location: diagnostic.Location = .{
+            .byte_offset = state.binary_byte_offset orelse state.byte_offset,
+            .spectrum_index = state.owner_spectrum_index,
+        };
+
         if (state.encoded_length_declared) |declared| {
-            const has_content = if (state.saw_zlib_compression)
-                state.zlib_encoded_len > 0
-            else
-                state.base64_stream.sig_len > 0;
-            if (declared == 0 and has_content) {
+            if (declared == 0 and state.encoded_text_len > 0) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
                     .rule = RuleId.mzml_binary_length_mismatch,
@@ -889,12 +894,27 @@ pub const BinaryValidator = struct {
                 });
                 return;
             }
+            if (declared > 0 and state.encoded_text_len == 0) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_length_mismatch,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "binary payload is empty but encodedLength declares data",
+                });
+                return;
+            }
+            if (declared > 0 and state.encoded_text_len > 0 and declared != state.encoded_text_len) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_length_mismatch,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "encodedLength does not match binary payload length",
+                });
+                return;
+            }
         }
-
-        const location: diagnostic.Location = .{
-            .byte_offset = state.binary_byte_offset orelse state.byte_offset,
-            .spectrum_index = state.owner_spectrum_index,
-        };
 
         const compression_terms: u8 =
             @as(u8, @intFromBool(state.saw_no_compression)) +
@@ -932,11 +952,7 @@ pub const BinaryValidator = struct {
 
         // Without a declaration, only the completed payload establishes the limit.
         if (state.encoded_length_declared == null) {
-            const actual = if (state.saw_zlib_compression)
-                state.zlib_encoded_len
-            else
-                state.base64_stream.sig_len;
-            if (actual > validator.maxEncodedBytes()) {
+            if (state.encoded_text_len > validator.maxEncodedBytes()) {
                 try validator.appendDiagnostic(.{
                     .severity = .@"error",
                     .rule = RuleId.mzml_binary_oversized,
@@ -985,7 +1001,7 @@ pub const BinaryValidator = struct {
                     });
                     return;
                 };
-                if (state.zlib_encoded_len == 0) break :blk 0;
+                if (state.encoded_text_len == 0) break :blk 0;
 
                 const expected_decoded_bytes = if (state.default_array_length) |count|
                     std.math.mul(usize, count, width) catch {
@@ -1088,23 +1104,6 @@ pub const BinaryValidator = struct {
                 .message = precisionDivisibilityMessage(precision),
             });
             return;
-        }
-
-        // Empty payload with a non-zero encodedLength is always a mismatch:
-        // something declared data that never arrived.
-        if (decoded_bytes == 0) {
-            if (state.encoded_length_declared) |declared| {
-                if (declared > 0) {
-                    try validator.appendDiagnostic(.{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_binary_length_mismatch,
-                        .location = location,
-                        .path = validator.path,
-                        .message = "binary payload is empty but encodedLength declares data",
-                    });
-                    return;
-                }
-            }
         }
 
         const element_count = decoded_bytes / width;
@@ -1281,14 +1280,15 @@ fn addDecodedChunk(count: *usize, adler: *std.hash.Adler32, chunk: []const u8, l
     count.* = next;
 }
 
-fn isWhitespaceOnly(value: []const u8) bool {
+fn countBase64Significant(value: []const u8) usize {
+    var count: usize = 0;
     for (value) |byte| {
         switch (byte) {
             ' ', '\t', '\n', '\r' => {},
-            else => return false,
+            else => count += 1,
         }
     }
-    return true;
+    return count;
 }
 
 fn zlibAdler32(compressed: []const u8) error{InvalidBinaryPayload}!u32 {
@@ -1303,8 +1303,9 @@ fn zlibAdler32(compressed: []const u8) error{InvalidBinaryPayload}!u32 {
 }
 
 fn parseOptionalUnsigned(value: ?[]const u8) ?usize {
-    const slice = value orelse return null;
-    const parsed = std.fmt.parseUnsigned(u64, std.mem.trim(u8, slice, " \t\r\n"), 10) catch return null;
+    var slice = std.mem.trim(u8, value orelse return null, " \t\r\n");
+    if (slice.len > 0 and slice[0] == '+') slice = slice[1..];
+    const parsed = std.fmt.parseUnsigned(u64, slice, 10) catch return null;
     return std.math.cast(usize, parsed);
 }
 
@@ -1458,7 +1459,7 @@ test "binary validator C.0 parity snapshots decision order edge cases" {
         "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
         "<spectrum index=\"13\" id=\"scan=13\">" ++
         "<binaryDataArrayList count=\"1\">" ++
-        "<binaryDataArray encodedLength=\"8\">" ++
+        "<binaryDataArray encodedLength=\"16\">" ++
         "<cvParam accession=\"MS:1000521\"/>" ++
         "<cvParam accession=\"MS:1000574\"/>" ++
         "<cvParam accession=\"MS:1000515\"/>" ++
@@ -1615,6 +1616,107 @@ test "streaming base64 decoder preserves invalid padding behavior" {
 
     try std.testing.expect(stream.errored);
     try std.testing.expectError(error.InvalidBase64, stream.finish());
+}
+
+test "[unit]: streaming base64 codecs reject noncanonical final pad bits" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct {
+        payload: []const u8,
+        valid: bool,
+    }{
+        .{ .payload = "AA==", .valid = true },
+        .{ .payload = "AAA=", .valid = true },
+        .{ .payload = "AB==", .valid = false },
+        .{ .payload = "AAB=", .valid = false },
+    };
+
+    for (cases) |case| {
+        var counter: StreamingBase64Counter = .{};
+        counter.feed(case.payload);
+        var decoded: std.ArrayList(u8) = .empty;
+        defer decoded.deinit(allocator);
+        var decoder: StreamingBase64Decoder = .{};
+        try decoder.feed(allocator, &decoded, case.payload);
+
+        if (case.valid) {
+            _ = try counter.result();
+            try decoder.finish();
+        } else {
+            try std.testing.expectError(error.InvalidBase64, counter.result());
+            try std.testing.expectError(error.InvalidBase64, decoder.finish());
+        }
+    }
+}
+
+test "[unit]: binary validator compares every nonzero encodedLength with significant Base64 length" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = [_][]const u8{
+        minimalSpectrumMzmlWithEncodedLength("AACAPw==", 1, "MS:1000576", 4),
+        minimalSpectrumMzmlWithEncodedLength("eJxzdIQAAAksAgk=", 2, "MS:1000574", 20),
+    };
+
+    try std.testing.expectEqual(@as(?usize, 12), parseOptionalUnsigned(" +12 "));
+
+    for (fixtures) |fixture| {
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_length_mismatch,
+            "encodedLength does not match binary payload length",
+        );
+        try std.testing.expectEqual(@as(?usize, 0), diagnostics.items[0].location.spectrum_index);
+    }
+}
+
+test "[unit]: binary validator excludes XML whitespace from encodedLength" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixtures = [_][]const u8{
+        minimalSpectrumMzmlWithEncodedLength("AA CA\tPw ==\n", 1, "MS:1000576", 8),
+        minimalSpectrumMzmlWithEncodedLength("eJxz dIQA\nAAks Agk=", 2, "MS:1000574", 16),
+    };
+
+    for (fixtures) |fixture| {
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "[unit]: binary validator preserves final Base64 checks across reader chunks" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const valid_fixtures = [_][]const u8{
+        minimalSpectrumMzmlWithEncodedLength("AACAPw==", 1, "MS:1000576", 8),
+        minimalSpectrumMzmlWithEncodedLength("eJxzdIQAAAksAgk=", 2, "MS:1000574", 16),
+    };
+    const invalid_fixtures = [_][]const u8{
+        minimalSpectrumMzmlWithEncodedLength("AAB=", 1, "MS:1000576", 4),
+        minimalSpectrumMzmlWithEncodedLength("eJxzdIQAAAksAgl=", 2, "MS:1000574", 16),
+    };
+
+    for (1..10) |chunk_size| {
+        for (valid_fixtures) |fixture| {
+            var diagnostics = try runChunkedBinaryValidation(allocator, io, fixture, chunk_size);
+            defer diagnostics.deinit(allocator);
+
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+        }
+        for (invalid_fixtures) |fixture| {
+            var diagnostics = try runChunkedBinaryValidation(allocator, io, fixture, chunk_size);
+            defer diagnostics.deinit(allocator);
+
+            try expectSingleBinaryDiagnostic(
+                diagnostics.items,
+                RuleId.mzml_binary_base64,
+                "binary payload is not valid base64",
+            );
+        }
+    }
 }
 
 test "binary validator accepts clean single spectrum fixture" {
@@ -1994,6 +2096,7 @@ test "binary validator reports empty payload with non-zero encodedLength and no 
         RuleId.mzml_binary_length_mismatch,
         "binary payload is empty but encodedLength declares data",
     );
+    try std.testing.expectEqual(@as(?usize, 0), diagnostics.items[0].location.spectrum_index);
 }
 
 test "binary validator does not report error for encodedLength=0 with no payload and no defaultArrayLength" {
@@ -2071,7 +2174,7 @@ test "binary validator reports invalid chromatogram payload without spectrum ind
     const io = std.testing.io;
 
     const fixture = minimalChromatogramMzml(
-        "%%%%",
+        "%%%%%%%%",
         "AAAAAA==",
     );
 
@@ -2228,6 +2331,55 @@ fn runBinaryValidationIntoWithLimits(
     diagnostics.clearRetainingCapacity();
     var reader = std.Io.Reader.fixed(fixture);
     try BinaryValidator.validateReaderWithLimits(allocator, io, &reader, diagnostics, "fixture", limits);
+}
+
+const ChunkedBinaryReader = struct {
+    reader: std.Io.Reader,
+    input: []const u8,
+    offset: usize,
+    chunk_size: usize,
+    buffer: [64]u8 = undefined,
+
+    fn init(reader: *ChunkedBinaryReader, input: []const u8, chunk_size: usize) void {
+        reader.* = .{
+            .reader = undefined,
+            .input = input,
+            .offset = 0,
+            .chunk_size = chunk_size,
+        };
+        reader.reader = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = &reader.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn stream(reader: *std.Io.Reader, writer: *std.Io.Writer, limit: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        const chunked: *ChunkedBinaryReader = @alignCast(@fieldParentPtr("reader", reader));
+        if (chunked.offset == chunked.input.len) return error.EndOfStream;
+        const available = chunked.input.len - chunked.offset;
+        const allowed = limit.toInt() orelse available;
+        const count = @min(chunked.chunk_size, @min(available, allowed));
+        if (count == 0) return error.EndOfStream;
+        try writer.writeAll(chunked.input[chunked.offset..][0..count]);
+        chunked.offset += count;
+        return count;
+    }
+};
+
+fn runChunkedBinaryValidation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    fixture: []const u8,
+    chunk_size: usize,
+) !DiagnosticSink {
+    var diagnostics: DiagnosticSink = .empty;
+    errdefer diagnostics.deinit(allocator);
+    var chunked: ChunkedBinaryReader = undefined;
+    chunked.init(fixture, chunk_size);
+    try BinaryValidator.validateReader(allocator, io, &chunked.reader, &diagnostics, "fixture");
+    return diagnostics;
 }
 
 fn expectSingleBinaryDiagnostic(diagnostics: []const Diagnostic, expected_rule: []const u8, expected_message: ?[]const u8) !void {
@@ -2416,6 +2568,7 @@ test "[unit]: binary validator reports count-width multiplication overflow" {
         .default_array_length_invalid = false,
         .encoded_length = 8,
         .encoded_length_declared = 8,
+        .encoded_text_len = 8,
         .saw_precision_32 = true,
         .saw_no_compression = true,
     };
@@ -2445,6 +2598,7 @@ test "[unit]: malformed owner length does not suppress binary payload validation
         .default_array_length_invalid = true,
         .encoded_length = 4,
         .encoded_length_declared = 4,
+        .encoded_text_len = 4,
         .saw_precision_32 = true,
         .saw_no_compression = true,
     };
@@ -2522,12 +2676,21 @@ fn minimalChromatogramMzml(comptime first_payload: []const u8, comptime second_p
 }
 
 fn minimalSpectrumMzml(comptime payload: []const u8, comptime default_array_length: usize, comptime compression_accession: []const u8) []const u8 {
+    return minimalSpectrumMzmlWithEncodedLength(payload, default_array_length, compression_accession, payload.len);
+}
+
+fn minimalSpectrumMzmlWithEncodedLength(
+    comptime payload: []const u8,
+    comptime default_array_length: usize,
+    comptime compression_accession: []const u8,
+    comptime encoded_length: usize,
+) []const u8 {
     return "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\" version=\"1.1.0\">" ++
         "<run id=\"run-1\" defaultInstrumentConfigurationRef=\"IC1\">" ++
         "<spectrumList count=\"1\" defaultDataProcessingRef=\"DP1\">" ++
         "<spectrum index=\"0\" id=\"scan=1\" defaultArrayLength=\"" ++ std.fmt.comptimePrint("{d}", .{default_array_length}) ++ "\">" ++
         "<binaryDataArrayList count=\"1\">" ++
-        "<binaryDataArray encodedLength=\"" ++ std.fmt.comptimePrint("{d}", .{payload.len}) ++ "\">" ++
+        "<binaryDataArray encodedLength=\"" ++ std.fmt.comptimePrint("{d}", .{encoded_length}) ++ "\">" ++
         "<cvParam accession=\"MS:1000521\"/>" ++
         "<cvParam accession=\"" ++ compression_accession ++ "\"/>" ++
         "<cvParam accession=\"MS:1000515\"/>" ++

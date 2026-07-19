@@ -2350,7 +2350,7 @@ test "path check: reports chromatogram binary errors without a spectrum index" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const fixture = chromatogramMzmlWithPayloads("%%%%", "AAAAAA==");
+    const fixture = chromatogramMzmlWithPayloads("%%%%%%%%", "AAAAAA==");
 
     var temp_dir = std.testing.tmpDir(.{});
     defer temp_dir.cleanup();

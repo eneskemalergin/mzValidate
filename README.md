@@ -236,7 +236,7 @@ Category header rows align with the Validation sections above.
 | `mzml.binary.decompress`         | error    | Invalid zlib compressed data                                               |
 | `mzml.binary.compression`        | error    | Conflicting or unsupported compression terms                               |
 | `mzml.binary.precision-mismatch` | error    | Declared precision does not match payload                                  |
-| `mzml.binary.length-mismatch`    | error    | Decoded length does not match `defaultArrayLength`                         |
+| `mzml.binary.length-mismatch`    | error    | Encoded or decoded binary length does not match its declaration            |
 | `mzml.binary.oversized`          | error    | Payload exceeds `-max-binary-size` limit                                   |
 | `mzml.binary.type-mismatch`      | error    | Duplicate array type in one `binaryDataArrayList`                          |
 | **Index**                        |          |                                                                            |
