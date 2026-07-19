@@ -123,28 +123,43 @@ pub fn build(b: *std.Build) void {
     cli_invalid_cmd.expectExitCode(2);
     cli_invalid_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
 
+    const cli_schema_finding_cmd = b.addRunArtifact(exe);
+    cli_schema_finding_cmd.step.dependOn(b.getInstallStep());
+    cli_schema_finding_cmd.addArg("check");
+    cli_schema_finding_cmd.addArg("fixtures/mzml/adversarial/missing-default-array-length.mzML");
+    cli_schema_finding_cmd.addArg("-skip-semantic");
+    cli_schema_finding_cmd.addArg("-skip-index");
+    cli_schema_finding_cmd.addArg("-summary");
+    cli_schema_finding_cmd.expectExitCode(2);
+    cli_schema_finding_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
+
     const cli_incomplete_cmd = b.addRunArtifact(exe);
     cli_incomplete_cmd.step.dependOn(b.getInstallStep());
     cli_incomplete_cmd.addArg("check");
-    cli_incomplete_cmd.addArg("fixtures/mzml/adversarial/missing-default-array-length.mzML");
+    cli_incomplete_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
+    cli_incomplete_cmd.addArg("-skip-binary");
     cli_incomplete_cmd.addArg("-skip-semantic");
-    cli_incomplete_cmd.addArg("-skip-index");
     cli_incomplete_cmd.addArg("-summary");
     cli_incomplete_cmd.expectExitCode(2);
     cli_incomplete_cmd.expectStdOutMatch("incomplete: errors (info=0 warnings=0 errors=");
+    cli_incomplete_cmd.expectStdOutMatch("failure: stage=index reason=resource");
 
     const cli_json_cmd = b.addRunArtifact(exe);
     cli_json_cmd.step.dependOn(b.getInstallStep());
     cli_json_cmd.addArg("check");
-    cli_json_cmd.addArg("fixtures/mzml/invalid/invalid-base64.mzML");
+    cli_json_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
+    cli_json_cmd.addArg("-skip-binary");
     cli_json_cmd.addArg("-skip-semantic");
     cli_json_cmd.addArg("-json");
     cli_json_cmd.expectExitCode(2);
     cli_json_cmd.expectStdOutMatch("\"schema_version\": 1");
+    cli_json_cmd.expectStdOutMatch("\"completion\": \"incomplete\"");
+    cli_json_cmd.expectStdOutMatch("\"reason\": \"resource\"");
 
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
     cli_contract_step.dependOn(&cli_invalid_cmd.step);
+    cli_contract_step.dependOn(&cli_schema_finding_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);
     cli_contract_step.dependOn(&cli_json_cmd.step);
 

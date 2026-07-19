@@ -468,7 +468,6 @@ pub const SemanticValidator = struct {
 
     param_groups: std.StringHashMap(std.ArrayList([]const u8)),
     current_group_id: ?[]const u8 = null,
-    ancestry_limit_reported: bool = false,
     descendant_cache: [descendant_cache_len]DescendantCacheEntry = @splat(.{}),
 
     pub fn init(
@@ -1197,17 +1196,15 @@ pub const SemanticValidator = struct {
         }
 
         const result = try validator.resolveDescendant(accession, ancestor, byte_offset);
-        if (!validator.ancestry_limit_reported) {
-            // Scope values may borrow a parser buffer. Retain only canonical
-            // invocation-owned slices from the CV table on a cache miss.
-            if (validator.cv_table.lookup(accession)) |accession_term| {
-                if (validator.cv_table.lookup(ancestor)) |ancestor_term| {
-                    validator.descendant_cache[cache_index] = .{
-                        .accession = accession_term.accession,
-                        .ancestor = ancestor_term.accession,
-                        .result = result,
-                    };
-                }
+        // Scope values may borrow a parser buffer. Retain only canonical
+        // invocation-owned slices from the CV table on a cache miss.
+        if (validator.cv_table.lookup(accession)) |accession_term| {
+            if (validator.cv_table.lookup(ancestor)) |ancestor_term| {
+                validator.descendant_cache[cache_index] = .{
+                    .accession = accession_term.accession,
+                    .ancestor = ancestor_term.accession,
+                    .result = result,
+                };
             }
         }
         return result;
@@ -1217,18 +1214,15 @@ pub const SemanticValidator = struct {
         return switch (validator.cv_table.isDescendantOf(accession, ancestor)) {
             .yes => true,
             .no => false,
-            .limit_exceeded => limit: {
-                if (!validator.ancestry_limit_reported) {
-                    _ = try validator.diagnostics.append(validator.allocator, .{
-                        .severity = .@"error",
-                        .rule = RuleId.mzml_cv_ancestry_limit,
-                        .location = .{ .byte_offset = byte_offset },
-                        .path = validator.path,
-                        .message = "CV ancestry traversal exceeded its configured limit",
-                    });
-                    validator.ancestry_limit_reported = true;
-                }
-                break :limit false;
+            .limit_exceeded => {
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_cv_ancestry_limit,
+                    .location = .{ .byte_offset = byte_offset },
+                    .path = validator.path,
+                    .message = "CV ancestry traversal exceeded its configured limit",
+                });
+                return error.ResourceLimitExceeded;
             },
         };
     }
@@ -1702,6 +1696,38 @@ test "SemanticValidator: descendant cache retains canonical CV accessions" {
         }
     }
     try testing.expect(found);
+}
+
+test "SemanticValidator: ancestry traversal exhaustion stops semantic validation" {
+    const allocator = testing.allocator;
+    var obo_text = std.ArrayList(u8).empty;
+    defer obo_text.deinit(allocator);
+
+    for (0..258) |i| {
+        try obo_text.appendSlice(allocator, "[Term]\nid: MS:");
+        var id_buffer: [32]u8 = undefined;
+        const id = try std.fmt.bufPrint(&id_buffer, "{d}\nname: term\n", .{i});
+        try obo_text.appendSlice(allocator, id);
+        if (i > 0) {
+            try obo_text.appendSlice(allocator, "is_a: MS:");
+            const parent = try std.fmt.bufPrint(&id_buffer, "{d} ! parent\n", .{i - 1});
+            try obo_text.appendSlice(allocator, parent);
+        }
+    }
+
+    var cv_table = try CvTable.init(allocator, obo_text.items);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, "ancestry-limit.mzML");
+    defer sv.deinit();
+
+    try testing.expectError(error.ResourceLimitExceeded, sv.matchesDescendant("MS:257", "MS:0", 23));
+    try testing.expectEqual(@as(usize, 1), diagnostics.items.len);
+    try testing.expectEqualStrings(RuleId.mzml_cv_ancestry_limit, diagnostics.items[0].rule);
+    try testing.expectEqual(@as(u64, 23), diagnostics.items[0].location.byte_offset);
 }
 
 test "SemanticValidator: raw attribute fallback ignores foreign attributes" {

@@ -1226,7 +1226,11 @@ test "slice result: reports a semantic resource limit" {
     const result = context.checkSliceResult(xml, &diagnostics, "semantic-limit.mzML", null);
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.stageBit(.input), result.completed_stages);
+    try std.testing.expect(result.enabled_stages & diagnostic.stageBit(.semantic) != 0);
+    try std.testing.expectEqual(diagnostic.ValidationStage.semantic, result.first_failure.?.stage);
     try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expectEqual(diagnostic.Totals{ .errors = 2 }, result.totals);
     try std.testing.expectEqualStrings(RuleId.runtime_semantic_limit, diagnostics.items[0].rule);
 }
 
@@ -1252,7 +1256,7 @@ test "path check: runs mapping rules for an indexed fixture" {
     try std.testing.expect(found_required_mapping_error);
 }
 
-test "path check: reports incomplete binary validation without array length" {
+test "path result: missing array length is complete with an error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1264,20 +1268,24 @@ test "path check: reports incomplete binary validation without array length" {
         .skip_semantic = true,
     });
 
-    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
-    try std.testing.expectEqual(diagnostic.ValidationStage.binary, result.first_failure.?.stage);
-    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
+    try std.testing.expectEqual(result.enabled_stages, result.completed_stages);
+    try std.testing.expectEqual(@as(?diagnostic.FirstFailure, null), result.first_failure);
+    try std.testing.expectEqual(diagnostic.ResultStatus.errors_present, result.status());
+    try std.testing.expectEqual(diagnostic.count(diagnostics.items), result.totals);
+    try std.testing.expectEqual(@as(usize, 0), result.totals.info);
+    try std.testing.expectEqual(@as(usize, 0), result.totals.warnings);
+    try std.testing.expect(result.totals.errors >= 2);
 
-    var found_binary_diagnostic = false;
+    var binary_diagnostic_count: usize = 0;
     for (diagnostics.items) |item| {
         if (std.mem.eql(u8, item.rule, RuleId.mzml_binary_length_mismatch) and
             std.mem.eql(u8, item.message, "non-empty binary payload is missing required defaultArrayLength"))
         {
-            found_binary_diagnostic = true;
-            break;
+            binary_diagnostic_count += 1;
         }
     }
-    try std.testing.expect(found_binary_diagnostic);
+    try std.testing.expectEqual(@as(usize, 2), binary_diagnostic_count);
 }
 
 test "path check: reports a missing required reference" {
@@ -2084,7 +2092,11 @@ test "path result: resource limit is incomplete" {
     });
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.stageBit(.input), result.completed_stages);
+    try std.testing.expect(result.enabled_stages & diagnostic.stageBit(.index) != 0);
+    try std.testing.expectEqual(diagnostic.ValidationStage.index, result.first_failure.?.stage);
     try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expect(result.totals.errors > 0);
     var found_limit = false;
     for (diagnostics.items) |item| {
         if (std.mem.eql(u8, item.rule, RuleId.mzml_index_offset_list)) {

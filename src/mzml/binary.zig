@@ -1116,17 +1116,14 @@ pub const BinaryValidator = struct {
                 .path = validator.path,
                 .message = "non-empty binary payload is missing required defaultArrayLength",
             });
-            return error.ResourceLimitExceeded;
+            return;
         }
         const declared_count = state.default_array_length orelse return;
         if (element_count == declared_count) return;
 
         const alternate_width: usize = if (width == 4) 8 else 4;
-        const alternate_bytes = std.math.mul(usize, declared_count, alternate_width) catch {
-            try validator.appendBinaryLimitDiagnostic(state, "binary array count-width arithmetic overflow");
-            return error.ResourceLimitExceeded;
-        };
-        if (declared_count != 0 and decoded_bytes == alternate_bytes) {
+        const alternate_bytes: ?usize = std.math.mul(usize, declared_count, alternate_width) catch null;
+        if (declared_count != 0 and alternate_bytes != null and decoded_bytes == alternate_bytes.?) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
                 .rule = RuleId.mzml_binary_precision_mismatch,
@@ -1468,10 +1465,7 @@ test "binary validator C.0 parity snapshots decision order edge cases" {
         "</spectrumList></run></mzML>";
     var no_default_diagnostics: DiagnosticSink = .empty;
     defer no_default_diagnostics.deinit(allocator);
-    try std.testing.expectError(
-        error.ResourceLimitExceeded,
-        runBinaryValidationInto(allocator, io, no_default_array_length, &no_default_diagnostics),
-    );
+    try runBinaryValidationInto(allocator, io, no_default_array_length, &no_default_diagnostics);
     try expectSingleBinaryDiagnostic(
         no_default_diagnostics.items,
         RuleId.mzml_binary_length_mismatch,
@@ -1496,10 +1490,7 @@ test "binary validator rejects non-empty chromatogram without array length" {
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
 
-    try std.testing.expectError(
-        error.ResourceLimitExceeded,
-        runBinaryValidationInto(allocator, io, fixture, &diagnostics),
-    );
+    try runBinaryValidationInto(allocator, io, fixture, &diagnostics);
     try expectSingleBinaryDiagnostic(
         diagnostics.items,
         RuleId.mzml_binary_length_mismatch,
@@ -2568,7 +2559,7 @@ test "binary validator rejects huge encodedLength before zlib reservation" {
     try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
 }
 
-test "[unit]: binary validator reports count-width multiplication overflow" {
+test "[unit]: alternate-width overflow remains an ordinary length mismatch" {
     const allocator = std.testing.allocator;
 
     var diagnostics: DiagnosticSink = .empty;
@@ -2590,12 +2581,13 @@ test "[unit]: binary validator reports count-width multiplication overflow" {
     };
     state.base64_stream.feed("AAAAAA==");
 
-    try std.testing.expectError(
-        error.ResourceLimitExceeded,
-        validator.validateBinaryArray(&state),
-    );
+    try validator.validateBinaryArray(&state);
 
-    try expectSingleBinaryDiagnostic(diagnostics.items, RuleId.mzml_binary_oversized, null);
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_length_mismatch,
+        "decoded array length does not match defaultArrayLength",
+    );
 }
 
 test "[unit]: malformed owner length does not suppress binary payload validation" {
