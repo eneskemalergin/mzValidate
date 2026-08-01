@@ -41,7 +41,6 @@ pub const Severity = diagnostic.Severity;
 pub const ResourceLimits = diagnostic.ResourceLimits;
 pub const OutputMode = output.OutputMode;
 pub const CheckOptions = validate.CheckOptions;
-pub const InputMode = validate.InputMode;
 pub const InvocationContext = validate.InvocationContext;
 pub const json_schema_version = version.json_schema;
 

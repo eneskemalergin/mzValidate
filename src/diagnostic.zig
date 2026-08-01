@@ -13,7 +13,6 @@ pub const mzml_namespace = "http://psi.hupo.org/ms/mzml";
 /// so it is a breaking change to rename or remove an existing entry.
 pub const RuleId = struct {
     pub const runtime_file_open = "runtime.file-open";
-    pub const runtime_input_mode = "runtime.input-mode";
     pub const runtime_file_stability = "runtime.file-stability";
     pub const runtime_catalog = "runtime.catalog";
     pub const runtime_catalog_limit = "runtime.catalog-limit";

@@ -2,7 +2,7 @@
 //! Keep `semantic` in sync with `build.zig.zon` or the build breaks.
 
 /// Release version for `-version` and `build.zig` package metadata.
-pub const semantic = "0.1.4";
+pub const semantic = "0.1.5";
 
 /// Schema version emitted by `mzValidate check -json`.
 pub const json_schema: u32 = 1;

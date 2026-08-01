@@ -1,6 +1,12 @@
+// Package manifest for mzValidate.
+// Do not run `zig fetch .` from this repo: Zig copies the whole working tree
+// into ./zig-pkg/.tmp-* before applying `.paths` below, which recursively
+// nests zig-pkg/ and tmp/ and can consume tens of GB. `.dependencies` is
+// empty, so normal builds never create zig-pkg/. To hash this package, copy
+// only the `.paths` entries into a clean temp directory and fetch from there.
 .{
     .name = .mzvalidate,
-    .version = "0.1.4",
+    .version = "0.1.5",
     .fingerprint = 0x852e43c03f8a10d3,
     .minimum_zig_version = "0.16.0",
     .dependencies = .{},

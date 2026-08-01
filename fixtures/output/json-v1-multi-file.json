@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "input_mode": "stream",
   "files": [
     {
       "path": "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",

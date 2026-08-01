@@ -30,7 +30,6 @@ pub fn renderTextResult(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
     const emergency = hasEmergencyFailure(results);
     const truncated = hasDiagnosticTruncation(results);
@@ -54,7 +53,7 @@ pub fn renderTextResult(
         }
     }
     if (rendered_failure) try writer.writeByte('\n');
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results));
 }
 
 /// Writes one file's text diagnostics and any retained failure metadata.
@@ -84,7 +83,6 @@ pub fn renderTextFile(
 pub fn renderTextFinal(
     writer: *std.Io.Writer,
     results: []const diagnostic.FileResult,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
     var rendered = false;
     for (results) |result| {
@@ -94,7 +92,7 @@ pub fn renderTextFinal(
         }
     }
     if (!rendered) try writer.writeAll("OK: no diagnostics emitted\n\n");
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results));
 }
 
 fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -148,13 +146,12 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
     );
 }
 
-/// Writes completion, severity, failure, and input-mode metadata.
+/// Writes completion, severity, and failure metadata.
 pub fn renderSummaryResult(
     writer: *std.Io.Writer,
     results: []const diagnostic.FileResult,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results));
 }
 
 /// Groups diagnostics by severity+rule+message and prints compact counts.
@@ -273,9 +270,8 @@ pub fn renderBriefResult(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
     results: []const diagnostic.FileResult,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results));
     try renderEmergencyFailures(writer, results);
     if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
     for (results) |result| {
@@ -288,9 +284,8 @@ pub fn renderBriefGroupsResult(
     writer: *std.Io.Writer,
     groups: *BriefGroups,
     results: []const diagnostic.FileResult,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results), requested_input_mode);
+    try writeResultBlock(writer, diagnostic.summarizeResults(results));
     try renderEmergencyFailures(writer, results);
     if (groups.length > 0) try groups.render(writer);
     for (results) |result| {
@@ -306,9 +301,8 @@ pub fn renderJsonResult(
     diagnostics: []const Diagnostic,
     result: *const diagnostic.FileResult,
     path: []const u8,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
-    var stream = try JsonStream.init(writer, requested_input_mode);
+    var stream = try JsonStream.init(writer);
     try stream.writeFile(diagnostics, result, path);
     try stream.finish();
 }
@@ -320,10 +314,8 @@ pub const JsonStream = struct {
     summary: diagnostic.Summary = .{},
 
     /// Writes the report header and borrows the supplied writer.
-    pub fn init(writer: *std.Io.Writer, requested_input_mode: []const u8) std.Io.Writer.Error!JsonStream {
-        try writer.print("{{\n  \"schema_version\": {d},\n  \"input_mode\": ", .{version.json_schema});
-        try writeJsonString(writer, requested_input_mode);
-        try writer.writeAll(",\n  \"files\": [");
+    pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
+        try writer.print("{{\n  \"schema_version\": {d},\n  \"files\": [", .{version.json_schema});
         return .{ .writer = writer };
     }
 
@@ -616,7 +608,6 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
 fn writeResultBlock(
     writer: *std.Io.Writer,
     summary: diagnostic.Summary,
-    requested_input_mode: []const u8,
 ) std.Io.Writer.Error!void {
     try writer.print("{s}: {s} (info={d} warnings={d} errors={d})\n", .{
         summary.completion.label(),
@@ -630,7 +621,6 @@ fn writeResultBlock(
         if (failure.path()) |path| try writer.print(" input={s}", .{path});
         try writer.writeByte('\n');
     }
-    try writeConfigLine(writer, requested_input_mode);
 }
 
 fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
@@ -639,16 +629,6 @@ fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
         .warnings_only => "warnings",
         .errors_present => "errors",
     };
-}
-
-fn writeConfigLine(
-    writer: *std.Io.Writer,
-    requested_input_mode: []const u8,
-) std.Io.Writer.Error!void {
-    const mode_changed = !std.mem.eql(u8, requested_input_mode, "stream");
-    if (!mode_changed) return;
-
-    try writer.print("config: input={s} behavior=explicit\n", .{requested_input_mode});
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
@@ -729,27 +709,11 @@ test "summary result reports incomplete failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "stream");
+    try renderSummaryResult(&allocating_writer.writer, &.{result});
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
             "failure: stage=parser reason=parser rule=runtime.incomplete input=sample.mzML\n",
-        allocating_writer.written(),
-    );
-}
-
-test "summary result reports explicit input mode" {
-    var result = diagnostic.FileResult.init(0);
-    result.finalize(&.{});
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "mmap");
-
-    try std.testing.expectEqualStrings(
-        "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=mmap behavior=explicit\n",
         allocating_writer.written(),
     );
 }
@@ -766,27 +730,10 @@ test "summary result uses human warning status" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result}, "stream");
+    try renderSummaryResult(&allocating_writer.writer, &.{result});
 
     try std.testing.expectEqualStrings(
         "complete: warnings (info=2 warnings=1 errors=0)\n",
-        allocating_writer.written(),
-    );
-}
-
-test "text result reports explicit input mode" {
-    var result = diagnostic.FileResult.init(0);
-    result.finalize(&.{});
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "mmap");
-
-    try std.testing.expectEqualStrings(
-        "OK: no diagnostics emitted\n\n" ++
-            "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=mmap behavior=explicit\n",
         allocating_writer.written(),
     );
 }
@@ -799,7 +746,7 @@ test "[unit]: text result emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderTextResult(&allocating_writer.writer, &.{}, &.{result}, "stream");
+    try renderTextResult(&allocating_writer.writer, &.{}, &.{result});
 
     try std.testing.expectEqualStrings(
         "input: sample.mzML\n" ++
@@ -827,22 +774,6 @@ test "[unit]: per-file text renderer emits emergency failure" {
     );
 }
 
-test "brief result reports explicit input mode" {
-    var result = diagnostic.FileResult.init(0);
-    result.finalize(&.{});
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result}, "mmap");
-
-    try std.testing.expectEqualStrings(
-        "complete: clean (info=0 warnings=0 errors=0)\n" ++
-            "config: input=mmap behavior=explicit\n",
-        allocating_writer.written(),
-    );
-}
-
 test "json result emits emergency failure" {
     var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
     result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
@@ -851,7 +782,7 @@ test "json result emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderJsonResult(&allocating_writer.writer, &.{}, &result, "sample.mzML", "stream");
+    try renderJsonResult(&allocating_writer.writer, &.{}, &result, "sample.mzML");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"rule\": \"runtime.incomplete\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"path\": \"sample.mzML\"") != null);
@@ -871,7 +802,7 @@ test "json output keeps rule IDs separate from messages" {
     var result = diagnostic.FileResult.init(0);
     result.finalize(&diagnostics);
 
-    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "sample.mzML", "stream");
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "sample.mzML");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"schema_version\": 1") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"rule\": \"mzml.binary.length-mismatch\"") != null);
@@ -967,7 +898,7 @@ test "json output escapes control characters" {
     var result = diagnostic.FileResult.init(0);
     result.finalize(&diagnostics);
 
-    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "escape.mzML", "stream");
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "escape.mzML");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"quote=\\\" slash=\\\\ line=\\n tab=\\t raw=\\u0001\"") != null);
 }
@@ -984,7 +915,7 @@ test "json output replaces invalid UTF-8" {
     var result = diagnostic.FileResult.init(0);
     result.finalize(&diagnostics);
 
-    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "invalid-utf8.mzML", "stream");
+    try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "invalid-utf8.mzML");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"bad\\uFFFDvalue\"") != null);
 }
@@ -1007,7 +938,7 @@ test "brief result emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result}, "stream");
+    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result});
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "runtime.incomplete") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "stage=parser reason=allocation") != null);
@@ -1022,7 +953,7 @@ test "[unit]: pre-grouped brief renderer emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderBriefGroupsResult(&allocating_writer.writer, &groups, &.{result}, "stream");
+    try renderBriefGroupsResult(&allocating_writer.writer, &groups, &.{result});
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
@@ -1041,12 +972,12 @@ test "bounded output reports dropped severity totals" {
 
     var text_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer text_writer.deinit();
-    try renderTextResult(&text_writer.writer, &.{}, &.{result}, "stream");
+    try renderTextResult(&text_writer.writer, &.{}, &.{result});
     try std.testing.expect(std.mem.indexOf(u8, text_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
 
     var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer json_writer.deinit();
-    var stream = try JsonStream.init(&json_writer.writer, "stream");
+    var stream = try JsonStream.init(&json_writer.writer);
     try stream.writeFile(&.{}, &result, "sample.mzML");
     try stream.finish();
     try std.testing.expect(std.mem.indexOf(u8, json_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
@@ -1081,7 +1012,7 @@ test "json contract: truncated result matches golden" {
     var allocating_writer: std.Io.Writer.Allocating = .init(allocator);
     defer allocating_writer.deinit();
 
-    try renderJsonResult(&allocating_writer.writer, sink.items, &result, "truncated.mzML", "stream");
+    try renderJsonResult(&allocating_writer.writer, sink.items, &result, "truncated.mzML");
     const expected = try std.Io.Dir.cwd().readFileAlloc(
         io,
         "fixtures/output/json-v1-truncated.json",

@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "input_mode": "stream",
   "files": [
     {
       "path": "missing-p51.mzML",

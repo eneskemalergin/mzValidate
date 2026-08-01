@@ -1,7 +1,6 @@
 //! CLI parsing, validation dispatch, and output selection.
 //!
-//! Regular-file validation uses bounded stream input. The explicit mmap selector is
-//! retained for compatibility and returns an incomplete result without fallback.
+//! Regular-file validation uses bounded stream input.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -17,7 +16,6 @@ pub const CheckCommand = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
-    input_mode: validate.InputMode = .stream,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
     inputs: []const []const u8,
@@ -50,8 +48,6 @@ const ParseError = error{
     MissingOboPath,
     InvalidValue,
     Overflow,
-    MissingInputMode,
-    InvalidInputMode,
 };
 
 const ParseArgsError = ParseError || std.mem.Allocator.Error;
@@ -122,8 +118,6 @@ pub fn runArgs(
         error.MissingOboPath,
         error.InvalidValue,
         error.Overflow,
-        error.MissingInputMode,
-        error.InvalidInputMode,
         => {
             const parse_err: ParseError = @errorCast(err);
             try writeParseError(stderr, parse_err, args);
@@ -152,7 +146,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var skip_binary = false;
     var skip_index = false;
     var skip_semantic = false;
-    var input_mode: validate.InputMode = .stream;
     var max_binary_size: ?usize = null;
     var obo_path: ?[]const u8 = null;
 
@@ -175,16 +168,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         }
         if (std.mem.eql(u8, arg, "-skip-semantic")) {
             skip_semantic = true;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-input-mode")) {
-            i += 1;
-            if (i >= args.len) return error.MissingInputMode;
-            input_mode = parseInputMode(args[i]) catch return error.InvalidInputMode;
-            continue;
-        }
-        if (std.mem.eql(u8, arg, "-mmap")) {
-            input_mode = .mmap;
             continue;
         }
         if (std.mem.eql(u8, arg, "-obo")) {
@@ -223,7 +206,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         .skip_binary = skip_binary,
         .skip_index = skip_index,
         .skip_semantic = skip_semantic,
-        .input_mode = input_mode,
         .max_binary_size = max_binary_size,
         .obo_path = obo_path,
         .inputs = try input_paths.toOwnedSlice(allocator),
@@ -264,7 +246,7 @@ fn runCheck(
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     var brief_groups: output.BriefGroups = .{};
     var json_stream: ?output.JsonStream = if (check.output_mode == .json)
-        try output.JsonStream.init(writer, @tagName(check.input_mode))
+        try output.JsonStream.init(writer)
     else
         null;
 
@@ -272,7 +254,6 @@ fn runCheck(
         .skip_binary = check.skip_binary,
         .skip_index = check.skip_index,
         .skip_semantic = check.skip_semantic,
-        .input_mode = check.input_mode,
         .max_binary_size = check.max_binary_size,
         .obo_path = check.obo_path,
     };
@@ -298,10 +279,10 @@ fn runCheck(
     }
 
     switch (check.output_mode) {
-        .text => try output.renderTextFinal(writer, results.items, @tagName(check.input_mode)),
+        .text => try output.renderTextFinal(writer, results.items),
         .json => if (json_stream) |*stream| try stream.finish(),
-        .summary => try output.renderSummaryResult(writer, results.items, @tagName(check.input_mode)),
-        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items, @tagName(check.input_mode)),
+        .summary => try output.renderSummaryResult(writer, results.items),
+        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items),
     }
 
     return diagnostic.exitCodeForResults(results.items);
@@ -325,9 +306,6 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  -skip-index  Skip index offset and checksum checks.\n" ++
             "  -skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
-            "  -input-mode stream|mmap\n" ++
-            "               Use bounded stream input (default). mmap is refused safely.\n" ++
-            "  -mmap        Compatibility alias for -input-mode mmap.\n" ++
             "  -max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
@@ -339,9 +317,8 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Behavior\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
             "  Human result lines show completion, status, and severity counts.\n" ++
-            "  A config line appears only when the input mode differs from the default.\n" ++
             "  Text mode groups diagnostics by input path and ends with the result.\n" ++
-            "  JSON mode records input mode, file results, diagnostics, and one summary.\n" ++
+            "  JSON mode records file results, diagnostics, and one summary.\n" ++
             "  Summary mode reports the aggregate result for the whole invocation.\n" ++
             "  Brief mode groups identical diagnostics by severity, rule, and message\n" ++
             "  with occurrence counts. Ideal for spotting patterns in large files.\n\n" ++
@@ -383,22 +360,7 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
         error.MissingOboPath => try writer.writeAll("error: -obo requires a path"),
         error.InvalidValue => try writer.writeAll("error: invalid -max-binary-size value"),
         error.Overflow => try writer.writeAll("error: -max-binary-size value overflow (too large)"),
-        error.MissingInputMode => try writer.writeAll("error: -input-mode requires a value (stream or mmap)"),
-        error.InvalidInputMode => {
-            if (findFlagValue(args, "-input-mode")) |value| {
-                try writer.print("error: invalid -input-mode value '{s}' (expected stream or mmap)", .{value});
-            } else {
-                try writer.writeAll("error: invalid -input-mode value (expected stream or mmap)");
-            }
-        },
     }
-}
-
-fn findFlagValue(args: []const []const u8, flag: []const u8) ?[]const u8 {
-    for (0..args.len) |i| {
-        if (std.mem.eql(u8, args[i], flag) and args.len - i > 1) return args[i + 1];
-    }
-    return null;
 }
 
 fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
@@ -414,19 +376,11 @@ fn isKnownFlag(arg: []const u8) bool {
         std.mem.eql(u8, arg, "-skip-binary") or
         std.mem.eql(u8, arg, "-skip-index") or
         std.mem.eql(u8, arg, "-skip-semantic") or
-        std.mem.eql(u8, arg, "-input-mode") or
-        std.mem.eql(u8, arg, "-mmap") or
         std.mem.eql(u8, arg, "-max-binary-size") or
         std.mem.eql(u8, arg, "-obo") or
         std.mem.eql(u8, arg, "-json") or
         std.mem.eql(u8, arg, "-summary") or
         std.mem.eql(u8, arg, "-brief");
-}
-
-fn parseInputMode(value: []const u8) error{InvalidValue}!validate.InputMode {
-    if (std.mem.eql(u8, value, "stream")) return .stream;
-    if (std.mem.eql(u8, value, "mmap")) return .mmap;
-    return error.InvalidValue;
 }
 
 // Bare K/M/G/T suffixes use binary units; KB/MB/GB use decimal units.
@@ -526,7 +480,6 @@ test "parses flags and input paths" {
         "sample-a.mzML",
         "-json",
         "-skip-binary",
-        "-mmap",
         "sample-b.mzML",
     };
 
@@ -537,79 +490,11 @@ test "parses flags and input paths" {
         .check => |check| {
             try std.testing.expectEqual(output.OutputMode.json, check.output_mode);
             try std.testing.expect(check.skip_binary);
-            try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
             try std.testing.expectEqual(@as(usize, 2), check.inputs.len);
             try std.testing.expectEqualStrings("sample-a.mzML", check.inputs[0]);
             try std.testing.expectEqualStrings("sample-b.mzML", check.inputs[1]);
         },
     }
-}
-
-test "records explicit stream input mode" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-        "-input-mode",
-        "stream",
-    };
-
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
-
-    switch (command) {
-        .check => |check| {
-            try std.testing.expectEqual(validate.InputMode.stream, check.input_mode);
-        },
-    }
-}
-
-test "defaults to stream input" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-    };
-
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
-
-    switch (command) {
-        .check => |check| {
-            try std.testing.expectEqual(validate.InputMode.stream, check.input_mode);
-        },
-    }
-}
-
-test "records explicit mmap input mode" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-        "-input-mode",
-        "mmap",
-    };
-
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
-
-    switch (command) {
-        .check => |check| {
-            try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
-        },
-    }
-}
-
-test "rejects an invalid input mode" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-        "-input-mode",
-        "auto",
-    };
-
-    try std.testing.expectError(error.InvalidInputMode, parseArgs(std.testing.allocator, &argv));
 }
 
 test "rejects the removed memory limit flag" {
@@ -773,27 +658,6 @@ test "parses size suffixes case-insensitively" {
     try std.testing.expectEqual(@as(usize, 1 * 1024 * 1024 * 1024), try parseSize("1g"));
 }
 
-test "parses the mmap compatibility flag" {
-    const allocator = std.testing.allocator;
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "sample.mzML",
-        "-mmap",
-    };
-
-    var command = try parseArgs(allocator, &argv);
-    defer command.deinit(allocator);
-
-    switch (command) {
-        .check => |check| {
-            try std.testing.expectEqual(validate.InputMode.mmap, check.input_mode);
-            try std.testing.expect(!check.skip_binary);
-            try std.testing.expectEqual(@as(usize, 1), check.inputs.len);
-        },
-    }
-}
-
 test "help writes usage to stdout" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -807,8 +671,7 @@ test "help writes usage to stdout" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-input-mode stream|mmap") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "mmap is refused safely") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-max-binary-size N") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
@@ -846,61 +709,8 @@ test "check help writes usage to stdout" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-mmap        Compatibility alias") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-skip-semantic") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
-}
-
-test "summary reports explicit mmap refusal" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
-        "-skip-binary",
-        "-skip-index",
-        "-skip-semantic",
-        "-input-mode",
-        "mmap",
-        "-summary",
-    };
-
-    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stdout_writer.deinit();
-    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stderr_writer.deinit();
-
-    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
-
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=input reason=input rule=runtime.input-mode input=fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML\n" ++
-            "config: input=mmap behavior=explicit\n",
-        stdout_writer.written(),
-    );
-    try std.testing.expectEqualStrings("", stderr_writer.written());
-}
-
-test "invalid input mode reports a usage error" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-input-mode", "auto" };
-
-    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stdout_writer.deinit();
-    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stderr_writer.deinit();
-
-    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
-
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expectEqualStrings("", stdout_writer.written());
-    try std.testing.expectEqualStrings(
-        "error: invalid -input-mode value 'auto' (expected stream or mmap)\n" ++
-            "usage: mzValidate check <input.mzML> [more files...] [options]\n",
-        stderr_writer.written(),
-    );
 }
 
 test "unsupported command reports a usage error" {
@@ -1074,34 +884,6 @@ test "json contract: multi-file result matches golden" {
     };
 
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-multi-file.json");
-}
-
-test "json contract: explicit mmap refusal is recorded" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
-        "-skip-semantic",
-        "-skip-index",
-        "-input-mode",
-        "mmap",
-        "-json",
-    };
-    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stdout_writer.deinit();
-    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stderr_writer.deinit();
-
-    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
-
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"input_mode\": \"mmap\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"completion\": \"incomplete\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"rule\": \"runtime.input-mode\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "\"reason\": \"input\"") != null);
-    try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
 test "external entities report an XML contract diagnostic" {

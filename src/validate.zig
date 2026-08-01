@@ -3,11 +3,9 @@
 //! Coordinates slice, reader, and regular-file validation.
 //!
 //! Parser and validators share one primary event pass. Regular files use bounded stream
-//! input. The explicit mmap selector is refused because mutable mappings are not safe to
-//! access in process after concurrent file truncation.
+//! input with file-stability checks around validation.
 
 const std = @import("std");
-const builtin = @import("builtin");
 const binary = @import("mzml/binary.zig");
 const diagnostic = @import("diagnostic.zig");
 const elements = @import("mzml/elements.zig");
@@ -32,20 +30,12 @@ const stream_input_buffer_bytes = 64 * 1024;
 
 // --- Public entry points ---
 
-/// Requested input source mode. Mmap is retained as an explicit, non-fallback selector,
-/// but path validation refuses it before mapping mutable file storage.
-pub const InputMode = enum {
-    stream,
-    mmap,
-};
-
 /// Per-run flags for `checkPath`, `checkSlice`, and `checkReader`.
 /// `obo_path` is borrowed only while an invocation context is initialized.
 pub const CheckOptions = struct {
     skip_binary: bool = false,
     skip_index: bool = false,
     skip_semantic: bool = false,
-    input_mode: InputMode = .stream,
     max_binary_size: ?usize = null,
     resource_limits: diagnostic.ResourceLimits = .{},
     obo_path: ?[]const u8 = null,
@@ -244,7 +234,7 @@ pub const ValidationError = error{
     ValidationIncomplete,
 };
 
-/// Validates an mzML file on disk using the requested input mode.
+/// Validates an mzML file on disk using bounded stream input.
 pub fn checkPath(
     allocator: std.mem.Allocator,
     io: std.Io,
@@ -348,16 +338,7 @@ fn checkPathInternal(
         return;
     }
 
-    switch (context.options.input_mode) {
-        .mmap => try appendModeFailureDiagnostic(
-            context,
-            diagnostics,
-            result,
-            path,
-            "requested mmap input mode is refused because mutable file mappings cannot be validated safely in process",
-        ),
-        .stream => try checkPathStream(context, file, opened_stat, diagnostics, path, result),
-    }
+    try checkPathStream(context, file, opened_stat, diagnostics, path, result);
 }
 
 fn checkPathStream(
@@ -421,28 +402,6 @@ fn appendFileStabilityDiagnostic(
         .{
             .severity = .@"error",
             .rule = RuleId.runtime_file_stability,
-            .path = path,
-            .message = message,
-        },
-    );
-}
-
-fn appendModeFailureDiagnostic(
-    context: *InvocationContext,
-    diagnostics: *DiagnosticSink,
-    result: *FileResult,
-    path: []const u8,
-    message: []const u8,
-) !void {
-    try appendFailureDiagnostic(
-        context.allocator,
-        diagnostics,
-        result,
-        .input,
-        .input,
-        .{
-            .severity = .@"error",
-            .rule = RuleId.runtime_input_mode,
             .path = path,
             .message = message,
         },
@@ -896,26 +855,10 @@ test "path check: uses bounded stream input" {
         .skip_binary = true,
         .skip_index = true,
         .skip_semantic = true,
-        .input_mode = .stream,
     });
 
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
-}
-
-test "check options: default to stream input" {
-    const options = CheckOptions{};
-    try std.testing.expectEqual(InputMode.stream, options.input_mode);
-}
-
-test "check options: explicit mmap input has one source of truth" {
-    var context = InvocationContext.init(std.testing.allocator, std.testing.io, .{
-        .skip_semantic = true,
-        .input_mode = .mmap,
-    });
-    defer context.deinit();
-
-    try std.testing.expectEqual(InputMode.mmap, context.options.input_mode);
 }
 
 test "slice result owns failure metadata after borrowed inputs expire" {
@@ -1000,28 +943,6 @@ test "[unit]: legacy path wrapper reports intentionally non-retained failure det
     try std.testing.expectEqual(diagnostic.Totals{ .errors = 1 }, diagnostics.totals);
 }
 
-test "path check: refuses mmap without falling back to stream" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    const path = "fixtures/mzml/valid/tiny.pwiz.1.1.mzML";
-
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-    const result = checkPathResult(allocator, io, &diagnostics, path, .{
-        .skip_binary = true,
-        .skip_index = true,
-        .skip_semantic = true,
-        .input_mode = .mmap,
-    });
-
-    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
-    try std.testing.expectEqual(@as(u16, 0), result.completed_stages);
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings(RuleId.runtime_input_mode, diagnostics.items[0].rule);
-    try std.testing.expectEqual(FailureReason.input, result.first_failure.?.reason);
-}
-
 test "path check: rejects a changed file" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1048,49 +969,6 @@ test "path check: rejects a changed file" {
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expectEqualStrings(RuleId.runtime_file_stability, diagnostics.items[0].rule);
-}
-
-test "mmap host behavior: multi-page truncation faults only the child process" {
-    if (builtin.os.tag != .linux) return error.SkipZigTest;
-
-    const io = std.testing.io;
-    const linux = std.os.linux;
-    const page_size = std.heap.pageSize();
-    const mapped_len = page_size * 3;
-
-    var temp_dir = std.testing.tmpDir(.{});
-    defer temp_dir.cleanup();
-    var file = try temp_dir.dir.createFile(io, "mapped-truncated.mzML", .{ .read = true });
-    defer file.close(io);
-    try file.setLength(io, mapped_len);
-
-    var mm = try std.Io.File.MemoryMap.create(io, file, .{
-        .len = mapped_len,
-        .protection = .{ .read = true },
-        .populate = false,
-    });
-    defer mm.destroy(io);
-
-    const fork_result = linux.fork();
-    if (linux.errno(fork_result) != .SUCCESS) return error.ForkFailed;
-    if (fork_result == 0) {
-        if (linux.errno(linux.ftruncate(file.handle, 1)) != .SUCCESS) linux.exit(120);
-        const default_bus_action: linux.Sigaction = .{
-            .handler = .{ .handler = null },
-            .mask = std.mem.zeroes(linux.sigset_t),
-            .flags = 0,
-        };
-        if (linux.errno(linux.sigaction(.BUS, &default_bus_action, null)) != .SUCCESS) linux.exit(121);
-        const beyond_eof: *const volatile u8 = @ptrCast(&mm.memory[page_size * 2]);
-        _ = beyond_eof.*;
-        linux.exit(0);
-    }
-
-    var status: u32 = 0;
-    const wait_result = linux.waitpid(@intCast(fork_result), &status, 0);
-    if (linux.errno(wait_result) != .SUCCESS) return error.WaitFailed;
-    try std.testing.expect(linux.W.IFSIGNALED(status));
-    try std.testing.expectEqual(linux.SIG.BUS, linux.W.TERMSIG(status));
 }
 
 test "path check: validates structure when binary checks are skipped" {
@@ -1355,7 +1233,6 @@ test "path check: validates a stream SHA-1 checksum" {
     const result = checkPathResult(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
-        .input_mode = .stream,
     });
 
     for (diagnostics.items) |d| {
@@ -1479,7 +1356,6 @@ test "path check: detects a corrupt SHA-1 checksum" {
     try checkPath(allocator, io, &diagnostics, path, .{
         .skip_binary = true,
         .skip_semantic = true,
-        .input_mode = .stream,
     });
 
     var found = false;
@@ -1587,19 +1463,6 @@ test "path check: accepts indexed input without a checksum" {
     }
 }
 
-test "path check: reports a missing file before mmap selection" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
-
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-
-    try checkPath(allocator, io, &diagnostics, "definitely-missing.mzML", .{ .input_mode = .mmap });
-
-    try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings(RuleId.runtime_file_open, diagnostics.items[0].rule);
-}
-
 test "path check: validates the valid fixture corpus" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1644,7 +1507,6 @@ test "path check: reports a binary length mismatch in stream mode" {
     defer diagnostics.deinit(allocator);
 
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/adversarial/large-binary-text.mzML", .{
-        .input_mode = .stream,
         .skip_semantic = true,
     });
 

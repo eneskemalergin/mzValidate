@@ -6,6 +6,7 @@ zig-cache/
 
 # Local Zig installation (download separately)
 zig-*/
+zig-pkg/
 
 # Local zig wrapper (uses project-local zig installation)
 /zig

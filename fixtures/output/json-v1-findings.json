@@ -1,6 +1,5 @@
 {
   "schema_version": 1,
-  "input_mode": "stream",
   "files": [
     {
       "path": "fixtures/mzml/invalid/invalid-base64.mzML",
