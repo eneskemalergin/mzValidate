@@ -1741,6 +1741,57 @@ test "required state: allocation failures stay incomplete and leak-free" {
     }, null, true);
 }
 
+test "[unit]: binary and index allocation failures stay incomplete and leak-free" {
+    const xml = binarySpectrumListMzml(
+        "eJxjYGBgAAAABAAB",
+        "AAAAAA==",
+        1,
+        "MS:1000574",
+        "zlib compression",
+    );
+    try expectAllocationFailuresIncomplete(xml, .{
+        .skip_semantic = true,
+    }, xml, false);
+}
+
+fn fuzzValidationCleanup(_: void, smith: *std.testing.Smith) !void {
+    const seed = comptime binarySpectrumListMzml(
+        "eJxjYGBgAAAABAAB",
+        "AAAAAA==",
+        1,
+        "MS:1000574",
+        "zlib compression",
+    );
+    var mutated: [seed.len]u8 = undefined;
+    @memcpy(&mutated, seed);
+
+    var edits: [24]u8 = undefined;
+    const edit_len: usize = smith.slice(&edits);
+    var index: usize = 0;
+    while (index + 1 < edit_len) : (index += 2) {
+        mutated[edits[index] % mutated.len] ^= edits[index + 1];
+    }
+    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(seed.len));
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    _ = checkSliceResult(
+        std.testing.allocator,
+        std.testing.io,
+        mutated[0..len],
+        &diagnostics,
+        "fuzz.mzML",
+        .{ .skip_semantic = true },
+        null,
+    );
+}
+
+test "[unit]: streaming validation mutation cleanup is leak-free" {
+    try std.testing.fuzz({}, fuzzValidationCleanup, .{
+        .corpus = &.{ "", "truncate", "byte-edit", "binary" },
+    });
+}
+
 test "[unit]: forward-reference allocation failures remain incomplete" {
     const xml = spectrumListMzml(
         "<spectrumList count=\"2\" defaultDataProcessingRef=\"DP1\">" ++
@@ -1866,6 +1917,45 @@ test "invocation context: owns the catalog across multiple paths" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, second.completion);
     try std.testing.expect(context.catalog != null);
     try std.testing.expectEqual(initial_usage, context.resourceUsage());
+}
+
+test "[unit]: invocation context file-local owners return to the catalog baseline" {
+    var allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{});
+    var context = InvocationContext.init(allocator.allocator(), std.testing.io, .{});
+    var context_live = true;
+    defer if (context_live) context.deinit();
+    try std.testing.expect(context.catalog != null);
+
+    const catalog_live_bytes = allocator.allocated_bytes - allocator.freed_bytes;
+    const clean = spectrumListMzml("<spectrumList count=\"0\" defaultDataProcessingRef=\"DP1\"/>");
+    const zlib = binarySpectrumListMzml(
+        "eJxjYGBgAAAABAAB",
+        "AAAAAA==",
+        1,
+        "MS:1000574",
+        "zlib compression",
+    );
+    const malformed = "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run";
+    const cases = [_][]const u8{
+        clean,
+        clean[0 .. clean.len - 7],
+        zlib,
+        malformed,
+    };
+
+    for (cases) |bytes| {
+        var diagnostics: DiagnosticSink = .empty;
+        _ = context.checkSliceResult(bytes, &diagnostics, "lifetime.mzML", null);
+        diagnostics.deinit(allocator.allocator());
+        try std.testing.expectEqual(
+            catalog_live_bytes,
+            allocator.allocated_bytes - allocator.freed_bytes,
+        );
+    }
+
+    context.deinit();
+    context_live = false;
+    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
 }
 
 test "[unit]: embedded semantic catalog reports shared invocation capacity" {

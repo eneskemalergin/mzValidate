@@ -849,6 +849,74 @@ test "diagnostic sink handles maximal configured capacity without arithmetic ove
     try std.testing.expectEqual(@as(usize, 0), sink.capacity);
 }
 
+fn diagnosticGrowthAllocationCheck(allocator: std.mem.Allocator) !void {
+    var sink: DiagnosticSink = .empty;
+    defer sink.deinit(allocator);
+    for (0..17) |index| {
+        _ = try sink.append(allocator, .{
+            .severity = if (index % 2 == 0) .warning else .@"error",
+            .rule = "test.allocation",
+            .message = "retained diagnostic",
+        });
+    }
+}
+
+test "[unit]: diagnostic sink cleans every growth allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        diagnosticGrowthAllocationCheck,
+        .{},
+    );
+}
+
+test "[unit]: diagnostic sink preserves ownership when remap growth fails" {
+    const backing = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(backing);
+    var fixed = std.heap.FixedBufferAllocator.init(backing);
+    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
+        .resize_fail_index = 0,
+    });
+    try diagnosticGrowthAllocationCheck(allocator.allocator());
+    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
+}
+
+test "[unit]: diagnostic sink keeps old storage when remap and fallback allocation fail" {
+    const backing = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(backing);
+    var fixed = std.heap.FixedBufferAllocator.init(backing);
+    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+    {
+        var sink: DiagnosticSink = .empty;
+        defer sink.deinit(allocator.allocator());
+
+        _ = try sink.append(allocator.allocator(), .{
+            .severity = .warning,
+            .rule = "test.first",
+            .message = "retained",
+        });
+        while (sink.items.len < sink.capacity) {
+            _ = try sink.append(allocator.allocator(), .{
+                .severity = .warning,
+                .rule = "test.fill",
+                .message = "retained",
+            });
+        }
+        const retained_len = sink.items.len;
+        try std.testing.expectError(error.OutOfMemory, sink.append(allocator.allocator(), .{
+            .severity = .@"error",
+            .rule = "test.second",
+            .message = "must fail",
+        }));
+        try std.testing.expect(allocator.has_induced_failure);
+        try std.testing.expectEqual(retained_len, sink.items.len);
+        try std.testing.expectEqualStrings("test.first", sink.items[0].rule);
+    }
+    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
+}
+
 test "diagnostic sink bounds detail while retaining complete totals" {
     var sink = DiagnosticSink.init(.{ .max_diagnostics = 2, .max_rendered_bytes = 4096 });
     defer sink.deinit(std.testing.allocator);

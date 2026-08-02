@@ -537,6 +537,52 @@ test "parses flags and input paths" {
     }
 }
 
+fn parseArgsAllocationCheck(allocator: std.mem.Allocator) !void {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "one.mzML",
+        "two.mzML",
+        "three.mzML",
+        "four.mzML",
+        "five.mzML",
+    };
+    var command = try parseArgs(allocator, &argv);
+    defer command.deinit(allocator);
+}
+
+test "[unit]: command parsing cleans every allocation failure" {
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        parseArgsAllocationCheck,
+        .{},
+    );
+}
+
+test "[unit]: command parsing owns the result when shrinking cannot remap" {
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
+        .resize_fail_index = 0,
+    });
+    try parseArgsAllocationCheck(allocator.allocator());
+    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
+}
+
+test "[unit]: command parsing cleans the list when remap and fallback allocation fail" {
+    const argv = [_][]const u8{ "mzValidate", "check", "one.mzML" };
+    var backing: [4096]u8 = undefined;
+    var fixed = std.heap.FixedBufferAllocator.init(&backing);
+    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
+
+    try std.testing.expectError(error.OutOfMemory, parseArgs(allocator.allocator(), &argv));
+    try std.testing.expect(allocator.has_induced_failure);
+    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
+}
+
 test "rejects the removed memory limit flag" {
     const argv = [_][]const u8{
         "mzValidate",

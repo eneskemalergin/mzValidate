@@ -510,26 +510,48 @@ test "rule engine returns empty rules for invalid path state" {
     try std.testing.expectEqual(@as(usize, 0), engine.rulesForState(invalid_state).len);
 }
 
-test "rule engine cleans path index allocation failures" {
+fn ruleEngineAllocationCheck(allocator: std.mem.Allocator, xml: []const u8) !void {
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+}
+
+test "[unit]: rule engine cleans path index allocation failures" {
     const xml = "<CvMapping><CvMappingRuleList>" ++
         "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
         "<CvTerm termAccession=\"MS:1000001\"></CvTerm>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
 
-    var reached_success = false;
-    for (0..64) |fail_index| {
-        var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = fail_index });
-        if (RuleEngine.init(failing_allocator.allocator(), xml)) |engine_value| {
-            var engine = engine_value;
-            engine.deinit();
-            reached_success = true;
-        } else |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-        }
-        try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
-        if (reached_success) break;
+    try std.testing.checkAllAllocationFailures(
+        std.testing.allocator,
+        ruleEngineAllocationCheck,
+        .{xml},
+    );
+}
+
+fn fuzzRuleEngineCleanup(_: void, smith: *std.testing.Smith) !void {
+    const seed = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"seed\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var mutated: [seed.len]u8 = undefined;
+    @memcpy(&mutated, seed);
+
+    var edits: [16]u8 = undefined;
+    const edit_len: usize = smith.slice(&edits);
+    var index: usize = 0;
+    while (index + 1 < edit_len) : (index += 2) {
+        mutated[edits[index] % mutated.len] ^= edits[index + 1];
     }
-    try std.testing.expect(reached_success);
+    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(seed.len));
+
+    var engine = RuleEngine.init(std.testing.allocator, mutated[0..len]) catch return;
+    engine.deinit();
+}
+
+test "[unit]: rule engine mutation cleanup is leak-free" {
+    try std.testing.fuzz({}, fuzzRuleEngineCleanup, .{
+        .corpus = &.{ "", "truncate", "byte-edit" },
+    });
 }
 
 test "rule engine ignores commented-out rules" {

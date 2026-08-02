@@ -847,25 +847,22 @@ test "[unit]: OBO catalog accepts its exact peak limit and rejects one byte less
     try std.testing.expectEqual(@as(usize, 0), too_small_allocator.allocated_bytes);
 }
 
-test "cv table cleans every field on allocation failure" {
+fn cvTableAllocationCheck(allocator: std.mem.Allocator, obo: []const u8) !void {
+    var table = try CvTable.init(allocator, obo);
+    defer table.deinit();
+}
+
+test "[unit]: cv table cleans every field on allocation failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const obo = try readFixture(allocator, io, "fixtures/obo/adversarial/allocation-failure.obo");
     defer allocator.free(obo);
-    var succeeded = false;
 
-    var fail_index: usize = 0;
-    while (fail_index < 128) : (fail_index += 1) {
-        var failing_allocator = std.testing.FailingAllocator.init(allocator, .{ .fail_index = fail_index });
-        var table = CvTable.init(failing_allocator.allocator(), obo) catch |err| {
-            try std.testing.expectEqual(error.OutOfMemory, err);
-            continue;
-        };
-        succeeded = true;
-        table.deinit();
-    }
-
-    try std.testing.expect(succeeded);
+    try std.testing.checkAllAllocationFailures(
+        allocator,
+        cvTableAllocationCheck,
+        .{obo},
+    );
 
     var table = try CvTable.init(allocator, obo);
     defer table.deinit();
@@ -877,4 +874,34 @@ test "cv table cleans every field on allocation failure" {
     try std.testing.expectEqual(@as(usize, 1), term.synonyms.len);
     try std.testing.expectEqual(@as(usize, 1), term.allowed_units.len);
     try std.testing.expectEqual(@as(usize, 1), term.binary_data_types.len);
+}
+
+fn fuzzCvTableCleanup(_: void, smith: *std.testing.Smith) !void {
+    const seed =
+        "format-version: 1.2\n" ++
+        "[Term]\n" ++
+        "id: MS:9000001\n" ++
+        "name: fuzz seed\n" ++
+        "namespace: MS\n" ++
+        "is_a: MS:1000001\n" ++
+        "synonym: \"seed\" EXACT []\n";
+    var mutated: [seed.len]u8 = undefined;
+    @memcpy(&mutated, seed);
+
+    var edits: [16]u8 = undefined;
+    const edit_len: usize = smith.slice(&edits);
+    var index: usize = 0;
+    while (index + 1 < edit_len) : (index += 2) {
+        mutated[edits[index] % mutated.len] ^= edits[index + 1];
+    }
+    const len: usize = smith.valueRangeAtMost(u16, 0, @intCast(seed.len));
+
+    var table = CvTable.init(std.testing.allocator, mutated[0..len]) catch return;
+    table.deinit();
+}
+
+test "[unit]: cv table mutation cleanup is leak-free" {
+    try std.testing.fuzz({}, fuzzCvTableCleanup, .{
+        .corpus = &.{ "", "truncate", "byte-edit" },
+    });
 }

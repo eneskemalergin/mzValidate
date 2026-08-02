@@ -1173,7 +1173,10 @@ pub const BinaryValidator = struct {
         if (comptime build_options.enable_libdeflate) {
             if (expected_decoded_bytes) |expected| {
                 if (expected > 0 and expected <= validator.limits.max_binary_materialized_bytes) {
-                    validator.ensureScratchCapacity(&validator.libdeflate_output, expected) catch return error.ScratchLimitExceeded;
+                    validator.ensureScratchCapacity(&validator.libdeflate_output, expected) catch |err| switch (err) {
+                        error.OutOfMemory => return error.OutOfMemory,
+                        error.ResourceLimitExceeded => return error.ScratchLimitExceeded,
+                    };
                     const decompressor = try validator.ensureLibdeflateDecompressor();
                     try validator.libdeflate_output.resize(validator.allocator, expected);
 
@@ -1201,7 +1204,10 @@ pub const BinaryValidator = struct {
             }
         }
 
-        validator.ensureScratchCapacity(&validator.flate_buffer, flate_buffer_len) catch return error.ScratchLimitExceeded;
+        validator.ensureScratchCapacity(&validator.flate_buffer, flate_buffer_len) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            error.ResourceLimitExceeded => return error.ScratchLimitExceeded,
+        };
         try validator.flate_buffer.resize(validator.allocator, flate_buffer_len);
         return inflateCountWithBuffer(
             compressed,
@@ -2010,7 +2016,13 @@ test "binary scratch limit applies to selected capacity class" {
 }
 
 test "binary scratch growth failure releases retained capacity" {
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    const backing = try std.testing.allocator.alloc(u8, 64 * 1024);
+    defer std.testing.allocator.free(backing);
+    var fixed = std.heap.FixedBufferAllocator.init(backing);
+    var failing_allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
+        .fail_index = 1,
+        .resize_fail_index = 0,
+    });
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(std.testing.allocator);
 
@@ -2022,6 +2034,31 @@ test "binary scratch growth failure releases retained capacity" {
         try std.testing.expectError(
             error.OutOfMemory,
             validator.ensureScratchCapacity(&validator.compressed_payload, 4 * 1024 + 1),
+        );
+    }
+
+    try std.testing.expect(failing_allocator.has_induced_failure);
+    try std.testing.expectEqual(failing_allocator.allocated_bytes, failing_allocator.freed_bytes);
+}
+
+test "[unit]: binary decompression preserves scratch allocation failure" {
+    const compressed = [_]u8{
+        0x78, 0x9c, 0xcb, 0x48, 0xcd, 0xc9, 0xc9, 0x07,
+        0x00, 0x06, 0x2c, 0x02, 0x15,
+    };
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+
+    {
+        var validator = BinaryValidator.init(failing_allocator.allocator(), &diagnostics, "fixture");
+        defer validator.deinit();
+        const expected_bytes: ?usize = if (comptime build_options.enable_libdeflate) 5 else null;
+        try std.testing.expectError(
+            error.OutOfMemory,
+            validator.inflateDecodedZlib(&compressed, expected_bytes),
         );
     }
 

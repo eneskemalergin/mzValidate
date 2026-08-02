@@ -2873,6 +2873,33 @@ test "[unit]: unresolved diagnostic allocation failure propagates" {
     try expectError(error.OutOfMemory, table.resolveAll(&diagnostics, null));
 }
 
+fn fuzzReferenceOwnership(_: void, smith: *std.testing.Smith) !void {
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    var budget = SemanticBudget.init(std.testing.allocator, &diagnostics, null, .{});
+    var table = RefTable.init(std.testing.allocator);
+    defer table.deinit(&budget);
+
+    const ids = [_][]const u8{ "a", "b", "c", "d", "e", "f", "g", "h" };
+    var operations: [32]u8 = undefined;
+    const operation_len: usize = smith.slice(&operations);
+    for (operations[0..operation_len], 0..) |operation, index| {
+        const id = ids[(operation >> 1) % ids.len];
+        if (operation & 1 == 0) {
+            try table.addRef(&budget, &diagnostics, null, id, .software, index);
+        } else {
+            _ = try table.declare(&budget, &diagnostics, null, id, .software, index);
+        }
+    }
+    try table.resolveAll(&diagnostics, null);
+}
+
+test "[unit]: semantic reference mutation cleanup is leak-free" {
+    try std.testing.fuzz({}, fuzzReferenceOwnership, .{
+        .corpus = &.{ "", "references", "declarations", "mixed-order" },
+    });
+}
+
 test "[unit]: addRef cleans every allocation failure" {
     const reference_count = 8;
 
