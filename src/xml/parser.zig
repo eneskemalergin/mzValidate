@@ -1063,7 +1063,27 @@ pub const Parser = struct {
     }
 
     fn appendLiteralTokenSlice(parser: *Parser, bytes: []const u8, field: LimitField) ParseError!void {
-        for (bytes, 0..) |byte, index| {
+        var fast_len: usize = 0;
+        if (parser.literal_validator.expected_len == 0) {
+            for (bytes) |byte| {
+                if (byte >= 0x7f or (byte < 0x20 and byte != '\t' and byte != '\n' and byte != '\r')) break;
+                if (field == .attribute and byte == '<') break;
+                if ((field == .scalar_text or field == .binary_text) and (byte == ']' or byte == '>')) break;
+                fast_len += 1;
+            }
+            if (fast_len > 0) {
+                if (parser.ensureTokenAppend(field, fast_len)) {
+                    @memcpy(parser.token_buffer[parser.token_len..][0..fast_len], bytes[0..fast_len]);
+                    parser.token_len += fast_len;
+                    if (field == .scalar_text or field == .binary_text) parser.plain_text_brackets = 0;
+                } else |_| {
+                    // Keep limit failures byte-wise so the diagnostic points at the crossing byte.
+                    fast_len = 0;
+                }
+            }
+        }
+
+        for (bytes[fast_len..], fast_len..) |byte, index| {
             if (field == .attribute and byte == '<') {
                 parser.consumeBufferedBytes(index + 1);
                 return error.InvalidXmlCharacter;

@@ -118,6 +118,31 @@ pub fn validateName(bytes: []const u8) NameError!void {
 }
 
 pub fn validateQName(bytes: []const u8) NameError!void {
+    var part_start = true;
+    var colon_seen = false;
+    for (bytes) |byte| {
+        if (byte >= 0x80) break;
+        if (byte == ':') {
+            if (part_start or colon_seen) return validateQNameUnicode(bytes);
+            colon_seen = true;
+            part_start = true;
+            continue;
+        }
+        const valid = if (part_start)
+            byte == '_' or std.ascii.isAlphabetic(byte)
+        else
+            byte == '_' or byte == '-' or byte == '.' or std.ascii.isAlphanumeric(byte);
+        if (!valid) return validateQNameUnicode(bytes);
+        part_start = false;
+    } else {
+        if (part_start) return error.InvalidName;
+        return;
+    }
+
+    return validateQNameUnicode(bytes);
+}
+
+fn validateQNameUnicode(bytes: []const u8) NameError!void {
     const view = std.unicode.Utf8View.init(bytes) catch return error.InvalidUtf8;
     var iterator = view.iterator();
     var part_start = true;
@@ -239,6 +264,10 @@ test "XML QName production accepts Unicode boundaries and rejects punctuation" {
     try std.testing.expectError(error.InvalidName, validateQName("1root"));
     try std.testing.expectError(error.InvalidName, validateQName("root:$attr"));
     try std.testing.expectError(error.InvalidName, validateQName("root:child:leaf"));
+}
+
+test "[unit]: QName validation preserves invalid UTF-8 precedence" {
+    try std.testing.expectError(error.InvalidUtf8, validateQName("1\xff"));
 }
 
 test "XML name productions preserve included ranges and excluded gaps" {
