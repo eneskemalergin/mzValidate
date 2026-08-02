@@ -220,6 +220,33 @@ pub fn nameCharRunLen(bytes: []const u8) usize {
     return bytes.len;
 }
 
+/// Run of ordinary ASCII literal bytes before a field-specific delimiter.
+pub fn asciiLiteralRunLen(bytes: []const u8, comptime stops: []const u8) usize {
+    var offset: usize = 0;
+    while (bytes.len - offset >= chunk_len) {
+        const chunk: ByteVector = bytes[offset..][0..chunk_len].*;
+        const allowed_control = (chunk == @as(ByteVector, @splat('\t'))) |
+            (chunk == @as(ByteVector, @splat('\n'))) |
+            (chunk == @as(ByteVector, @splat('\r')));
+        var invalid = (chunk >= @as(ByteVector, @splat(0x7f))) |
+            ((chunk < @as(ByteVector, @splat(0x20))) & !allowed_control);
+        inline for (stops) |stop| {
+            invalid = invalid | (chunk == @as(ByteVector, @splat(stop)));
+        }
+        if (std.simd.firstTrue(invalid)) |pos| return offset + pos;
+        offset += chunk_len;
+    }
+    for (bytes[offset..], 0..) |byte, index| {
+        if (byte >= 0x7f or (byte < 0x20 and byte != '\t' and byte != '\n' and byte != '\r')) {
+            return offset + index;
+        }
+        inline for (stops) |stop| {
+            if (byte == stop) return offset + index;
+        }
+    }
+    return bytes.len;
+}
+
 const text_stops = [_]u8{ '<', '&' };
 
 /// Plain text run before `<` or `&` (no entity decoding needed).
@@ -380,6 +407,10 @@ test "scanner handles delimiters at SIMD boundaries" {
     attribute[chunk_len - 1] = '"';
     try std.testing.expectEqual(chunk_len - 1, attrValuePlainRunLen(&attribute, '"'));
 
+    var literal: [chunk_len + 2]u8 = @splat('a');
+    literal[chunk_len - 1] = ']';
+    try std.testing.expectEqual(chunk_len - 1, asciiLiteralRunLen(&literal, &.{ ']', '>' }));
+
     var cdata: [chunk_len + 3]u8 = @splat('x');
     cdata[chunk_len - 1] = ']';
     cdata[chunk_len] = ']';
@@ -396,6 +427,16 @@ test "scanner handles delimiters at SIMD boundaries" {
     pi[chunk_len - 1] = '?';
     pi[chunk_len] = '>';
     try std.testing.expectEqual(@as(?usize, chunk_len - 1), piEndLen(&pi));
+}
+
+test "[unit]: ASCII literal scanner leaves exceptional bytes for validation" {
+    const ordinary = "base64+/= text\t\n\r";
+
+    try std.testing.expectEqual(ordinary.len, asciiLiteralRunLen(ordinary, &.{ ']', '>' }));
+    try std.testing.expectEqual(@as(usize, 3), asciiLiteralRunLen("abc\x7fdef", &.{}));
+    try std.testing.expectEqual(@as(usize, 3), asciiLiteralRunLen("abc\x0bdef", &.{}));
+    try std.testing.expectEqual(@as(usize, 3), asciiLiteralRunLen("abc<def", &.{'<'}));
+    try std.testing.expectEqual(@as(usize, 3), asciiLiteralRunLen("abc]def", &.{ ']', '>' }));
 }
 
 test "raw start tag scanner keeps quoted greater-than bytes inside values" {

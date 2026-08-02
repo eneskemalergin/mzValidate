@@ -1065,12 +1065,11 @@ pub const Parser = struct {
     fn appendLiteralTokenSlice(parser: *Parser, bytes: []const u8, field: LimitField) ParseError!void {
         var fast_len: usize = 0;
         if (parser.literal_validator.expected_len == 0) {
-            for (bytes) |byte| {
-                if (byte >= 0x7f or (byte < 0x20 and byte != '\t' and byte != '\n' and byte != '\r')) break;
-                if (field == .attribute and byte == '<') break;
-                if ((field == .scalar_text or field == .binary_text) and (byte == ']' or byte == '>')) break;
-                fast_len += 1;
-            }
+            fast_len = switch (field) {
+                .attribute => scan.asciiLiteralRunLen(bytes, &.{'<'}),
+                .scalar_text, .binary_text => scan.asciiLiteralRunLen(bytes, &.{ ']', '>' }),
+                .start_tag => scan.asciiLiteralRunLen(bytes, &.{}),
+            };
             if (fast_len > 0) {
                 if (parser.ensureTokenAppend(field, fast_len)) {
                     @memcpy(parser.token_buffer[parser.token_len..][0..fast_len], bytes[0..fast_len]);
