@@ -1278,6 +1278,21 @@ pub const Parser = struct {
     fn consumeBufferedAttrValuePlainRun(parser: *Parser, quote: u8, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
         const tail = parser.bufferedTail() orelse return;
+        qualified: {
+            if (parser.literal_validator.expected_len == 0) {
+                const qualified_len = if (quote == '"')
+                    scan.asciiLiteralRunLen(tail, &.{ '"', '&', '<' })
+                else
+                    scan.asciiLiteralRunLen(tail, &.{ '\'', '&', '<' });
+                if (qualified_len > 0) {
+                    parser.ensureTokenAppend(field, qualified_len) catch break :qualified;
+                    @memcpy(parser.token_buffer[parser.token_len..][0..qualified_len], tail[0..qualified_len]);
+                    parser.token_len += qualified_len;
+                    parser.consumeBufferedBytes(qualified_len);
+                    return;
+                }
+            }
+        }
         const run_len = scan.attrValuePlainRunLen(tail, quote);
         if (run_len == 0) return;
         try parser.appendLiteralTokenSlice(tail[0..run_len], field);
