@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.5-blue?style=flat-square" alt="version 0.1.5">
+  <img src="https://img.shields.io/badge/version-0.1.6-blue?style=flat-square" alt="version 0.1.6">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-development-green?style=flat-square" alt="status: development">
   <br/>
@@ -150,7 +150,7 @@ Rule IDs are the stable machine contract. Human-readable `message` text is separ
 
 `FileResult` is a self-contained value. It does not reference parser buffers, file-local validation state, the semantic catalog, or diagnostic storage. Its `FirstFailure` owns bounded copies of the rule, message, and path; the accessor slices borrow the `FirstFailure` value itself. The fixed capacities are 64 bytes for a rule ID, 512 bytes for a message, and `std.Io.Dir.max_path_bytes` for a path. An overlong value is copied as a prefix ending in `...`, and `FirstFailure.metadataTruncated()` reports that condition.
 
-The CLI is the reference caller. It creates one invocation context, validates explicit paths serially in input order, releases each file's diagnostic sink before the next file completes, and retains only fixed `FileResult` values for final aggregation.
+The CLI is the reference caller. It creates one invocation context, validates explicit paths serially in input order, and releases each file's diagnostic sink and file-local state before starting the next path. One fixed `Summary` retains invocation totals, completion, truncation, and first-failure metadata. JSON file objects are written incrementally, and brief mode retains at most 256 borrowed rule and message groups until final rendering. Run independent mzValidate processes when an external scheduler needs parallel file validation; the built-in CLI does not schedule workers.
 
 Validation phases (each flag disables one phase). By default all phases run:
 
@@ -241,7 +241,7 @@ Category header rows align with the Validation sections above.
 | **Index**                        |          |                                                                            |
 | `mzml.index.offset-list`         | error    | `indexListOffset` does not match actual offset                             |
 | `mzml.index.offset`              | error    | Index offset does not match recorded position                              |
-| `mzml.index.duplicate-id`        | error    | Indexed ID repeats within its spectrum or chromatogram kind                 |
+| `mzml.index.duplicate-id`        | error    | Indexed ID repeats within its spectrum or chromatogram kind                |
 | `mzml.index.truncated`           | error    | Index offset points past end of file                                       |
 | `mzml.index.checksum`            | error    | SHA-1 mismatch or invalid hex format                                       |
 | **Semantic**                     |          |                                                                            |

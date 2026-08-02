@@ -82,17 +82,12 @@ pub fn renderTextFile(
 /// Writes the final text result block for an invocation.
 pub fn renderTextFinal(
     writer: *std.Io.Writer,
-    results: []const diagnostic.FileResult,
+    summary: diagnostic.Summary,
 ) std.Io.Writer.Error!void {
-    var rendered = false;
-    for (results) |result| {
-        if (result.totals.info != 0 or result.totals.warnings != 0 or result.totals.errors != 0) {
-            rendered = true;
-            break;
-        }
+    if (summary.totals.info == 0 and summary.totals.warnings == 0 and summary.totals.errors == 0) {
+        try writer.writeAll("OK: no diagnostics emitted\n\n");
     }
-    if (!rendered) try writer.writeAll("OK: no diagnostics emitted\n\n");
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
+    try writeResultBlock(writer, summary);
 }
 
 fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -149,9 +144,9 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
 /// Writes completion, severity, and failure metadata.
 pub fn renderSummaryResult(
     writer: *std.Io.Writer,
-    results: []const diagnostic.FileResult,
+    summary: diagnostic.Summary,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
+    try writeResultBlock(writer, summary);
 }
 
 /// Groups diagnostics by severity+rule+message and prints compact counts.
@@ -170,6 +165,7 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
 }
 
 /// Fixed-capacity grouping state holding borrowed rule and message slices.
+/// Borrowed text must outlive the final call to `render`.
 pub const BriefGroups = struct {
     const max_groups = 256;
 
@@ -283,15 +279,19 @@ pub fn renderBriefResult(
 pub fn renderBriefGroupsResult(
     writer: *std.Io.Writer,
     groups: *BriefGroups,
-    results: []const diagnostic.FileResult,
+    summary: diagnostic.Summary,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
-    try renderEmergencyFailures(writer, results);
-    if (groups.length > 0) try groups.render(writer);
-    for (results) |result| {
-        if (hasDroppedDiagnostics(result)) {
-            try renderTruncationText(writer, result.dropped_diagnostics, null);
+    try writeResultBlock(writer, summary);
+    if (summary.first_emergency_failure) |failure| {
+        try renderFailureText(writer, failure);
+        if (summary.emergency_failures > 1) {
+            try writer.print("... and {d} more emergency failures\n", .{summary.emergency_failures - 1});
         }
+        try writer.writeByte('\n');
+    }
+    if (groups.length > 0) try groups.render(writer);
+    if (hasDroppedTotals(summary.dropped_diagnostics)) {
+        try renderTruncationText(writer, summary.dropped_diagnostics, null);
     }
 }
 
@@ -663,9 +663,11 @@ fn renderTruncationText(writer: *std.Io.Writer, dropped: diagnostic.Totals, path
 }
 
 fn hasDroppedDiagnostics(result: diagnostic.FileResult) bool {
-    return result.dropped_diagnostics.info != 0 or
-        result.dropped_diagnostics.warnings != 0 or
-        result.dropped_diagnostics.errors != 0;
+    return hasDroppedTotals(result.dropped_diagnostics);
+}
+
+fn hasDroppedTotals(totals: diagnostic.Totals) bool {
+    return totals.info != 0 or totals.warnings != 0 or totals.errors != 0;
 }
 
 fn hasDiagnosticTruncation(results: []const diagnostic.FileResult) bool {
@@ -709,7 +711,7 @@ test "summary result reports incomplete failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result});
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
@@ -730,7 +732,7 @@ test "summary result uses human warning status" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, &.{result});
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
 
     try std.testing.expectEqualStrings(
         "complete: warnings (info=2 warnings=1 errors=0)\n",
@@ -953,13 +955,58 @@ test "[unit]: pre-grouped brief renderer emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderBriefGroupsResult(&allocating_writer.writer, &groups, &.{result});
+    try renderBriefGroupsResult(
+        &allocating_writer.writer,
+        &groups,
+        diagnostic.summarizeResults(&.{result}),
+    );
 
     try std.testing.expectEqualStrings(
         "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
             "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n" ++
             "input: sample.mzML\n" ++
             "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: brief summary counts emergency failures without retaining results" {
+    var first = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    first.recordEmergencyFailure(.parser, .allocation, "first.mzML");
+    first.finalize(&.{});
+    var second = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
+    second.recordEmergencyFailure(.parser, .allocation, "second.mzML");
+    second.finalize(&.{});
+    var groups: BriefGroups = .{};
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderBriefGroupsResult(
+        &allocating_writer.writer,
+        &groups,
+        diagnostic.summarizeResults(&.{ first, second }),
+    );
+
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input=first.mzML") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "... and 1 more emergency failures") != null);
+    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input: second.mzML") == null);
+}
+
+test "[unit]: brief summary reports aggregate dropped totals" {
+    var groups: BriefGroups = .{};
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+    const summary = diagnostic.Summary{
+        .totals = .{ .warnings = 3, .errors = 4 },
+        .diagnostics_truncated = true,
+        .dropped_diagnostics = .{ .warnings = 2, .errors = 3 },
+    };
+
+    try renderBriefGroupsResult(&allocating_writer.writer, &groups, summary);
+
+    try std.testing.expectEqualStrings(
+        "complete: errors (info=0 warnings=3 errors=4)\n" ++
+            "  warning [runtime.diagnostics-truncated] diagnostic detail truncated (dropped info=0 warnings=2 errors=3)\n",
         allocating_writer.written(),
     );
 }

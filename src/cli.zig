@@ -239,16 +239,39 @@ fn runCheck(
     writer: *std.Io.Writer,
     check: CheckCommand,
 ) !u8 {
-    var results: std.ArrayList(diagnostic.FileResult) = .empty;
-    try results.ensureTotalCapacity(allocator, check.inputs.len);
-    defer results.deinit(allocator);
+    // Keep each mode's fixed output state out of the other modes' stack frames.
+    // Combining them regresses payload-heavy parsing under ReleaseFast.
+    return switch (check.output_mode) {
+        .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check }),
+        .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check }),
+        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check }),
+        .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check }),
+    };
+}
 
+const BriefRunState = struct {
+    summary: diagnostic.Summary = .{},
+    groups: output.BriefGroups = .{},
+};
+
+fn runCheckMode(
+    comptime mode: output.OutputMode,
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    writer: *std.Io.Writer,
+    check: CheckCommand,
+) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
-    var brief_groups: output.BriefGroups = .{};
-    var json_stream: ?output.JsonStream = if (check.output_mode == .json)
-        try output.JsonStream.init(writer)
-    else
-        null;
+    const State = switch (mode) {
+        .text, .summary => diagnostic.Summary,
+        .json => output.JsonStream,
+        .brief => BriefRunState,
+    };
+    var state: State = switch (mode) {
+        .text, .summary => .{},
+        .json => try output.JsonStream.init(writer),
+        .brief => .{},
+    };
 
     const options = validate.CheckOptions{
         .skip_binary = check.skip_binary,
@@ -262,30 +285,45 @@ fn runCheck(
 
     for (check.inputs) |path| {
         var diagnostics = DiagnosticSink.init(.{
-            .max_diagnostics = if (check.output_mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
-            .max_rendered_bytes = if (check.output_mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
-            .retain_details = check.output_mode != .summary,
+            .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
+            .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
+            .retain_details = mode != .summary,
         });
         defer diagnostics.deinit(allocator);
 
         const result = context.validateOne(&diagnostics, path);
-        try results.append(allocator, result);
-        switch (check.output_mode) {
-            .text => try output.renderTextFile(writer, diagnostics.items, &results.items[results.items.len - 1], path),
-            .json => if (json_stream) |*stream| try stream.writeFile(diagnostics.items, &results.items[results.items.len - 1], path),
-            .summary => {},
-            .brief => for (diagnostics.items) |item| brief_groups.add(item),
+        switch (mode) {
+            .text => {
+                state.addResult(result);
+                try output.renderTextFile(writer, diagnostics.items, &result, path);
+            },
+            .json => try state.writeFile(diagnostics.items, &result, path),
+            .summary => state.addResult(result),
+            .brief => {
+                state.summary.addResult(result);
+                for (diagnostics.items) |item| state.groups.add(item);
+            },
         }
     }
 
-    switch (check.output_mode) {
-        .text => try output.renderTextFinal(writer, results.items),
-        .json => if (json_stream) |*stream| try stream.finish(),
-        .summary => try output.renderSummaryResult(writer, results.items),
-        .brief => try output.renderBriefGroupsResult(writer, &brief_groups, results.items),
-    }
-
-    return diagnostic.exitCodeForResults(results.items);
+    return switch (mode) {
+        .text => exit_code: {
+            try output.renderTextFinal(writer, state);
+            break :exit_code diagnostic.exitCodeForSummary(state);
+        },
+        .json => exit_code: {
+            try state.finish();
+            break :exit_code diagnostic.exitCodeForSummary(state.summary);
+        },
+        .summary => exit_code: {
+            try output.renderSummaryResult(writer, state);
+            break :exit_code diagnostic.exitCodeForSummary(state);
+        },
+        .brief => exit_code: {
+            try output.renderBriefGroupsResult(writer, &state.groups, state.summary);
+            break :exit_code diagnostic.exitCodeForSummary(state.summary);
+        },
+    };
 }
 
 // --- Private Helpers ---
@@ -315,6 +353,8 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "               Print the mzValidate version number and exit.\n" ++
             "  -h, --help   Show this help text.\n\n" ++
             "Behavior\n" ++
+            "  Inputs are validated serially in command-line order. Use separate processes\n" ++
+            "  when an external scheduler needs parallel file validation.\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
             "  Human result lines show completion, status, and severity counts.\n" ++
             "  Text mode groups diagnostics by input path and ends with the result.\n" ++
@@ -673,6 +713,7 @@ test "help writes usage to stdout" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-max-binary-size N") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Inputs are validated serially") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -818,6 +859,8 @@ test "summary aggregates clean and corrupt inputs" {
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
+        "-skip-semantic",
+        "-skip-index",
         "-summary",
     };
 
@@ -915,6 +958,8 @@ test "text output groups clean and corrupt inputs" {
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
+        "-skip-semantic",
+        "-skip-index",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -932,6 +977,36 @@ test "text output groups clean and corrupt inputs" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
+test "[unit]: brief output aggregates repeated findings across inputs" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "-skip-semantic",
+        "-skip-index",
+        "-brief",
+    };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqualStrings(
+        "complete: errors (info=0 warnings=0 errors=2)\n" ++
+            "\n" ++
+            "2  error  mzml.binary.base64  binary payload is not valid base64\n",
+        stdout_writer.written(),
+    );
+    try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
 test "skipping binary checks keeps valid structure clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -940,6 +1015,8 @@ test "skipping binary checks keeps valid structure clean" {
         "check",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "-skip-binary",
+        "-skip-semantic",
+        "-skip-index",
         "-summary",
     };
 
@@ -983,4 +1060,27 @@ test "summary reports each missing input failure" {
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
+test "[unit]: multi-file summary does not retain completed file results" {
+    const input_count = 4096;
+    const inputs = try std.testing.allocator.alloc([]const u8, input_count);
+    defer std.testing.allocator.free(inputs);
+    @memset(inputs, "missing-bounded-input.mzML");
+
+    var stdout_buffer: [256]u8 = undefined;
+    var stdout = std.Io.Writer.fixed(&stdout_buffer);
+
+    const exit_code = try runCheck(std.testing.failing_allocator, std.testing.io, &stdout, .{
+        .output_mode = .summary,
+        .skip_semantic = true,
+        .inputs = inputs,
+    });
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqualStrings(
+        "incomplete: errors (info=0 warnings=0 errors=4096)\n" ++
+            "failure: stage=input reason=input rule=runtime.file-open input=missing-bounded-input.mzML\n",
+        stdout_buffer[0..stdout.end],
+    );
 }

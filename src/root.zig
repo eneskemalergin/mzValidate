@@ -52,6 +52,7 @@ pub fn run(init: std.process.Init) !u8 {
 // --- Unit Tests ---
 
 test "library imports compile" {
+    _ = @import("cli.zig");
     _ = @import("output.zig");
     _ = @import("xml/events.zig");
     _ = @import("xml/parse_errors.zig");
