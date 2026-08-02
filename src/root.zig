@@ -42,6 +42,7 @@ pub const ResourceLimits = diagnostic.ResourceLimits;
 pub const OutputMode = output.OutputMode;
 pub const CheckOptions = validate.CheckOptions;
 pub const InvocationContext = validate.InvocationContext;
+pub const InvocationResourceUsage = validate.InvocationResourceUsage;
 pub const json_schema_version = version.json_schema;
 
 /// Runs the CLI and returns its process exit code.

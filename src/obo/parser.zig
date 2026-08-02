@@ -98,6 +98,28 @@ pub const CvTable = struct {
         return table.map.get(accession);
     }
 
+    /// Returns allocator-requested catalog capacity retained by this table and
+    /// any catalog object built with its allocator.
+    pub fn currentBytes(table: *const CvTable) usize {
+        return table.budget.current_bytes;
+    }
+
+    /// Returns the largest allocator-requested catalog capacity observed.
+    pub fn peakBytes(table: *const CvTable) usize {
+        return table.budget.peak_bytes;
+    }
+
+    /// Reports whether the catalog allocator rejected growth at its byte limit.
+    pub fn limitExceeded(table: *const CvTable) bool {
+        return table.budget.limit_exceeded;
+    }
+
+    /// Allocator for catalog data that shares this table's limit. Every allocation
+    /// made through it must be released before `deinit` destroys the table.
+    pub fn catalogAllocator(table: *CvTable) std.mem.Allocator {
+        return table.allocator;
+    }
+
     /// Validates that `accession` exists in the table and belongs to namespace
     /// `cv_ref`. Returns null on success, or an error message on failure.
     pub fn validate(table: *const CvTable, cv_ref: []const u8, accession: []const u8) ?[]const u8 {

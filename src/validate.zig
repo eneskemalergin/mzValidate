@@ -41,6 +41,17 @@ pub const CheckOptions = struct {
     obo_path: ?[]const u8 = null,
 };
 
+/// Invocation-owned heap capacity shared by every file checked through one context.
+/// Counts are allocator-requested bytes; allocator metadata and external library
+/// state remain visible only in process RSS.
+pub const InvocationResourceUsage = struct {
+    obo_source_peak_bytes: usize = 0,
+    catalog_current_bytes: usize = 0,
+    catalog_peak_bytes: usize = 0,
+    /// Construction peak while a custom source and the growing catalog overlap.
+    peak_bytes: usize = 0,
+};
+
 const CatalogFailure = struct {
     reason: FailureReason,
     rule: []const u8,
@@ -65,6 +76,7 @@ pub const InvocationContext = struct {
     options: CheckOptions,
     catalog: ?SemanticCatalog = null,
     catalog_failure: ?CatalogFailure = null,
+    resource_usage: InvocationResourceUsage = .{},
 
     /// Builds the semantic catalog once. A catalog failure is retained as fixed
     /// metadata so file validation can stop before opening an input.
@@ -82,6 +94,21 @@ pub const InvocationContext = struct {
     pub fn deinit(context: *InvocationContext) void {
         if (context.catalog) |*catalog| catalog.deinit();
         context.* = undefined;
+    }
+
+    /// Returns shared invocation capacity without charging it to each file result.
+    pub fn resourceUsage(context: *const InvocationContext) InvocationResourceUsage {
+        var usage = context.resource_usage;
+        if (context.catalog) |*catalog| {
+            usage.catalog_current_bytes = catalog.cv_table.currentBytes();
+            usage.catalog_peak_bytes = catalog.cv_table.peakBytes();
+            usage.peak_bytes = std.math.add(
+                usize,
+                usage.obo_source_peak_bytes,
+                usage.catalog_peak_bytes,
+            ) catch std.math.maxInt(usize);
+        }
+        return usage;
     }
 
     /// Validates one path using this invocation's immutable resources.
@@ -155,14 +182,22 @@ pub const InvocationContext = struct {
         const options = context.options;
         const obo_text: ?[]const u8 = if (options.obo_path) |obo_path| blk: {
             const cwd = std.Io.Dir.cwd();
-            const text = cwd.readFileAlloc(context.io, obo_path, context.allocator, .limited(50 * 1024 * 1024)) catch |err| {
+            const text = cwd.readFileAlloc(
+                context.io,
+                obo_path,
+                context.allocator,
+                .limited(options.resource_limits.max_obo_source_bytes),
+            ) catch |err| {
+                const source_limit = err == error.StreamTooLong;
                 context.catalog_failure = .{
-                    .reason = if (err == error.OutOfMemory) .allocation else if (err == error.StreamTooLong) .resource else .catalog,
-                    .rule = RuleId.runtime_file_open,
-                    .message = "unable to read OBO file",
+                    .reason = if (err == error.OutOfMemory) .allocation else if (source_limit) .resource else .catalog,
+                    .rule = if (source_limit) RuleId.runtime_catalog_limit else RuleId.runtime_file_open,
+                    .message = if (source_limit) "custom OBO source exceeds the configured size limit" else "unable to read OBO file",
                 };
                 break :blk null;
             };
+            context.resource_usage.obo_source_peak_bytes = text.len;
+            context.resource_usage.peak_bytes = text.len;
             break :blk text;
         } else @embedFile("data/psi-ms.obo");
         const text = obo_text orelse return;
@@ -178,19 +213,29 @@ pub const InvocationContext = struct {
             return;
         };
 
-        var engine = rule_engine.RuleEngine.init(context.allocator, @embedFile("data/ms-mapping.xml")) catch |err| {
+        var engine = rule_engine.RuleEngine.init(table.catalogAllocator(), @embedFile("data/ms-mapping.xml")) catch |err| {
+            const catalog_limit = table.limitExceeded();
+            context.recordCatalogUsage(&table);
             table.deinit();
+            context.resource_usage.catalog_current_bytes = 0;
             context.catalog_failure = .{
-                .reason = if (err == error.OutOfMemory) .allocation else .catalog,
-                .rule = RuleId.runtime_catalog,
-                .message = if (err == error.OutOfMemory) "unable to allocate mapping state" else "unable to parse mapping rules",
+                .reason = if (catalog_limit) .resource else if (err == error.OutOfMemory) .allocation else .catalog,
+                .rule = if (catalog_limit) RuleId.runtime_catalog_limit else RuleId.runtime_catalog,
+                .message = if (catalog_limit)
+                    "semantic catalog exceeds the configured memory limit"
+                else if (err == error.OutOfMemory)
+                    "unable to allocate mapping state"
+                else
+                    "unable to parse mapping rules",
             };
             return;
         };
 
         if (engine.firstMissingVocabularyTerm(&table) != null) {
+            context.recordCatalogUsage(&table);
             engine.deinit();
             table.deinit();
+            context.resource_usage.catalog_current_bytes = 0;
             context.catalog_failure = .{
                 .reason = .catalog,
                 .rule = RuleId.runtime_catalog,
@@ -200,6 +245,16 @@ pub const InvocationContext = struct {
         }
 
         context.catalog = .{ .cv_table = table, .rule_engine = engine };
+    }
+
+    fn recordCatalogUsage(context: *InvocationContext, table: *const obo_parser.CvTable) void {
+        context.resource_usage.catalog_current_bytes = table.currentBytes();
+        context.resource_usage.catalog_peak_bytes = table.peakBytes();
+        context.resource_usage.peak_bytes = std.math.add(
+            usize,
+            context.resource_usage.obo_source_peak_bytes,
+            context.resource_usage.catalog_peak_bytes,
+        ) catch std.math.maxInt(usize);
     }
 
     fn catalogFailureResult(
@@ -1790,6 +1845,14 @@ test "invocation context: owns the catalog across multiple paths" {
     });
     defer context.deinit();
     try std.testing.expect(context.catalog != null);
+    const initial_usage = context.resourceUsage();
+    try std.testing.expectEqual(@as(usize, @embedFile("data/psi-ms.obo").len), initial_usage.obo_source_peak_bytes);
+    try std.testing.expect(initial_usage.catalog_current_bytes > 0);
+    try std.testing.expect(initial_usage.catalog_peak_bytes >= initial_usage.catalog_current_bytes);
+    try std.testing.expectEqual(
+        initial_usage.obo_source_peak_bytes + initial_usage.catalog_peak_bytes,
+        initial_usage.peak_bytes,
+    );
     try temp_dir.dir.deleteFile(io, "psi-ms.obo");
 
     var diagnostics: DiagnosticSink = .empty;
@@ -1802,6 +1865,55 @@ test "invocation context: owns the catalog across multiple paths" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, first.completion);
     try std.testing.expectEqual(diagnostic.CompletionState.complete, second.completion);
     try std.testing.expect(context.catalog != null);
+    try std.testing.expectEqual(initial_usage, context.resourceUsage());
+}
+
+test "[unit]: embedded semantic catalog reports shared invocation capacity" {
+    var context = InvocationContext.init(std.testing.allocator, std.testing.io, .{});
+    defer context.deinit();
+
+    const usage = context.resourceUsage();
+    try std.testing.expect(context.catalog != null);
+    try std.testing.expectEqual(@as(usize, 0), usage.obo_source_peak_bytes);
+    try std.testing.expect(usage.catalog_current_bytes > 0);
+    try std.testing.expect(usage.catalog_peak_bytes >= usage.catalog_current_bytes);
+    try std.testing.expectEqual(usage.catalog_peak_bytes, usage.peak_bytes);
+    try std.testing.expect(usage.peak_bytes <= context.options.resource_limits.max_obo_catalog_bytes);
+}
+
+test "[unit]: mapping growth at the shared catalog limit is an incomplete resource failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const obo_path = "fixtures/obo/adversarial/custom-namespace.obo";
+    const obo_text = try std.Io.Dir.cwd().readFileAlloc(io, obo_path, allocator, .limited(64 * 1024));
+    defer allocator.free(obo_text);
+    var table = try obo_parser.CvTable.init(allocator, obo_text);
+    const obo_peak_bytes = table.peakBytes();
+    table.deinit();
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .resource_limits = .{ .max_obo_catalog_bytes = obo_peak_bytes },
+        .obo_path = obo_path,
+    });
+    defer context.deinit();
+    try std.testing.expect(context.catalog == null);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, context.catalog_failure.?.reason);
+    try std.testing.expectEqualStrings(
+        "semantic catalog exceeds the configured memory limit",
+        context.catalog_failure.?.message,
+    );
+    const usage = context.resourceUsage();
+    try std.testing.expectEqual(@as(usize, 0), usage.catalog_current_bytes);
+    try std.testing.expectEqual(obo_peak_bytes, usage.catalog_peak_bytes);
+    try std.testing.expectEqual(obo_text.len, usage.obo_source_peak_bytes);
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    const result = context.validateOne(&diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
 }
 
 test "path check: rejects an incompatible custom vocabulary" {
@@ -1865,6 +1977,32 @@ test "[unit]: custom OBO catalog limit is an incomplete resource failure" {
         "OBO catalog exceeds the configured memory limit",
         diagnostics.items[0].message,
     );
+}
+
+test "[unit]: custom OBO source limit is an incomplete resource failure" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var context = InvocationContext.init(allocator, io, .{
+        .skip_binary = true,
+        .skip_index = true,
+        .resource_limits = .{ .max_obo_source_bytes = 1 },
+        .obo_path = "fixtures/obo/adversarial/custom-namespace.obo",
+    });
+    defer context.deinit();
+    const result = context.validateOne(&diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.semantic, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.resource, result.first_failure.?.reason);
+    try std.testing.expectEqualStrings(RuleId.runtime_catalog_limit, result.first_failure.?.rule());
+    try std.testing.expectEqualStrings(
+        "custom OBO source exceeds the configured size limit",
+        result.first_failure.?.message(),
+    );
+    try std.testing.expectEqual(@as(usize, 0), context.resourceUsage().peak_bytes);
 }
 
 test "path result: invalid zlib is complete with an error" {

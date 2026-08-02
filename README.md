@@ -7,7 +7,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.6-blue?style=flat-square" alt="version 0.1.6">
+  <img src="https://img.shields.io/badge/version-0.1.7-blue?style=flat-square" alt="version 0.1.7">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-development-green?style=flat-square" alt="status: development">
   <br/>

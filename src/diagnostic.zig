@@ -100,6 +100,7 @@ pub const ResourceLimits = struct {
     max_file_checksum_text_bytes: usize = 64,
     max_obo_line_bytes: usize = 1024 * 1024,
     max_obo_xref_accession_bytes: usize = 128,
+    max_obo_source_bytes: usize = 50 * 1024 * 1024,
     max_obo_catalog_bytes: usize = 64 * 1024 * 1024,
     max_semantic_bytes: usize = 64 * 1024 * 1024,
     max_diagnostics: usize = 4096,
@@ -381,7 +382,8 @@ pub const Totals = struct {
 /// Parser bytes cover the eager caller-owned token buffer. Binary scratch bytes
 /// cover allocator-owned compressed, flate, and libdeflate output capacities;
 /// the opaque allocation owned by libdeflate's decompressor is external and
-/// excluded because its ABI does not expose an allocation size.
+/// excluded because its ABI does not expose an allocation size. Diagnostic
+/// bytes cover the sink's retained record capacity at file finalization.
 pub const ResourceUsage = struct {
     parser_current_bytes: usize = 0,
     parser_peak_bytes: usize = 0,
@@ -399,6 +401,8 @@ pub const ResourceUsage = struct {
     semantic_unresolved_peak_bytes: usize = 0,
     semantic_scope_peak_bytes: usize = 0,
     semantic_param_group_peak_bytes: usize = 0,
+    diagnostic_current_bytes: usize = 0,
+    diagnostic_peak_bytes: usize = 0,
 };
 
 fn BoundedFailureText(comptime capacity: usize) type {
@@ -541,6 +545,9 @@ pub const FileResult = struct {
         result.totals = sink.totalsSince(mark_value);
         result.dropped_diagnostics = sink.droppedSince(mark_value);
         result.diagnostics_truncated = result.diagnostics_truncated or sink.truncatedSince(mark_value);
+        const capacity_bytes = std.math.mul(usize, sink.capacity, @sizeOf(Diagnostic)) catch std.math.maxInt(usize);
+        result.resource_usage.diagnostic_current_bytes = capacity_bytes;
+        result.resource_usage.diagnostic_peak_bytes = capacity_bytes;
         result.finish();
     }
 
@@ -861,6 +868,8 @@ test "diagnostic sink bounds detail while retaining complete totals" {
     try std.testing.expect(result.diagnostics_truncated);
     try std.testing.expectEqual(@as(usize, 1), result.dropped_diagnostics.errors);
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
+    try std.testing.expectEqual(sink.capacity * @sizeOf(Diagnostic), result.resource_usage.diagnostic_current_bytes);
+    try std.testing.expectEqual(result.resource_usage.diagnostic_current_bytes, result.resource_usage.diagnostic_peak_bytes);
 }
 
 test "diagnostic sink can count without retaining detail" {

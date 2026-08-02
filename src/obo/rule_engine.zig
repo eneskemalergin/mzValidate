@@ -561,4 +561,30 @@ test "rule engine checks mapping terms against the vocabulary" {
     );
 }
 
+test "[unit]: mapping capacity can share the bounded OBO catalog owner" {
+    const allocator = std.testing.allocator;
+    var counting_allocator = std.testing.FailingAllocator.init(allocator, .{});
+    var table = try obo.CvTable.init(counting_allocator.allocator(), @embedFile("../data/psi-ms.obo"));
+    var table_live = true;
+    defer if (table_live) table.deinit();
+    const obo_current_bytes = table.currentBytes();
+
+    var engine = try RuleEngine.init(table.catalogAllocator(), @embedFile("../data/ms-mapping.xml"));
+    var engine_live = true;
+    defer if (engine_live) engine.deinit();
+
+    try std.testing.expect(table.currentBytes() > obo_current_bytes);
+    try std.testing.expectEqual(
+        counting_allocator.allocated_bytes - counting_allocator.freed_bytes,
+        table.currentBytes(),
+    );
+
+    engine.deinit();
+    engine_live = false;
+    try std.testing.expectEqual(obo_current_bytes, table.currentBytes());
+    table.deinit();
+    table_live = false;
+    try std.testing.expectEqual(counting_allocator.allocated_bytes, counting_allocator.freed_bytes);
+}
+
 const version = @import("../version.zig");
