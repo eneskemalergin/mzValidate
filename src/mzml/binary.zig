@@ -1299,7 +1299,14 @@ fn addDecodedChunk(count: *usize, adler: *std.hash.Adler32, chunk: []const u8, l
 
 fn countBase64Significant(value: []const u8) usize {
     var count: usize = 0;
-    for (value) |byte| {
+    var offset: usize = 0;
+    while (value.len - offset >= base64_simd_chunk_len) {
+        const bytes = StreamingBase64Counter.loadBase64Chunk(value, offset);
+        const whitespace = StreamingBase64Counter.whitespaceLanes(bytes);
+        count += base64_simd_chunk_len - StreamingBase64Counter.countTrueLanes(whitespace);
+        offset += base64_simd_chunk_len;
+    }
+    for (value[offset..]) |byte| {
         switch (byte) {
             ' ', '\t', '\n', '\r' => {},
             else => count += 1,
@@ -1525,6 +1532,16 @@ test "streaming base64 counter C.2 scalar short path stays exact" {
     try std.testing.expectEqual(@as(usize, 8), counter.sig_len);
     try std.testing.expectEqual(@as(usize, 2), counter.padding);
     try std.testing.expectEqual(@as(usize, 4), try counter.result());
+}
+
+test "Base64 significant-byte count preserves SIMD boundaries" {
+    var payload: [base64_simd_chunk_len * 2 + 3]u8 = @splat('A');
+    payload[0] = ' ';
+    payload[base64_simd_chunk_len - 1] = '\t';
+    payload[base64_simd_chunk_len] = '\r';
+    payload[payload.len - 1] = '\n';
+
+    try std.testing.expectEqual(payload.len - 4, countBase64Significant(&payload));
 }
 
 test "streaming base64 counter C.1 SIMD counts long clean and whitespace runs" {
