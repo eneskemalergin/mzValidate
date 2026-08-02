@@ -1,4 +1,4 @@
-//! SIMD and scalar scanning helpers for the XML slice parser.
+//! SIMD and scalar scanning helpers for contiguous XML bytes.
 //! Raw attribute views borrow contiguous tag bytes and do not decode values.
 
 const std = @import("std");

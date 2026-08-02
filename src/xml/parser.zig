@@ -283,7 +283,7 @@ pub const Parser = struct {
                         const before_literal = literal_failure == null or close_offset < literal_failure.?.index;
                         const before_limit = limit_failure == null or close_offset <= limit_failure.?;
                         if (before_literal and before_limit) {
-                            parser.consumeSliceBytes(close_offset);
+                            parser.consumeBufferedBytes(close_offset);
                             return error.MalformedXml;
                         }
                     }
@@ -294,10 +294,10 @@ pub const Parser = struct {
                     }
                 }
                 if (limit_failure) |failure_index| {
-                    if (failure_index >= 1) parser.consumeSliceBytes(failure_index);
+                    if (failure_index >= 1) parser.consumeBufferedBytes(failure_index);
                     return errorForField(field);
                 }
-                parser.consumeSliceBytes(plain_len);
+                parser.consumeBufferedBytes(plain_len);
                 if (!from_cdata and isWhitespaceOnly(value)) return null;
                 return .{ .text = .{
                     .byte_offset = byte_offset,
@@ -321,7 +321,7 @@ pub const Parser = struct {
         parser.text_bytes = 0;
         try parser.appendDecodedTextByte(first_byte, field);
 
-        try parser.consumeSliceTextPlainRun(field);
+        try parser.consumeBufferedTextPlainRun(field);
 
         while (true) {
             const next_byte = try parser.peekOptionalByte();
@@ -348,6 +348,9 @@ pub const Parser = struct {
 
         while (true) {
             const state = &parser.text_state.?;
+            if (parser.token_len < parser.textChunkCapacity()) {
+                try parser.consumeBufferedTextPlainRun(field);
+            }
             const next_byte = try parser.peekOptionalByte();
             if (next_byte == null or next_byte.? == '<') {
                 try finishLiteral(&parser.literal_validator);
@@ -653,7 +656,7 @@ pub const Parser = struct {
         const value_start = parser.token_len;
         parser.literal_validator.reset();
         while (true) {
-            try parser.consumeSliceAttrValuePlainRun(quote, .attribute);
+            try parser.consumeBufferedAttrValuePlainRun(quote, .attribute);
             const next_byte = try parser.takeRequiredByte();
             if (next_byte == quote) break;
             try parser.appendDecodedTextByte(next_byte, .attribute);
@@ -749,11 +752,11 @@ pub const Parser = struct {
                     }
                 }
                 if (content_len > limit) {
-                    parser.consumeSliceBytes(limit + 1);
+                    parser.consumeBufferedBytes(limit + 1);
                     return errorForField(field);
                 }
                 const consumed_len = std.math.add(usize, content_len, 3) catch return error.UnexpectedEof;
-                parser.consumeSliceBytes(consumed_len);
+                parser.consumeBufferedBytes(consumed_len);
                 return .{ .text = .{
                     .byte_offset = byte_offset,
                     .value = value,
@@ -784,7 +787,7 @@ pub const Parser = struct {
                 if (end > parser.token_buffer.len) return error.TokenTooLong;
                 try parser.handleProcessingInstruction(tail[0..end], content_offset);
                 const consumed_len = std.math.add(usize, end, 2) catch return error.UnexpectedEof;
-                parser.consumeSliceBytes(consumed_len);
+                parser.consumeBufferedBytes(consumed_len);
                 return;
             }
         }
@@ -836,7 +839,7 @@ pub const Parser = struct {
             if (scan.commentEndLen(tail)) |end| {
                 try parser.validateSliceLiteral(tail[0..end], 0);
                 const consumed_len = std.math.add(usize, end, 3) catch return error.UnexpectedEof;
-                parser.consumeSliceBytes(consumed_len);
+                parser.consumeBufferedBytes(consumed_len);
                 return;
             }
         }
@@ -861,7 +864,7 @@ pub const Parser = struct {
         const start = parser.token_len;
         try parser.appendTokenByte(first_byte, field);
 
-        try parser.consumeSliceNameCharRun(field);
+        try parser.consumeBufferedNameCharRun(field);
 
         while (true) {
             const next_byte = try parser.peekOptionalByte();
@@ -1062,11 +1065,11 @@ pub const Parser = struct {
     fn appendLiteralTokenSlice(parser: *Parser, bytes: []const u8, field: LimitField) ParseError!void {
         for (bytes, 0..) |byte, index| {
             if (field == .attribute and byte == '<') {
-                parser.consumeSliceBytes(index + 1);
+                parser.consumeBufferedBytes(index + 1);
                 return error.InvalidXmlCharacter;
             }
             parser.literal_validator.feedByte(byte, parser.xml_version) catch |err| {
-                parser.consumeSliceBytes(index + 1);
+                parser.consumeBufferedBytes(index + 1);
                 return switch (err) {
                     error.InvalidUtf8 => error.InvalidUtf8,
                     error.InvalidCharacter => error.InvalidXmlCharacter,
@@ -1074,12 +1077,12 @@ pub const Parser = struct {
             };
             if (field == .scalar_text or field == .binary_text) {
                 parser.notePlainTextByte(byte) catch |err| {
-                    parser.consumeSliceBytes(index + 1);
+                    parser.consumeBufferedBytes(index + 1);
                     return err;
                 };
             }
             parser.appendTokenByte(byte, field) catch |err| {
-                parser.consumeSliceBytes(index + 1);
+                parser.consumeBufferedBytes(index + 1);
                 return err;
             };
         }
@@ -1091,7 +1094,7 @@ pub const Parser = struct {
     }
 
     fn sliceLiteralError(parser: *Parser, failure: characters.LiteralFailure, already_consumed: usize) ParseError {
-        if (failure.index >= already_consumed) parser.consumeSliceBytes(failure.index - already_consumed + 1);
+        if (failure.index >= already_consumed) parser.consumeBufferedBytes(failure.index - already_consumed + 1);
         return switch (failure.kind) {
             .invalid_utf8 => error.InvalidUtf8,
             .invalid_character => error.InvalidXmlCharacter,
@@ -1195,7 +1198,7 @@ pub const Parser = struct {
 
     fn skipWhitespace(parser: *Parser) ParseError!void {
         if (parser.lookahead == null) {
-            if (parser.consumeSliceWhitespaceRun()) return;
+            if (parser.consumeBufferedWhitespaceRun()) return;
         }
 
         while (try parser.peekOptionalByte()) |byte| {
@@ -1204,58 +1207,62 @@ pub const Parser = struct {
         }
     }
 
-    fn sliceTail(parser: *Parser) ?[]const u8 {
+    fn bufferedTail(parser: *Parser) ?[]const u8 {
         return switch (parser.input) {
             .slice => |*slice| if (slice.pos >= slice.bytes.len) null else slice.bytes[slice.pos..],
-            .reader => null,
+            .reader => |reader| if (reader.bufferedLen() == 0) null else reader.buffered(),
         };
     }
 
-    fn consumeSliceBytes(parser: *Parser, count: usize) void {
+    fn consumeBufferedBytes(parser: *Parser, count: usize) void {
         switch (parser.input) {
-            .slice => |*slice| {
-                slice.pos += count;
-                parser.absolute_offset += @intCast(count);
-                if (count > 0) parser.last_byte_offset = parser.absolute_offset - 1;
-            },
-            .reader => {},
+            .slice => |*slice| slice.pos += count,
+            .reader => |reader| reader.toss(count),
         }
+        parser.absolute_offset += @intCast(count);
+        if (count > 0) parser.last_byte_offset = parser.absolute_offset - 1;
     }
 
-    fn consumeSliceWhitespaceRun(parser: *Parser) bool {
-        const tail = parser.sliceTail() orelse return false;
+    fn consumeBufferedWhitespaceRun(parser: *Parser) bool {
+        const tail = parser.bufferedTail() orelse return false;
         const run_len = scan.skipWhitespaceRun(tail);
-        if (run_len == 0) return false;
-        parser.consumeSliceBytes(run_len);
-        return true;
+        parser.consumeBufferedBytes(run_len);
+        return run_len < tail.len;
     }
 
-    fn consumeSliceNameCharRun(parser: *Parser, field: LimitField) ParseError!void {
+    fn consumeBufferedNameCharRun(parser: *Parser, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
-        const tail = parser.sliceTail() orelse return;
+        const tail = parser.bufferedTail() orelse return;
         const run_len = scan.nameCharRunLen(tail);
         if (run_len == 0) return;
-        if (field == .start_tag) try parser.ensureStartTagLimit(run_len);
-        try parser.appendTokenSlice(tail[0..run_len], field);
-        parser.consumeSliceBytes(run_len);
+        // Leave an over-limit run buffered so byte-wise parsing reports the crossing byte.
+        if (field == .start_tag) parser.ensureStartTagLimit(run_len) catch return;
+        parser.ensureTokenAppend(field, run_len) catch return;
+        @memcpy(parser.token_buffer[parser.token_len..][0..run_len], tail[0..run_len]);
+        parser.token_len += run_len;
+        parser.consumeBufferedBytes(run_len);
     }
 
-    fn consumeSliceTextPlainRun(parser: *Parser, field: LimitField) ParseError!void {
+    fn consumeBufferedTextPlainRun(parser: *Parser, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
-        const tail = parser.sliceTail() orelse return;
-        const run_len = scan.textPlainRunLen(tail);
+        const tail = parser.bufferedTail() orelse return;
+        const available = switch (parser.input) {
+            .slice => tail.len,
+            .reader => parser.textChunkCapacity() - parser.token_len,
+        };
+        const run_len = @min(scan.textPlainRunLen(tail), available);
         if (run_len == 0) return;
         try parser.appendLiteralTokenSlice(tail[0..run_len], field);
-        parser.consumeSliceBytes(run_len);
+        parser.consumeBufferedBytes(run_len);
     }
 
-    fn consumeSliceAttrValuePlainRun(parser: *Parser, quote: u8, field: LimitField) ParseError!void {
+    fn consumeBufferedAttrValuePlainRun(parser: *Parser, quote: u8, field: LimitField) ParseError!void {
         if (parser.lookahead != null) return;
-        const tail = parser.sliceTail() orelse return;
+        const tail = parser.bufferedTail() orelse return;
         const run_len = scan.attrValuePlainRunLen(tail, quote);
         if (run_len == 0) return;
         try parser.appendLiteralTokenSlice(tail[0..run_len], field);
-        parser.consumeSliceBytes(run_len);
+        parser.consumeBufferedBytes(run_len);
     }
 
     fn expectByte(parser: *Parser, expected: u8) ParseError!void {
@@ -1807,6 +1814,33 @@ test "parser accepts XML name production boundaries" {
 
     try std.testing.expectEqual(@as(?ParseError, null), reader_error);
     try std.testing.expectEqual(reader_error, slice_error);
+}
+
+test "[unit]: parser reports the byte that crosses a name limit" {
+    const cases = [_]struct {
+        xml: []const u8,
+        limits: Limits,
+        expected_error: ParseError,
+        expected_offset: u64,
+    }{
+        .{ .xml = "<abcdefgh/>", .limits = .{ .max_start_tag_bytes = 5 }, .expected_error = error.StartTagTooLong, .expected_offset = 5 },
+        .{ .xml = "<root abcdefgh=\"x\"/>", .limits = .{ .max_attribute_bytes = 5 }, .expected_error = error.AttributeTooLong, .expected_offset = 11 },
+    };
+
+    for (cases) |case| {
+        var reader_harness: InlineParserHarness = undefined;
+        reader_harness.initWithLimits(case.xml, case.limits);
+        var slice_harness: InlineSliceParserHarness = undefined;
+        slice_harness.initWithLimits(case.xml, case.limits);
+
+        const reader_error = firstParserError(&reader_harness.parser);
+        const slice_error = firstParserError(&slice_harness.parser);
+
+        try std.testing.expectEqual(@as(?ParseError, case.expected_error), reader_error);
+        try std.testing.expectEqual(reader_error, slice_error);
+        try std.testing.expectEqual(case.expected_offset, reader_harness.parser.byteOffset());
+        try std.testing.expectEqual(reader_harness.parser.byteOffset(), slice_harness.parser.byteOffset());
+    }
 }
 
 test "parser rejects illegal literal XML characters with reader and slice parity" {
