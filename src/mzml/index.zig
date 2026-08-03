@@ -424,7 +424,7 @@ pub const IndexValidator = struct {
         while (hashed < checksum_offset) {
             const remaining = checksum_offset - hashed;
             const want: usize = @intCast(@min(remaining, @as(u64, buffer.len)));
-            const n = try std.Io.File.readPositionalAll(file, io, buffer[0..want], hashed);
+            const n = std.Io.File.readPositionalAll(file, io, buffer[0..want], hashed) catch return error.InputOutput;
             if (n != want) {
                 try validator.appendDiagnostic(
                     checksum_offset,
@@ -575,9 +575,10 @@ pub const IndexValidator = struct {
         required: u32,
         byte_offset: u64,
     ) !void {
+        if (required == 0) return;
         const old_capacity = map.capacity();
         if (old_capacity != 0) {
-            const load_limit = std.math.mul(u64, old_capacity, 80) catch unreachable;
+            const load_limit = std.math.mul(u64, old_capacity, std.hash_map.default_max_load_percentage) catch unreachable;
             if (@as(u64, required) <= load_limit / 100) return;
         }
         const target_without_minimum = mapCapacityForCount(required) catch {
@@ -597,6 +598,7 @@ pub const IndexValidator = struct {
         try validator.reserveIndexBytes(new_bytes, byte_offset);
         errdefer validator.releaseIndexBytes(new_bytes);
         try map.ensureTotalCapacity(required);
+        std.debug.assert(map.capacity() == target);
         validator.releaseIndexBytes(old_bytes);
     }
 
@@ -672,7 +674,7 @@ pub const IndexValidator = struct {
         var offset = declared;
         while (offset < actual) {
             const want: usize = @intCast(@min(actual - offset, @as(u64, buffer.len)));
-            const n = try std.Io.File.readPositionalAll(file, io, buffer[0..want], offset);
+            const n = std.Io.File.readPositionalAll(file, io, buffer[0..want], offset) catch return error.InputOutput;
             if (n != want) return false;
             for (buffer[0..n]) |byte| {
                 switch (byte) {
@@ -823,17 +825,35 @@ fn freeHashMap(allocator: std.mem.Allocator, map: *std.StringHashMap(IndexRecord
 
 fn mapCapacityForCount(required: u32) !u32 {
     const scaled = try std.math.mul(u64, required, 100);
-    const needed = try std.math.add(u64, scaled / 80, 1);
+    const needed = try std.math.add(u64, scaled / std.hash_map.default_max_load_percentage, 1);
     const bounded = std.math.cast(u32, needed) orelse return error.Overflow;
     return std.math.ceilPowerOfTwo(u32, bounded) catch return error.Overflow;
 }
 
 fn mapStorageBytes(capacity: u32) !usize {
     if (capacity == 0) return 0;
-    const per_slot = @sizeOf([]const u8) + @sizeOf(IndexRecord) +
-        @alignOf([]const u8) + @alignOf(IndexRecord) + @sizeOf(u8);
-    const slots = try std.math.mul(usize, @intCast(capacity), per_slot);
-    return std.math.add(usize, slots, 128);
+
+    // Mirror the bundled HashMap allocation so the budget includes its alignment padding.
+    const Header = struct {
+        values: [*]IndexRecord,
+        keys: [*][]const u8,
+        capacity: u32,
+    };
+    const key_type = []const u8;
+    const map_alignment = @max(@alignOf(Header), @alignOf(key_type), @alignOf(IndexRecord));
+    const metadata_end = try std.math.add(usize, @sizeOf(Header), @intCast(capacity));
+    const keys_start = try alignForward(metadata_end, @alignOf(key_type));
+    const keys_bytes = try std.math.mul(usize, @intCast(capacity), @sizeOf(key_type));
+    const keys_end = try std.math.add(usize, keys_start, keys_bytes);
+    const values_start = try alignForward(keys_end, @alignOf(IndexRecord));
+    const values_bytes = try std.math.mul(usize, @intCast(capacity), @sizeOf(IndexRecord));
+    const values_end = try std.math.add(usize, values_start, values_bytes);
+    return alignForward(values_end, map_alignment);
+}
+
+fn alignForward(value: usize, alignment: usize) !usize {
+    const with_padding = try std.math.add(usize, value, alignment - 1);
+    return with_padding & ~(alignment - 1);
 }
 
 fn computeChecksumBatch(bytes: []const u8, checksum_offset: u64) [20]u8 {
@@ -997,6 +1017,54 @@ test "IndexValidator: index state tracks one key copy per record" {
 
     try expectEqualStrings("s1", v.spectrum_offsets.getKey("s1").?);
     try expect(v.index_state_current_bytes > 0);
+}
+
+test "[unit]: index state accounting matches live allocator bytes" {
+    var allocator = testing.FailingAllocator.init(testing.allocator, .{});
+    var diagnostics = DiagnosticSink.init(.{ .retain_details = false });
+    defer diagnostics.deinit(allocator.allocator());
+
+    var validator = IndexValidator.init(allocator.allocator(), &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try validator.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 1);
+
+    const live_bytes = allocator.allocated_bytes - allocator.freed_bytes;
+    try expectEqual(live_bytes, validator.index_state_current_bytes);
+}
+
+test "[unit]: zero declared count does not charge unallocated index storage" {
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(testing.allocator);
+
+    var validator = IndexValidator.init(testing.allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try validator.consumeStart(test_events.startUnknown("spectrumList", &.{test_events.attr("count", "0")}, 10), 1);
+
+    try expectEqual(@as(u32, 0), validator.spectrum_offsets.capacity());
+    try expectEqual(@as(usize, 0), validator.index_state_current_bytes);
+}
+
+test "[unit]: positional-read failures normalize to input I/O" {
+    const io = testing.io;
+    var temp_dir = testing.tmpDir(.{});
+    defer temp_dir.cleanup();
+    const file = try temp_dir.dir.createFile(io, "closed.mzML", .{});
+    file.close(io);
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(testing.allocator);
+    var validator = IndexValidator.init(testing.allocator, &diagnostics, null);
+    defer validator.deinit();
+    validator.setStreamSource(io, file, 1);
+    validator.file_checksum_ok = true;
+    validator.file_checksum_byte_offset = 1;
+
+    try testing.expectError(error.InputOutput, validator.completeStreamChecksum());
+    try testing.expectError(error.InputOutput, validator.offsetsMatchWithWhitespace(0, 1));
 }
 
 test "IndexValidator: state byte limit rejects map growth" {

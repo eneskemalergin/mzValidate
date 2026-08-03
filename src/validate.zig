@@ -660,7 +660,7 @@ fn runValidation(
                 diagnostics,
                 result,
                 .parser,
-                .parser,
+                if (err == error.ReadFailed) .input else .parser,
                 .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_structure_xml,
@@ -800,6 +800,8 @@ fn recordUnhandledFailure(result: *FileResult, err: anyerror, path: []const u8) 
         .allocation
     else if (err == error.ResourceLimitExceeded)
         .resource
+    else if (err == error.InputOutput)
+        .input
     else
         .unknown;
     result.recordEmergencyFailure(result.active_stage, reason, path);
@@ -870,6 +872,24 @@ fn expectAllocationFailuresIncomplete(
         }
     }
 }
+
+const FailingInputReader = struct {
+    reader: std.Io.Reader,
+    buffer: [1]u8 = undefined,
+
+    fn init(failing: *FailingInputReader) void {
+        failing.reader = .{
+            .vtable = &.{ .stream = stream },
+            .buffer = &failing.buffer,
+            .seek = 0,
+            .end = 0,
+        };
+    }
+
+    fn stream(_: *std.Io.Reader, _: *std.Io.Writer, _: std.Io.Limit) std.Io.Reader.StreamError!usize {
+        return error.ReadFailed;
+    }
+};
 
 // --- Unit Tests ---
 
@@ -1636,6 +1656,40 @@ test "reader result: marks truncated XML incomplete" {
     try std.testing.expectEqual(diagnostic.FailureReason.parser, result.first_failure.?.reason);
     try std.testing.expectEqual(diagnostic.stageBit(.input), result.completed_stages);
     try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+}
+
+test "[unit]: reader I/O failure is classified as an input failure" {
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(std.testing.allocator);
+    var failing_reader: FailingInputReader = undefined;
+    failing_reader.init();
+
+    const result = checkReaderResult(
+        std.testing.allocator,
+        std.testing.io,
+        &failing_reader.reader,
+        &diagnostics,
+        "unreadable.mzML",
+        .{ .skip_binary = true, .skip_index = true, .skip_semantic = true },
+        null,
+    );
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.parser, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.input, result.first_failure.?.reason);
+    try expectSingleDiagnostic(diagnostics.items, RuleId.mzml_structure_xml, "failed while reading XML input");
+}
+
+test "[unit]: index I/O failure is classified as an input failure" {
+    var result = FileResult.init(diagnostic.stageBit(.index));
+    result.beginStage(.index);
+
+    recordUnhandledFailure(&result, error.InputOutput, "unreadable-index.mzML");
+    result.finalize(&.{});
+
+    try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
+    try std.testing.expectEqual(diagnostic.ValidationStage.index, result.first_failure.?.stage);
+    try std.testing.expectEqual(diagnostic.FailureReason.input, result.first_failure.?.reason);
 }
 
 test "reader result: marks clean input complete" {

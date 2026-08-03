@@ -25,6 +25,7 @@ pub fn build(b: *std.Build) void {
         "single-threaded",
         "Compile CLI executables for a single-threaded runtime (default: true)",
     ) orelse true;
+    const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
     if (target.result.ptrBitWidth() != 64) {
         std.log.err(
             "mzValidate supports only 64-bit targets; {s} uses {d}-bit pointers",
@@ -69,11 +70,13 @@ pub fn build(b: *std.Build) void {
 
     const mod_tests = b.addTest(.{
         .root_module = mzvalidate_mod,
+        .filters = if (test_filter) |filter| &.{ "library imports compile", filter } else &.{},
     });
     const run_mod_tests = b.addRunArtifact(mod_tests);
 
     const exe_tests = b.addTest(.{
         .root_module = exe.root_module,
+        .filters = if (test_filter) |filter| &.{filter} else &.{},
     });
     const run_exe_tests = b.addRunArtifact(exe_tests);
 
