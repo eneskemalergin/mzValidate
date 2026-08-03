@@ -50,6 +50,7 @@ pub const RawAttributeScanner = struct {
 
     /// Returns the next borrowed attribute, or null after the tag body.
     pub fn next(scanner: *RawAttributeScanner) RawAttributeError!?RawAttribute {
+        const whitespace_start = scanner.pos;
         while (scanner.pos < scanner.bytes.len and isXmlWhitespaceByte(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}
         if (scanner.pos == scanner.bytes.len) return null;
 
@@ -58,6 +59,7 @@ pub const RawAttributeScanner = struct {
             if (scanner.pos != scanner.bytes.len) return error.Malformed;
             return null;
         }
+        if (scanner.pos == whitespace_start) return error.Malformed;
 
         const name_start = scanner.pos;
         while (scanner.pos < scanner.bytes.len and !isRawNameTerminator(scanner.bytes[scanner.pos])) : (scanner.pos += 1) {}

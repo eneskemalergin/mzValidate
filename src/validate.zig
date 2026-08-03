@@ -2408,16 +2408,11 @@ test "reader check: reports text before the root" {
 
     try checkReader(allocator, io, &reader, &diagnostics, "inline-text-before-root.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true }, null);
 
-    var found = false;
-    for (diagnostics.items) |d| {
-        if (std.mem.eql(u8, d.rule, RuleId.mzml_structure_xml) and
-            std.mem.eql(u8, d.message, "text outside the mzML root element is not allowed"))
-        {
-            found = true;
-            break;
-        }
-    }
-    try std.testing.expect(found);
+    try expectSingleDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_xml,
+        "malformed XML input",
+    );
 }
 
 test "reader check: accepts a prefixed PSI namespace" {

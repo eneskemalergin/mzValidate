@@ -102,6 +102,7 @@ pub const Parser = struct {
 
     xml_version: characters.Version = .xml_1_0,
     xml_declaration_allowed: bool = true,
+    document_element_seen: bool = false,
     literal_validator: characters.LiteralValidator = .{},
 
     lookahead: ?u8 = null,
@@ -178,15 +179,28 @@ pub const Parser = struct {
                     @branchHint(.cold);
                     return error.UnexpectedEof;
                 }
+                if (!parser.document_element_seen) {
+                    @branchHint(.cold);
+                    return error.MalformedXml;
+                }
                 return null;
             };
             const start_offset = parser.last_byte_offset;
 
             if (first_byte != '<') {
                 parser.xml_declaration_allowed = false;
-                if (try parser.parseText(start_offset, first_byte, false)) |event| {
-                    return event;
+                if (parser.element_count == 0) {
+                    if (!characters.isWhitespaceByte(first_byte)) return error.MalformedXml;
+                    while (try parser.peekOptionalByte()) |next_byte| {
+                        if (!characters.isWhitespaceByte(next_byte)) {
+                            if (next_byte != '<') return error.MalformedXml;
+                            break;
+                        }
+                        _ = try parser.takeRequiredByte();
+                    }
+                    continue;
                 }
+                if (try parser.parseText(start_offset, first_byte, false)) |event| return event;
                 continue;
             }
 
@@ -466,6 +480,7 @@ pub const Parser = struct {
     }
 
     fn parseStartElement(parser: *Parser, byte_offset: u64, first_name_byte: u8) ParseError!Event {
+        if (parser.element_count == 0 and parser.document_element_seen) return error.MalformedXml;
         parser.start_tag_offset = byte_offset;
         defer parser.start_tag_offset = null;
 
@@ -546,7 +561,7 @@ pub const Parser = struct {
         }
 
         while (true) {
-            try parser.skipWhitespace();
+            const separated = try parser.skipWhitespace();
             try parser.ensureStartTagLimit(0);
             const next_byte = try parser.peekRequiredByte();
 
@@ -572,6 +587,7 @@ pub const Parser = struct {
                     return event;
                 },
                 else => {
+                    if (!separated) return error.MalformedXml;
                     try parser.parseAttribute();
                     try parser.ensureStartTagLimit(0);
                 },
@@ -602,6 +618,7 @@ pub const Parser = struct {
         try parser.ensureUniqueAttributes();
         const element_id = elements.idFromParts(name.local_name, name.namespace_uri);
         try parser.pushElementFrame(name, namespace_count_before, namespace_bytes_before, synthetic_end_byte_offset, element_id);
+        parser.document_element_seen = true;
 
         return .{ .start_element = .{
             .byte_offset = byte_offset,
@@ -619,7 +636,7 @@ pub const Parser = struct {
 
         const first_name_byte = try parser.takeRequiredByte();
         const actual_name = try parser.parseName(first_name_byte, .start_tag);
-        try parser.skipWhitespace();
+        _ = try parser.skipWhitespace();
         try parser.expectByte('>');
 
         const frame = parser.topElementFrame();
@@ -646,9 +663,9 @@ pub const Parser = struct {
         const byte_offset = parser.last_byte_offset;
         const name = try parser.parseName(byte, .attribute);
 
-        try parser.skipWhitespace();
+        _ = try parser.skipWhitespace();
         try parser.expectByte('=');
-        try parser.skipWhitespace();
+        _ = try parser.skipWhitespace();
 
         const quote = try parser.takeRequiredByte();
         if (quote != '"' and quote != '\'') return error.MalformedXml;
@@ -724,6 +741,7 @@ pub const Parser = struct {
                 return null;
             },
             '[' => {
+                if (parser.element_count == 0) return error.MalformedXml;
                 try parser.expectBytes("CDATA[");
                 parser.resetEventStorage();
                 const content_offset = parser.absolute_offset;
@@ -837,6 +855,12 @@ pub const Parser = struct {
             const slice = &parser.input.slice;
             const tail = slice.bytes[slice.pos..];
             if (scan.commentEndLen(tail)) |end| {
+                const body_and_first_close_dash_len = std.math.add(usize, end, 1) catch return error.UnexpectedEof;
+                if (std.mem.indexOf(u8, tail[0..body_and_first_close_dash_len], "--")) |invalid_start| {
+                    const consumed_len = std.math.add(usize, invalid_start, 3) catch return error.UnexpectedEof;
+                    parser.consumeBufferedBytes(consumed_len);
+                    return error.MalformedXml;
+                }
                 try parser.validateSliceLiteral(tail[0..end], 0);
                 const consumed_len = std.math.add(usize, end, 3) catch return error.UnexpectedEof;
                 parser.consumeBufferedBytes(consumed_len);
@@ -1215,15 +1239,23 @@ pub const Parser = struct {
         parser.attribute_count = 0;
     }
 
-    fn skipWhitespace(parser: *Parser) ParseError!void {
+    fn skipWhitespace(parser: *Parser) ParseError!bool {
+        var consumed = false;
         if (parser.lookahead == null) {
-            if (parser.consumeBufferedWhitespaceRun()) return;
+            if (parser.bufferedTail()) |tail| {
+                const run_len = scan.skipWhitespaceRun(tail);
+                parser.consumeBufferedBytes(run_len);
+                consumed = run_len != 0;
+                if (run_len < tail.len) return consumed;
+            }
         }
 
         while (try parser.peekOptionalByte()) |byte| {
             if (!characters.isWhitespaceByte(byte)) break;
             _ = try parser.takeRequiredByte();
+            consumed = true;
         }
+        return consumed;
     }
 
     fn bufferedTail(parser: *Parser) ?[]const u8 {
@@ -1240,13 +1272,6 @@ pub const Parser = struct {
         }
         parser.absolute_offset += @intCast(count);
         if (count > 0) parser.last_byte_offset = parser.absolute_offset - 1;
-    }
-
-    fn consumeBufferedWhitespaceRun(parser: *Parser) bool {
-        const tail = parser.bufferedTail() orelse return false;
-        const run_len = scan.skipWhitespaceRun(tail);
-        parser.consumeBufferedBytes(run_len);
-        return run_len < tail.len;
     }
 
     fn consumeBufferedNameCharRun(parser: *Parser, field: LimitField) ParseError!void {
@@ -1517,27 +1542,76 @@ fn parseXmlDeclarationVersion(content: []const u8) ParseError!characters.Version
     if (pos >= content.len or !characters.isWhitespaceByte(content[pos])) return error.MalformedXml;
     while (pos < content.len and characters.isWhitespaceByte(content[pos])) : (pos += 1) {}
 
-    const version_name = "version";
-    if (content.len - pos < version_name.len or !std.mem.eql(u8, content[pos..][0..version_name.len], version_name)) {
-        return error.MalformedXml;
+    const version_attribute = try parseXmlDeclarationAttribute(content, &pos);
+    if (!std.mem.eql(u8, version_attribute.name, "version")) return error.MalformedXml;
+    const version: characters.Version = if (std.mem.eql(u8, version_attribute.value, "1.0"))
+        .xml_1_0
+    else if (std.mem.eql(u8, version_attribute.value, "1.1"))
+        .xml_1_1
+    else
+        return error.UnsupportedXmlVersion;
+
+    var saw_encoding = false;
+    var saw_standalone = false;
+    while (pos < content.len) {
+        if (!characters.isWhitespaceByte(content[pos])) return error.MalformedXml;
+        while (pos < content.len and characters.isWhitespaceByte(content[pos])) : (pos += 1) {}
+        if (pos == content.len) break;
+
+        const attribute = try parseXmlDeclarationAttribute(content, &pos);
+        if (std.mem.eql(u8, attribute.name, "encoding")) {
+            if (saw_encoding or saw_standalone or !isValidEncodingName(attribute.value)) return error.MalformedXml;
+            saw_encoding = true;
+        } else if (std.mem.eql(u8, attribute.name, "standalone")) {
+            if (saw_standalone or
+                (!std.mem.eql(u8, attribute.value, "yes") and !std.mem.eql(u8, attribute.value, "no")))
+            {
+                return error.MalformedXml;
+            }
+            saw_standalone = true;
+        } else {
+            return error.MalformedXml;
+        }
     }
-    pos += version_name.len;
-    while (pos < content.len and characters.isWhitespaceByte(content[pos])) : (pos += 1) {}
-    if (pos >= content.len or content[pos] != '=') return error.MalformedXml;
-    pos += 1;
-    while (pos < content.len and characters.isWhitespaceByte(content[pos])) : (pos += 1) {}
-    if (pos >= content.len or (content[pos] != '"' and content[pos] != '\'')) return error.MalformedXml;
+    return version;
+}
 
-    const quote = content[pos];
-    pos += 1;
-    const value_start = pos;
-    while (pos < content.len and content[pos] != quote) : (pos += 1) {}
-    if (pos >= content.len) return error.MalformedXml;
-    const value = content[value_start..pos];
+const XmlDeclarationAttribute = struct {
+    name: []const u8,
+    value: []const u8,
+};
 
-    if (std.mem.eql(u8, value, "1.0")) return .xml_1_0;
-    if (std.mem.eql(u8, value, "1.1")) return .xml_1_1;
-    return error.UnsupportedXmlVersion;
+fn parseXmlDeclarationAttribute(content: []const u8, pos: *usize) ParseError!XmlDeclarationAttribute {
+    const name_start = pos.*;
+    while (pos.* < content.len and
+        !characters.isWhitespaceByte(content[pos.*]) and
+        content[pos.*] != '=') : (pos.* += 1)
+    {}
+    if (pos.* == name_start) return error.MalformedXml;
+    const name = content[name_start..pos.*];
+
+    while (pos.* < content.len and characters.isWhitespaceByte(content[pos.*])) : (pos.* += 1) {}
+    if (pos.* >= content.len or content[pos.*] != '=') return error.MalformedXml;
+    pos.* += 1;
+    while (pos.* < content.len and characters.isWhitespaceByte(content[pos.*])) : (pos.* += 1) {}
+    if (pos.* >= content.len or (content[pos.*] != '"' and content[pos.*] != '\'')) return error.MalformedXml;
+
+    const quote = content[pos.*];
+    pos.* += 1;
+    const value_start = pos.*;
+    while (pos.* < content.len and content[pos.*] != quote) : (pos.* += 1) {}
+    if (pos.* >= content.len) return error.MalformedXml;
+    const value = content[value_start..pos.*];
+    pos.* += 1;
+    return .{ .name = name, .value = value };
+}
+
+fn isValidEncodingName(name: []const u8) bool {
+    if (name.len == 0 or !std.ascii.isAlphabetic(name[0])) return false;
+    for (name[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '.' and byte != '_' and byte != '-') return false;
+    }
+    return true;
 }
 
 fn parseCharacterReference(bytes: []const u8, version: characters.Version) ParseError!u21 {
@@ -1748,6 +1822,35 @@ fn firstParserError(parser: *Parser) ?ParseError {
     }
 }
 
+fn expectOutcomeAcrossRefills(xml: []const u8, expected: ?ParseError) !void {
+    var slice_harness: InlineSliceParserHarness = undefined;
+    slice_harness.init(xml);
+    const slice_error = firstParserError(&slice_harness.parser);
+
+    try std.testing.expectEqual(expected, slice_error);
+    for ([_]usize{ 1, 2, 3, 7, 64 }) |refill_size| {
+        var chunked_reader: ChunkedReader = undefined;
+        chunked_reader.init(xml, refill_size);
+        var token: [1024]u8 = undefined;
+        var attributes: [16]Attribute = undefined;
+        var namespaces: [16]NamespaceBinding = undefined;
+        var namespace_bytes: [512]u8 = undefined;
+        var stack: [32]ElementFrame = undefined;
+        var element_bytes: [512]u8 = undefined;
+        var parser = Parser.init(chunked_reader.readerPtr(), .{
+            .token = &token,
+            .attributes = &attributes,
+            .namespace_bindings = &namespaces,
+            .namespace_bytes = &namespace_bytes,
+            .element_stack = &stack,
+            .element_bytes = &element_bytes,
+        });
+
+        try std.testing.expectEqual(slice_error, firstParserError(&parser));
+        try std.testing.expectEqual(slice_harness.parser.byteOffset(), parser.byteOffset());
+    }
+}
+
 fn expectFixtureError(allocator: std.mem.Allocator, io: std.Io, sub_path: []const u8, expected: anyerror) !void {
     const fixture = try std.Io.Dir.cwd().readFileAlloc(io, sub_path, allocator, .limited(64 * 1024));
     defer allocator.free(fixture);
@@ -1808,6 +1911,66 @@ fn initFixtureParser(allocator: std.mem.Allocator, fixture: []const u8) !*Fixtur
 test "parser character reference rejects overflow" {
     // Regression: unchecked u32 arithmetic accepted this as codepoint 0.
     try std.testing.expectError(error.InvalidCharacterReference, parseCharacterReference("x20000000", .xml_1_0));
+}
+
+test "[unit]: parser rejects documents without exactly one root element across refills" {
+    const cases = [_][]const u8{
+        "",
+        " \n\t",
+        "<!--comment only-->",
+        "text<root/>",
+        "<root/>text",
+        "&#32;<root/>",
+        "<root/> &#x20;",
+        "<first/><second/>",
+        "<![CDATA[outside]]><root/>",
+        "<root/><![CDATA[outside]]>",
+    };
+
+    for (cases) |xml| try expectOutcomeAcrossRefills(xml, error.MalformedXml);
+}
+
+test "[unit]: parser requires whitespace before every attribute across refills" {
+    const cases = [_][]const u8{
+        "<root first=\"1\"second=\"2\"/>",
+        "<cvParam accession=\"MS:1000001\"name=\"sample number\"/>",
+    };
+
+    for (cases) |xml| try expectOutcomeAcrossRefills(xml, error.MalformedXml);
+}
+
+test "[unit]: parser rejects malformed comment bodies across refills" {
+    const cases = [_][]const u8{
+        "<root><!--bad--comment--></root>",
+        "<root><!--bad---></root>",
+    };
+
+    for (cases) |xml| try expectOutcomeAcrossRefills(xml, error.MalformedXml);
+}
+
+test "[unit]: parser validates the complete XML declaration across refills" {
+    const cases = [_][]const u8{
+        "<?xml version=\"1.0\" garbage?><root/>",
+        "<?xml version=\"1.0\" unknown=\"value\"?><root/>",
+        "<?xml version=\"1.0\" version=\"1.0\"?><root/>",
+        "<?xml version=\"1.0\" encoding=\"UTF-8\" encoding=\"UTF-8\"?><root/>",
+        "<?xml version=\"1.0\" standalone=\"yes\" standalone=\"no\"?><root/>",
+        "<?xml version=\"1.0\"encoding=\"UTF-8\"?><root/>",
+        "<?xml version=\"1.0\" standalone=\"maybe\"?><root/>",
+        "<?xml version=\"1.0\" standalone=\"yes\" encoding=\"UTF-8\"?><root/>",
+        "<?xml version=\"1.0\" encoding=\"1UTF\"?><root/>",
+    };
+
+    for (cases) |xml| try expectOutcomeAcrossRefills(xml, error.MalformedXml);
+}
+
+test "[unit]: parser accepts supported complete XML declarations across refills" {
+    const cases = [_][]const u8{
+        "<?xml version = '1.0' encoding = \"ISO-8859-1\" standalone='yes' ?><root/>",
+        "<?xml version=\"1.1\" standalone = 'no'?><root/>",
+    };
+
+    for (cases) |xml| try expectOutcomeAcrossRefills(xml, null);
 }
 
 test "parser rejects invalid XML names with reader and slice parity" {
