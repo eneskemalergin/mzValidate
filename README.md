@@ -1,10 +1,8 @@
 <!-- markdownlint-disable MD033 MD036 MD041 -->
 
 <p align="center">
-  <img src="assets/mzvalidate-icon.svg" alt="mzValidate logo" width="90">
+  <img src="assets/logo-readme.svg" alt="mzValidate" width="180">
 </p>
-
-<h1 align="center">mzValidate</h1>
 
 <p align="center">
   Validates mzML files with one primary streaming parser pass. No JVM or managed runtime.

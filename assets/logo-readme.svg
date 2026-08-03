@@ -1,0 +1,117 @@
+<?xml version="1.0" encoding="UTF-8" standalone="no"?>
+<svg
+   viewBox="0 0 170 170.91813"
+   role="img"
+   aria-labelledby="title description"
+   version="1.1"
+   id="svg3"
+   sodipodi:docname="logo-readme.svg"
+   width="170"
+   height="170.91814"
+   inkscape:version="1.4.4 (dcaf3e7d9e, 2026-05-05)"
+   xmlns:inkscape="http://www.inkscape.org/namespaces/inkscape"
+   xmlns:sodipodi="http://sodipodi.sourceforge.net/DTD/sodipodi-0.dtd"
+   xmlns="http://www.w3.org/2000/svg"
+   xmlns:svg="http://www.w3.org/2000/svg"
+   xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#"
+   xmlns:cc="http://creativecommons.org/ns#"
+   xmlns:dc="http://purl.org/dc/elements/1.1/">
+  <defs
+     id="defs3" />
+  <sodipodi:namedview
+     id="namedview3"
+     pagecolor="#ffffff"
+     bordercolor="#000000"
+     borderopacity="0.25"
+     inkscape:showpageshadow="2"
+     inkscape:pageopacity="0.0"
+     inkscape:pagecheckerboard="0"
+     inkscape:deskcolor="#d1d1d1"
+     inkscape:zoom="4.24"
+     inkscape:cx="-24.528302"
+     inkscape:cy="119.10377"
+     inkscape:window-width="3840"
+     inkscape:window-height="2089"
+     inkscape:window-x="2160"
+     inkscape:window-y="34"
+     inkscape:window-maximized="1"
+     inkscape:current-layer="svg3" />
+  <title
+     id="title">mzValidate</title>
+  <desc
+     id="description">The mzValidate icon above the project name.</desc>
+  <g
+     id="g5"
+     transform="translate(-15,0.77273881)">
+    <g
+       transform="translate(20)"
+       id="g3">
+      <rect
+         x="2.9033139"
+         y="2.9033139"
+         width="154.19337"
+         height="134.6179"
+         rx="27.033903"
+         fill="#151515"
+         stroke="#f7a41d"
+         stroke-width="3"
+         id="rect1" />
+      <g
+         id="g4"
+         transform="translate(0,-9.7877338)">
+        <path
+           d="m 44,39 -19,41 19,41 m 72,-82 19,41 -19,41"
+           fill="none"
+           stroke="#f4eed7"
+           stroke-width="8"
+           stroke-linecap="round"
+           stroke-linejoin="round"
+           id="path1" />
+        <path
+           d="m 51.5,80 h 5 l 2,-10 2,10 h 6 l 2,-26 2,26 h 5 l 2,-15 2,15 h 6 l 2,-39 2,39 h 5 l 2,-23 2,23 h 10"
+           fill="none"
+           stroke="#f4eed7"
+           stroke-width="2.4"
+           stroke-linecap="round"
+           stroke-linejoin="round"
+           id="path2" />
+        <text
+           x="79.879753"
+           y="92.746902"
+           fill="#f4eed7"
+           font-family="monospace"
+           font-size="10.0519px"
+           letter-spacing="1"
+           text-anchor="middle"
+           id="text2">MS DATA</text>
+        <path
+           d="m 68,112 9,9 15,-17"
+           fill="none"
+           stroke="#f7a41d"
+           stroke-width="3.5"
+           stroke-linecap="round"
+           stroke-linejoin="round"
+           id="path3" />
+      </g>
+    </g>
+    <text
+       x="99.609375"
+       y="167.59435"
+       fill="#f7a41d"
+       font-family="system-ui, '-apple-system', 'Segoe UI', sans-serif"
+       font-size="32px"
+       font-weight="700"
+       letter-spacing="0.25"
+       text-anchor="middle"
+       id="text3">mzValidate</text>
+  </g>
+  <metadata
+     id="metadata3">
+    <rdf:RDF>
+      <cc:Work
+         rdf:about="">
+        <dc:title>mzValidate</dc:title>
+      </cc:Work>
+    </rdf:RDF>
+  </metadata>
+</svg>
