@@ -21,6 +21,7 @@ tmp/
 ref/
 /data/
 plan/
-assets/
+/assets/*
+!/assets/mzvalidate-icon.svg
 experiments/
 tools/
