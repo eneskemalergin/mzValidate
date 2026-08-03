@@ -120,9 +120,9 @@ JSON schema version 1 records every file result in input order and one invocatio
       "path": "sample.mzML",
       "completion": "complete",
       "status": "clean",
-      "totals": {"info": 0, "warnings": 0, "errors": 0},
+      "totals": { "info": 0, "warnings": 0, "errors": 0 },
       "diagnostics_truncated": false,
-      "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+      "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
       "first_failure": null,
       "diagnostics": []
     }
@@ -132,9 +132,9 @@ JSON schema version 1 records every file result in input order and one invocatio
     "status": "clean",
     "files": 1,
     "incomplete_files": 0,
-    "totals": {"info": 0, "warnings": 0, "errors": 0},
+    "totals": { "info": 0, "warnings": 0, "errors": 0 },
     "diagnostics_truncated": false,
-    "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
+    "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
     "first_failure": null
   }
 }
@@ -203,11 +203,11 @@ Every file is checked in one primary forward pass over parser events. Indexed st
 
 The XML parser enforces supported XML 1.0 and 1.1 syntax, legal names and characters, matching tags, namespace bindings, and unique expanded attribute names. It rejects DTD and external-entity declarations. The structural validator requires the mzML namespace, recognizes the mzML and indexed mzML element set, and checks implemented parent, child-order, cardinality, required-child, list-count, required-attribute, unqualified-attribute, and selected attribute-datatype rules.
 
-This is not a general XSD engine and is not a claim of exhaustive mzML schema conformance. String and URI lexical spaces are not exhaustively validated, and foreign namespaced attributes are generally outside the mzML attribute contract.
+This is not a general XSD engine and is not a claim of exhaustive mzML schema conformance. String lexical spaces remain broad, and URI reachability is not checked. URI lexical errors, unknown unqualified attributes, foreign attributes, and unsupported XML Schema instance attributes are reported instead of ignored. Namespace declarations and supported schema-location hints remain accepted.
 
 ### Binary integrity
 
-Each `binaryDataArray` is checked for canonical base64, `encodedLength`, applicable decoded length against `defaultArrayLength`, declared 32-bit or 64-bit precision, and duplicate array types within a `binaryDataArrayList`. Zlib payloads are decompressed and checked for corrupt, truncated, or trailing compressed input. Uncompressed arrays use a streaming base64 counter that avoids materializing the full decoded payload. Zlib arrays use reusable compressed scratch and a bounded decoded workspace. Recognized unsupported compression schemes are reported rather than ignored.
+Each `binaryDataArray` must declare exactly one compression type, one supported binary datatype, and one array type. Fixed-width arrays are checked for canonical base64, `encodedLength`, width divisibility, and element count. Null-terminated ASCII arrays are checked for byte range, termination, and string count. Metadata arrays may use `arrayLength`; default m/z, intensity, and time arrays inherit their owner length and reject forbidden length or processing overrides. Zlib payloads are decompressed and checked for corrupt, truncated, or trailing compressed input. Unsupported catalog terms fail visibly instead of being interpreted as raw bytes.
 
 ### Index and checksum
 
@@ -215,52 +215,58 @@ For indexed mzML files, validation checks the index list count and position, spe
 
 ### Semantic
 
-The embedded catalog contains PSI-MS 4.1.248 and Unit Ontology terms. For embedded terms, validation checks accession and `cvRef` prefixes, obsolete status, namespace, known datatypes for present values, and allowed units. BTO, GO, and PATO are accepted external prefixes, but their terms are not resolved because those ontologies are not embedded. The `cvRef` still has to match the accession prefix.
+The embedded catalog contains PSI-MS 4.1.248 and Unit Ontology terms. For embedded terms, validation checks accession, declared `cvRef`, namespace, obsolete status, catalog name or synonym, required typed values, datatype lexical space, and unit contracts. BTO, GO, and PATO terms cannot be resolved because those ontologies are not embedded; a declared external namespace remains visibly unverified instead of being treated as fully validated.
 
-The embedded mapping rules (`mzML.xsd` model version 1.0.0) enforce their MUST and SHOULD term requirements, repeatability, and selected contradictions. Supported unqualified reference attributes are resolved against typed declarations with bounded forward-reference state. These checks include PSI-MS terms used by IM-MS and DIA data, but they do not establish that every external ontology term or every possible mzML semantic rule is covered.
+The embedded mapping rules (`mzML.xsd` model version 1.0.0) enforce location, MUST and SHOULD requirements, optional AND, OR, and XOR combinations, descendant matching, and repeatability. The default source-file object rule is enforced separately. Supported unqualified reference attributes are resolved against typed declarations with bounded forward-reference state, including local and external spectrum-reference combinations. These checks include PSI-MS terms used by IM-MS and DIA data, but they do not establish that every external ontology term or every possible mzML semantic rule is covered.
 
 ### Rule reference
 
 Category header rows align with the Validation sections above.
 
-| Rule ID                          | Severity | Description                                                                |
-| -------------------------------- | -------- | -------------------------------------------------------------------------- |
-| **Structural**                   |          |                                                                            |
-| `mzml.structure.xml`             | error    | Malformed XML or parser error                                              |
-| `mzml.structure.root`            | error    | Missing or wrong root element                                              |
-| `mzml.structure.nesting`         | error    | Invalid element nesting                                                    |
-| `mzml.structure.attribute`       | error    | Missing or invalid attribute                                               |
-| `mzml.structure.count`           | error    | List count mismatch                                                        |
-| `mzml.structure.missing-child`   | error    | Required child element absent                                              |
-| **Binary**                       |          |                                                                            |
-| `mzml.binary.base64`             | error    | Invalid base64 encoding                                                    |
-| `mzml.binary.decompress`         | error    | Invalid zlib compressed data                                               |
-| `mzml.binary.compression`        | error    | Conflicting or unsupported compression terms                               |
-| `mzml.binary.precision-mismatch` | error    | Declared precision does not match payload                                  |
-| `mzml.binary.length-mismatch`    | error    | Encoded or decoded binary length does not match its declaration            |
-| `mzml.binary.oversized`          | error    | Payload exceeds `-max-binary-size` limit                                   |
-| `mzml.binary.type-mismatch`      | error    | Duplicate array type in one `binaryDataArrayList`                          |
-| **Index**                        |          |                                                                            |
-| `mzml.index.offset-list`         | error    | `indexListOffset` does not match actual offset                             |
-| `mzml.index.offset`              | error    | Index offset does not match recorded position                              |
-| `mzml.index.duplicate-id`        | error    | Indexed ID repeats within its spectrum or chromatogram kind                |
-| `mzml.index.truncated`           | error    | Index offset points past end of file                                       |
-| `mzml.index.checksum`            | error    | SHA-1 mismatch or invalid hex format                                       |
-| **Semantic**                     |          |                                                                            |
-| `mzml.cv.accession`              | error    | Unrecognized CV accession                                                  |
-| `mzml.cv.obsolete`               | warning  | CV term is obsolete                                                        |
-| `mzml.cv.namespace`              | error    | `cvRef` does not match term namespace                                      |
-| `mzml.cv.name`                   | error    | Required CV term name is empty                                             |
-| `mzml.cv.unit`                   | error    | Unrecognized unit accession (info: unitName does not match canonical name) |
-| `mzml.cv.value`                  | error    | Present value does not match the CV term's declared datatype               |
-| `mzml.cv.required`               | error    | Missing required CV term                                                   |
-| `mzml.cv.recommended`            | warning  | Missing recommended CV term                                                |
-| `mzml.cv.contradiction`          | warning  | Mutually exclusive CV terms on same element                                |
-| `mzml.cv.term-repeat`            | warning  | Non-repeatable CV term appears more than once                              |
-| **References**                   |          |                                                                            |
-| `mzml.ref.unresolved`            | error    | Supported reference attribute does not resolve to a typed declaration      |
-| `mzml.ref.duplicate-id`          | error    | Two or more elements share the same `id`                                   |
-| `mzml.ref.missing`               | error    | Required `*Ref` attribute is missing                                       |
+| Rule ID                          | Severity           | Description                                                                           |
+| -------------------------------- | ------------------ | ------------------------------------------------------------------------------------- |
+| **Structural**                   |                    |                                                                                       |
+| `mzml.structure.xml`             | error              | Malformed XML or parser error                                                         |
+| `mzml.structure.root`            | error              | Missing or wrong root element                                                         |
+| `mzml.structure.nesting`         | error              | Invalid element nesting                                                               |
+| `mzml.structure.attribute`       | error              | Missing or invalid attribute                                                          |
+| `mzml.structure.count`           | error              | List count mismatch                                                                   |
+| `mzml.structure.missing-child`   | error              | Required child element absent                                                         |
+| **Binary**                       |                    |                                                                                       |
+| `mzml.binary.base64`             | error              | Invalid base64 encoding                                                               |
+| `mzml.binary.decompress`         | error              | Invalid zlib compressed data                                                          |
+| `mzml.binary.compression`        | error              | Conflicting or unsupported compression terms                                          |
+| `mzml.binary.precision-mismatch` | error              | Declared precision does not match payload                                             |
+| `mzml.binary.length-mismatch`    | error              | Encoded or decoded binary length does not match its declaration                       |
+| `mzml.binary.oversized`          | error              | Payload exceeds `-max-binary-size` limit                                              |
+| `mzml.binary.type-mismatch`      | error              | Invalid binary datatype declaration or duplicate array type                           |
+| `mzml.binary.default-array`      | error              | Default array declares a forbidden length or processing override                      |
+| **Index**                        |                    |                                                                                       |
+| `mzml.index.offset-list`         | error              | `indexListOffset` does not match actual offset                                        |
+| `mzml.index.offset`              | error              | Index offset does not match recorded position                                         |
+| `mzml.index.duplicate-id`        | error              | Indexed ID repeats within its spectrum or chromatogram kind                           |
+| `mzml.index.truncated`           | error              | Index offset points past end of file                                                  |
+| `mzml.index.checksum`            | error / warning    | SHA-1 mismatch, invalid hex, or non-canonical surrounding whitespace                  |
+| **Semantic**                     |                    |                                                                                       |
+| `mzml.cv.accession`              | error              | Unrecognized CV accession                                                             |
+| `mzml.cv.obsolete`               | warning            | CV term is obsolete                                                                   |
+| `mzml.cv.namespace`              | error              | `cvRef` does not match term namespace                                                 |
+| `mzml.cv.name`                   | error              | Required CV term name is empty                                                        |
+| `mzml.cv.name-mismatch`          | warning            | Known CV term name differs from the catalog name and synonyms                         |
+| `mzml.cv.unverified-namespace`   | warning            | Declared external ontology is not bundled, so accessions were not verified            |
+| `mzml.cv.unit`                   | error/warning/info | Required unit missing, unrecognized, or disallowed; unexpected unit remains visible   |
+| `mzml.cv.value`                  | error/warning      | Missing or invalid typed value, or non-empty value without a datatype contract        |
+| `mzml.cv.required`               | error              | Missing required CV term                                                              |
+| `mzml.cv.recommended`            | warning            | Missing recommended CV term                                                           |
+| `mzml.cv.location`               | error/warning      | CV term is invalid at a mapped location, or the element has no location mapping       |
+| `mzml.cv.contradiction`          | warning            | Mutually exclusive CV terms on same element                                           |
+| `mzml.cv.term-repeat`            | error              | Non-repeatable CV mapping term is matched more than once                              |
+| `mzml.cv.source-file`            | error/warning      | Default source-file object rule failed or could not include a forward parameter group |
+| **References**                   |                    |                                                                                       |
+| `mzml.ref.unresolved`            | error              | Supported reference attribute does not resolve to a typed declaration                 |
+| `mzml.ref.duplicate-id`          | error              | Two or more elements share the same `id`                                              |
+| `mzml.ref.missing`               | error              | Required `*Ref` attribute is missing                                                  |
+| `mzml.ref.spectrum-form`         | error              | Local and external spectrum reference attributes form an invalid combination          |
 
 ## Architecture
 

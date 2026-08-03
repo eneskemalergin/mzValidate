@@ -31,7 +31,7 @@
   </dataProcessingList>
   <run id="run-1" defaultInstrumentConfigurationRef="IC1">
     <spectrumList count="1" defaultDataProcessingRef="DP1">
-      <spectrum index="8" id="scan=8" defaultArrayLength="1">
+      <spectrum index="0" id="scan=8" defaultArrayLength="1">
         <scanList count="1"><scan/></scanList>
         <binaryDataArrayList count="2">
           <binaryDataArray encodedLength="8">

@@ -1088,7 +1088,7 @@ test "path check: reports a clean file when structure and binary pass" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "path check: validates indexed fixture structure when binary checks are skipped" {
+test "path check: reports indexed fixture URI deviations when binary checks are skipped" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1106,7 +1106,7 @@ test "path check: validates indexed fixture structure when binary checks are ski
 
     try checkPath(allocator, io, &diagnostics, path, .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectTinyUriDiagnostics(diagnostics.items);
 }
 
 test "path check: validates the larger indexed fixture structure" {
@@ -1121,7 +1121,7 @@ test "path check: validates the larger indexed fixture structure" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "path check: validates indexed structure with index checks disabled" {
+test "path check: keeps structural URI findings when index checks are disabled" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -1132,7 +1132,7 @@ test "path check: validates indexed structure with index checks disabled" {
     // Index SHA-1 verification is tested separately with correct fixtures.
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_semantic = true, .skip_index = true });
 
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectTinyUriDiagnostics(diagnostics.items);
 }
 
 test "path check: runs semantic validation end to end" {
@@ -1263,7 +1263,7 @@ test "path check: skips index checks for indexed input" {
 
     try checkPath(allocator, io, &diagnostics, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", .{ .skip_binary = true, .skip_index = true, .skip_semantic = true });
 
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectTinyUriDiagnostics(diagnostics.items);
 }
 
 test "path check: validates a stream SHA-1 checksum" {
@@ -1491,15 +1491,16 @@ test "path check: skips SHA-1 for an indexed fixture when requested" {
         .skip_index = true,
     });
 
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectTinyUriDiagnostics(diagnostics.items);
 }
 
-test "path check: accepts indexed input without a checksum" {
+test "path check: missing required indexed checksum is structural, not a SHA mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    // A minimal indexed mzML without a fileChecksum element.
-    // The spec allows indexed mzML without checksum.
+    // The indexed 1.1.3 schema requires fileChecksum. Structural validation
+    // owns the missing child; the index validator must not invent a checksum
+    // mismatch when there is no declared digest to recompute.
     const xml =
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
         "<indexedmzML xmlns=\"http://psi.hupo.org/ms/mzml\">\n" ++
@@ -1531,14 +1532,21 @@ test "path check: accepts indexed input without a checksum" {
         .skip_semantic = true,
     });
 
+    var saw_missing_checksum = false;
     for (diagnostics.items) |d| {
         if (std.mem.eql(u8, d.rule, RuleId.mzml_index_checksum)) {
             return error.TestUnexpectedChecksumError;
         }
+        if (std.mem.eql(u8, d.rule, RuleId.mzml_structure_missing_child) and
+            std.mem.eql(u8, d.message, "indexedmzML is missing required child fileChecksum"))
+        {
+            saw_missing_checksum = true;
+        }
     }
+    try std.testing.expect(saw_missing_checksum);
 }
 
-test "path check: validates the valid fixture corpus" {
+test "path check: validates the conforming fixture corpus and preserves visible URI deviations" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const root = "fixtures/mzml/valid";
@@ -1548,7 +1556,7 @@ test "path check: validates the valid fixture corpus" {
         io,
         root,
         .{ .skip_binary = true, .skip_semantic = true, .skip_index = true },
-        .clean,
+        .valid_with_uri_compat,
     );
 
     try std.testing.expect(fixture_count > 0);
@@ -2878,7 +2886,7 @@ test "path check: reports the expected rule for each invalid binary fixture" {
     const io = std.testing.io;
     const expectations = [_]InvalidBinaryExpectation{
         .{ .sub_path = "fixtures/mzml/invalid/conflicting-compression.mzML", .rule = RuleId.mzml_binary_compression, .message = "binaryDataArray declares conflicting compression terms" },
-        .{ .sub_path = "fixtures/mzml/invalid/conflicting-precision.mzML", .rule = RuleId.mzml_binary_precision_mismatch, .message = "binaryDataArray declares conflicting 32-bit and 64-bit precision" },
+        .{ .sub_path = "fixtures/mzml/invalid/conflicting-precision.mzML", .rule = RuleId.mzml_binary_type_mismatch, .message = "binaryDataArray declares more than one binary datatype" },
         .{ .sub_path = "fixtures/mzml/invalid/invalid-base64.mzML", .rule = RuleId.mzml_binary_base64, .message = "binary payload is not valid base64" },
         .{ .sub_path = "fixtures/mzml/invalid/invalid-zlib.mzML", .rule = RuleId.mzml_binary_decompress, .message = "binary payload is not valid zlib data" },
         .{ .sub_path = "fixtures/mzml/invalid/unsupported-compression.mzML", .rule = RuleId.mzml_binary_compression, .message = "binaryDataArray declares unsupported compression terms" },
@@ -2950,6 +2958,7 @@ test "path check: repeated clean and corrupt runs reset diagnostics" {
 const CorpusExpectation = enum {
     clean,
     non_empty,
+    valid_with_uri_compat,
 };
 
 const InvalidBinaryExpectation = struct {
@@ -3072,6 +3081,17 @@ fn expectCorpusDiagnostics(
             .non_empty => {
                 if (diagnostics.items.len == 0) {
                     std.debug.print("expected diagnostics for {s}, but run was clean\n", .{path});
+                    return error.TestUnexpectedResult;
+                }
+            },
+            .valid_with_uri_compat => {
+                if (std.mem.eql(u8, entry.path, "tiny.pwiz.1.1.mzML")) {
+                    try expectTinyUriDiagnostics(diagnostics.items);
+                } else if (diagnostics.items.len != 0) {
+                    std.debug.print(
+                        "unexpected diagnostics for {s}: first rule={s} message={s}\n",
+                        .{ path, diagnostics.items[0].rule, diagnostics.items[0].message },
+                    );
                     return error.TestUnexpectedResult;
                 }
             },
@@ -3248,6 +3268,14 @@ fn expectSingleDiagnostic(diagnostics: []const Diagnostic, expected_rule: []cons
     try std.testing.expectEqual(@as(usize, 1), diagnostics.len);
     try std.testing.expectEqualStrings(expected_rule, diagnostics[0].rule);
     try std.testing.expectEqualStrings(expected_message, diagnostics[0].message);
+}
+
+fn expectTinyUriDiagnostics(diagnostics: []const Diagnostic) !void {
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.len);
+    for (diagnostics) |item| {
+        try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, item.rule);
+        try std.testing.expectEqualStrings("attribute must be an XML Schema anyURI", item.message);
+    }
 }
 
 fn oversizedAttributeValueMzml(allocator: std.mem.Allocator, text_len: usize) ![]u8 {

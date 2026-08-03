@@ -92,20 +92,30 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
-    const valid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/valid") catch
-        @panic("failed to collect valid mzML fixtures");
     const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch
         @panic("failed to collect invalid mzML fixtures");
 
     const cli_valid_cmd = b.addRunArtifact(exe);
     cli_valid_cmd.step.dependOn(b.getInstallStep());
     cli_valid_cmd.addArg("check");
-    addFixtureArgs(cli_valid_cmd, valid_fixtures);
+    cli_valid_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_valid_cmd.addArg("fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML");
+    cli_valid_cmd.addArg("fixtures/mzml/valid/small_miape.pwiz.1.1.mzML");
     cli_valid_cmd.addArg("fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
     cli_valid_cmd.addArg("-skip-semantic");
     cli_valid_cmd.addArg("-skip-index");
     cli_valid_cmd.addArg("-summary");
     cli_valid_cmd.expectStdOutEqual("complete: clean (info=0 warnings=0 errors=0)\n");
+
+    const cli_known_findings_cmd = b.addRunArtifact(exe);
+    cli_known_findings_cmd.step.dependOn(b.getInstallStep());
+    cli_known_findings_cmd.addArg("check");
+    cli_known_findings_cmd.addArg("fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
+    cli_known_findings_cmd.addArg("-skip-semantic");
+    cli_known_findings_cmd.addArg("-skip-index");
+    cli_known_findings_cmd.addArg("-summary");
+    cli_known_findings_cmd.expectExitCode(2);
+    cli_known_findings_cmd.expectStdOutEqual("complete: errors (info=0 warnings=0 errors=13)\n");
 
     const cli_invalid_cmd = b.addRunArtifact(exe);
     cli_invalid_cmd.step.dependOn(b.getInstallStep());
@@ -151,6 +161,7 @@ pub fn build(b: *std.Build) void {
 
     const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
     cli_contract_step.dependOn(&cli_valid_cmd.step);
+    cli_contract_step.dependOn(&cli_known_findings_cmd.step);
     cli_contract_step.dependOn(&cli_invalid_cmd.step);
     cli_contract_step.dependOn(&cli_schema_finding_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);

@@ -20,11 +20,13 @@ pub const RequirementLevel = enum(u8) {
 pub const CombinationLogic = enum(u8) {
     @"and",
     @"or",
+    xor,
 };
 
 /// A CV term reference owned by the containing `RuleEngine`.
 pub const MappingTerm = struct {
     accession: []const u8,
+    use_term: bool,
     allow_children: bool,
     is_repeatable: bool,
 };
@@ -32,7 +34,10 @@ pub const MappingTerm = struct {
 /// A mapping rule owned by the containing `RuleEngine`.
 pub const MappingRule = struct {
     id: []const u8,
+    /// Owning element path derived from `cvElementPath`.
     element_path: []const u8,
+    /// Element scope within which repeatability applies.
+    scope_path: []const u8,
     requirement: RequirementLevel,
     logic: CombinationLogic,
     terms: []const MappingTerm,
@@ -66,6 +71,13 @@ pub const RuleEngine = struct {
         };
         errdefer engine.deinit();
 
+        for (engine.rules) |rule| {
+            if (std.mem.eql(u8, rule.element_path, rule.scope_path)) continue;
+            for (rule.terms) |term| {
+                if (!term.is_repeatable) return error.UnsupportedMappingRepeatScope;
+            }
+        }
+
         engine.grouped_rules = try allocator.alloc(MappingRule, engine.rules.len);
         var i: usize = 0;
         var group_index: usize = 0;
@@ -92,6 +104,7 @@ pub const RuleEngine = struct {
         for (engine.rules) |rule| {
             engine.allocator.free(rule.id);
             engine.allocator.free(rule.element_path);
+            engine.allocator.free(rule.scope_path);
             for (rule.terms) |term| engine.allocator.free(term.accession);
             engine.allocator.free(rule.terms);
         }
@@ -168,6 +181,7 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         for (rules.items) |rule| {
             allocator.free(rule.id);
             allocator.free(rule.element_path);
+            allocator.free(rule.scope_path);
             for (rule.terms) |term| allocator.free(term.accession);
             allocator.free(rule.terms);
         }
@@ -200,12 +214,14 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
 
     var current_id: ?[]u8 = null;
     var current_path: ?[]u8 = null;
+    var current_scope_path: ?[]u8 = null;
     var current_requirement: RequirementLevel = .may;
     var current_logic: CombinationLogic = .@"and";
     var mapping_rule_depth: usize = 0;
     errdefer {
         if (current_id) |id| allocator.free(id);
         if (current_path) |p| allocator.free(p);
+        if (current_scope_path) |p| allocator.free(p);
     }
 
     while (true) {
@@ -220,7 +236,12 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                     if (mapping_rule_depth != 1) continue;
 
                     current_id = try dupeRequiredAttr(allocator, start.attributes, "id");
-                    current_path = try dupeRequiredAttr(allocator, start.attributes, "scopePath");
+                    current_path = try dupeCvOwnerPath(
+                        allocator,
+                        findAttr(start.attributes, "cvElementPath") orelse
+                            return error.MissingMappingAttribute,
+                    );
+                    current_scope_path = try dupeRequiredAttr(allocator, start.attributes, "scopePath");
                     current_requirement = try parseRequirement(
                         findAttr(start.attributes, "requirementLevel") orelse
                             return error.MissingMappingAttribute,
@@ -243,10 +264,24 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                     }
                     const owned = try dupeRequiredAttr(allocator, start.attributes, "termAccession");
                     errdefer allocator.free(owned);
-                    const allow_children = eqTrue(findAttr(start.attributes, "allowChildren"));
-                    const is_repeatable = eqTrue(findAttr(start.attributes, "isRepeatable"));
+                    _ = findAttr(start.attributes, "termName") orelse return error.MissingMappingAttribute;
+                    const cv_identifier_ref = findAttr(start.attributes, "cvIdentifierRef") orelse
+                        return error.MissingMappingAttribute;
+                    if (!accessionMatchesIdentifier(owned, cv_identifier_ref)) {
+                        return error.MappingNamespaceMismatch;
+                    }
+                    if (findAttr(start.attributes, "useTermName")) |value| {
+                        if (try parseMappingBoolean(value)) return error.UnsupportedMappingTermName;
+                    }
+                    const use_term = try parseRequiredMappingBoolean(start.attributes, "useTerm");
+                    const allow_children = try parseRequiredMappingBoolean(start.attributes, "allowChildren");
+                    const is_repeatable = if (findAttr(start.attributes, "isRepeatable")) |value|
+                        try parseMappingBoolean(value)
+                    else
+                        true;
                     try current_terms.?.append(allocator, .{
                         .accession = owned,
+                        .use_term = use_term,
                         .allow_children = allow_children,
                         .is_repeatable = is_repeatable,
                     });
@@ -267,6 +302,7 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                 try rules.append(allocator, .{
                     .id = current_id.?,
                     .element_path = current_path.?,
+                    .scope_path = current_scope_path.?,
                     .requirement = current_requirement,
                     .logic = current_logic,
                     .terms = owned_terms,
@@ -275,6 +311,7 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
                 current_terms = null;
                 current_id = null;
                 current_path = null;
+                current_scope_path = null;
             },
             .text => {},
         }
@@ -296,8 +333,27 @@ fn dupeRequiredAttr(allocator: std.mem.Allocator, attrs: []const Attribute, loca
     return allocator.dupe(u8, value);
 }
 
-fn eqTrue(value: ?[]const u8) bool {
-    return if (value) |item| std.mem.eql(u8, item, "true") else false;
+fn dupeCvOwnerPath(allocator: std.mem.Allocator, cv_element_path: []const u8) ![]u8 {
+    const suffix = "/cvParam/@accession";
+    if (!std.mem.endsWith(u8, cv_element_path, suffix)) return error.InvalidMappingElementPath;
+    const owner_path = cv_element_path[0 .. cv_element_path.len - suffix.len];
+    if (owner_path.len == 0 or owner_path[0] != '/') return error.InvalidMappingElementPath;
+    return allocator.dupe(u8, owner_path);
+}
+
+fn parseRequiredMappingBoolean(attrs: []const Attribute, local_name: []const u8) !bool {
+    return parseMappingBoolean(findAttr(attrs, local_name) orelse return error.MissingMappingAttribute);
+}
+
+fn parseMappingBoolean(value: []const u8) !bool {
+    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) return true;
+    if (std.mem.eql(u8, value, "false") or std.mem.eql(u8, value, "0")) return false;
+    return error.InvalidMappingBoolean;
+}
+
+fn accessionMatchesIdentifier(accession: []const u8, identifier: []const u8) bool {
+    const colon = std.mem.indexOfScalar(u8, accession, ':') orelse return false;
+    return colon > 0 and std.mem.eql(u8, accession[0..colon], identifier);
 }
 
 fn parseRequirement(value: []const u8) !RequirementLevel {
@@ -310,6 +366,7 @@ fn parseRequirement(value: []const u8) !RequirementLevel {
 fn parseLogic(value: []const u8) !CombinationLogic {
     if (std.mem.eql(u8, value, "AND")) return .@"and";
     if (std.mem.eql(u8, value, "OR")) return .@"or";
+    if (std.mem.eql(u8, value, "XOR")) return .xor;
     return error.InvalidCombinationLogic;
 }
 
@@ -322,6 +379,8 @@ fn isExternalPrefix(accession: []const u8) bool {
 }
 
 // --- Unit Tests ---
+
+const test_mapping_term_attrs = " useTerm=\"true\" termName=\"test\" isRepeatable=\"true\" allowChildren=\"false\" cvIdentifierRef=\"MS\"";
 
 test "rule engine parses the embedded mapping" {
     const allocator = std.testing.allocator;
@@ -420,9 +479,9 @@ test "rule engine groups rules when paths are interleaved" {
     const allocator = std.testing.allocator;
     const xml =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"run_first\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"><CvTerm termAccession=\"MS:1\"/></CvMappingRule>" ++
-        "<CvMappingRule id=\"spectrum\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"/></CvMappingRule>" ++
-        "<CvMappingRule id=\"run_second\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:3\"/></CvMappingRule>" ++
+        "<CvMappingRule id=\"run_first\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"><CvTerm termAccession=\"MS:1\"" ++ test_mapping_term_attrs ++ "/></CvMappingRule>" ++
+        "<CvMappingRule id=\"spectrum\" cvElementPath=\"/mzML/spectrum/cvParam/@accession\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"" ++ test_mapping_term_attrs ++ "/></CvMappingRule>" ++
+        "<CvMappingRule id=\"run_second\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:3\"" ++ test_mapping_term_attrs ++ "/></CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
 
     var engine = try RuleEngine.init(allocator, xml);
@@ -438,13 +497,32 @@ test "rule engine groups rules when paths are interleaved" {
     try std.testing.expectEqualSlices(MappingRule, rules, engine.rulesForState(state));
 }
 
+test "rule engine indexes cvElementPath and retains the repeat scope" {
+    const allocator = std.testing.allocator;
+    const xml =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"XOR\">" ++
+        "<CvTerm termAccession=\"MS:1\"" ++ test_mapping_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+
+    var engine = try RuleEngine.init(allocator, xml);
+    defer engine.deinit();
+
+    const rules = engine.rulesFor("/mzML/run");
+    try std.testing.expectEqual(@as(usize, 1), rules.len);
+    try std.testing.expectEqualStrings("/mzML", rules[0].scope_path);
+    try std.testing.expectEqual(CombinationLogic.xor, rules[0].logic);
+    try std.testing.expect(rules[0].terms[0].is_repeatable);
+    try std.testing.expectEqual(@as(usize, 0), engine.rulesFor("/mzML").len);
+}
+
 test "rule engine ignores nested mapping rules" {
     const allocator = std.testing.allocator;
     const xml =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"outer\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1\"/>" ++
-        "<CvMappingRule id=\"inner\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"/></CvMappingRule>" ++
+        "<CvMappingRule id=\"outer\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1\"" ++ test_mapping_term_attrs ++ "/>" ++
+        "<CvMappingRule id=\"inner\" cvElementPath=\"/mzML/spectrum/cvParam/@accession\" scopePath=\"/mzML/spectrum\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm termAccession=\"MS:2\"/></CvMappingRule>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
 
     var engine = try RuleEngine.init(allocator, xml);
@@ -459,27 +537,61 @@ test "rule engine rejects missing and invalid rule attributes" {
     const allocator = std.testing.allocator;
     const missing_id =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"/>" ++
+        "<CvMappingRule cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\"/>" ++
         "</CvMappingRuleList></CvMapping>";
     try std.testing.expectError(error.MissingMappingAttribute, RuleEngine.init(allocator, missing_id));
 
     const invalid_requirement =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"REQUIRED\" cvTermsCombinationLogic=\"AND\"/>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"REQUIRED\" cvTermsCombinationLogic=\"AND\"/>" ++
         "</CvMappingRuleList></CvMapping>";
     try std.testing.expectError(error.InvalidRequirementLevel, RuleEngine.init(allocator, invalid_requirement));
 
     const invalid_logic =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"XOR\"/>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"NOR\"/>" ++
         "</CvMappingRuleList></CvMapping>";
     try std.testing.expectError(error.InvalidCombinationLogic, RuleEngine.init(allocator, invalid_logic));
 
+    const invalid_element_path =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"/>" ++
+        "</CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.InvalidMappingElementPath, RuleEngine.init(allocator, invalid_element_path));
+
     const missing_term_accession =
         "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm/></CvMappingRule>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"><CvTerm/></CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     try std.testing.expectError(error.MissingMappingAttribute, RuleEngine.init(allocator, missing_term_accession));
+
+    const invalid_boolean =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1\" useTerm=\"yes\" termName=\"test\" allowChildren=\"false\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.InvalidMappingBoolean, RuleEngine.init(allocator, invalid_boolean));
+
+    const namespace_mismatch =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1\" useTerm=\"true\" termName=\"test\" allowChildren=\"false\" cvIdentifierRef=\"UO\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.MappingNamespaceMismatch, RuleEngine.init(allocator, namespace_mismatch));
+
+    const unsupported_term_name =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1\" useTermName=\"true\" useTerm=\"true\" termName=\"test\" allowChildren=\"false\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.UnsupportedMappingTermName, RuleEngine.init(allocator, unsupported_term_name));
+
+    const unsupported_repeat_scope =
+        "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1\" useTerm=\"true\" termName=\"test\" allowChildren=\"false\" isRepeatable=\"false\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    try std.testing.expectError(error.UnsupportedMappingRepeatScope, RuleEngine.init(allocator, unsupported_repeat_scope));
 }
 
 test "rule engine enforces the mapping rule limit" {
@@ -492,7 +604,7 @@ test "rule engine enforces the mapping rule limit" {
         const id = try std.fmt.bufPrint(&id_buf, "rule_{d}", .{i});
         try xml.appendSlice(allocator, "<CvMappingRule id=\"");
         try xml.appendSlice(allocator, id);
-        try xml.appendSlice(allocator, "\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"/>");
+        try xml.appendSlice(allocator, "\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MAY\" cvTermsCombinationLogic=\"OR\"/>");
     }
     try xml.appendSlice(allocator, "</CvMappingRuleList></CvMapping>");
 
@@ -517,8 +629,8 @@ fn ruleEngineAllocationCheck(allocator: std.mem.Allocator, xml: []const u8) !voi
 
 test "[unit]: rule engine cleans path index allocation failures" {
     const xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000001\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ test_mapping_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
 
     try std.testing.checkAllAllocationFailures(
@@ -530,8 +642,8 @@ test "[unit]: rule engine cleans path index allocation failures" {
 
 fn fuzzRuleEngineCleanup(_: void, smith: *std.testing.Smith) !void {
     const seed = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"seed\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000001\"/>" ++
+        "<CvMappingRule id=\"seed\" cvElementPath=\"/mzML/run/cvParam/@accession\" scopePath=\"/mzML/run\" requirementLevel=\"MUST\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ test_mapping_term_attrs ++ "/>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
     var mutated: [seed.len]u8 = undefined;
     @memcpy(&mutated, seed);

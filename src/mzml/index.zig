@@ -50,7 +50,6 @@ pub const IndexValidator = struct {
     current_index_kind: ?IndexKind = null,
     offset_id_ref: ?[]const u8 = null,
     index_entry_count: usize = 0,
-    previous_index_offset: ?u64 = null,
 
     // --- indexListOffset ---
     index_list_offset_depth: ?usize = null,
@@ -355,6 +354,15 @@ pub const IndexValidator = struct {
                         "fileChecksum must be a 40-character hexadecimal string",
                     ) catch |append_err| return append_err;
                 } else {
+                    if (hex.len != raw.len) {
+                        _ = try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .warning,
+                            .rule = RuleId.mzml_index_checksum,
+                            .location = .{ .byte_offset = validator.file_checksum_byte_offset orelse 0 },
+                            .path = validator.path,
+                            .message = "fileChecksum contains non-canonical surrounding whitespace",
+                        });
+                    }
                     decodeHex(hex, &validator.file_checksum_raw);
                     validator.file_checksum_ok = true;
                 }
@@ -624,16 +632,6 @@ pub const IndexValidator = struct {
                 try validator.appendDiagnostic(byte_offset, RuleId.mzml_index_offset, "duplicate idRef in index");
             }
         }
-        if (validator.previous_index_offset) |previous| {
-            if (offset < previous) {
-                try validator.appendDiagnostic(
-                    byte_offset,
-                    RuleId.mzml_index_offset,
-                    "index offsets are not monotonically increasing",
-                );
-            }
-        }
-        validator.previous_index_offset = offset;
         if (validator.input_size) |size| {
             if (offset >= size) {
                 try validator.appendDiagnostic(
@@ -1154,6 +1152,25 @@ test "IndexValidator: valid indexed mzML cross-checks correctly" {
     try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
 }
 
+test "[unit]: exact index offsets may appear in non-monotonic order" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var validator = IndexValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    try validator.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try validator.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s1")}, 100), 1);
+    try validator.consumeStart(test_events.startUnknown("spectrum", &.{test_events.attr("id", "s2")}, 300), 1);
+    validator.current_index_kind = .spectrum;
+
+    try validator.checkIndexEntry("s2", 300, 500);
+    try validator.checkIndexEntry("s1", 100, 520);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
 test "IndexValidator: mismatched offset value produces diagnostic" {
     const allocator = testing.allocator;
     var diagnostics: DiagnosticSink = .empty;
@@ -1459,7 +1476,7 @@ test "IndexValidator: online SHA batches parser boundaries and flushes checksum 
     try testing.expectEqualSlices(u8, &batch, &v.sha_computed);
 }
 
-test "IndexValidator: fileChecksum with surrounding whitespace passes validation" {
+test "IndexValidator: fileChecksum with surrounding whitespace is verified with a warning" {
     const allocator = testing.allocator;
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
@@ -1495,6 +1512,49 @@ test "IndexValidator: fileChecksum with surrounding whitespace passes validation
     try v.consumeText(test_events.text("\n  "));
     try v.consumeText(test_events.text(hex_str));
     try v.consumeText(test_events.text("\n"));
+    try v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
+    try v.consumeEnd(test_events.endUnknown("mzML"), 0);
+
+    try v.finish(file_bytes);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_index_checksum, diagnostics.items[0].rule);
+}
+
+test "IndexValidator: uppercase fileChecksum hex is accepted" {
+    const allocator = testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var v = IndexValidator.init(allocator, &diagnostics, null);
+    defer v.deinit();
+
+    const prefix = "<?xml version=\"1.0\"?><mzML><run id=\"r\"></run>";
+    var expected_sha: [20]u8 = undefined;
+    {
+        var ctx = std.crypto.hash.Sha1.init(.{});
+        ctx.update(prefix);
+        ctx.update("<fileChecksum>");
+        ctx.final(&expected_sha);
+    }
+    var upper_hex: [40]u8 = undefined;
+    for (0..20) |i| {
+        const hi = expected_sha[i] >> 4;
+        const lo = expected_sha[i] & 0xf;
+        upper_hex[2 * i] = std.ascii.toUpper(hexChar(@as(u4, @intCast(hi))));
+        upper_hex[2 * i + 1] = std.ascii.toUpper(hexChar(@as(u4, @intCast(lo))));
+    }
+
+    const file_bytes = prefix ++ "<fileChecksum>" ++ upper_hex ++ "</fileChecksum>";
+
+    try v.consumeStart(test_events.startUnknown("mzML", &.{}, 0), 0);
+    try v.consumeStart(test_events.startUnknown("run", &.{test_events.attr("id", "r")}, 10), 1);
+    try v.consumeEnd(test_events.endUnknown("run"), 1);
+    try v.consumeStart(test_events.startUnknown("indexList", &.{test_events.attr("count", "0")}, 500), 1);
+    try v.consumeEnd(test_events.endUnknown("indexList"), 1);
+    try v.consumeStart(test_events.startUnknown("fileChecksum", &.{}, @intCast(prefix.len)), 1);
+    try v.consumeText(test_events.text(&upper_hex));
     try v.consumeEnd(test_events.endUnknown("fileChecksum"), 1);
     try v.consumeEnd(test_events.endUnknown("mzML"), 0);
 

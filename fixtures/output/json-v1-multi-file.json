@@ -2,7 +2,7 @@
   "schema_version": 1,
   "files": [
     {
-      "path": "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+      "path": "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
       "completion": "complete",
       "status": "clean",
       "totals": {"info": 0, "warnings": 0, "errors": 0},
@@ -24,7 +24,7 @@
           "severity": "error",
           "rule": "mzml.binary.base64",
           "path": "fixtures/mzml/invalid/invalid-base64.mzML",
-          "location": {"byte_offset": 1970, "spectrum_index": 7},
+          "location": {"byte_offset": 1970, "spectrum_index": 0},
           "message": "binary payload is not valid base64"
         }
       ]

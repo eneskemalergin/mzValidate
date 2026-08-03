@@ -2,7 +2,7 @@
   "schema_version": 1,
   "files": [
     {
-      "path": "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+      "path": "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
       "completion": "complete",
       "status": "clean",
       "totals": {"info": 0, "warnings": 0, "errors": 0},

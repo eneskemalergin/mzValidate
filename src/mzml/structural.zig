@@ -614,6 +614,7 @@ pub const StructuralValidator = struct {
                 validator.chromatogram_list = try validator.initListCountState(start, element_depth, "chromatogramList", "chromatogram", 1);
             },
             .spectrum => {
+                try validator.validateListIndex(start, validator.spectrum_list, element_depth, "spectrum index must be zero-based and consecutive within spectrumList");
                 validator.bumpListItemCount(&validator.spectrum_list, element_depth);
                 if (validator.spectrum_list_depth != element_depth - 1) {
                     try validator.nestingError(start.byte_offset, "spectrum must be a child of spectrumList");
@@ -621,6 +622,7 @@ pub const StructuralValidator = struct {
                 validator.spectrum = .{ .byte_offset = start.byte_offset, .depth = element_depth };
             },
             .chromatogram => {
+                try validator.validateListIndex(start, validator.chromatogram_list, element_depth, "chromatogram index must be zero-based and consecutive within chromatogramList");
                 validator.bumpListItemCount(&validator.chromatogram_list, element_depth);
                 if (validator.chromatogram_list_depth != element_depth - 1) {
                     try validator.nestingError(start.byte_offset, "chromatogram must be a child of chromatogramList");
@@ -1281,6 +1283,21 @@ pub const StructuralValidator = struct {
         }
     }
 
+    fn validateListIndex(
+        validator: *StructuralValidator,
+        start: StartElement,
+        state: ?ListCountState,
+        element_depth: usize,
+        message: []const u8,
+    ) !void {
+        const active = state orelse return;
+        if (active.depth + 1 != element_depth) return;
+        const value = start.attr("index") orelse return;
+        const declared = parseNonNegativeInteger(value) orelse return;
+        if (declared == active.actual_count) return;
+        try validator.attributeError(start.byte_offset, message);
+    }
+
     fn finishListCount(validator: *StructuralValidator, state: *?ListCountState, element_depth: usize) !void {
         if (state.*) |active| {
             if (active.depth == element_depth) {
@@ -1371,20 +1388,40 @@ pub const StructuralValidator = struct {
         for (start.attributes) |attribute| {
             if (attribute.is_namespace_declaration) continue;
             if (attribute.name.namespace_uri) |namespace_uri| {
-                if (tag == .indexListOffset and
-                    std.mem.eql(u8, namespace_uri, xml_schema_instance_namespace) and
-                    std.mem.eql(u8, attribute.name.local_name, "nil"))
-                {
-                    const value = trimSchemaWhitespace(attribute.value);
-                    if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
-                        nilled = true;
-                    } else if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "0")) {
-                        try validator.attributeError(attribute.byte_offset, "xsi:nil must be true, false, 1, or 0");
+                if (std.mem.eql(u8, namespace_uri, xml_schema_instance_namespace)) {
+                    const local_name = attribute.name.local_name;
+                    if (std.mem.eql(u8, local_name, "schemaLocation") or
+                        std.mem.eql(u8, local_name, "noNamespaceSchemaLocation"))
+                    {
+                        continue;
                     }
+                    if (std.mem.eql(u8, local_name, "nil")) {
+                        if (tag != .indexListOffset) {
+                            try validator.attributeError(attribute.byte_offset, "xsi:nil is not allowed on this mzML element");
+                            continue;
+                        }
+                        const value = trimSchemaWhitespace(attribute.value);
+                        if (std.mem.eql(u8, value, "true") or std.mem.eql(u8, value, "1")) {
+                            nilled = true;
+                        } else if (!std.mem.eql(u8, value, "false") and !std.mem.eql(u8, value, "0")) {
+                            try validator.attributeError(attribute.byte_offset, "xsi:nil must be true, false, 1, or 0");
+                        }
+                        continue;
+                    }
+                    if (std.mem.eql(u8, local_name, "type")) {
+                        try validator.attributeError(attribute.byte_offset, "xsi:type is unsupported for mzML structural validation");
+                        continue;
+                    }
+                    try validator.attributeError(attribute.byte_offset, "mzML element has an unsupported XML Schema instance attribute");
+                    continue;
                 }
+                try validator.attributeError(attribute.byte_offset, "mzML element has an unsupported foreign attribute");
                 continue;
             }
-            if (attribute.name.prefix != null) continue;
+            if (attribute.name.prefix != null) {
+                try validator.attributeError(attribute.byte_offset, "mzML element has an unsupported qualified attribute");
+                continue;
+            }
 
             const spec = attributeSpec(tag, attribute.name.local_name) orelse {
                 try validator.attributeError(attribute.byte_offset, "mzML element has an unknown unqualified attribute");
@@ -1401,7 +1438,8 @@ pub const StructuralValidator = struct {
     fn validateAttributeValue(validator: *StructuralValidator, attribute: Attribute, spec: AttributeSpec, element_name: []const u8) !void {
         const value = attribute.value;
         const valid = switch (spec.kind) {
-            .string, .any_uri => true,
+            .string => true,
+            .any_uri => isSchemaAnyUri(value),
             .id, .id_ref => isNcName(value),
             .non_negative_integer => parseNonNegativeInteger(value) != null,
             .int => parseSchemaInt(value) != null,
@@ -1428,7 +1466,8 @@ pub const StructuralValidator = struct {
         }
 
         const message = switch (spec.kind) {
-            .string, .any_uri => unreachable,
+            .string => unreachable,
+            .any_uri => "attribute must be an XML Schema anyURI",
             .id => "ID attribute must be an XML NCName",
             .id_ref => "reference attribute must be an XML NCName",
             .non_negative_integer => "attribute must be a non-negative integer within the supported range",
@@ -1727,6 +1766,75 @@ fn chromatogramAttributeSpec(name: []const u8) ?AttributeSpec {
 
 fn trimSchemaWhitespace(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n");
+}
+
+pub fn isSchemaAnyUri(value: []const u8) bool {
+    const token = trimSchemaWhitespace(value);
+    if (token.len == 0) return true;
+
+    var index: usize = 0;
+    var fragment_seen = false;
+    while (index < token.len) {
+        if (token[index] == '#') {
+            if (fragment_seen) return false;
+            fragment_seen = true;
+        } else if (token[index] == '%') {
+            if (token.len - index < 3 or !std.ascii.isHex(token[index + 1]) or !std.ascii.isHex(token[index + 2])) return false;
+            index += 2;
+        }
+        index += 1;
+    }
+
+    var scheme_end: ?usize = null;
+    for (token, 0..) |byte, offset| {
+        if (byte == ':') {
+            scheme_end = offset;
+            break;
+        }
+        if (byte == '/' or byte == '?' or byte == '#') break;
+    }
+    const reference = if (scheme_end) |colon| blk: {
+        if (!isUriScheme(token[0..colon])) return false;
+        break :blk token[colon + 1 ..];
+    } else token;
+
+    if (!std.mem.startsWith(u8, reference, "//")) {
+        return std.mem.indexOfAny(u8, reference, "[]") == null;
+    }
+
+    const authority_end = std.mem.indexOfAny(u8, reference[2..], "/?#") orelse reference.len - 2;
+    const authority = reference[2..][0..authority_end];
+    if (std.mem.indexOfAny(u8, reference[2 + authority_end ..], "[]") != null) return false;
+    const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
+    if (host_start > 0 and std.mem.indexOfScalar(u8, authority[0 .. host_start - 1], '@') != null) return false;
+    const host_port = authority[host_start..];
+    if (std.mem.startsWith(u8, host_port, "[")) {
+        const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return false;
+        if (std.mem.indexOfAny(u8, host_port[1..close], "[]") != null) return false;
+        if (close + 1 == host_port.len) return true;
+        if (host_port[close + 1] != ':') return false;
+        return isUriPort(host_port[close + 2 ..]);
+    }
+    if (std.mem.indexOfAny(u8, host_port, "[]") != null) return false;
+    if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
+        if (std.mem.indexOfScalar(u8, host_port[0..colon], ':') != null) return false;
+        return isUriPort(host_port[colon + 1 ..]);
+    }
+    return true;
+}
+
+fn isUriScheme(value: []const u8) bool {
+    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
+    for (value[1..]) |byte| {
+        if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return false;
+    }
+    return true;
+}
+
+fn isUriPort(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
+    return true;
 }
 
 fn parseNonNegativeInteger(value: []const u8) ?usize {
@@ -2190,7 +2298,7 @@ test "structural validator accepts realistic one-spectrum mzML fixture" {
     try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
-test "structural validator accepts indexed mzML PSI tiny fixture" {
+test "structural validator reports schema-invalid producer URIs in indexed mzML PSI tiny fixture" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = try readFixtureAlloc(allocator, io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
@@ -2201,7 +2309,11 @@ test "structural validator accepts indexed mzML PSI tiny fixture" {
     defer diagnostics.deinit(allocator);
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
-    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    try std.testing.expectEqual(@as(usize, 3), diagnostics.items.len);
+    for (diagnostics.items) |item| {
+        try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, item.rule);
+        try std.testing.expectEqualStrings("attribute must be an XML Schema anyURI", item.message);
+    }
 }
 
 test "structural validator accepts valid chromatogram fixture" {
@@ -2415,6 +2527,83 @@ test "structural validator reports spectrumList count mismatch" {
     try std.testing.expectEqualStrings("spectrumList count does not match actual spectrum elements", diagnostics.items[0].message);
 }
 
+test "[unit]: spectrum indices are zero-based and consecutive across boundary shapes" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    const message = "spectrum index must be zero-based and consecutive within spectrumList";
+    const cases = [_]struct {
+        expected_position: usize,
+        declared_index: []const u8,
+        reports_error: bool,
+    }{
+        .{ .expected_position = 0, .declared_index = "0", .reports_error = false },
+        .{ .expected_position = 0, .declared_index = "1", .reports_error = true },
+        .{ .expected_position = 1, .declared_index = "2", .reports_error = true },
+        .{ .expected_position = 1, .declared_index = "0", .reports_error = true },
+        .{ .expected_position = 0, .declared_index = std.fmt.comptimePrint("{d}", .{std.math.maxInt(usize)}), .reports_error = true },
+    };
+
+    for (cases) |case| {
+        diagnostics.clearRetainingCapacity();
+        validator.spectrum_list = .{
+            .byte_offset = 0,
+            .depth = 2,
+            .declared_count = case.expected_position + 1,
+            .actual_count = case.expected_position,
+            .min_count = 0,
+            .label = "spectrumList",
+            .child_label = "spectrum",
+        };
+        const start = test_events.startInterned("spectrum", &.{
+            test_events.attr("index", case.declared_index),
+            test_events.attr("id", "scan=1"),
+            test_events.attr("defaultArrayLength", "0"),
+        }, 40);
+        try validator.validateListIndex(start, validator.spectrum_list, 3, message);
+
+        if (case.reports_error) {
+            try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, message);
+        } else {
+            try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+        }
+    }
+}
+
+test "[unit]: chromatogram index check is scoped to the owning list and reusable" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    const message = "chromatogram index must be zero-based and consecutive within chromatogramList";
+    const start = test_events.startInterned("chromatogram", &.{
+        test_events.attr("index", "1"),
+        test_events.attr("id", "tic=1"),
+        test_events.attr("defaultArrayLength", "0"),
+    }, 40);
+
+    validator.chromatogram_list = .{
+        .byte_offset = 0,
+        .depth = 2,
+        .declared_count = 1,
+        .min_count = 1,
+        .label = "chromatogramList",
+        .child_label = "chromatogram",
+    };
+    try validator.validateListIndex(start, validator.chromatogram_list, 3, message);
+    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, message);
+
+    diagnostics.clearRetainingCapacity();
+    validator.chromatogram_list.?.actual_count = 1;
+    try validator.validateListIndex(start, validator.chromatogram_list, 3, message);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
 test "structural validator reports top-level list count mismatch" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2601,11 +2790,11 @@ test "structural validator does not accept a foreign required attribute" {
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
 
-    try expectSingleStructuralDiagnostic(
-        diagnostics.items,
-        RuleId.mzml_structure_attribute,
-        "run is missing required attribute id",
-    );
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("mzML element has an unsupported foreign attribute", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, diagnostics.items[1].rule);
+    try std.testing.expectEqualStrings("run is missing required attribute id", diagnostics.items[1].message);
 }
 
 test "structural validator: accepts spectrum without optional binaryDataArrayList" {
@@ -3118,7 +3307,7 @@ test "[unit]: cvParam identity fields are required" {
     try std.testing.expectEqualStrings("cvParam is missing required attribute name", diagnostics.items[2].message);
 }
 
-test "[unit]: unknown unqualified attributes are rejected" {
+test "[unit]: unknown unqualified and foreign attributes are rejected" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const fixture = minimalMzml("<cvParam xmlns:ext=\"urn:extension\" cvRef=\"MS\" accession=\"MS:1\" name=\"term\" ext:note=\"allowed\" bogus=\"rejected\"/>", "");
@@ -3129,7 +3318,61 @@ test "[unit]: unknown unqualified attributes are rejected" {
 
     try StructuralValidator.validateReader(allocator, io, &reader, &diagnostics, "fixture");
 
-    try expectSingleStructuralDiagnostic(diagnostics.items, RuleId.mzml_structure_attribute, "mzML element has an unknown unqualified attribute");
+    try std.testing.expectEqual(@as(usize, 2), diagnostics.items.len);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("mzML element has an unsupported foreign attribute", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_structure_attribute, diagnostics.items[1].rule);
+    try std.testing.expectEqualStrings("mzML element has an unknown unqualified attribute", diagnostics.items[1].message);
+}
+
+test "[unit]: schema-location hints are accepted but semantic xsi attributes fail closed" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = StructuralValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+
+    const schema_location = Attribute{
+        .byte_offset = 5,
+        .name = .{ .prefix = "xsi", .local_name = "schemaLocation", .namespace_uri = xml_schema_instance_namespace },
+        .value = "http://psi.hupo.org/ms/mzml mzML1.1.1.xsd",
+    };
+    _ = try validator.validateAttributes(test_events.startInterned("mzML", &.{
+        test_events.attr("version", "1.1.0"),
+        schema_location,
+    }, 0), .mzML);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+
+    const xsi_type = Attribute{
+        .byte_offset = 10,
+        .name = .{ .prefix = "xsi", .local_name = "type", .namespace_uri = xml_schema_instance_namespace },
+        .value = "customType",
+    };
+    _ = try validator.validateAttributes(test_events.startInterned("mzML", &.{
+        test_events.attr("version", "1.1.0"),
+        xsi_type,
+    }, 0), .mzML);
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_attribute,
+        "xsi:type is unsupported for mzML structural validation",
+    );
+
+    diagnostics.clearRetainingCapacity();
+    const xsi_nil = Attribute{
+        .byte_offset = 15,
+        .name = .{ .prefix = "xsi", .local_name = "nil", .namespace_uri = xml_schema_instance_namespace },
+        .value = "true",
+    };
+    _ = try validator.validateAttributes(test_events.startInterned("mzML", &.{
+        test_events.attr("version", "1.1.0"),
+        xsi_nil,
+    }, 0), .mzML);
+    try expectSingleStructuralDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_structure_attribute,
+        "xsi:nil is not allowed on this mzML element",
+    );
 }
 
 test "[unit]: structural attribute validator rejects empty typed required values" {
@@ -3176,6 +3419,32 @@ test "[unit]: structural numeric attribute lexical forms cover boundaries" {
     try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("-2147483649"));
     try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("2147483648"));
     try std.testing.expectEqual(@as(?i32, null), parseSchemaInt("1e2"));
+}
+
+test "[differential]: XML Schema anyURI lexical boundaries match libxml2" {
+    const cases = [_]struct {
+        value: []const u8,
+        valid: bool,
+    }{
+        .{ .value = "", .valid = true },
+        .{ .value = "relative/path", .valid = true },
+        .{ .value = "https://example.org/a%20b", .valid = true },
+        .{ .value = "urn:example:test", .valid = true },
+        .{ .value = "file:///C:/data", .valid = true },
+        .{ .value = "file://F:/data", .valid = false },
+        .{ .value = "http://host:80/path", .valid = true },
+        .{ .value = "http://host:/path", .valid = false },
+        .{ .value = "1bad:value", .valid = false },
+        .{ .value = "http://a/%ZZ", .valid = false },
+        .{ .value = "http://a/x#one#two", .valid = false },
+        .{ .value = "http://[::1]/x", .valid = true },
+        .{ .value = "http://a b/x", .valid = true },
+        .{ .value = "a[b]", .valid = false },
+    };
+
+    for (cases) |case| {
+        try std.testing.expectEqual(case.valid, isSchemaAnyUri(case.value));
+    }
 }
 
 test "[unit]: structural ID reference and spectrum lexical forms are exact" {

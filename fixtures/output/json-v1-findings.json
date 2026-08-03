@@ -14,7 +14,7 @@
           "severity": "error",
           "rule": "mzml.binary.base64",
           "path": "fixtures/mzml/invalid/invalid-base64.mzML",
-          "location": {"byte_offset": 1970, "spectrum_index": 7},
+          "location": {"byte_offset": 1970, "spectrum_index": 0},
           "message": "binary payload is not valid base64"
         }
       ]

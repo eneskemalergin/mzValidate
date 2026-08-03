@@ -1,7 +1,7 @@
 //! CV, mapping-rule, and reference validation for mzML.
 //!
-//! Tracks element scopes incrementally, validates CV terms and units, detects
-//! mapping contradictions, and resolves id/*Ref links within a bounded
+//! Tracks element scopes incrementally, validates CV terms and units, enforces
+//! mapping requirements, and resolves id/*Ref links within a bounded
 //! per-file semantic owner.
 
 const std = @import("std");
@@ -15,6 +15,7 @@ const elements = @import("elements.zig");
 const structural = @import("structural.zig");
 
 const Attribute = xml_events.Attribute;
+const CvTerm = obo.CvTerm;
 const CvTable = obo.CvTable;
 const DiagnosticSink = diagnostic.DiagnosticSink;
 const RuleEngine = rule_engine.RuleEngine;
@@ -26,11 +27,24 @@ const MappingRule = rule_engine.MappingRule;
 const MappingTerm = rule_engine.MappingTerm;
 
 const descendant_cache_len = 128;
+const mapping_location_cache_len = 128;
 
 const DescendantCacheEntry = struct {
     accession: ?[]const u8 = null,
     ancestor: []const u8 = &.{},
     result: bool = false,
+};
+
+const MappingLocationVerdict = enum(u8) {
+    allowed,
+    disallowed,
+    unmapped,
+};
+
+const MappingLocationCacheEntry = struct {
+    accession: ?[]const u8 = null,
+    path_state: ?rule_engine.PathState = null,
+    verdict: MappingLocationVerdict = .unmapped,
 };
 
 const mzml_namespace = diagnostic.mzml_namespace;
@@ -172,7 +186,10 @@ const ScopeItem = struct {
 const ScopeFrame = struct {
     scope_start: usize,
     rules: []const MappingRule,
+    element_id: ElementId,
+    path_state: ?rule_engine.PathState,
     parent_path_state: ?rule_engine.PathState,
+    has_unexpanded_param_group_ref: bool = false,
 };
 
 const UnresolvedRef = struct {
@@ -451,7 +468,7 @@ fn mapCapacityForCount(required: u32) !u32 {
     return std.math.ceilPowerOfTwo(u32, bounded) catch return error.Overflow;
 }
 
-/// CV terms, scope rules, contradictions, and id/*Ref resolution.
+/// CV terms, scope rules, and id/*Ref resolution.
 pub const SemanticValidator = struct {
     allocator: std.mem.Allocator,
     cv_table: *const CvTable,
@@ -469,6 +486,9 @@ pub const SemanticValidator = struct {
     param_groups: std.StringHashMap(std.ArrayList([]const u8)),
     current_group_id: ?[]const u8 = null,
     descendant_cache: [descendant_cache_len]DescendantCacheEntry = @splat(.{}),
+    mapping_location_cache: [mapping_location_cache_len]MappingLocationCacheEntry = @splat(.{}),
+    mapping_location_evaluations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    external_namespace_warnings: u8 = 0,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -629,6 +649,10 @@ pub const SemanticValidator = struct {
             else => {},
         }
 
+        if (tag == .scan or tag == .precursor) {
+            try validator.validateSpectrumReferenceForm(start, tag);
+        }
+
         if (tag == .cvParam or tag == .userParam) {
             if (pa) |acc| {
                 if (validator.scope_frames.items.len > 0) {
@@ -686,8 +710,11 @@ pub const SemanticValidator = struct {
                         if (validator.scope_frames.items.len >= 1) {
                             for (group_terms.items) |acc| {
                                 try validator.appendScopeItem(acc, true, start.byte_offset);
+                                try validator.validateMappingLocation(acc, start.byte_offset);
                             }
                         }
+                    } else if (validator.scope_frames.items.len >= 1) {
+                        validator.scope_frames.items[validator.scope_frames.items.len - 1].has_unexpanded_param_group_ref = true;
                     }
                 }
             }
@@ -713,6 +740,8 @@ pub const SemanticValidator = struct {
             try validator.scope_frames.append(validator.allocator, ScopeFrame{
                 .scope_start = scope_start,
                 .rules = rules,
+                .element_id = tag,
+                .path_state = path_state,
                 .parent_path_state = parent_path_state,
             });
             validator.path_state = path_state;
@@ -791,20 +820,19 @@ pub const SemanticValidator = struct {
         else
             false;
         if (!cv_declared) {
-            if (!isKnownExternalPrefix(cv_ref)) {
-                _ = try validator.diagnostics.append(validator.allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_cv_namespace,
-                    .location = .{ .byte_offset = start.byte_offset },
-                    .path = validator.path,
-                    .message = "cvRef does not match any declared cv id in cvList",
-                });
-                return;
-            }
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.mzml_cv_namespace,
+                .location = .{ .byte_offset = start.byte_offset },
+                .path = validator.path,
+                .message = "cvRef does not match any declared cv id in cvList",
+            });
+            return;
         }
 
         const term = validator.cv_table.lookup(accession);
         if (term) |t| {
+            if (tag == .cvParam) try validator.validateMappingLocation(accession, start.byte_offset);
             if (t.is_obsolete) {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .warning,
@@ -826,8 +854,21 @@ pub const SemanticValidator = struct {
                     .message = "cvRef does not match term namespace",
                 });
             }
-            if (pv) |value| {
-                if (t.xsd_type) |xsd_type| {
+            if (tag == .cvParam) {
+                if (pn) |name| {
+                    if (trimSchemaWhitespace(name).len > 0 and !matchesTermName(t, name)) {
+                        _ = try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .warning,
+                            .rule = RuleId.mzml_cv_name_mismatch,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "CV term name does not match the catalog name or a synonym",
+                        });
+                    }
+                }
+            }
+            if (t.xsd_type) |xsd_type| {
+                if (pv) |value| {
                     if (validateXsdValue(xsd_type, value)) |valid| {
                         if (!valid) {
                             _ = try validator.diagnostics.append(validator.allocator, .{
@@ -838,8 +879,52 @@ pub const SemanticValidator = struct {
                                 .message = "CV value does not match the term's declared datatype",
                             });
                         }
+                    } else {
+                        _ = try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_cv_value,
+                            .location = .{ .byte_offset = start.byte_offset },
+                            .path = validator.path,
+                            .message = "CV term declares an unsupported value datatype",
+                        });
                     }
+                } else {
+                    _ = try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .@"error",
+                        .rule = RuleId.mzml_cv_value,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "CV term requires a value",
+                    });
                 }
+            } else if (pv) |value| {
+                if (trimSchemaWhitespace(value).len > 0) {
+                    _ = try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .warning,
+                        .rule = RuleId.mzml_cv_value,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "CV term has a non-empty value but declares no value datatype",
+                    });
+                }
+            }
+            if (t.allowed_units.len > 0 and ua == null) {
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_cv_unit,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "CV term requires a unit accession",
+                });
+            }
+            if (t.allowed_units.len == 0 and ua != null) {
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .warning,
+                    .rule = RuleId.mzml_cv_unit,
+                    .location = .{ .byte_offset = start.byte_offset },
+                    .path = validator.path,
+                    .message = "unit accession is present but the CV term declares no allowed units",
+                });
             }
             if (ua) |unit_acc| {
                 if (t.allowed_units.len > 0 and validator.cv_table.lookup(unit_acc) != null) {
@@ -862,7 +947,19 @@ pub const SemanticValidator = struct {
                 }
             }
         } else {
-            if (!isKnownExternalPrefix(accession_prefix)) {
+            if (externalPrefixIndex(accession_prefix)) |prefix_index| {
+                const prefix_bit = @as(u8, 1) << prefix_index;
+                if (validator.external_namespace_warnings & prefix_bit == 0) {
+                    validator.external_namespace_warnings |= prefix_bit;
+                    _ = try validator.diagnostics.append(validator.allocator, .{
+                        .severity = .warning,
+                        .rule = RuleId.mzml_cv_unverified_namespace,
+                        .location = .{ .byte_offset = start.byte_offset },
+                        .path = validator.path,
+                        .message = "external CV namespace is declared but its ontology is not bundled; accession was not verified",
+                    });
+                }
+            } else {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_cv_accession,
@@ -924,6 +1021,120 @@ pub const SemanticValidator = struct {
         }
     }
 
+    fn validateSpectrumReferenceForm(
+        validator: *SemanticValidator,
+        start: StartElement,
+        tag: ElementId,
+    ) !void {
+        const has_local = start.attr("spectrumRef") != null;
+        const has_source = start.attr("sourceFileRef") != null;
+        const has_external_id = start.attr("externalSpectrumID") != null;
+        const label = if (tag == .scan) "scan" else "precursor";
+
+        if (has_local and (has_source or has_external_id)) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .@"error",
+                .rule = RuleId.mzml_ref_spectrum_form,
+                .location = .{ .byte_offset = start.byte_offset },
+                .path = validator.path,
+                .message = if (std.mem.eql(u8, label, "scan"))
+                    "scan mixes local and external spectrum reference forms"
+                else
+                    "precursor mixes local and external spectrum reference forms",
+            });
+            return;
+        }
+        if (has_source == has_external_id) return;
+        _ = try validator.diagnostics.append(validator.allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_ref_spectrum_form,
+            .location = .{ .byte_offset = start.byte_offset },
+            .path = validator.path,
+            .message = if (std.mem.eql(u8, label, "scan"))
+                "scan external spectrum reference requires both sourceFileRef and externalSpectrumID"
+            else
+                "precursor external spectrum reference requires both sourceFileRef and externalSpectrumID",
+        });
+    }
+
+    fn validateMappingLocation(
+        validator: *SemanticValidator,
+        accession: []const u8,
+        byte_offset: u64,
+    ) !void {
+        // An explicitly empty engine disables mapping checks for callers that
+        // use this validator only for catalog or reference validation.
+        if (validator.rule_engine.rules.len == 0) return;
+        if (validator.scope_frames.items.len == 0) return;
+        const frame = validator.scope_frames.items[validator.scope_frames.items.len - 1];
+        // Parameter groups are validated in the context where they are used.
+        // Source-file CV terms are owned by the default object rule.
+        if (frame.element_id == .referenceableParamGroup or frame.element_id == .sourceFile) return;
+
+        const canonical_accession = if (validator.cv_table.lookup(accession)) |term|
+            term.accession
+        else
+            null;
+        const cache_index = if (canonical_accession) |canonical|
+            mappingLocationCacheIndex(frame.path_state, canonical)
+        else
+            null;
+        if (cache_index) |index| {
+            const cached = validator.mapping_location_cache[index];
+            if (cached.accession) |cached_accession| {
+                if (cached.path_state == frame.path_state and std.mem.eql(u8, cached_accession, canonical_accession.?)) {
+                    return validator.emitMappingLocationVerdict(cached.verdict, byte_offset);
+                }
+            }
+        }
+
+        if (builtin.is_test) validator.mapping_location_evaluations += 1;
+        const verdict: MappingLocationVerdict = if (frame.rules.len == 0)
+            .unmapped
+        else verdict: {
+            for (frame.rules) |rule| {
+                for (rule.terms) |mapping_term| {
+                    if (try validator.matchesMappingTerm(accession, mapping_term, byte_offset)) break :verdict .allowed;
+                }
+            }
+            break :verdict .disallowed;
+        };
+        if (cache_index) |index| {
+            validator.mapping_location_cache[index] = .{
+                .accession = canonical_accession.?,
+                .path_state = frame.path_state,
+                .verdict = verdict,
+            };
+        }
+        try validator.emitMappingLocationVerdict(verdict, byte_offset);
+    }
+
+    fn emitMappingLocationVerdict(
+        validator: *SemanticValidator,
+        verdict: MappingLocationVerdict,
+        byte_offset: u64,
+    ) !void {
+        if (verdict == .allowed) return;
+        if (verdict == .unmapped) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .warning,
+                .rule = RuleId.mzml_cv_location,
+                .location = .{ .byte_offset = byte_offset },
+                .path = validator.path,
+                .message = "no CV location mapping covers this element",
+            });
+            return;
+        }
+
+        _ = try validator.diagnostics.append(validator.allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_cv_location,
+            .location = .{ .byte_offset = byte_offset },
+            .path = validator.path,
+            .message = "CV term is not allowed at this element location",
+        });
+    }
+
     pub fn consumeEnd(validator: *SemanticValidator, end: EndElement) !void {
         const tag = end.resolvedId();
 
@@ -949,6 +1160,9 @@ pub const SemanticValidator = struct {
 
         if (tag == .binaryDataArray) {
             try validator.validateBinaryDataType(scope, end.byte_offset);
+        }
+        if (tag == .sourceFile) {
+            try validator.validateSourceFile(scope, frame.has_unexpanded_param_group_ref, end.byte_offset);
         }
 
         // Capture referenceableParamGroup cvParams for later ref resolution.
@@ -1006,58 +1220,16 @@ pub const SemanticValidator = struct {
         }
 
         const rules = frame.rules;
-        var repeat_violation = false;
-        var contradiction_violation = false;
         for (rules) |rule| {
             var matched: usize = 0;
-            if (rule.logic == .@"or" and rule.terms.len <= @bitSizeOf(u64)) {
-                var matched_terms: u64 = 0;
-                var exact_terms: u64 = 0;
-                var matched_scope_items: usize = 0;
-                var matched_disallow_children = false;
-                var first_term: ?usize = null;
+            var repeat_violation = false;
+            for (rule.terms) |term| {
+                var term_matches: usize = 0;
                 for (scope) |st| {
-                    var scope_term: ?usize = null;
-                    for (rule.terms, 0..) |rt, term_index| {
-                        const term_bit = @as(u64, 1) << @intCast(term_index);
-                        if (std.mem.eql(u8, st.accession, rt.accession)) {
-                            if (!rt.is_repeatable and exact_terms & term_bit != 0) repeat_violation = true;
-                            exact_terms |= term_bit;
-                        }
-                        if (scope_term == null and try validator.matchesMappingTerm(st.accession, rt, end.byte_offset)) {
-                            scope_term = term_index;
-                        }
-                    }
-                    if (scope_term) |term_index| {
-                        const term_bit = @as(u64, 1) << @intCast(term_index);
-                        matched_terms |= term_bit;
-                        matched_scope_items += 1;
-                        matched_disallow_children = matched_disallow_children or
-                            !rule.terms[term_index].allow_children;
-                        if (first_term) |first_index| {
-                            if (first_index == term_index and !rule.terms[term_index].is_repeatable) {
-                                contradiction_violation = true;
-                            }
-                        } else {
-                            first_term = term_index;
-                        }
-                    }
+                    if (try validator.matchesMappingTerm(st.accession, term, end.byte_offset)) term_matches += 1;
                 }
-                matched = @popCount(matched_terms);
-                if (matched_scope_items > 1 and matched_disallow_children) contradiction_violation = true;
-            } else {
-                for (rule.terms) |rt| {
-                    var term_matched = false;
-                    var exact_matches: usize = 0;
-                    for (scope) |st| {
-                        if (std.mem.eql(u8, st.accession, rt.accession)) exact_matches += 1;
-                        if (!term_matched) {
-                            term_matched = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
-                        }
-                    }
-                    if (term_matched) matched += 1;
-                    if (!rt.is_repeatable and exact_matches > 1) repeat_violation = true;
-                }
+                if (term_matches > 0) matched += 1;
+                if (!term.is_repeatable and term_matches > 1) repeat_violation = true;
             }
 
             switch (rule.requirement) {
@@ -1065,6 +1237,7 @@ pub const SemanticValidator = struct {
                     const ok = switch (rule.logic) {
                         .@"and" => matched == rule.terms.len,
                         .@"or" => matched > 0,
+                        .xor => matched == 1,
                     };
                     if (!ok) {
                         _ = try validator.diagnostics.append(validator.allocator, .{
@@ -1074,13 +1247,13 @@ pub const SemanticValidator = struct {
                             .path = validator.path,
                             .message = "missing required CV term for element",
                         });
-                        return;
                     }
                 },
                 .should => {
                     const ok = switch (rule.logic) {
                         .@"and" => matched == rule.terms.len,
                         .@"or" => matched > 0,
+                        .xor => matched == 1,
                     };
                     if (!ok) {
                         _ = try validator.diagnostics.append(validator.allocator, .{
@@ -1092,89 +1265,38 @@ pub const SemanticValidator = struct {
                         });
                     }
                 },
-                .may => {},
-            }
-        }
-
-        // Exact duplicate counts are folded into the rule-term scan above,
-        // avoiding a second quadratic pass over the scope.
-        if (repeat_violation) {
-            _ = try validator.diagnostics.append(validator.allocator, .{
-                .severity = .warning,
-                .rule = RuleId.mzml_cv_term_repeat,
-                .location = .{ .byte_offset = end.byte_offset },
-                .path = validator.path,
-                .message = "non-repeatable CV term appears more than once on the same element",
-            });
-            return;
-        }
-
-        // Contradiction: two alternatives from the same OR rule on one element.
-        // A contradiction exists when:
-        //   1. Two scope items match the same rule term which is
-        //      is_repeatable=false (e.g., both positive and negative scan),
-        //   2. OR two scope items match different rule terms and at least
-        //      one has allow_children=false (specific alternatives).
-        // Terms with is_repeatable=true are broad categories that can
-        // legitimately have multiple children (e.g., "selection window
-        // attribute" with upper and lower limits).
-        if (scope.len >= 2) {
-            for (rules) |r| {
-                if (r.logic != .@"or" or r.terms.len <= @bitSizeOf(u64)) continue;
-                var or_matched: usize = 0;
-                var matched_disallow_children = false;
-                var first_term: ?usize = null;
-                for (scope) |st| {
-                    for (r.terms, 0..) |rt, i| {
-                        const is_match = try validator.matchesMappingTerm(st.accession, rt, end.byte_offset);
-                        if (is_match) {
-                            or_matched += 1;
-                            matched_disallow_children = matched_disallow_children or !rt.allow_children;
-                            if (first_term) |idx| {
-                                if (i == idx) {
-                                    if (!rt.is_repeatable) {
-                                        _ = try validator.diagnostics.append(validator.allocator, .{
-                                            .severity = .warning,
-                                            .rule = RuleId.mzml_cv_contradiction,
-                                            .location = .{ .byte_offset = end.byte_offset },
-                                            .path = validator.path,
-                                            .message = "element has contradictory CV terms",
-                                        });
-                                        return;
-                                    }
-                                }
-                            } else {
-                                first_term = i;
-                            }
-                            break;
-                        }
+                .may => {
+                    const invalid = switch (rule.logic) {
+                        .@"and" => matched != 0 and matched != rule.terms.len,
+                        .@"or" => false,
+                        .xor => matched > 1,
+                    };
+                    if (invalid) {
+                        _ = try validator.diagnostics.append(validator.allocator, .{
+                            .severity = .@"error",
+                            .rule = RuleId.mzml_cv_required,
+                            .location = .{ .byte_offset = end.byte_offset },
+                            .path = validator.path,
+                            .message = "optional CV term combination is incomplete or contradictory",
+                        });
                     }
-                }
-                if (or_matched > 1 and matched_disallow_children) {
-                    _ = try validator.diagnostics.append(validator.allocator, .{
-                        .severity = .warning,
-                        .rule = RuleId.mzml_cv_contradiction,
-                        .location = .{ .byte_offset = end.byte_offset },
-                        .path = validator.path,
-                        .message = "element has contradictory CV terms",
-                    });
-                    return;
-                }
+                },
             }
-        }
-        if (contradiction_violation) {
-            _ = try validator.diagnostics.append(validator.allocator, .{
-                .severity = .warning,
-                .rule = RuleId.mzml_cv_contradiction,
-                .location = .{ .byte_offset = end.byte_offset },
-                .path = validator.path,
-                .message = "element has contradictory CV terms",
-            });
+            if (repeat_violation) {
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_cv_term_repeat,
+                    .location = .{ .byte_offset = end.byte_offset },
+                    .path = validator.path,
+                    .message = "non-repeatable mapping term is matched more than once on the same element",
+                });
+            }
         }
     }
 
     fn matchesMappingTerm(validator: *SemanticValidator, accession: []const u8, term: MappingTerm, byte_offset: u64) !bool {
-        if (!term.allow_children) return std.mem.eql(u8, accession, term.accession);
+        if (std.mem.eql(u8, accession, term.accession)) return term.use_term;
+        if (!term.allow_children) return false;
         return validator.matchesDescendant(accession, term.accession, byte_offset);
     }
 
@@ -1254,6 +1376,49 @@ pub const SemanticValidator = struct {
         });
     }
 
+    fn validateSourceFile(
+        validator: *SemanticValidator,
+        scope: []const ScopeItem,
+        has_unexpanded_param_group_ref: bool,
+        byte_offset: u64,
+    ) !void {
+        if (has_unexpanded_param_group_ref) {
+            _ = try validator.diagnostics.append(validator.allocator, .{
+                .severity = .warning,
+                .rule = RuleId.mzml_cv_source_file,
+                .location = .{ .byte_offset = byte_offset },
+                .path = validator.path,
+                .message = "sourceFile CV object rule could not include a forward parameter-group reference",
+            });
+            return;
+        }
+
+        for (scope) |item| {
+            if (std.mem.eql(u8, item.accession, "MS:1000740")) return;
+        }
+
+        const required_roots = [_][]const u8{ "MS:1000560", "MS:1000561", "MS:1000767" };
+        for (required_roots) |root| {
+            var found = false;
+            for (scope) |item| {
+                if (try validator.matchesDescendant(item.accession, root, byte_offset)) {
+                    found = true;
+                    break;
+                }
+            }
+            if (!found) {
+                _ = try validator.diagnostics.append(validator.allocator, .{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_cv_source_file,
+                    .location = .{ .byte_offset = byte_offset },
+                    .path = validator.path,
+                    .message = "sourceFile must describe a parameter file or include file format, checksum type, and native ID format CV terms",
+                });
+                return;
+            }
+        }
+    }
+
     pub fn finish(validator: *SemanticValidator) !void {
         try validator.ref_table.resolveAll(validator.diagnostics, validator.path);
     }
@@ -1261,6 +1426,12 @@ pub const SemanticValidator = struct {
 
 fn trimSchemaWhitespace(value: []const u8) []const u8 {
     return std.mem.trim(u8, value, " \t\r\n");
+}
+
+fn mappingLocationCacheIndex(path_state: ?rule_engine.PathState, accession: []const u8) usize {
+    const seed: u64 = if (path_state) |state| @as(u64, state) + 1 else 0;
+    const hash = std.hash.Wyhash.hash(seed, accession);
+    return @intCast(hash & (mapping_location_cache_len - 1));
 }
 
 fn setParamAttribute(
@@ -1293,7 +1464,7 @@ fn setParamAttribute(
 
 fn validateXsdValue(xsd_type: []const u8, value: []const u8) ?bool {
     if (std.mem.eql(u8, xsd_type, "xsd:string")) return true;
-    if (std.mem.eql(u8, xsd_type, "xsd:anyURI")) return isSchemaAnyUri(value);
+    if (std.mem.eql(u8, xsd_type, "xsd:anyURI")) return structural.isSchemaAnyUri(value);
     if (std.mem.eql(u8, xsd_type, "xsd:boolean")) return isSchemaBoolean(value);
     if (std.mem.eql(u8, xsd_type, "xsd:int")) return isSchemaInt(value);
     if (std.mem.eql(u8, xsd_type, "xsd:integer")) return parseSchemaInteger(value) != null;
@@ -1311,75 +1482,6 @@ fn validateXsdValue(xsd_type: []const u8, value: []const u8) ?bool {
     }
     if (std.mem.eql(u8, xsd_type, "xsd:dateTime")) return structural.isSchemaDateTime(value);
     return null;
-}
-
-fn isSchemaAnyUri(value: []const u8) bool {
-    const token = trimSchemaWhitespace(value);
-    if (token.len == 0) return true;
-
-    var index: usize = 0;
-    var fragment_seen = false;
-    while (index < token.len) {
-        if (token[index] == '#') {
-            if (fragment_seen) return false;
-            fragment_seen = true;
-        } else if (token[index] == '%') {
-            if (token.len - index < 3 or !std.ascii.isHex(token[index + 1]) or !std.ascii.isHex(token[index + 2])) return false;
-            index += 2;
-        }
-        index += 1;
-    }
-
-    var scheme_end: ?usize = null;
-    for (token, 0..) |byte, offset| {
-        if (byte == ':') {
-            scheme_end = offset;
-            break;
-        }
-        if (byte == '/' or byte == '?' or byte == '#') break;
-    }
-    const reference = if (scheme_end) |colon| blk: {
-        if (!isUriScheme(token[0..colon])) return false;
-        break :blk token[colon + 1 ..];
-    } else token;
-
-    if (!std.mem.startsWith(u8, reference, "//")) {
-        return std.mem.indexOfAny(u8, reference, "[]") == null;
-    }
-
-    const authority_end = std.mem.indexOfAny(u8, reference[2..], "/?#") orelse reference.len - 2;
-    const authority = reference[2..][0..authority_end];
-    if (std.mem.indexOfAny(u8, reference[2 + authority_end ..], "[]") != null) return false;
-    const host_start = if (std.mem.lastIndexOfScalar(u8, authority, '@')) |at| at + 1 else 0;
-    if (host_start > 0 and std.mem.indexOfScalar(u8, authority[0 .. host_start - 1], '@') != null) return false;
-    const host_port = authority[host_start..];
-    if (std.mem.startsWith(u8, host_port, "[")) {
-        const close = std.mem.indexOfScalar(u8, host_port, ']') orelse return false;
-        if (std.mem.indexOfAny(u8, host_port[1..close], "[]") != null) return false;
-        if (close + 1 == host_port.len) return true;
-        if (host_port[close + 1] != ':') return false;
-        return isUriPort(host_port[close + 2 ..]);
-    }
-    if (std.mem.indexOfAny(u8, host_port, "[]") != null) return false;
-    if (std.mem.lastIndexOfScalar(u8, host_port, ':')) |colon| {
-        if (std.mem.indexOfScalar(u8, host_port[0..colon], ':') != null) return false;
-        return isUriPort(host_port[colon + 1 ..]);
-    }
-    return true;
-}
-
-fn isUriScheme(value: []const u8) bool {
-    if (value.len == 0 or !std.ascii.isAlphabetic(value[0])) return false;
-    for (value[1..]) |byte| {
-        if (!std.ascii.isAlphanumeric(byte) and byte != '+' and byte != '-' and byte != '.') return false;
-    }
-    return true;
-}
-
-fn isUriPort(value: []const u8) bool {
-    if (value.len == 0) return false;
-    for (value) |byte| if (!std.ascii.isDigit(byte)) return false;
-    return true;
 }
 
 fn isSchemaBoolean(value: []const u8) bool {
@@ -1432,18 +1534,17 @@ fn isSchemaDecimal(value: []const u8) bool {
     return index == token.len and (integer_digits != 0 or fraction_digits != 0);
 }
 
-// Recognised external CV prefixes not defined in psi-ms.obo.
-// Matching OpenMS behaviour: BTO, GO, PATO terms are not validated
-// because their ontologies are not embedded.
-fn isKnownExternalPrefix(prefix: []const u8) bool {
-    if (prefix.len == 3) {
-        return prefix[0] == 'B' and prefix[1] == 'T' and prefix[2] == 'O';
-    }
-    if (prefix.len == 2) {
-        return prefix[0] == 'G' and prefix[1] == 'O';
-    }
-    if (prefix.len == 4) {
-        return prefix[0] == 'P' and prefix[1] == 'A' and prefix[2] == 'T' and prefix[3] == 'O';
+fn externalPrefixIndex(prefix: []const u8) ?u3 {
+    if (std.mem.eql(u8, prefix, "BTO")) return 0;
+    if (std.mem.eql(u8, prefix, "GO")) return 1;
+    if (std.mem.eql(u8, prefix, "PATO")) return 2;
+    return null;
+}
+
+fn matchesTermName(term: CvTerm, name: []const u8) bool {
+    if (std.mem.eql(u8, name, term.name) or std.ascii.eqlIgnoreCase(name, term.name)) return true;
+    for (term.synonyms) |synonym| {
+        if (std.mem.eql(u8, name, synonym) or std.ascii.eqlIgnoreCase(name, synonym)) return true;
     }
     return false;
 }
@@ -1525,6 +1626,27 @@ fn consumeCvParam(validator: *SemanticValidator, accession: []const u8, cv_ref: 
     });
 }
 
+fn consumeCvParamWithName(
+    validator: *SemanticValidator,
+    accession: []const u8,
+    cv_ref: []const u8,
+    name: []const u8,
+    byte_offset: u64,
+) !void {
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
+        .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
+        .{ .byte_offset = 0, .name = .{ .local_name = "name" }, .value = name },
+    };
+    try validator.consumeStart(.{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
+        .attributes = &attributes,
+        .self_closing = false,
+    });
+}
+
 fn consumeCvParamValue(
     validator: *SemanticValidator,
     accession: []const u8,
@@ -1575,11 +1697,37 @@ fn consumeCv(validator: *SemanticValidator, id: []const u8) !void {
 }
 
 fn consumeUnitParam(validator: *SemanticValidator, accession: []const u8, cv_ref: []const u8, unit_acc: []const u8, byte_offset: u64) !void {
+    const unit_cv_ref = extractAccessionPrefix(unit_acc) orelse "";
     const attributes = [_]Attribute{
         .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
         .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
         .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = unit_acc },
-        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = "UO" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = unit_cv_ref },
+    };
+    try validator.consumeStart(.{
+        .byte_offset = byte_offset,
+        .name = .{ .local_name = "cvParam", .namespace_uri = mzml_namespace },
+        .element_id = .cvParam,
+        .attributes = &attributes,
+        .self_closing = false,
+    });
+}
+
+fn consumeUnitParamValue(
+    validator: *SemanticValidator,
+    accession: []const u8,
+    cv_ref: []const u8,
+    value: []const u8,
+    unit_acc: []const u8,
+    byte_offset: u64,
+) !void {
+    const unit_cv_ref = extractAccessionPrefix(unit_acc) orelse "";
+    const attributes = [_]Attribute{
+        .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
+        .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
+        .{ .byte_offset = 0, .name = .{ .local_name = "value" }, .value = value },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = unit_acc },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = unit_cv_ref },
     };
     try validator.consumeStart(.{
         .byte_offset = byte_offset,
@@ -1591,11 +1739,12 @@ fn consumeUnitParam(validator: *SemanticValidator, accession: []const u8, cv_ref
 }
 
 fn consumeUnitParamWithName(validator: *SemanticValidator, accession: []const u8, cv_ref: []const u8, unit_acc: []const u8, unit_name: []const u8, byte_offset: u64) !void {
+    const unit_cv_ref = extractAccessionPrefix(unit_acc) orelse "";
     const attributes = [_]Attribute{
         .{ .byte_offset = 0, .name = .{ .local_name = "accession" }, .value = accession },
         .{ .byte_offset = 0, .name = .{ .local_name = "cvRef" }, .value = cv_ref },
         .{ .byte_offset = 0, .name = .{ .local_name = "unitAccession" }, .value = unit_acc },
-        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = "UO" },
+        .{ .byte_offset = 0, .name = .{ .local_name = "unitCvRef" }, .value = unit_cv_ref },
         .{ .byte_offset = 0, .name = .{ .local_name = "unitName" }, .value = unit_name },
     };
     try validator.consumeStart(.{
@@ -1647,6 +1796,8 @@ fn consumeParamGroup(validator: *SemanticValidator, id: []const u8, accession: [
 fn testEngine(allocator: std.mem.Allocator) !RuleEngine {
     return try RuleEngine.init(allocator, "<CvMapping><CvMappingRuleList></CvMappingRuleList></CvMapping>");
 }
+
+const mapping_test_term_attrs = " useTerm=\"true\" termName=\"test\" isRepeatable=\"true\" allowChildren=\"false\" cvIdentifierRef=\"MS\"";
 
 // --- Unit Tests ---
 
@@ -1872,6 +2023,35 @@ test "SemanticValidator: allowed unit restriction produces error" {
     try expectEqualStrings("unit accession is not allowed for CV term", diagnostics.items[0].message);
 }
 
+test "[unit]: CV term with declared units requires a unit accession" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: sample value\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_units UO:0000001\n" ++
+        "\n[Term]\n" ++
+        "id: UO:0000001\n" ++
+        "name: allowed unit\n" ++
+        "namespace: UO\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    try consumeCvParam(&sv, "MS:1000001", "MS", 100);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_unit, diagnostics.items[0].rule);
+    try expectEqualStrings("CV term requires a unit accession", diagnostics.items[0].message);
+}
+
 test "SemanticValidator: binary data type restriction produces error" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++
@@ -1906,6 +2086,90 @@ test "SemanticValidator: binary data type restriction produces error" {
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_binary_type_mismatch, diagnostics.items[0].rule);
     try expectEqualStrings("binary array type is incompatible with its declared precision", diagnostics.items[0].message);
+}
+
+test "[unit]: default source-file object rule accepts parameter files and complete mass spectra files" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000740\nname: parameter file\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000560\nname: mass spectrometer file format\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000561\nname: data file checksum type\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000767\nname: native spectrum identifier format\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:2000001\nname: test format\nnamespace: MS\nis_a: MS:1000560 ! mass spectrometer file format\n" ++
+        "\n[Term]\nid: MS:2000002\nname: test checksum\nnamespace: MS\nis_a: MS:1000561 ! data file checksum type\n" ++
+        "\n[Term]\nid: MS:2000003\nname: test native ID\nnamespace: MS\nis_a: MS:1000767 ! native spectrum identifier format\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+
+    for ([_]bool{ true, false }) |parameter_file| {
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+        var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+        defer sv.deinit();
+        try consumeCv(&sv, "MS");
+        try sv.consumeStart(test_events.startInterned("sourceFile", &.{}, 1));
+        if (parameter_file) {
+            try consumeCvParam(&sv, "MS:1000740", "MS", 2);
+        } else {
+            try consumeCvParam(&sv, "MS:2000001", "MS", 2);
+            try consumeCvParam(&sv, "MS:2000002", "MS", 3);
+            try consumeCvParam(&sv, "MS:2000003", "MS", 4);
+        }
+        try sv.consumeEnd(test_events.endInterned("sourceFile", 5));
+        try expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "[unit]: default source-file object rule rejects incomplete mass spectra metadata" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000560\nname: mass spectrometer file format\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000561\nname: data file checksum type\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000767\nname: native spectrum identifier format\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("sourceFile", &.{}, 1));
+    try consumeCvParam(&sv, "MS:1000560", "MS", 2);
+    try sv.consumeEnd(test_events.endInterned("sourceFile", 3));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.@"error", diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_source_file, diagnostics.items[0].rule);
+}
+
+test "[unit]: source-file object rule reports forward parameter-group coverage" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: test\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("sourceFile", &.{}, 1));
+    try sv.consumeStart(test_events.startInterned("referenceableParamGroupRef", &.{
+        test_events.attr("ref", "later-group"),
+    }, 2));
+    try sv.consumeEnd(test_events.endInterned("referenceableParamGroupRef", 3));
+    try sv.consumeEnd(test_events.endInterned("sourceFile", 4));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_source_file, diagnostics.items[0].rule);
 }
 
 test "SemanticValidator: mismatched cvRef/namespace produces error" {
@@ -1950,7 +2214,34 @@ test "[unit]: CV external exemptions do not hide accession prefix mismatches" {
     }
 }
 
-test "[unit]: matching external CV prefixes remain accepted" {
+test "[unit]: declared external CV prefixes produce one bounded warning per namespace" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "BTO");
+    try consumeCv(&sv, "GO");
+    try consumeCv(&sv, "PATO");
+
+    try consumeCvParam(&sv, "BTO:0000001", "BTO", 10);
+    try consumeCvParam(&sv, "BTO:9999999", "BTO", 15);
+    try consumeCvParam(&sv, "GO:0000001", "GO", 20);
+    try consumeCvParam(&sv, "PATO:0000001", "PATO", 30);
+
+    try expectEqual(@as(usize, 3), diagnostics.items.len);
+    for (diagnostics.items) |item| {
+        try expectEqual(.warning, item.severity);
+        try expectEqualStrings(RuleId.mzml_cv_unverified_namespace, item.rule);
+    }
+}
+
+test "[unit]: undeclared external CV prefix is rejected" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -1962,11 +2253,11 @@ test "[unit]: matching external CV prefixes remain accepted" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
 
-    try consumeCvParam(&sv, "BTO:0000001", "BTO", 10);
-    try consumeCvParam(&sv, "GO:0000001", "GO", 20);
-    try consumeCvParam(&sv, "PATO:0000001", "PATO", 30);
+    try consumeCvParam(&sv, "GO:0000001", "GO", 10);
 
-    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
+    try expectEqualStrings("cvRef does not match any declared cv id in cvList", diagnostics.items[0].message);
 }
 
 test "[unit]: external CV prefix does not hide a known term namespace mismatch" {
@@ -1980,6 +2271,7 @@ test "[unit]: external CV prefix does not hide a known term namespace mismatch" 
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
+    try consumeCv(&sv, "GO");
 
     try consumeCvParam(&sv, "GO:0000001", "GO", 10);
 
@@ -2043,6 +2335,33 @@ test "[unit]: empty required CV term name is rejected" {
     }
 }
 
+test "[unit]: CV term name accepts canonical names and synonyms and warns on mismatch" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: sample name\n" ++
+        "namespace: MS\n" ++
+        "synonym: \"sample label\" EXACT []\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParamWithName(&sv, "MS:1000001", "MS", "sample name", 10);
+    try consumeCvParamWithName(&sv, "MS:1000001", "MS", "SAMPLE NAME", 20);
+    try consumeCvParamWithName(&sv, "MS:1000001", "MS", "sample label", 30);
+    try consumeCvParamWithName(&sv, "MS:1000001", "MS", "unrelated label", 40);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_name_mismatch, diagnostics.items[0].rule);
+}
+
 test "SemanticValidator: cvRef not in cvList produces error" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
@@ -2063,7 +2382,7 @@ test "SemanticValidator: cvRef not in cvList produces error" {
 
 test "SemanticValidator: valid unit accession produces no diagnostic" {
     const allocator = testing.allocator;
-    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n" ++ "\n" ++ "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n";
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n" ++ "relationship: has_units UO:0000000\n" ++ "\n" ++ "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n";
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
@@ -2080,9 +2399,35 @@ test "SemanticValidator: valid unit accession produces no diagnostic" {
     try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
+test "[unit]: unit on a term without an allowed-unit contract is visible" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: sample name\nnamespace: MS\n\n" ++
+        "[Term]\nid: UO:0000000\nname: length unit\nnamespace: UO\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    try consumeCv(&sv, "MS");
+    try consumeCv(&sv, "UO");
+    try consumeUnitParam(&sv, "MS:1000001", "MS", "UO:0000000", 100);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(Severity.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_unit, diagnostics.items[0].rule);
+    try expectEqualStrings(
+        "unit accession is present but the CV term declares no allowed units",
+        diagnostics.items[0].message,
+    );
+}
+
 test "SemanticValidator: invalid unit accession produces error" {
     const allocator = testing.allocator;
-    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n" ++ "relationship: has_units UO:0000000\n";
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
@@ -2101,7 +2446,7 @@ test "SemanticValidator: invalid unit accession produces error" {
 
 test "SemanticValidator: unitCvRef mismatch produces error" {
     const allocator = testing.allocator;
-    const obo_text = "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n";
+    const obo_text = "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n" ++ "relationship: has_units UO:0000000\n";
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
@@ -2125,7 +2470,7 @@ test "SemanticValidator: unitCvRef mismatch produces error" {
 
 test "SemanticValidator: unitName mismatch produces info" {
     const allocator = testing.allocator;
-    const obo_text = "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n";
+    const obo_text = "[Term]\n" ++ "id: UO:0000000\n" ++ "name: length unit\n" ++ "namespace: UO\n" ++ "relationship: has_units UO:0000000\n";
     var cv_table = try CvTable.init(allocator, obo_text);
     defer cv_table.deinit();
 
@@ -2274,7 +2619,7 @@ test "[unit]: CV dateTime datatype boundaries are enforced" {
     }
 }
 
-test "[unit]: present invalid typed CV values emit stable diagnostics without semantic growth" {
+test "[unit]: CV value contract violations emit stable diagnostics without semantic growth" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++
         "id: MS:1000001\n" ++
@@ -2305,11 +2650,14 @@ test "[unit]: present invalid typed CV values emit stable diagnostics without se
     try sv.consumeStart(raw_start);
 
     try expectEqual(semantic_bytes, sv.resourceUsage().semantic_current_bytes);
-    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqual(@as(usize, 4), diagnostics.items.len);
     for (diagnostics.items) |item| {
         try expectEqualStrings(RuleId.mzml_cv_value, item.rule);
-        try expectEqualStrings("CV value does not match the term's declared datatype", item.message);
     }
+    try expectEqualStrings("CV term requires a value", diagnostics.items[0].message);
+    try expectEqualStrings("CV term declares an unsupported value datatype", diagnostics.items[1].message);
+    try expectEqualStrings("CV value does not match the term's declared datatype", diagnostics.items[2].message);
+    try expectEqualStrings("CV value does not match the term's declared datatype", diagnostics.items[3].message);
 }
 
 test "[unit]: obsolete typed CV term still validates its present value" {
@@ -2337,6 +2685,82 @@ test "[unit]: obsolete typed CV term still validates its present value" {
     try expectEqualStrings(RuleId.mzml_cv_value, diagnostics.items[1].rule);
 }
 
+test "[unit]: typed CV term requires a value attribute" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: integer term\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_value_type xsd:int\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParam(&sv, "MS:1000001", "MS", 10);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.@"error", diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_value, diagnostics.items[0].rule);
+    try expectEqualStrings("CV term requires a value", diagnostics.items[0].message);
+}
+
+test "[unit]: unsupported catalog value datatype fails closed" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++
+        "id: MS:1000001\n" ++
+        "name: future typed term\n" ++
+        "namespace: MS\n" ++
+        "relationship: has_value_type xsd:duration\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "P1D", 10);
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.@"error", diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_value, diagnostics.items[0].rule);
+    try expectEqualStrings("CV term declares an unsupported value datatype", diagnostics.items[0].message);
+}
+
+test "[unit]: only non-empty values without a datatype contract are visible" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: untyped term\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "", 10);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "semantic value", 20);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(Severity.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_value, diagnostics.items[0].rule);
+    try expectEqualStrings(
+        "CV term has a non-empty value but declares no value datatype",
+        diagnostics.items[0].message,
+    );
+}
+
 test "SemanticValidator: no contradiction with single term" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000130\n" ++ "name: positive scan\n" ++ "namespace: MS\n";
@@ -2347,9 +2771,9 @@ test "SemanticValidator: no contradiction with single term" {
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
-        "<CvTerm termAccession=\"MS:1000130\"></CvTerm>" ++
-        "<CvTerm termAccession=\"MS:1000129\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/spectrum/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000130\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000129\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -2377,8 +2801,8 @@ test "SemanticValidator: must rule fires when term missing" {
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -2392,8 +2816,9 @@ test "SemanticValidator: must rule fires when term missing" {
     try consumeCvParam(&sv, "MS:1000482", "MS", 10);
 
     try sv.consumeEnd(test_events.endInterned("source", 20));
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[1].rule);
 }
 
 test "SemanticValidator: indexed wrapper preserves mapping paths" {
@@ -2404,8 +2829,8 @@ test "SemanticValidator: indexed wrapper preserves mapping paths" {
     defer cv_table.deinit();
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/mzML/source\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/mzML/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/mzML/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
     defer engine.deinit();
@@ -2425,8 +2850,9 @@ test "SemanticValidator: indexed wrapper preserves mapping paths" {
         try sv.consumeEnd(test_events.endInterned("mzML", 5));
         if (indexed) try sv.consumeEnd(test_events.endInterned("indexedmzML", 6));
 
-        try expectEqual(@as(usize, 1), diagnostics.items.len);
-        try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+        try expectEqual(@as(usize, 2), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+        try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[1].rule);
     }
 }
 
@@ -2440,8 +2866,8 @@ test "SemanticValidator: must rule passes when term present" {
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"source_must\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
+        "<CvMappingRule id=\"source_must\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -2456,6 +2882,40 @@ test "SemanticValidator: must rule passes when term present" {
 
     try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: mapping useTerm false rejects the category root but accepts a child" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: category root\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: usable child\nnamespace: MS\nis_a: MS:1000001 ! category root\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\" useTerm=\"false\" termName=\"test\" allowChildren=\"true\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+
+    for ([_][]const u8{ "MS:1000001", "MS:1000002" }, 0..) |accession, index| {
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+        var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+        defer sv.deinit();
+        try consumeCv(&sv, "MS");
+        try sv.consumeStart(test_events.startInterned("source", &.{}, 1));
+        try consumeCvParam(&sv, accession, "MS", 2);
+        try sv.consumeEnd(test_events.endInterned("source", 3));
+
+        if (index == 0) {
+            try expectEqual(@as(usize, 2), diagnostics.items.len);
+            try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+            try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[1].rule);
+        } else {
+            try expectEqual(@as(usize, 0), diagnostics.items.len);
+        }
+    }
 }
 
 test "SemanticValidator: must or rule fires when no term matches" {
@@ -2470,9 +2930,9 @@ test "SemanticValidator: must or rule fires when no term matches" {
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
-        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
-        "<CvTerm termAccession=\"MS:1000443\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000443\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -2486,8 +2946,9 @@ test "SemanticValidator: must or rule fires when no term matches" {
     try consumeCvParam(&sv, "MS:1000482", "MS", 10);
 
     try sv.consumeEnd(test_events.endInterned("source", 20));
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+    try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[1].rule);
 }
 
 test "SemanticValidator: must or rule passes when one term present" {
@@ -2501,9 +2962,9 @@ test "SemanticValidator: must or rule passes when one term present" {
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
-        "<CvTerm termAccession=\"MS:1000008\"></CvTerm>" ++
-        "<CvTerm termAccession=\"MS:1000443\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000008\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000443\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -2518,6 +2979,171 @@ test "SemanticValidator: must or rule passes when one term present" {
 
     try sv.consumeEnd(test_events.endInterned("source", 20));
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: missing location mapping is visible" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: test term\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000001", "MS", 1);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 2));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+}
+
+test "[unit]: mapping location cache preserves repeated diagnostics and canonical lifetime" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: allowed\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: misplaced\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+
+    for ([_]u64{ 10, 20 }) |byte_offset| {
+        const borrowed = try allocator.dupe(u8, "MS:1000002");
+        try consumeCvParam(&sv, borrowed, "MS", byte_offset);
+        allocator.free(borrowed);
+    }
+
+    try expectEqual(@as(usize, 2), diagnostics.items.len);
+    try expectEqual(@as(u64, 10), diagnostics.items[0].location.byte_offset);
+    try expectEqual(@as(u64, 20), diagnostics.items[1].location.byte_offset);
+    try expectEqual(@as(usize, 1), sv.mapping_location_evaluations);
+    const canonical = cv_table.lookup("MS:1000002").?.accession;
+    const cache_index = mappingLocationCacheIndex(sv.path_state, canonical);
+    try testing.expect(sv.mapping_location_cache[cache_index].accession.?.ptr == canonical.ptr);
+}
+
+test "[unit]: mapping location cache distinguishes exact paths" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: allowed\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000001", "MS", 1);
+    try sv.consumeEnd(test_events.endInterned("source", 2));
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 3));
+    try consumeCvParam(&sv, "MS:1000001", "MS", 4);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 5));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.warning, diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 2), sv.mapping_location_evaluations);
+}
+
+test "[unit]: parameter group terms use the reference location mapping" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: allowed\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: misplaced\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"source\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+
+    for ([_][]const u8{ "MS:1000001", "MS:1000002" }, 0..) |accession, index| {
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+        var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+        defer sv.deinit();
+        try consumeCv(&sv, "MS");
+        try consumeParamGroup(&sv, "group", accession, 1);
+        try sv.consumeStart(test_events.startInterned("source", &.{}, 10));
+        try sv.consumeStart(test_events.startInterned("referenceableParamGroupRef", &.{
+            test_events.attr("ref", "group"),
+        }, 11));
+        try sv.consumeEnd(test_events.endInterned("referenceableParamGroupRef", 12));
+        try sv.consumeEnd(test_events.endInterned("source", 13));
+        try sv.finish();
+
+        if (index == 0) {
+            try expectEqual(@as(usize, 0), diagnostics.items.len);
+        } else {
+            try expectEqual(@as(usize, 1), diagnostics.items.len);
+            try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
+        }
+    }
+}
+
+test "[unit]: optional AND and XOR mapping combinations are enforced" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: first\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: second\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    for ([_][]const u8{ "AND", "XOR" }) |logic| {
+        var rule_buf: [1024]u8 = undefined;
+        const rule_xml = try std.fmt.bufPrint(
+            &rule_buf,
+            "<CvMapping><CvMappingRuleList>" ++
+                "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"{s}\">" ++
+                "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/><CvTerm termAccession=\"MS:1000002\"" ++ mapping_test_term_attrs ++ "/>" ++
+                "</CvMappingRule></CvMappingRuleList></CvMapping>",
+            .{logic},
+        );
+        var engine = try RuleEngine.init(allocator, rule_xml);
+        defer engine.deinit();
+        var diagnostics: DiagnosticSink = .empty;
+        defer diagnostics.deinit(allocator);
+        var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+        defer sv.deinit();
+        try consumeCv(&sv, "MS");
+
+        try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+        try consumeCvParam(&sv, "MS:1000001", "MS", 1);
+        if (std.mem.eql(u8, logic, "XOR")) try consumeCvParam(&sv, "MS:1000002", "MS", 2);
+        try sv.consumeEnd(test_events.endInterned("source", 3));
+
+        try expectEqual(@as(usize, 1), diagnostics.items.len);
+        try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[0].rule);
+    }
 }
 
 test "SemanticValidator: declared id resolves in finish" {
@@ -2745,6 +3371,64 @@ test "SemanticValidator: foreign reference attributes are ignored" {
     try sv.finish();
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: scan and precursor spectrum reference forms require complete exclusive pairs" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: test\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    const local = test_events.attr("spectrumRef", "scan=1");
+    const source = test_events.attr("sourceFileRef", "SF1");
+    const external = test_events.attr("externalSpectrumID", "scan=2");
+
+    for ([_]ElementId{ .scan, .precursor }) |tag| {
+        const name = if (tag == .scan) "scan" else "precursor";
+        const valid_cases = [_][]const Attribute{
+            &.{},
+            &.{local},
+            &.{ source, external },
+        };
+        for (valid_cases) |attributes| {
+            diagnostics.clearRetainingCapacity();
+            try sv.validateSpectrumReferenceForm(test_events.startInterned(name, attributes, 10), tag);
+            try expectEqual(@as(usize, 0), diagnostics.items.len);
+        }
+
+        const invalid_cases = [_]struct {
+            attributes: []const Attribute,
+            mixed: bool,
+        }{
+            .{ .attributes = &.{source}, .mixed = false },
+            .{ .attributes = &.{external}, .mixed = false },
+            .{ .attributes = &.{ local, source }, .mixed = true },
+            .{ .attributes = &.{ local, external }, .mixed = true },
+            .{ .attributes = &.{ local, source, external }, .mixed = true },
+        };
+        for (invalid_cases) |case| {
+            diagnostics.clearRetainingCapacity();
+            try sv.validateSpectrumReferenceForm(test_events.startInterned(name, case.attributes, 20), tag);
+            try expectEqual(@as(usize, 1), diagnostics.items.len);
+            try expectEqualStrings(RuleId.mzml_ref_spectrum_form, diagnostics.items[0].rule);
+            const expected_message = if (tag == .scan)
+                if (case.mixed)
+                    "scan mixes local and external spectrum reference forms"
+                else
+                    "scan external spectrum reference requires both sourceFileRef and externalSpectrumID"
+            else if (case.mixed)
+                "precursor mixes local and external spectrum reference forms"
+            else
+                "precursor external spectrum reference requires both sourceFileRef and externalSpectrumID";
+            try expectEqualStrings(expected_message, diagnostics.items[0].message);
+        }
+    }
 }
 
 test "[unit]: semantic validator leaves missing cvRef to structural validation" {
@@ -3262,11 +3946,12 @@ test "SemanticValidator: IM-MS and DIA CV terms are recognised" {
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
     try consumeCv(&sv, "MS");
+    try consumeCv(&sv, "UO");
 
-    try consumeCvParam(&sv, "MS:1002476", "MS", 0);
-    try consumeCvParam(&sv, "MS:1002815", "MS", 10);
-    try consumeCvParam(&sv, "MS:1002836", "MS", 20);
-    try consumeCvParam(&sv, "MS:1000826", "MS", 30);
+    try consumeUnitParamValue(&sv, "MS:1002476", "MS", "1.0", "UO:0000028", 0);
+    try consumeUnitParamValue(&sv, "MS:1002815", "MS", "1.0", "MS:1002814", 10);
+    try consumeCvParamValue(&sv, "MS:1002836", "MS", "PXD000001", 20);
+    try consumeUnitParamValue(&sv, "MS:1000826", "MS", "1.0", "UO:0000010", 30);
     try consumeCvParam(&sv, "MS:1002446", "MS", 40);
     try consumeCvParam(&sv, "MS:1002687", "MS", 50);
 
@@ -3316,7 +4001,7 @@ test "SemanticValidator: userParam with invalid accession produces error" {
 
 // --- BTO/GO/PATO Support ---
 
-test "SemanticValidator: BTO accession does not produce unrecognized error" {
+test "SemanticValidator: declared BTO accession reports unverified namespace" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
     var cv_table = try CvTable.init(allocator, obo_text);
@@ -3329,9 +4014,11 @@ test "SemanticValidator: BTO accession does not produce unrecognized error" {
     defer engine.deinit();
     var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
     defer sv.deinit();
+    try consumeCv(&sv, "BTO");
 
     try consumeCvParam(&sv, "BTO:0000001", "BTO", 0);
-    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_unverified_namespace, diagnostics.items[0].rule);
 }
 
 // --- Contradiction Detection Across All Rules ---
@@ -3345,8 +4032,8 @@ test "SemanticValidator: non-repeatable exact duplicates are detected during rul
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"AND\">" ++
-        "<CvTerm termAccession=\"MS:1000130\" isRepeatable=\"false\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/spectrum/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000130\" useTerm=\"true\" termName=\"test\" allowChildren=\"false\" isRepeatable=\"false\" cvIdentifierRef=\"MS\"></CvTerm>" ++
         "</CvMappingRule></CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
     defer engine.deinit();
@@ -3360,10 +4047,42 @@ test "SemanticValidator: non-repeatable exact duplicates are detected during rul
     try sv.consumeEnd(test_events.endInterned("spectrum", 30));
 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.@"error", diagnostics.items[0].severity);
     try expectEqualStrings(RuleId.mzml_cv_term_repeat, diagnostics.items[0].rule);
 }
 
-test "SemanticValidator: contradiction detected when two OR alternatives on same element" {
+test "[unit]: non-repeatable mapping root counts different matching descendants" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: category\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: first child\nnamespace: MS\nis_a: MS:1000001 ! category\n" ++
+        "\n[Term]\nid: MS:1000003\nname: second child\nnamespace: MS\nis_a: MS:1000001 ! category\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/spectrum/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\" useTerm=\"false\" termName=\"test\" allowChildren=\"true\" isRepeatable=\"false\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("spectrum", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000002", "MS", 10);
+    try consumeCvParam(&sv, "MS:1000003", "MS", 20);
+    try sv.consumeEnd(test_events.endInterned("spectrum", 30));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqual(.@"error", diagnostics.items[0].severity);
+    try expectEqualStrings(RuleId.mzml_cv_term_repeat, diagnostics.items[0].rule);
+}
+
+test "SemanticValidator: OR mapping permits multiple alternatives" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000130\n" ++ "name: positive scan\n" ++ "namespace: MS\n" ++
         "[Term]\n" ++ "id: MS:1000129\n" ++ "name: negative scan\n" ++ "namespace: MS\n";
@@ -3374,9 +4093,9 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
-        "<CvTerm termAccession=\"MS:1000130\"></CvTerm>" ++
-        "<CvTerm termAccession=\"MS:1000129\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/spectrum/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000130\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000129\"" ++ mapping_test_term_attrs ++ "></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);
@@ -3391,8 +4110,7 @@ test "SemanticValidator: contradiction detected when two OR alternatives on same
     try consumeCvParam(&sv, "MS:1000129", "MS", 20);
 
     try sv.consumeEnd(test_events.endInterned("spectrum", 30));
-    try expectEqual(@as(usize, 1), diagnostics.items.len);
-    try expectEqualStrings(RuleId.mzml_cv_contradiction, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "SemanticValidator: unmatched exact OR term does not create contradiction" {
@@ -3422,9 +4140,9 @@ test "SemanticValidator: unmatched exact OR term does not create contradiction" 
     defer diagnostics.deinit(allocator);
 
     const rule_xml = "<CvMapping><CvMappingRuleList>" ++
-        "<CvMappingRule id=\"test\" cvElementPath=\"/\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
-        "<CvTerm termAccession=\"MS:1000001\" allowChildren=\"true\" isRepeatable=\"true\"></CvTerm>" ++
-        "<CvTerm termAccession=\"MS:1000004\" allowChildren=\"false\"></CvTerm>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/spectrum/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/spectrum\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:1000001\" useTerm=\"true\" termName=\"test\" allowChildren=\"true\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"></CvTerm>" ++
+        "<CvTerm termAccession=\"MS:1000004\" useTerm=\"true\" termName=\"test\" allowChildren=\"false\" cvIdentifierRef=\"MS\"></CvTerm>" ++
         "</CvMappingRule>" ++
         "</CvMappingRuleList></CvMapping>";
     var engine = try RuleEngine.init(allocator, rule_xml);

@@ -34,6 +34,7 @@ pub const RuleId = struct {
     pub const mzml_binary_precision_mismatch = "mzml.binary.precision-mismatch";
     pub const mzml_binary_oversized = "mzml.binary.oversized";
     pub const mzml_binary_type_mismatch = "mzml.binary.type-mismatch";
+    pub const mzml_binary_default_array = "mzml.binary.default-array";
 
     /// Declared indexListOffset does not match the actual byte offset of indexList.
     pub const mzml_index_offset_list = "mzml.index.offset-list";
@@ -44,7 +45,7 @@ pub const RuleId = struct {
     pub const mzml_index_duplicate_id = "mzml.index.duplicate-id";
     /// Index offset points past the end of the file (truncated file).
     pub const mzml_index_truncated = "mzml.index.truncated";
-    /// fileChecksum SHA-1 digest does not match the recomputed value.
+    /// fileChecksum SHA-1 text is invalid, non-canonical, or does not match.
     pub const mzml_index_checksum = "mzml.index.checksum";
 
     /// CV accession does not exist in the controlled vocabulary.
@@ -55,20 +56,29 @@ pub const RuleId = struct {
     pub const mzml_cv_namespace = "mzml.cv.namespace";
     /// A required CV term name is empty.
     pub const mzml_cv_name = "mzml.cv.name";
+    /// A present CV term name does not match the catalog name or a synonym.
+    pub const mzml_cv_name_mismatch = "mzml.cv.name-mismatch";
+    /// A declared external ontology is not bundled, so its accessions were not checked.
+    pub const mzml_cv_unverified_namespace = "mzml.cv.unverified-namespace";
     /// Unit term accession is not recognised.
     pub const mzml_cv_unit = "mzml.cv.unit";
-    /// A present CV value does not match the term's declared datatype.
+    /// CV value is missing, invalid, unsupported, or present without a datatype contract.
     pub const mzml_cv_value = "mzml.cv.value";
     /// A required CV term is missing from an element.
     pub const mzml_cv_required = "mzml.cv.required";
     /// A recommended CV term is missing from an element.
     pub const mzml_cv_recommended = "mzml.cv.recommended";
+    /// A CV term is not allowed at its mapped element location, or no location
+    /// mapping covers the element.
+    pub const mzml_cv_location = "mzml.cv.location";
     /// Mutually exclusive CV terms appear on the same element.
     pub const mzml_cv_contradiction = "mzml.cv.contradiction";
     /// CV ancestry traversal reached its configured bound.
     pub const mzml_cv_ancestry_limit = "mzml.cv.ancestry-limit";
     /// Non-repeatable CV term appears more than once on the same element.
     pub const mzml_cv_term_repeat = "mzml.cv.term-repeat";
+    /// A source file lacks the CV terms required by the default mzML object rule.
+    pub const mzml_cv_source_file = "mzml.cv.source-file";
     /// A *Ref attribute does not resolve to any declared id.
     pub const mzml_ref_unresolved = "mzml.ref.unresolved";
     /// A reference attribute is present but has an empty value.
@@ -79,6 +89,8 @@ pub const RuleId = struct {
     pub const mzml_ref_duplicate_id = "mzml.ref.duplicate-id";
     /// A required *Ref attribute is missing on an element.
     pub const mzml_ref_missing = "mzml.ref.missing";
+    /// Local and external spectrum reference attributes form an invalid combination.
+    pub const mzml_ref_spectrum_form = "mzml.ref.spectrum-form";
 };
 
 const emergency_failure_message = "validation stopped before all enabled stages completed";

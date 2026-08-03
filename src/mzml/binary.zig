@@ -94,11 +94,41 @@ const Precision = enum {
     }
 };
 
+const BinaryDataType = enum {
+    float32,
+    float64,
+    int32,
+    int64,
+    ascii,
+
+    fn width(data_type: BinaryDataType) ?usize {
+        return switch (data_type) {
+            .float32, .int32 => 4,
+            .float64, .int64 => 8,
+            .ascii => null,
+        };
+    }
+
+    fn precision(data_type: BinaryDataType) ?Precision {
+        return switch (data_type) {
+            .float32, .int32 => .bits32,
+            .float64, .int64 => .bits64,
+            .ascii => null,
+        };
+    }
+};
+
 const ArrayKind = enum {
     unknown,
     mz,
     intensity,
     time,
+    metadata,
+};
+
+const OwnerKind = enum {
+    spectrum,
+    chromatogram,
 };
 
 // --- Base64 streaming codec ---
@@ -374,6 +404,76 @@ const StreamingBase64Decoder = struct {
     }
 };
 
+const AsciiStats = struct {
+    byte_count: usize = 0,
+    terminator_count: usize = 0,
+    last_byte: ?u8 = null,
+    invalid_byte: bool = false,
+
+    fn inspect(stats: *AsciiStats, bytes: []const u8) error{ResourceLimitExceeded}!void {
+        stats.byte_count = std.math.add(usize, stats.byte_count, bytes.len) catch return error.ResourceLimitExceeded;
+        for (bytes) |byte| {
+            if (byte == 0) {
+                stats.terminator_count = std.math.add(usize, stats.terminator_count, 1) catch return error.ResourceLimitExceeded;
+            } else if (byte > 0x7f) {
+                stats.invalid_byte = true;
+            }
+            stats.last_byte = byte;
+        }
+    }
+
+    fn isValid(stats: *const AsciiStats) bool {
+        return !stats.invalid_byte and (stats.byte_count == 0 or stats.last_byte == 0);
+    }
+};
+
+/// Scalar Base64 decoder used only for the variable-width ASCII datatype.
+/// It retains counts and validity state, not decoded payload bytes.
+const StreamingBase64AsciiInspector = struct {
+    counter: StreamingBase64Counter = .{},
+    quad: [4]u8 = undefined,
+    quad_len: usize = 0,
+    quad_padding: usize = 0,
+    stats: AsciiStats = .{},
+
+    fn feed(inspector: *@This(), chunk: []const u8) error{ResourceLimitExceeded}!void {
+        inspector.counter.feed(chunk);
+        if (inspector.counter.errored) return;
+
+        for (chunk) |byte| switch (byte) {
+            ' ', '\t', '\r', '\n' => {},
+            'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => try inspector.push(base64Value(byte)),
+            '=' => {
+                inspector.quad_padding += 1;
+                try inspector.push(0);
+            },
+            else => return,
+        };
+    }
+
+    fn push(inspector: *@This(), sextet: u8) error{ResourceLimitExceeded}!void {
+        inspector.quad[inspector.quad_len] = sextet;
+        inspector.quad_len += 1;
+        if (inspector.quad_len != 4) return;
+
+        var decoded: [3]u8 = .{
+            (inspector.quad[0] << 2) | (inspector.quad[1] >> 4),
+            ((inspector.quad[1] & 0x0f) << 4) | (inspector.quad[2] >> 2),
+            ((inspector.quad[2] & 0x03) << 6) | inspector.quad[3],
+        };
+        const output_len = 3 - inspector.quad_padding;
+        try inspector.stats.inspect(decoded[0..output_len]);
+        inspector.quad_len = 0;
+        inspector.quad_padding = 0;
+    }
+
+    fn finish(inspector: *const @This()) error{InvalidBase64}!usize {
+        const decoded = try inspector.counter.result();
+        if (inspector.quad_len != 0) return error.InvalidBase64;
+        return decoded;
+    }
+};
+
 fn base64ValueOrNull(c: u8) ?u8 {
     return switch (c) {
         'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => base64Value(c),
@@ -384,6 +484,7 @@ fn base64ValueOrNull(c: u8) ?u8 {
 // --- mzML element state ---
 
 const OwnerState = struct {
+    kind: OwnerKind,
     depth: usize,
     index: ?usize,
     default_array_length: ?usize,
@@ -394,20 +495,28 @@ const BinaryArrayState = struct {
     byte_offset: u64,
     depth: usize,
     owner_spectrum_index: ?usize,
+    owner_kind: OwnerKind,
     default_array_length: ?usize,
     default_array_length_invalid: bool,
+    array_length: ?usize = null,
+    array_length_declared: bool = false,
+    array_length_invalid: bool = false,
+    has_data_processing_ref: bool = false,
     encoded_length: ?usize = null,
     encoded_length_declared: ?usize = null,
-    precision: ?Precision = null,
-    saw_precision_32: bool = false,
-    saw_precision_64: bool = false,
+    data_type: ?BinaryDataType = null,
+    data_type_count: usize = 0,
+    saw_unsupported_data_type: bool = false,
     saw_no_compression: bool = false,
     saw_zlib_compression: bool = false,
     saw_unsupported_compression: bool = false,
+    compression_term_count: usize = 0,
     array_kind: ArrayKind = .unknown,
+    array_kind_count: usize = 0,
     binary_depth: ?usize = null,
     binary_byte_offset: ?u64 = null,
     base64_stream: StreamingBase64Counter = .{},
+    ascii_base64_stream: StreamingBase64AsciiInspector = .{},
     zlib_base64_stream: StreamingBase64Decoder = .{},
     encoded_text_len: usize = 0,
     skipped: bool = false,
@@ -417,13 +526,22 @@ const BinaryArrayState = struct {
         depth: usize,
         owner: OwnerState,
         encoded_length: ?usize,
+        array_length: ?usize,
+        array_length_declared: bool,
+        array_length_invalid: bool,
+        has_data_processing_ref: bool,
     ) BinaryArrayState {
         return .{
             .byte_offset = byte_offset,
             .depth = depth,
             .owner_spectrum_index = owner.index,
+            .owner_kind = owner.kind,
             .default_array_length = owner.default_array_length,
             .default_array_length_invalid = owner.default_array_length_invalid,
+            .array_length = array_length,
+            .array_length_declared = array_length_declared,
+            .array_length_invalid = array_length_invalid,
+            .has_data_processing_ref = has_data_processing_ref,
             .encoded_length = encoded_length,
             .encoded_length_declared = encoded_length,
         };
@@ -659,6 +777,7 @@ pub const BinaryValidator = struct {
                     }
                 }
                 validator.spectrum = .{
+                    .kind = .spectrum,
                     .depth = element_depth,
                     .index = parseOptionalUnsigned(start.attr("index")),
                     .default_array_length = if (dal_signed) |value| if (value >= 0) @intCast(value) else null else null,
@@ -680,6 +799,7 @@ pub const BinaryValidator = struct {
                     }
                 }
                 validator.chromatogram = .{
+                    .kind = .chromatogram,
                     .depth = element_depth,
                     .index = null,
                     .default_array_length = if (dal_signed) |value| if (value >= 0) @intCast(value) else null else null,
@@ -689,12 +809,34 @@ pub const BinaryValidator = struct {
             .binaryDataArray => {
                 if (validator.binary_array != null) return;
                 const encoded_length = parseOptionalUnsigned(start.attr("encodedLength"));
+                const array_length_attr = start.attr("arrayLength");
+                const array_length = parseOptionalUnsigned(array_length_attr);
+                const array_length_invalid = array_length_attr != null and array_length == null;
+                const has_data_processing_ref = start.attr("dataProcessingRef") != null;
                 if (validator.spectrum) |owner| {
-                    validator.binary_array = BinaryArrayState.init(start.byte_offset, element_depth, owner, encoded_length);
+                    validator.binary_array = BinaryArrayState.init(
+                        start.byte_offset,
+                        element_depth,
+                        owner,
+                        encoded_length,
+                        array_length,
+                        array_length_attr != null,
+                        array_length_invalid,
+                        has_data_processing_ref,
+                    );
                     return;
                 }
                 if (validator.chromatogram) |owner| {
-                    validator.binary_array = BinaryArrayState.init(start.byte_offset, element_depth, owner, encoded_length);
+                    validator.binary_array = BinaryArrayState.init(
+                        start.byte_offset,
+                        element_depth,
+                        owner,
+                        encoded_length,
+                        array_length,
+                        array_length_attr != null,
+                        array_length_invalid,
+                        has_data_processing_ref,
+                    );
                     return;
                 }
             },
@@ -704,34 +846,32 @@ pub const BinaryValidator = struct {
                     const accession = start.attr("accession") orelse return;
                     if (std.mem.eql(u8, accession, "MS:1000574")) {
                         state.saw_zlib_compression = true;
+                        state.compression_term_count = std.math.add(usize, state.compression_term_count, 1) catch return error.ResourceLimitExceeded;
                         return;
                     }
                     if (std.mem.eql(u8, accession, "MS:1000576")) {
                         state.saw_no_compression = true;
+                        state.compression_term_count = std.math.add(usize, state.compression_term_count, 1) catch return error.ResourceLimitExceeded;
                         return;
                     }
                     if (std.mem.startsWith(u8, accession, "MS:") and isCompressionAccession(accession)) {
                         state.saw_unsupported_compression = true;
+                        state.compression_term_count = std.math.add(usize, state.compression_term_count, 1) catch return error.ResourceLimitExceeded;
                         return;
                     }
-                    if (std.mem.eql(u8, accession, "MS:1000521") or std.mem.eql(u8, accession, "MS:1000519")) {
-                        state.saw_precision_32 = true;
+                    if (classifyBinaryDataType(accession)) |classification| {
+                        state.data_type_count = std.math.add(usize, state.data_type_count, 1) catch return error.ResourceLimitExceeded;
+                        switch (classification) {
+                            .supported => |data_type| {
+                                if (state.data_type == null) state.data_type = data_type;
+                            },
+                            .unsupported => state.saw_unsupported_data_type = true,
+                        }
                         return;
                     }
-                    if (std.mem.eql(u8, accession, "MS:1000523") or std.mem.eql(u8, accession, "MS:1000522")) {
-                        state.saw_precision_64 = true;
-                        return;
-                    }
-                    if (std.mem.eql(u8, accession, "MS:1000514")) {
-                        state.array_kind = .mz;
-                        return;
-                    }
-                    if (std.mem.eql(u8, accession, "MS:1000515")) {
-                        state.array_kind = .intensity;
-                        return;
-                    }
-                    if (std.mem.eql(u8, accession, "MS:1000595")) {
-                        state.array_kind = .time;
+                    if (classifyArrayKind(accession)) |array_kind| {
+                        state.array_kind_count = std.math.add(usize, state.array_kind_count, 1) catch return error.ResourceLimitExceeded;
+                        if (state.array_kind == .unknown) state.array_kind = array_kind;
                         return;
                     }
                 }
@@ -799,12 +939,12 @@ pub const BinaryValidator = struct {
                         defer validator.releaseOneOffScratch();
                         try validator.validateBinaryArray(state);
 
-                        if (state.array_kind != .unknown) {
+                        if (state.array_kind == .mz or state.array_kind == .intensity or state.array_kind == .time) {
                             const kind_bit: u3 = switch (state.array_kind) {
                                 .mz => 1 << 0,
                                 .intensity => 1 << 1,
                                 .time => 1 << 2,
-                                .unknown => unreachable,
+                                .unknown, .metadata => unreachable,
                             };
                             if (validator.seen_array_kinds & kind_bit != 0) {
                                 try validator.appendDiagnostic(.{
@@ -888,6 +1028,13 @@ pub const BinaryValidator = struct {
                         },
                         else => return err,
                     };
+                } else if (state.data_type == .ascii) {
+                    state.ascii_base64_stream.feed(text.value) catch {
+                        try validator.appendBinaryLimitDiagnostic(state, "binary payload decoded-size arithmetic overflow");
+                        state.skipped = true;
+                        state.binary_depth = null;
+                        return error.ResourceLimitExceeded;
+                    };
                 } else {
                     state.base64_stream.feed(text.value);
                 }
@@ -936,10 +1083,7 @@ pub const BinaryValidator = struct {
             }
         }
 
-        const compression_terms: u8 =
-            @as(u8, @intFromBool(state.saw_no_compression)) +
-            @as(u8, @intFromBool(state.saw_zlib_compression)) +
-            @as(u8, @intFromBool(state.saw_unsupported_compression));
+        const compression_terms = state.compression_term_count;
         if (compression_terms > 1) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
@@ -962,12 +1106,13 @@ pub const BinaryValidator = struct {
         }
         if (compression_terms == 0) {
             try validator.appendDiagnostic(.{
-                .severity = .info,
+                .severity = .@"error",
                 .rule = RuleId.mzml_binary_compression,
                 .location = location,
                 .path = validator.path,
                 .message = "binaryDataArray is missing a compression type declaration",
             });
+            return;
         }
 
         // Without a declaration, only the completed payload establishes the limit.
@@ -984,31 +1129,81 @@ pub const BinaryValidator = struct {
             }
         }
 
-        const precision = blk: {
-            if (state.saw_precision_32 and state.saw_precision_64) {
-                try validator.appendDiagnostic(.{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_binary_precision_mismatch,
-                    .location = location,
-                    .path = validator.path,
-                    .message = "binaryDataArray declares conflicting 32-bit and 64-bit precision",
-                });
-                return;
-            }
-            if (state.saw_precision_32) break :blk Precision.bits32;
-            if (state.saw_precision_64) break :blk Precision.bits64;
+        if (state.data_type_count > 1) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
-                .rule = RuleId.mzml_binary_precision_mismatch,
+                .rule = RuleId.mzml_binary_type_mismatch,
                 .location = location,
                 .path = validator.path,
-                .message = "binaryDataArray is missing declared 32-bit or 64-bit precision",
+                .message = "binaryDataArray declares more than one binary datatype",
+            });
+            return;
+        }
+        if (state.saw_unsupported_data_type) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_type_mismatch,
+                .location = location,
+                .path = validator.path,
+                .message = "binaryDataArray declares an unsupported binary datatype",
+            });
+            return;
+        }
+        const data_type = state.data_type orelse {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_type_mismatch,
+                .location = location,
+                .path = validator.path,
+                .message = "binaryDataArray is missing a binary datatype declaration",
             });
             return;
         };
 
-        const width = precision.width();
+        if (state.array_kind_count > 1) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_type_mismatch,
+                .location = location,
+                .path = validator.path,
+                .message = "binaryDataArray declares more than one array type",
+            });
+            return;
+        }
 
+        const default_array = switch (state.owner_kind) {
+            .spectrum => state.array_kind == .mz or state.array_kind == .intensity,
+            .chromatogram => state.array_kind == .time or state.array_kind == .intensity,
+        };
+        if (default_array and state.array_length_declared) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_default_array,
+                .location = location,
+                .path = validator.path,
+                .message = "default binary array must not declare arrayLength",
+            });
+            return;
+        }
+        if (default_array and state.has_data_processing_ref) {
+            try validator.appendDiagnostic(.{
+                .severity = .@"error",
+                .rule = RuleId.mzml_binary_default_array,
+                .location = location,
+                .path = validator.path,
+                .message = "default binary array must not declare dataProcessingRef",
+            });
+            return;
+        }
+        if (state.array_length_invalid) return;
+        const expected_array_length = if (!default_array and state.array_length_declared)
+            state.array_length
+        else if (!state.default_array_length_invalid)
+            state.default_array_length
+        else
+            null;
+
+        var inflated_ascii_stats: AsciiStats = .{};
         const decoded_bytes = blk: {
             if (state.saw_zlib_compression) {
                 state.zlib_base64_stream.finish() catch {
@@ -1023,17 +1218,20 @@ pub const BinaryValidator = struct {
                 };
                 if (state.encoded_text_len == 0) break :blk 0;
 
-                const expected_decoded_bytes = if (state.default_array_length) |count|
-                    std.math.mul(usize, count, width) catch {
-                        try validator.appendDiagnostic(.{
-                            .severity = .@"error",
-                            .rule = RuleId.mzml_binary_oversized,
-                            .location = location,
-                            .path = validator.path,
-                            .message = "binary payload decoded size exceeds decompressed output limit",
-                        });
-                        return error.ResourceLimitExceeded;
-                    }
+                const expected_decoded_bytes = if (data_type.width()) |width|
+                    if (expected_array_length) |count|
+                        std.math.mul(usize, count, width) catch {
+                            try validator.appendDiagnostic(.{
+                                .severity = .@"error",
+                                .rule = RuleId.mzml_binary_oversized,
+                                .location = location,
+                                .path = validator.path,
+                                .message = "binary payload decoded size exceeds decompressed output limit",
+                            });
+                            return error.ResourceLimitExceeded;
+                        }
+                    else
+                        null
                 else
                     null;
                 if (expected_decoded_bytes) |expected| {
@@ -1048,7 +1246,11 @@ pub const BinaryValidator = struct {
                         return error.ResourceLimitExceeded;
                     }
                 }
-                break :blk (validator.inflateDecodedZlib(validator.compressed_payload.items, expected_decoded_bytes) catch |err| switch (err) {
+                break :blk (validator.inflateDecodedZlib(
+                    validator.compressed_payload.items,
+                    expected_decoded_bytes,
+                    if (data_type == .ascii) &inflated_ascii_stats else null,
+                ) catch |err| switch (err) {
                     error.InvalidBase64 => {
                         try validator.appendDiagnostic(.{
                             .severity = .@"error",
@@ -1102,7 +1304,10 @@ pub const BinaryValidator = struct {
                     error.OutOfMemory => |oom| return oom,
                 });
             } else {
-                break :blk state.base64_stream.result() catch {
+                break :blk (if (data_type == .ascii)
+                    state.ascii_base64_stream.finish()
+                else
+                    state.base64_stream.result()) catch {
                     try validator.appendDiagnostic(.{
                         .severity = .@"error",
                         .rule = RuleId.mzml_binary_base64,
@@ -1115,6 +1320,47 @@ pub const BinaryValidator = struct {
             }
         };
 
+        if (data_type == .ascii) {
+            const ascii_stats = if (state.saw_zlib_compression)
+                &inflated_ascii_stats
+            else
+                &state.ascii_base64_stream.stats;
+            if (!ascii_stats.isValid()) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_type_mismatch,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "decoded ASCII array contains an invalid byte or unterminated string",
+                });
+                return;
+            }
+            if (expected_array_length == null and state.default_array_length_invalid) return;
+            if (expected_array_length == null and decoded_bytes > 0) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_length_mismatch,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "non-empty binary payload is missing required defaultArrayLength",
+                });
+                return;
+            }
+            const declared_count = expected_array_length orelse return;
+            if (ascii_stats.terminator_count != declared_count) {
+                try validator.appendDiagnostic(.{
+                    .severity = .@"error",
+                    .rule = RuleId.mzml_binary_length_mismatch,
+                    .location = location,
+                    .path = validator.path,
+                    .message = "decoded ASCII string count does not match effective array length",
+                });
+            }
+            return;
+        }
+
+        const width = data_type.width().?;
+        const precision = data_type.precision().?;
         if (decoded_bytes % width != 0) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
@@ -1127,8 +1373,8 @@ pub const BinaryValidator = struct {
         }
 
         const element_count = decoded_bytes / width;
-        if (state.default_array_length_invalid) return;
-        if (state.default_array_length == null and decoded_bytes > 0) {
+        if (expected_array_length == null and state.default_array_length_invalid) return;
+        if (expected_array_length == null and decoded_bytes > 0) {
             try validator.appendDiagnostic(.{
                 .severity = .@"error",
                 .rule = RuleId.mzml_binary_length_mismatch,
@@ -1138,7 +1384,7 @@ pub const BinaryValidator = struct {
             });
             return;
         }
-        const declared_count = state.default_array_length orelse return;
+        const declared_count = expected_array_length orelse return;
         if (element_count == declared_count) return;
 
         const alternate_width: usize = if (width == 4) 8 else 4;
@@ -1168,7 +1414,12 @@ pub const BinaryValidator = struct {
         return element_depth >= validator.mzml_depth.?;
     }
 
-    fn inflateDecodedZlib(validator: *BinaryValidator, compressed: []const u8, expected_decoded_bytes: ?usize) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory, ResourceLimitExceeded, ScratchLimitExceeded, DecodedLimitExceeded }!usize) {
+    fn inflateDecodedZlib(
+        validator: *BinaryValidator,
+        compressed: []const u8,
+        expected_decoded_bytes: ?usize,
+        ascii_stats: ?*AsciiStats,
+    ) (error{ InvalidBase64, InvalidBinaryPayload, OutOfMemory, ResourceLimitExceeded, ScratchLimitExceeded, DecodedLimitExceeded }!usize) {
         const expected_adler = try zlibAdler32(compressed);
         if (comptime build_options.enable_libdeflate) {
             if (expected_decoded_bytes) |expected| {
@@ -1195,6 +1446,9 @@ pub const BinaryValidator = struct {
                     switch (result) {
                         libdeflate.LIBDEFLATE_SUCCESS => {
                             if (actual_in != compressed.len) return error.InvalidBinaryPayload;
+                            if (ascii_stats) |stats| {
+                                stats.inspect(validator.libdeflate_output.items[0..actual_out]) catch return error.ResourceLimitExceeded;
+                            }
                             return actual_out;
                         },
                         libdeflate.LIBDEFLATE_INSUFFICIENT_SPACE => {},
@@ -1214,6 +1468,7 @@ pub const BinaryValidator = struct {
             validator.flate_buffer.items,
             validator.limits.max_binary_decoded_bytes,
             expected_adler,
+            ascii_stats,
         );
     }
 
@@ -1272,6 +1527,7 @@ fn inflateCountWithBuffer(
     flate_buffer: []u8,
     max_output_bytes: usize,
     expected_adler: u32,
+    ascii_stats: ?*AsciiStats,
 ) error{ InvalidBinaryPayload, DecodedLimitExceeded }!usize {
     var input = std.Io.Reader.fixed(compressed);
     var decompress: std.compress.flate.Decompress = .init(&input, .zlib, flate_buffer);
@@ -1283,22 +1539,29 @@ fn inflateCountWithBuffer(
         const slice = decompress.reader.peekGreedy(max_peek) catch |err| switch (err) {
             error.EndOfStream => {
                 const buffered = decompress.reader.buffered();
-                addDecodedChunk(&count, &adler, buffered, max_output_bytes) catch return error.DecodedLimitExceeded;
+                addDecodedChunk(&count, &adler, buffered, max_output_bytes, ascii_stats) catch return error.DecodedLimitExceeded;
                 break;
             },
             else => return error.InvalidBinaryPayload,
         };
         if (slice.len == 0) break;
-        addDecodedChunk(&count, &adler, slice, max_output_bytes) catch return error.DecodedLimitExceeded;
+        addDecodedChunk(&count, &adler, slice, max_output_bytes, ascii_stats) catch return error.DecodedLimitExceeded;
         decompress.reader.toss(slice.len);
     }
     if (input.seek != input.end or adler.adler != expected_adler) return error.InvalidBinaryPayload;
     return count;
 }
 
-fn addDecodedChunk(count: *usize, adler: *std.hash.Adler32, chunk: []const u8, limit: usize) error{DecodedLimitExceeded}!void {
+fn addDecodedChunk(
+    count: *usize,
+    adler: *std.hash.Adler32,
+    chunk: []const u8,
+    limit: usize,
+    ascii_stats: ?*AsciiStats,
+) error{DecodedLimitExceeded}!void {
     const next = std.math.add(usize, count.*, chunk.len) catch return error.DecodedLimitExceeded;
     if (next > limit) return error.DecodedLimitExceeded;
+    if (ascii_stats) |stats| stats.inspect(chunk) catch return error.DecodedLimitExceeded;
     adler.update(chunk);
     count.* = next;
 }
@@ -1361,8 +1624,118 @@ fn isCompressionAccession(accession: []const u8) bool {
         std.mem.eql(u8, accession, "MS:1002746") or
         std.mem.eql(u8, accession, "MS:1002747") or
         std.mem.eql(u8, accession, "MS:1002748") or
+        std.mem.eql(u8, accession, "MS:1003088") or
         std.mem.eql(u8, accession, "MS:1003089") or
-        std.mem.eql(u8, accession, "MS:1003090");
+        std.mem.eql(u8, accession, "MS:1003090") or
+        std.mem.eql(u8, accession, "MS:1003780") or
+        std.mem.eql(u8, accession, "MS:1003781") or
+        std.mem.eql(u8, accession, "MS:1003782") or
+        std.mem.eql(u8, accession, "MS:1003783") or
+        std.mem.eql(u8, accession, "MS:1003784") or
+        std.mem.eql(u8, accession, "MS:1003785") or
+        std.mem.eql(u8, accession, "MS:1003826");
+}
+
+const BinaryDataTypeClassification = union(enum) {
+    supported: BinaryDataType,
+    unsupported,
+};
+
+fn classifyBinaryDataType(accession: []const u8) ?BinaryDataTypeClassification {
+    if (std.mem.eql(u8, accession, "MS:1000519")) return .{ .supported = .int32 };
+    if (std.mem.eql(u8, accession, "MS:1000520")) return .unsupported;
+    if (std.mem.eql(u8, accession, "MS:1000521")) return .{ .supported = .float32 };
+    if (std.mem.eql(u8, accession, "MS:1000522")) return .{ .supported = .int64 };
+    if (std.mem.eql(u8, accession, "MS:1000523")) return .{ .supported = .float64 };
+    if (std.mem.eql(u8, accession, "MS:1001479")) return .{ .supported = .ascii };
+    return null;
+}
+
+fn classifyArrayKind(accession: []const u8) ?ArrayKind {
+    if (std.mem.eql(u8, accession, "MS:1000514")) return .mz;
+    if (std.mem.eql(u8, accession, "MS:1000515")) return .intensity;
+    if (std.mem.eql(u8, accession, "MS:1000595")) return .time;
+    const metadata_accessions = std.StaticStringMap(void).initComptime(.{
+        .{ "MS:1000516", {} },
+        .{ "MS:1000517", {} },
+        .{ "MS:1000617", {} },
+        .{ "MS:1000786", {} },
+        .{ "MS:1000820", {} },
+        .{ "MS:1000821", {} },
+        .{ "MS:1000822", {} },
+        .{ "MS:1002477", {} },
+        .{ "MS:1002478", {} },
+        .{ "MS:1002529", {} },
+        .{ "MS:1002530", {} },
+        .{ "MS:1002742", {} },
+        .{ "MS:1002743", {} },
+        .{ "MS:1002744", {} },
+        .{ "MS:1002745", {} },
+        .{ "MS:1002816", {} },
+        .{ "MS:1002893", {} },
+        .{ "MS:1003006", {} },
+        .{ "MS:1003007", {} },
+        .{ "MS:1003008", {} },
+        .{ "MS:1003143", {} },
+        .{ "MS:1003153", {} },
+        .{ "MS:1003154", {} },
+        .{ "MS:1003155", {} },
+        .{ "MS:1003156", {} },
+        .{ "MS:1003157", {} },
+        .{ "MS:1003158", {} },
+    });
+    return if (metadata_accessions.has(accession)) .metadata else null;
+}
+
+test "[catalog]: binary compression classifier covers every active embedded CV descendant" {
+    const obo = @import("../obo/parser.zig");
+    var table = try obo.CvTable.init(std.testing.allocator, @embedFile("../data/psi-ms.obo"));
+    defer table.deinit();
+
+    var covered: usize = 0;
+    var terms = table.map.iterator();
+    while (terms.next()) |entry| {
+        const term = entry.value_ptr.*;
+        if (term.is_obsolete or std.mem.eql(u8, term.accession, "MS:1000572")) continue;
+        if (table.isDescendantOf(term.accession, "MS:1000572") != .yes) continue;
+        try std.testing.expect(isCompressionAccession(term.accession));
+        covered += 1;
+    }
+    try std.testing.expect(covered > 0);
+}
+
+test "[catalog]: binary datatype classifier covers every embedded CV descendant" {
+    const obo = @import("../obo/parser.zig");
+    var table = try obo.CvTable.init(std.testing.allocator, @embedFile("../data/psi-ms.obo"));
+    defer table.deinit();
+
+    var covered: usize = 0;
+    var terms = table.map.iterator();
+    while (terms.next()) |entry| {
+        const term = entry.value_ptr.*;
+        if (std.mem.eql(u8, term.accession, "MS:1000518")) continue;
+        if (table.isDescendantOf(term.accession, "MS:1000518") != .yes) continue;
+        try std.testing.expect(classifyBinaryDataType(term.accession) != null);
+        covered += 1;
+    }
+    try std.testing.expect(covered > 0);
+}
+
+test "[catalog]: binary array-type classifier covers every embedded CV descendant" {
+    const obo = @import("../obo/parser.zig");
+    var table = try obo.CvTable.init(std.testing.allocator, @embedFile("../data/psi-ms.obo"));
+    defer table.deinit();
+
+    var covered: usize = 0;
+    var terms = table.map.iterator();
+    while (terms.next()) |entry| {
+        const term = entry.value_ptr.*;
+        if (std.mem.eql(u8, term.accession, "MS:1000513")) continue;
+        if (table.isDescendantOf(term.accession, "MS:1000513") != .yes) continue;
+        try std.testing.expect(classifyArrayKind(term.accession) != null);
+        covered += 1;
+    }
+    try std.testing.expect(covered > 0);
 }
 
 fn precisionDivisibilityMessage(precision: Precision) []const u8 {
@@ -1404,7 +1777,7 @@ test "binary validator C.0 parity snapshots fixture diagnostics" {
             .severity = .@"error",
             .rule = RuleId.mzml_binary_base64,
             .byte_offset = binaryTagOffset(invalid_base64, 0),
-            .spectrum_index = 7,
+            .spectrum_index = 0,
             .message = "binary payload is not valid base64",
         },
     });
@@ -1416,7 +1789,7 @@ test "binary validator C.0 parity snapshots fixture diagnostics" {
             .severity = .@"error",
             .rule = RuleId.mzml_binary_decompress,
             .byte_offset = binaryTagOffset(invalid_zlib, 0),
-            .spectrum_index = 4,
+            .spectrum_index = 0,
             .message = "binary payload is not valid zlib data",
         },
     });
@@ -1428,7 +1801,7 @@ test "binary validator C.0 parity snapshots fixture diagnostics" {
             .severity = .@"error",
             .rule = RuleId.mzml_binary_compression,
             .byte_offset = binaryTagOffset(conflicting_compression, 0),
-            .spectrum_index = 3,
+            .spectrum_index = 0,
             .message = "binaryDataArray declares conflicting compression terms",
         },
     });
@@ -1452,7 +1825,7 @@ test "binary validator C.0 parity snapshots decision order edge cases" {
         "</spectrumList></run></mzML>";
     try expectBinaryDiagnosticsSnapshot(allocator, io, missing_compression, &.{
         .{
-            .severity = .info,
+            .severity = .@"error",
             .rule = RuleId.mzml_binary_compression,
             .byte_offset = binaryTagOffset(missing_compression, 0),
             .spectrum_index = 11,
@@ -1833,24 +2206,24 @@ test "binary fallback uses the bounded flate workspace and validates boundaries"
     try std.testing.expectEqual(@as(usize, 2 * std.compress.flate.max_window_len), flate_buffer.len);
     try std.testing.expectEqual(
         @as(usize, 5),
-        try inflateCountWithBuffer(&compressed, flate_buffer, 5, adler.adler),
+        try inflateCountWithBuffer(&compressed, flate_buffer, 5, adler.adler, null),
     );
     try std.testing.expectError(
         error.DecodedLimitExceeded,
-        inflateCountWithBuffer(&compressed, flate_buffer, 4, adler.adler),
+        inflateCountWithBuffer(&compressed, flate_buffer, 4, adler.adler, null),
     );
 
     const with_trailing = compressed ++ [_]u8{0};
     try std.testing.expectError(
         error.InvalidBinaryPayload,
-        inflateCountWithBuffer(&with_trailing, flate_buffer, 5, adler.adler),
+        inflateCountWithBuffer(&with_trailing, flate_buffer, 5, adler.adler, null),
     );
 
     var corrupt = compressed;
     corrupt[5] ^= 1;
     try std.testing.expectError(
         error.InvalidBinaryPayload,
-        inflateCountWithBuffer(&corrupt, flate_buffer, 5, adler.adler),
+        inflateCountWithBuffer(&corrupt, flate_buffer, 5, adler.adler, null),
     );
 }
 
@@ -1867,7 +2240,7 @@ test "binary fallback owner accounts only the bounded flate workspace" {
 
     try std.testing.expectEqual(
         @as(usize, 5),
-        try validator.inflateDecodedZlib(&compressed, null),
+        try validator.inflateDecodedZlib(&compressed, null, null),
     );
     try std.testing.expectEqual(@as(usize, 2 * std.compress.flate.max_window_len), validator.flate_buffer.capacity);
     try std.testing.expectEqual(validator.flate_buffer.capacity, validator.scratch_current_bytes);
@@ -1952,6 +2325,7 @@ test "[unit]: ending a binary array releases only capacities above the reuse bou
         .byte_offset = 0,
         .depth = 2,
         .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
         .default_array_length = null,
         .default_array_length_invalid = false,
         .skipped = true,
@@ -1974,6 +2348,7 @@ test "[unit]: ending a binary array releases only capacities above the reuse bou
         .byte_offset = 0,
         .depth = 2,
         .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
         .default_array_length = null,
         .default_array_length_invalid = false,
         .skipped = true,
@@ -2058,7 +2433,7 @@ test "[unit]: binary decompression preserves scratch allocation failure" {
         const expected_bytes: ?usize = if (comptime build_options.enable_libdeflate) 5 else null;
         try std.testing.expectError(
             error.OutOfMemory,
-            validator.inflateDecodedZlib(&compressed, expected_bytes),
+            validator.inflateDecodedZlib(&compressed, expected_bytes, null),
         );
     }
 
@@ -2093,7 +2468,7 @@ test "binary validator reports invalid base64 payload" {
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_base64, diagnostics.items[0].rule);
-    try std.testing.expectEqual(@as(?usize, 7), diagnostics.items[0].location.spectrum_index);
+    try std.testing.expectEqual(@as(?usize, 0), diagnostics.items[0].location.spectrum_index);
 }
 
 test "binary validator reports invalid zlib payload" {
@@ -2159,8 +2534,170 @@ test "binary validator reports precision mismatch" {
     defer diagnostics.deinit(allocator);
 
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
-    try std.testing.expectEqualStrings(RuleId.mzml_binary_precision_mismatch, diagnostics.items[0].rule);
-    try std.testing.expectEqualStrings("binaryDataArray declares conflicting 32-bit and 64-bit precision", diagnostics.items[0].message);
+    try std.testing.expectEqualStrings(RuleId.mzml_binary_type_mismatch, diagnostics.items[0].rule);
+    try std.testing.expectEqualStrings("binaryDataArray declares more than one binary datatype", diagnostics.items[0].message);
+}
+
+test "[unit]: binary datatype declarations do not collapse exact or same-width duplicates" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_][]const u8{
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000521\"/>",
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000519\"/>",
+    };
+
+    for (cases) |declarations| {
+        const fixture = try std.fmt.allocPrint(
+            allocator,
+            "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+                "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+                "<binaryDataArray encodedLength=\"8\">{s}<cvParam accession=\"MS:1000576\"/>" ++
+                "<cvParam accession=\"MS:1000515\"/><binary>AACAPw==</binary>" ++
+                "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>",
+            .{declarations},
+        );
+        defer allocator.free(fixture);
+
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_type_mismatch,
+            "binaryDataArray declares more than one binary datatype",
+        );
+    }
+}
+
+test "[unit]: obsolete embedded 16-bit datatype fails explicitly as unsupported" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+        "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+        "<binaryDataArray encodedLength=\"4\"><cvParam accession=\"MS:1000520\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000515\"/>" ++
+        "<binary>AAA=</binary></binaryDataArray></binaryDataArrayList>" ++
+        "</spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_type_mismatch,
+        "binaryDataArray declares an unsupported binary datatype",
+    );
+}
+
+test "[unit]: multiple metadata array types in one binary array fail without semantic validation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+        "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000516\"/>" ++
+        "<cvParam accession=\"MS:1000517\"/><binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_type_mismatch,
+        "binaryDataArray declares more than one array type",
+    );
+}
+
+test "[unit]: distinct metadata array types remain legal in separate arrays" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+        "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000516\"/>" ++
+        "<binary>AACAPw==</binary></binaryDataArray>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000517\"/>" ++
+        "<binary>AACAPw==</binary></binaryDataArray>" ++
+        "</binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+    try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+}
+
+test "[unit]: raw and zlib ASCII metadata arrays validate bytes terminators and string count" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct {
+        compression: []const u8,
+        payload: []const u8,
+        encoded_length: usize,
+    }{
+        .{ .compression = "MS:1000576", .payload = "YQBiAA==", .encoded_length = 8 },
+        .{ .compression = "MS:1000574", .payload = "eJxLZEhiAAACTADE", .encoded_length = 16 },
+    };
+
+    for (cases) |case| {
+        const fixture = try asciiMetadataArrayFixture(
+            allocator,
+            case.compression,
+            case.payload,
+            case.encoded_length,
+            2,
+        );
+        defer allocator.free(fixture);
+
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
+}
+
+test "[unit]: ASCII metadata arrays reject invalid bytes unterminated strings and count mismatch" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct {
+        payload: []const u8,
+        array_length: usize,
+        rule: []const u8,
+        message: []const u8,
+    }{
+        .{
+            .payload = "gAA=",
+            .array_length = 1,
+            .rule = RuleId.mzml_binary_type_mismatch,
+            .message = "decoded ASCII array contains an invalid byte or unterminated string",
+        },
+        .{
+            .payload = "YQ==",
+            .array_length = 1,
+            .rule = RuleId.mzml_binary_type_mismatch,
+            .message = "decoded ASCII array contains an invalid byte or unterminated string",
+        },
+        .{
+            .payload = "YQA=",
+            .array_length = 2,
+            .rule = RuleId.mzml_binary_length_mismatch,
+            .message = "decoded ASCII string count does not match effective array length",
+        },
+    };
+
+    for (cases) |case| {
+        const fixture = try asciiMetadataArrayFixture(
+            allocator,
+            "MS:1000576",
+            case.payload,
+            case.payload.len,
+            case.array_length,
+        );
+        defer allocator.free(fixture);
+
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+        try expectSingleBinaryDiagnostic(diagnostics.items, case.rule, case.message);
+    }
 }
 
 test "binary validator reports defaultArrayLength mismatch" {
@@ -2191,6 +2728,97 @@ test "binary validator reports defaultArrayLength mismatch" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_length_mismatch, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("decoded array length does not match defaultArrayLength", diagnostics.items[0].message);
+}
+
+test "[unit]: default spectrum array rejects arrayLength override" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList><spectrum index=\"0\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList><binaryDataArray encodedLength=\"8\" arrayLength=\"1\">" ++
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000514\"/><binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_default_array,
+        "default binary array must not declare arrayLength",
+    );
+}
+
+test "[unit]: default spectrum array rejects dataProcessingRef override" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList><spectrum index=\"0\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList><binaryDataArray encodedLength=\"8\" dataProcessingRef=\"DP2\">" ++
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000514\"/><binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_default_array,
+        "default binary array must not declare dataProcessingRef",
+    );
+}
+
+test "[unit]: default chromatogram time array rejects arrayLength override" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><chromatogramList><chromatogram index=\"0\" defaultArrayLength=\"1\">" ++
+        "<binaryDataArrayList><binaryDataArray encodedLength=\"8\" arrayLength=\"1\">" ++
+        "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000595\"/><binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></chromatogram></chromatogramList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_default_array,
+        "default binary array must not declare arrayLength",
+    );
+}
+
+test "[unit]: non-default arrays may override owner length for raw and zlib payloads" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const cases = [_]struct {
+        compression: []const u8,
+        payload: []const u8,
+        encoded_length: usize,
+    }{
+        .{ .compression = "MS:1000576", .payload = "AACAPw==", .encoded_length = 8 },
+        .{ .compression = "MS:1000574", .payload = "eJxjYGBgAAAABAAB", .encoded_length = 16 },
+    };
+
+    for (cases) |case| {
+        const fixture = try std.fmt.allocPrint(
+            allocator,
+            "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList><spectrum index=\"0\" defaultArrayLength=\"2\">" ++
+                "<binaryDataArrayList><binaryDataArray encodedLength=\"{d}\" arrayLength=\"1\">" ++
+                "<cvParam accession=\"MS:1000521\"/><cvParam accession=\"{s}\"/>" ++
+                "<cvParam accession=\"MS:1000786\"/><binary>{s}</binary>" ++
+                "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>",
+            .{ case.encoded_length, case.compression, case.payload },
+        );
+        defer allocator.free(fixture);
+
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        try std.testing.expectEqual(@as(usize, 0), diagnostics.items.len);
+    }
 }
 
 test "binary validator reports empty binary payload when declared length is nonzero" {
@@ -2293,6 +2921,26 @@ test "binary validator reports conflicting compression terms" {
     try std.testing.expectEqualStrings("binaryDataArray declares conflicting compression terms", diagnostics.items[0].message);
 }
 
+test "[unit]: exact duplicate compression declarations remain conflicting without semantic validation" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const fixture =
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+        "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+        "<binaryDataArray encodedLength=\"8\"><cvParam accession=\"MS:1000521\"/>" ++
+        "<cvParam accession=\"MS:1000576\"/><cvParam accession=\"MS:1000576\"/>" ++
+        "<cvParam accession=\"MS:1000515\"/><binary>AACAPw==</binary>" ++
+        "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>";
+
+    var diagnostics = try runBinaryValidation(allocator, io, fixture);
+    defer diagnostics.deinit(allocator);
+    try expectSingleBinaryDiagnostic(
+        diagnostics.items,
+        RuleId.mzml_binary_compression,
+        "binaryDataArray declares conflicting compression terms",
+    );
+}
+
 test "binary validator reports unsupported compression terms" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -2306,6 +2954,33 @@ test "binary validator reports unsupported compression terms" {
     try std.testing.expectEqual(@as(usize, 1), diagnostics.items.len);
     try std.testing.expectEqualStrings(RuleId.mzml_binary_compression, diagnostics.items[0].rule);
     try std.testing.expectEqualStrings("binaryDataArray declares unsupported compression terms", diagnostics.items[0].message);
+}
+
+test "[unit]: every newer embedded compression term fails closed as unsupported" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+
+    const accessions = [_][]const u8{
+        "MS:1003088",
+        "MS:1003780",
+        "MS:1003781",
+        "MS:1003782",
+        "MS:1003783",
+        "MS:1003784",
+        "MS:1003785",
+        "MS:1003826",
+    };
+    inline for (accessions) |accession| {
+        const fixture = minimalSpectrumMzml("AACAPw==", 1, accession);
+        var diagnostics = try runBinaryValidation(allocator, io, fixture);
+        defer diagnostics.deinit(allocator);
+
+        try expectSingleBinaryDiagnostic(
+            diagnostics.items,
+            RuleId.mzml_binary_compression,
+            "binaryDataArray declares unsupported compression terms",
+        );
+    }
 }
 
 test "binary validator reports invalid chromatogram payload without spectrum index" {
@@ -2703,13 +3378,16 @@ test "[unit]: alternate-width overflow remains an ordinary length mismatch" {
         .byte_offset = 0,
         .depth = 0,
         .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
         .default_array_length = std.math.maxInt(usize),
         .default_array_length_invalid = false,
         .encoded_length = 8,
         .encoded_length_declared = 8,
         .encoded_text_len = 8,
-        .saw_precision_32 = true,
+        .data_type = .float32,
+        .data_type_count = 1,
         .saw_no_compression = true,
+        .compression_term_count = 1,
     };
     state.base64_stream.feed("AAAAAA==");
 
@@ -2734,13 +3412,16 @@ test "[unit]: malformed owner length does not suppress binary payload validation
         .byte_offset = 0,
         .depth = 0,
         .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
         .default_array_length = null,
         .default_array_length_invalid = true,
         .encoded_length = 4,
         .encoded_length_declared = 4,
         .encoded_text_len = 4,
-        .saw_precision_32 = true,
+        .data_type = .float32,
+        .data_type_count = 1,
         .saw_no_compression = true,
+        .compression_term_count = 1,
     };
     state.base64_stream.feed("%%%%");
 
@@ -2841,6 +3522,25 @@ fn minimalSpectrumMzmlWithEncodedLength(
         "</spectrumList>" ++
         "</run>" ++
         "</mzML>";
+}
+
+fn asciiMetadataArrayFixture(
+    allocator: std.mem.Allocator,
+    compression: []const u8,
+    payload: []const u8,
+    encoded_length: usize,
+    array_length: usize,
+) ![]u8 {
+    return std.fmt.allocPrint(
+        allocator,
+        "<mzML xmlns=\"http://psi.hupo.org/ms/mzml\"><run><spectrumList>" ++
+            "<spectrum index=\"0\" defaultArrayLength=\"1\"><binaryDataArrayList>" ++
+            "<binaryDataArray encodedLength=\"{d}\" arrayLength=\"{d}\">" ++
+            "<cvParam accession=\"MS:1001479\"/><cvParam accession=\"{s}\"/>" ++
+            "<cvParam accession=\"MS:1000786\"/><binary>{s}</binary>" ++
+            "</binaryDataArray></binaryDataArrayList></spectrum></spectrumList></run></mzML>",
+        .{ encoded_length, array_length, compression, payload },
+    );
 }
 
 const test_events = @import("test_events.zig");

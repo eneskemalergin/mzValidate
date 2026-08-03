@@ -929,7 +929,7 @@ test "json contract: clean result matches golden" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "-skip-semantic",
         "-skip-index",
         "-json",
@@ -965,7 +965,7 @@ test "json contract: multi-file result matches golden" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "-skip-semantic",
         "-skip-index",
