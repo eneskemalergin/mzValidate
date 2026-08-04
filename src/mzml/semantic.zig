@@ -35,16 +35,26 @@ const DescendantCacheEntry = struct {
     result: bool = false,
 };
 
-const MappingLocationVerdict = enum(u8) {
+const MappingLocationVerdict = enum(u2) {
     allowed,
     disallowed,
     unmapped,
 };
 
+const MappingMatch = u30;
+const mapping_match_multiple = std.math.maxInt(MappingMatch) - 2;
+const mapping_match_none = std.math.maxInt(MappingMatch) - 1;
+const mapping_match_unclassified = std.math.maxInt(MappingMatch);
+
+const MappingClassification = packed struct(u32) {
+    mapping_match: MappingMatch = mapping_match_unclassified,
+    verdict: MappingLocationVerdict = .unmapped,
+};
+
 const MappingLocationCacheEntry = struct {
     accession: ?[]const u8 = null,
     path_state: ?rule_engine.PathState = null,
-    verdict: MappingLocationVerdict = .unmapped,
+    classification: MappingClassification = .{},
 };
 
 const mzml_namespace = diagnostic.mzml_namespace;
@@ -179,6 +189,7 @@ const Declaration = struct {
 
 const ScopeItem = struct {
     accession: []const u8,
+    mapping_match: MappingMatch = mapping_match_unclassified,
     // Parser-backed accessions are borrowed; copied accessions are freed at scope exit.
     owned: bool,
 };
@@ -488,6 +499,7 @@ pub const SemanticValidator = struct {
     descendant_cache: [descendant_cache_len]DescendantCacheEntry = @splat(.{}),
     mapping_location_cache: [mapping_location_cache_len]MappingLocationCacheEntry = @splat(.{}),
     mapping_location_evaluations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
+    mapping_close_evaluations: if (builtin.is_test) usize else void = if (builtin.is_test) 0 else {},
     external_namespace_warnings: u8 = 0,
 
     pub fn init(
@@ -584,11 +596,12 @@ pub const SemanticValidator = struct {
         std.debug.assert(validator.budget.current_bytes == 0);
     }
 
-    fn appendScopeItem(validator: *SemanticValidator, accession: []const u8, owned: bool, byte_offset: u64) !void {
+    fn appendScopeItem(validator: *SemanticValidator, accession: []const u8, owned: bool, byte_offset: u64) !usize {
         try ensureListAppendCapacity(&validator.scope_items, &validator.budget, .scope, byte_offset);
+        const item_index = validator.scope_items.items.len;
         if (!owned) {
             try validator.scope_items.append(validator.allocator, .{ .accession = accession, .owned = false });
-            return;
+            return item_index;
         }
 
         try validator.budget.reserve(.scope, accession.len, byte_offset);
@@ -596,6 +609,7 @@ pub const SemanticValidator = struct {
         const owned_accession = try validator.allocator.dupe(u8, accession);
         errdefer validator.allocator.free(owned_accession);
         try validator.scope_items.append(validator.allocator, .{ .accession = owned_accession, .owned = true });
+        return item_index;
     }
 
     pub fn consumeStart(validator: *SemanticValidator, start: StartElement) !void {
@@ -608,6 +622,7 @@ pub const SemanticValidator = struct {
         var un: ?[]const u8 = null;
         var pn: ?[]const u8 = null;
         var pv: ?[]const u8 = null;
+        var mapping_scope_item: ?usize = null;
         if (tag == .cvParam or tag == .userParam) {
             if (start.attributes.len > 0) {
                 for (start.attributes) |attribute| {
@@ -658,9 +673,9 @@ pub const SemanticValidator = struct {
                 if (validator.scope_frames.items.len > 0) {
                     const on_slice = start.raw_tag.len > 0;
                     if (on_slice) {
-                        try validator.appendScopeItem(acc, false, start.byte_offset);
+                        mapping_scope_item = try validator.appendScopeItem(acc, false, start.byte_offset);
                     } else {
-                        try validator.appendScopeItem(acc, true, start.byte_offset);
+                        mapping_scope_item = try validator.appendScopeItem(acc, true, start.byte_offset);
                     }
                 }
             }
@@ -709,8 +724,8 @@ pub const SemanticValidator = struct {
                     if (validator.param_groups.get(trimSchemaWhitespace(ref_id))) |group_terms| {
                         if (validator.scope_frames.items.len >= 1) {
                             for (group_terms.items) |acc| {
-                                try validator.appendScopeItem(acc, true, start.byte_offset);
-                                try validator.validateMappingLocation(acc, start.byte_offset);
+                                const scope_item = try validator.appendScopeItem(acc, true, start.byte_offset);
+                                try validator.validateMappingLocation(acc, scope_item, start.byte_offset);
                             }
                         }
                     } else if (validator.scope_frames.items.len >= 1) {
@@ -832,7 +847,7 @@ pub const SemanticValidator = struct {
 
         const term = validator.cv_table.lookup(accession);
         if (term) |t| {
-            if (tag == .cvParam) try validator.validateMappingLocation(accession, start.byte_offset);
+            if (tag == .cvParam) try validator.validateMappingLocation(accession, mapping_scope_item, start.byte_offset);
             if (t.is_obsolete) {
                 _ = try validator.diagnostics.append(validator.allocator, .{
                     .severity = .warning,
@@ -1060,6 +1075,7 @@ pub const SemanticValidator = struct {
     fn validateMappingLocation(
         validator: *SemanticValidator,
         accession: []const u8,
+        scope_item: ?usize,
         byte_offset: u64,
     ) !void {
         // An explicitly empty engine disables mapping checks for callers that
@@ -1071,6 +1087,19 @@ pub const SemanticValidator = struct {
         // Source-file CV terms are owned by the default object rule.
         if (frame.element_id == .referenceableParamGroup or frame.element_id == .sourceFile) return;
 
+        const classification = try validator.classifyMappingLocation(frame, accession, byte_offset);
+        if (scope_item) |item_index| {
+            validator.scope_items.items[item_index].mapping_match = classification.mapping_match;
+        }
+        try validator.emitMappingLocationVerdict(classification.verdict, byte_offset);
+    }
+
+    fn classifyMappingLocation(
+        validator: *SemanticValidator,
+        frame: ScopeFrame,
+        accession: []const u8,
+        byte_offset: u64,
+    ) !MappingClassification {
         const canonical_accession = if (validator.cv_table.lookup(accession)) |term|
             term.accession
         else
@@ -1083,30 +1112,46 @@ pub const SemanticValidator = struct {
             const cached = validator.mapping_location_cache[index];
             if (cached.accession) |cached_accession| {
                 if (cached.path_state == frame.path_state and std.mem.eql(u8, cached_accession, canonical_accession.?)) {
-                    return validator.emitMappingLocationVerdict(cached.verdict, byte_offset);
+                    return cached.classification;
                 }
             }
         }
 
         if (builtin.is_test) validator.mapping_location_evaluations += 1;
-        const verdict: MappingLocationVerdict = if (frame.rules.len == 0)
-            .unmapped
-        else verdict: {
-            for (frame.rules) |rule| {
-                for (rule.terms) |mapping_term| {
-                    if (try validator.matchesMappingTerm(accession, mapping_term, byte_offset)) break :verdict .allowed;
-                }
-            }
-            break :verdict .disallowed;
+        var classification = MappingClassification{
+            .mapping_match = mapping_match_none,
+            .verdict = if (frame.rules.len == 0) .unmapped else .disallowed,
         };
+        var mapping_term_index: usize = 0;
+        classify: for (frame.rules) |rule| {
+            for (rule.terms) |mapping_term| {
+                if (classification.verdict != .allowed) {
+                    if (try validator.matchesMappingTerm(accession, mapping_term, byte_offset)) {
+                        classification.verdict = .allowed;
+                        classification.mapping_match = @intCast(mapping_term_index);
+                    }
+                } else switch (validator.probeMappingTerm(accession, mapping_term)) {
+                    .yes => {
+                        classification.mapping_match = mapping_match_multiple;
+                        break :classify;
+                    },
+                    .no => {},
+                    .limit_exceeded => {
+                        classification.mapping_match = mapping_match_unclassified;
+                        break :classify;
+                    },
+                }
+                mapping_term_index = std.math.add(usize, mapping_term_index, 1) catch unreachable;
+            }
+        }
         if (cache_index) |index| {
             validator.mapping_location_cache[index] = .{
                 .accession = canonical_accession.?,
                 .path_state = frame.path_state,
-                .verdict = verdict,
+                .classification = classification,
             };
         }
-        try validator.emitMappingLocationVerdict(verdict, byte_offset);
+        return classification;
     }
 
     fn emitMappingLocationVerdict(
@@ -1220,16 +1265,25 @@ pub const SemanticValidator = struct {
         }
 
         const rules = frame.rules;
+        var mapping_term_index: usize = 0;
         for (rules) |rule| {
             var matched: usize = 0;
             var repeat_violation = false;
             for (rule.terms) |term| {
                 var term_matches: usize = 0;
                 for (scope) |st| {
-                    if (try validator.matchesMappingTerm(st.accession, term, end.byte_offset)) term_matches += 1;
+                    const current_match: MappingMatch = @intCast(mapping_term_index);
+                    const matches = if (st.mapping_match == current_match)
+                        true
+                    else if (st.mapping_match == mapping_match_unclassified or st.mapping_match == mapping_match_multiple) fallback: {
+                        if (builtin.is_test) validator.mapping_close_evaluations += 1;
+                        break :fallback try validator.matchesMappingTerm(st.accession, term, end.byte_offset);
+                    } else false;
+                    if (matches) term_matches += 1;
                 }
                 if (term_matches > 0) matched += 1;
                 if (!term.is_repeatable and term_matches > 1) repeat_violation = true;
+                mapping_term_index = std.math.add(usize, mapping_term_index, 1) catch unreachable;
             }
 
             switch (rule.requirement) {
@@ -1300,8 +1354,22 @@ pub const SemanticValidator = struct {
         return validator.matchesDescendant(accession, term.accession, byte_offset);
     }
 
+    fn probeMappingTerm(validator: *SemanticValidator, accession: []const u8, term: MappingTerm) obo.DescendantResult {
+        if (std.mem.eql(u8, accession, term.accession)) return if (term.use_term) .yes else .no;
+        if (!term.allow_children) return .no;
+        return validator.descendantResult(accession, term.accession);
+    }
+
     fn matchesDescendant(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8, byte_offset: u64) !bool {
-        if (std.mem.eql(u8, accession, ancestor)) return true;
+        return switch (validator.descendantResult(accession, ancestor)) {
+            .yes => true,
+            .no => false,
+            .limit_exceeded => validator.resolveDescendantLimit(byte_offset),
+        };
+    }
+
+    fn descendantResult(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8) obo.DescendantResult {
+        if (std.mem.eql(u8, accession, ancestor)) return .yes;
 
         const cache_hash = std.hash.Wyhash.hash(
             std.hash.Wyhash.hash(0, accession),
@@ -1313,40 +1381,36 @@ pub const SemanticValidator = struct {
             if (std.mem.eql(u8, cached_accession, accession) and
                 std.mem.eql(u8, cached.ancestor, ancestor))
             {
-                return cached.result;
+                return if (cached.result) .yes else .no;
             }
         }
 
-        const result = try validator.resolveDescendant(accession, ancestor, byte_offset);
+        const result = validator.cv_table.isDescendantOf(accession, ancestor);
         // Scope values may borrow a parser buffer. Retain only canonical
         // invocation-owned slices from the CV table on a cache miss.
-        if (validator.cv_table.lookup(accession)) |accession_term| {
-            if (validator.cv_table.lookup(ancestor)) |ancestor_term| {
-                validator.descendant_cache[cache_index] = .{
-                    .accession = accession_term.accession,
-                    .ancestor = ancestor_term.accession,
-                    .result = result,
-                };
+        if (result != .limit_exceeded) {
+            if (validator.cv_table.lookup(accession)) |accession_term| {
+                if (validator.cv_table.lookup(ancestor)) |ancestor_term| {
+                    validator.descendant_cache[cache_index] = .{
+                        .accession = accession_term.accession,
+                        .ancestor = ancestor_term.accession,
+                        .result = result == .yes,
+                    };
+                }
             }
         }
         return result;
     }
 
-    fn resolveDescendant(validator: *SemanticValidator, accession: []const u8, ancestor: []const u8, byte_offset: u64) !bool {
-        return switch (validator.cv_table.isDescendantOf(accession, ancestor)) {
-            .yes => true,
-            .no => false,
-            .limit_exceeded => {
-                _ = try validator.diagnostics.append(validator.allocator, .{
-                    .severity = .@"error",
-                    .rule = RuleId.mzml_cv_ancestry_limit,
-                    .location = .{ .byte_offset = byte_offset },
-                    .path = validator.path,
-                    .message = "CV ancestry traversal exceeded its configured limit",
-                });
-                return error.ResourceLimitExceeded;
-            },
-        };
+    fn resolveDescendantLimit(validator: *SemanticValidator, byte_offset: u64) !bool {
+        _ = try validator.diagnostics.append(validator.allocator, .{
+            .severity = .@"error",
+            .rule = RuleId.mzml_cv_ancestry_limit,
+            .location = .{ .byte_offset = byte_offset },
+            .path = validator.path,
+            .message = "CV ancestry traversal exceeded its configured limit",
+        });
+        return error.ResourceLimitExceeded;
     }
 
     fn validateBinaryDataType(validator: *SemanticValidator, scope: []const ScopeItem, byte_offset: u64) !void {
@@ -1800,6 +1864,14 @@ fn testEngine(allocator: std.mem.Allocator) !RuleEngine {
 const mapping_test_term_attrs = " useTerm=\"true\" termName=\"test\" isRepeatable=\"true\" allowChildren=\"false\" cvIdentifierRef=\"MS\"";
 
 // --- Unit Tests ---
+
+test "[unit]: mapping classification uses existing scope and cache layout" {
+    if (@sizeOf(usize) == 8) {
+        try testing.expectEqual(@as(usize, 4), @sizeOf(MappingClassification));
+        try testing.expectEqual(@as(usize, 24), @sizeOf(MappingLocationCacheEntry));
+        try testing.expectEqual(@as(usize, 24), @sizeOf(ScopeItem));
+    }
+}
 
 test "SemanticValidator: valid accession produces no diagnostic" {
     const allocator = testing.allocator;
@@ -2819,6 +2891,7 @@ test "SemanticValidator: must rule fires when term missing" {
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
     try expectEqualStrings(RuleId.mzml_cv_required, diagnostics.items[1].rule);
+    try expectEqual(@as(usize, 0), sv.mapping_close_evaluations);
 }
 
 test "SemanticValidator: indexed wrapper preserves mapping paths" {
@@ -3107,7 +3180,102 @@ test "[unit]: parameter group terms use the reference location mapping" {
             try expectEqual(@as(usize, 1), diagnostics.items.len);
             try expectEqualStrings(RuleId.mzml_cv_location, diagnostics.items[0].rule);
         }
+        try expectEqual(@as(usize, 0), sv.mapping_close_evaluations);
     }
+}
+
+test "[unit]: multiple mapping matches retain the close-time fallback" {
+    const allocator = testing.allocator;
+    const obo_text =
+        "[Term]\nid: MS:1000001\nname: root\nnamespace: MS\n" ++
+        "\n[Term]\nid: MS:1000002\nname: branch\nnamespace: MS\nis_a: MS:1000001 ! root\n" ++
+        "\n[Term]\nid: MS:1000003\nname: child\nnamespace: MS\nis_a: MS:1000002 ! branch\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\" useTerm=\"false\" termName=\"root\" allowChildren=\"true\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"/>" ++
+        "<CvTerm termAccession=\"MS:1000002\" useTerm=\"false\" termName=\"branch\" allowChildren=\"true\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000003", "MS", 1);
+    try sv.consumeEnd(test_events.endInterned("source", 2));
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
+    try testing.expect(sv.mapping_close_evaluations > 0);
+}
+
+test "[unit]: namespace failure retains close-time mapping membership" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\nid: MS:1000001\nname: test\nnamespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MUST\" scopePath=\"/source\" cvTermsCombinationLogic=\"AND\">" ++
+        "<CvTerm termAccession=\"MS:1000001\"" ++ mapping_test_term_attrs ++ "/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+    try consumeCv(&sv, "GO");
+
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+    try consumeCvParam(&sv, "MS:1000001", "GO", 1);
+    try sv.consumeEnd(test_events.endInterned("source", 2));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_namespace, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 0), sv.mapping_location_evaluations);
+    try expectEqual(@as(usize, 1), sv.mapping_close_evaluations);
+}
+
+test "[unit]: later ancestry exhaustion remains a close-time failure" {
+    const allocator = testing.allocator;
+    var obo_text = std.ArrayList(u8).empty;
+    defer obo_text.deinit(allocator);
+    for (0..258) |i| {
+        try obo_text.appendSlice(allocator, "[Term]\nid: MS:");
+        var id_buffer: [32]u8 = undefined;
+        try obo_text.appendSlice(allocator, try std.fmt.bufPrint(&id_buffer, "{d}\nname: term\nnamespace: MS\n", .{i}));
+        if (i > 0) {
+            try obo_text.appendSlice(allocator, "is_a: MS:");
+            try obo_text.appendSlice(allocator, try std.fmt.bufPrint(&id_buffer, "{d} ! parent\n", .{i - 1}));
+        }
+    }
+    var cv_table = try CvTable.init(allocator, obo_text.items);
+    defer cv_table.deinit();
+    const rule_xml = "<CvMapping><CvMappingRuleList>" ++
+        "<CvMappingRule id=\"test\" cvElementPath=\"/source/cvParam/@accession\" requirementLevel=\"MAY\" scopePath=\"/source\" cvTermsCombinationLogic=\"OR\">" ++
+        "<CvTerm termAccession=\"MS:257\" useTerm=\"true\" termName=\"exact\" allowChildren=\"false\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"/>" ++
+        "<CvTerm termAccession=\"MS:0\" useTerm=\"true\" termName=\"ancestor\" allowChildren=\"true\" isRepeatable=\"true\" cvIdentifierRef=\"MS\"/>" ++
+        "</CvMappingRule></CvMappingRuleList></CvMapping>";
+    var engine = try RuleEngine.init(allocator, rule_xml);
+    defer engine.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+    try consumeCv(&sv, "MS");
+
+    try sv.consumeStart(test_events.startInterned("source", &.{}, 0));
+    try consumeCvParam(&sv, "MS:257", "MS", 10);
+    try expectError(error.ResourceLimitExceeded, sv.consumeEnd(test_events.endInterned("source", 30)));
+
+    try expectEqual(@as(usize, 1), diagnostics.items.len);
+    try expectEqualStrings(RuleId.mzml_cv_ancestry_limit, diagnostics.items[0].rule);
+    try expectEqual(@as(u64, 30), diagnostics.items[0].location.byte_offset);
 }
 
 test "[unit]: optional AND and XOR mapping combinations are enforced" {
@@ -4049,6 +4217,8 @@ test "SemanticValidator: non-repeatable exact duplicates are detected during rul
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqual(.@"error", diagnostics.items[0].severity);
     try expectEqualStrings(RuleId.mzml_cv_term_repeat, diagnostics.items[0].rule);
+    try expectEqual(@as(usize, 1), sv.mapping_location_evaluations);
+    try expectEqual(@as(usize, 0), sv.mapping_close_evaluations);
 }
 
 test "[unit]: non-repeatable mapping root counts different matching descendants" {
