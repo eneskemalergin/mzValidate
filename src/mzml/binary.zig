@@ -303,14 +303,20 @@ const StreamingBase64Decoder = struct {
         if (self.errored) return;
 
         var offset: usize = 0;
+        var try_bulk_decode = true;
         while (offset < chunk.len) {
-            if (!self.saw_pad and self.quad_len == 0 and chunk.len - offset >= base64_scalar_short_len) {
-                const clean_prefix = cleanBase64DataPrefixLen(chunk[offset..]);
-                const bulk_len = clean_prefix - (clean_prefix % 4);
+            if (try_bulk_decode and !self.saw_pad and self.quad_len == 0 and chunk.len - offset >= base64_scalar_short_len) {
+                const remaining = chunk.len - offset;
+                const aligned_len = remaining - (remaining % 4);
+                const final_quartet_has_padding = chunk[offset + aligned_len - 1] == '=' or
+                    chunk[offset + aligned_len - 2] == '=';
+                const bulk_len = if (final_quartet_has_padding) aligned_len - 4 else aligned_len;
                 if (bulk_len >= base64_scalar_short_len) {
-                    try self.decodeCleanRun(allocator, out, chunk[offset..][0..bulk_len]);
-                    offset += bulk_len;
-                    continue;
+                    try_bulk_decode = false;
+                    if (try self.decodeCleanRun(allocator, out, chunk[offset..][0..bulk_len])) {
+                        offset += bulk_len;
+                        continue;
+                    }
                 }
             }
 
@@ -370,37 +376,21 @@ const StreamingBase64Decoder = struct {
         self.quad_len = 0;
     }
 
-    fn decodeCleanRun(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), encoded: []const u8) !void {
+    fn decodeCleanRun(self: *@This(), allocator: std.mem.Allocator, out: *std.ArrayList(u8), encoded: []const u8) !bool {
         std.debug.assert(encoded.len % 4 == 0);
 
+        const next_sig_len = std.math.add(usize, self.sig_len, encoded.len) catch return error.ResourceLimitExceeded;
         const decoded_len = std.math.mul(usize, encoded.len / 4, 3) catch return error.ResourceLimitExceeded;
         const start = out.items.len;
         const end = std.math.add(usize, start, decoded_len) catch return error.ResourceLimitExceeded;
         try out.resize(allocator, end);
         std.base64.standard.Decoder.decode(out.items[start..][0..decoded_len], encoded) catch {
-            try out.resize(allocator, start);
-            self.errored = true;
-            return;
+            out.shrinkRetainingCapacity(start);
+            return false;
         };
-        self.sig_len = std.math.add(usize, self.sig_len, encoded.len) catch return error.ResourceLimitExceeded;
+        self.sig_len = next_sig_len;
         self.last_value = base64Value(encoded[encoded.len - 1]);
-    }
-
-    fn cleanBase64DataPrefixLen(bytes: []const u8) usize {
-        var offset: usize = 0;
-        while (bytes.len - offset >= base64_simd_chunk_len) {
-            const chunk = StreamingBase64Counter.loadBase64Chunk(bytes, offset);
-            if (!@reduce(.And, StreamingBase64Counter.base64CharLanes(chunk))) break;
-            offset += base64_simd_chunk_len;
-        }
-
-        while (offset < bytes.len) : (offset += 1) {
-            switch (bytes[offset]) {
-                'A'...'Z', 'a'...'z', '0'...'9', '+', '/' => {},
-                else => break,
-            }
-        }
-        return offset;
+        return true;
     }
 };
 
@@ -2020,6 +2010,34 @@ test "streaming base64 decoder decodes long clean bulk runs" {
     try stream.finish();
 
     try std.testing.expectEqual(@as(usize, 96), decoded.items.len);
+}
+
+test "[unit]: streaming base64 decoder falls back after optimistic whitespace failure" {
+    const allocator = std.testing.allocator;
+    var payload: [133]u8 = @splat('A');
+    payload[64] = '\n';
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var stream: StreamingBase64Decoder = .{};
+
+    try stream.feed(allocator, &decoded, &payload);
+    try stream.finish();
+
+    try std.testing.expectEqual(@as(usize, 99), decoded.items.len);
+}
+
+test "[unit]: streaming base64 decoder leaves final padded quartet scalar" {
+    const allocator = std.testing.allocator;
+    var payload: [128]u8 = @splat('A');
+    @memcpy(payload[124..], "AA==");
+    var decoded: std.ArrayList(u8) = .empty;
+    defer decoded.deinit(allocator);
+    var stream: StreamingBase64Decoder = .{};
+
+    try stream.feed(allocator, &decoded, &payload);
+    try stream.finish();
+
+    try std.testing.expectEqual(@as(usize, 94), decoded.items.len);
 }
 
 test "streaming base64 decoder decodes split chunks and whitespace" {
