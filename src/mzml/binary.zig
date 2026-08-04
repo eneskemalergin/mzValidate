@@ -994,6 +994,7 @@ pub const BinaryValidator = struct {
     fn handleText(validator: *BinaryValidator, text: xml_events.Text) !void {
         if (validator.binary_array) |*state| {
             if (state.binary_depth != null) {
+                if (state.saw_zlib_compression and validator.feedDeclaredZlibText(state, text.value)) return;
                 const text_len = std.math.add(
                     usize,
                     state.encoded_text_len,
@@ -1040,6 +1041,30 @@ pub const BinaryValidator = struct {
                 }
             }
         }
+    }
+
+    fn feedDeclaredZlibText(validator: *BinaryValidator, state: *BinaryArrayState, chunk: []const u8) bool {
+        const declared = state.encoded_length_declared orelse return false;
+        // Opening binary clears encoded_length only after reserving the declared output bound.
+        if (state.encoded_length != null or state.zlib_base64_stream.sig_len != state.encoded_text_len) return false;
+        const remaining = std.math.sub(usize, declared, state.encoded_text_len) catch return false;
+        if (chunk.len > remaining) return false;
+
+        const stream_before = state.zlib_base64_stream;
+        const output_len_before = validator.compressed_payload.items.len;
+        var accepted = false;
+        defer if (!accepted) {
+            state.zlib_base64_stream = stream_before;
+            validator.compressed_payload.shrinkRetainingCapacity(output_len_before);
+        };
+
+        state.zlib_base64_stream.feed(validator.allocator, &validator.compressed_payload, chunk) catch return false;
+        const expected_sig_len = std.math.add(usize, stream_before.sig_len, chunk.len) catch return false;
+        if (state.zlib_base64_stream.errored or state.zlib_base64_stream.sig_len != expected_sig_len) return false;
+
+        state.encoded_text_len = expected_sig_len;
+        accepted = true;
+        return true;
     }
 
     fn validateBinaryArray(validator: *BinaryValidator, state: *const BinaryArrayState) !void {
@@ -2023,6 +2048,64 @@ test "streaming base64 decoder preserves invalid padding behavior" {
 
     try std.testing.expect(stream.errored);
     try std.testing.expectError(error.InvalidBase64, stream.finish());
+}
+
+test "[unit]: declared zlib text derives clean count from decoder" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = BinaryValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+    var state: BinaryArrayState = .{
+        .byte_offset = 0,
+        .depth = 1,
+        .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
+        .default_array_length = null,
+        .default_array_length_invalid = false,
+        .encoded_length_declared = 8,
+        .saw_zlib_compression = true,
+        .binary_depth = 2,
+    };
+    try validator.ensureCompressedCapacity(&state, try base64SizeUpperBound(8));
+
+    try std.testing.expect(validator.feedDeclaredZlibText(&state, "QUJDREVG"));
+
+    try std.testing.expectEqual(@as(usize, 8), state.encoded_text_len);
+    try std.testing.expectEqual(@as(usize, 8), state.zlib_base64_stream.sig_len);
+    try std.testing.expectEqualStrings("ABCDEF", validator.compressed_payload.items);
+}
+
+test "[unit]: declared zlib text restores decoder and output for fallback" {
+    const allocator = std.testing.allocator;
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var validator = BinaryValidator.init(allocator, &diagnostics, null);
+    defer validator.deinit();
+    var state: BinaryArrayState = .{
+        .byte_offset = 0,
+        .depth = 1,
+        .owner_spectrum_index = null,
+        .owner_kind = .spectrum,
+        .default_array_length = null,
+        .default_array_length_invalid = false,
+        .encoded_length_declared = 65,
+        .saw_zlib_compression = true,
+        .binary_depth = 2,
+    };
+    try validator.ensureCompressedCapacity(&state, try base64SizeUpperBound(65));
+
+    try std.testing.expect(!validator.feedDeclaredZlibText(&state, "QUJD REVG"));
+    try std.testing.expectEqual(@as(usize, 0), state.encoded_text_len);
+    try std.testing.expectEqual(@as(usize, 0), state.zlib_base64_stream.sig_len);
+    try std.testing.expectEqual(@as(usize, 0), validator.compressed_payload.items.len);
+
+    var invalid: [65]u8 = @splat('A');
+    invalid[64] = '!';
+    try std.testing.expect(!validator.feedDeclaredZlibText(&state, &invalid));
+    try std.testing.expectEqual(@as(usize, 0), state.encoded_text_len);
+    try std.testing.expectEqual(@as(usize, 0), state.zlib_base64_stream.sig_len);
+    try std.testing.expectEqual(@as(usize, 0), validator.compressed_payload.items.len);
 }
 
 test "[unit]: streaming base64 codecs reject noncanonical final pad bits" {
