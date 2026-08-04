@@ -5,6 +5,7 @@
 //! Both pwiz element offsets and ThermoRawFileParser line offsets are accepted.
 
 const std = @import("std");
+const sha1 = @import("../checksum/sha1.zig");
 const diagnostic = @import("../diagnostic.zig");
 const xml_events = @import("../xml/events.zig");
 
@@ -75,28 +76,17 @@ pub const IndexValidator = struct {
 
     // Online SHA-1 over contiguous input bytes.
     sha_file_bytes: ?[]const u8 = null,
-    sha_ctx: std.crypto.hash.Sha1 = undefined,
+    sha_ctx: sha1.Sha1 = undefined,
     sha_bytes_hashed: u64 = 0,
     sha_complete: bool = false,
     sha_computed: [20]u8 = undefined,
-
-    pub fn isIndexed(validator: *const IndexValidator) bool {
-        return validator.saw_index_elements;
-    }
-
-    /// Returns the declared fileChecksum value parsed from `<fileChecksum>`.
-    /// Returns null if no fileChecksum was encountered.
-    pub fn declaredChecksum(validator: *const IndexValidator) ?[20]u8 {
-        if (!validator.file_checksum_ok) return null;
-        return validator.file_checksum_raw;
-    }
 
     /// Start incremental SHA-1 over contiguous input bytes. Call once before the
     /// parse loop when `file_bytes` is available.
     pub fn beginOnlineSha(validator: *IndexValidator, bytes: []const u8) void {
         validator.sha_file_bytes = bytes;
         validator.input_size = bytes.len;
-        validator.sha_ctx = std.crypto.hash.Sha1.init(.{});
+        validator.sha_ctx = sha1.Sha1.init();
         validator.sha_bytes_hashed = 0;
         validator.sha_complete = false;
     }
@@ -428,7 +418,7 @@ pub const IndexValidator = struct {
         };
         var buffer: [64 * 1024]u8 = undefined;
         var hashed: u64 = 0;
-        var ctx = std.crypto.hash.Sha1.init(.{});
+        var ctx = sha1.Sha1.init();
         while (hashed < checksum_offset) {
             const remaining = checksum_offset - hashed;
             const want: usize = @intCast(@min(remaining, @as(u64, buffer.len)));
@@ -856,7 +846,7 @@ fn alignForward(value: usize, alignment: usize) !usize {
 
 fn computeChecksumBatch(bytes: []const u8, checksum_offset: u64) [20]u8 {
     var computed: [20]u8 = undefined;
-    var ctx = std.crypto.hash.Sha1.init(.{});
+    var ctx = sha1.Sha1.init();
     ctx.update(bytes[0..checksum_offset]);
     ctx.final(&computed);
     return computed;
@@ -901,7 +891,7 @@ test "IndexValidator: non-indexed file produces no diagnostics" {
     try v.finish(null);
 
     try expectEqual(@as(usize, 0), diagnostics.items.len);
-    try expect(!v.isIndexed());
+    try expect(!v.saw_index_elements);
 }
 
 test "IndexValidator: records spectrum and chromatogram offsets" {

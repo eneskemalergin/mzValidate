@@ -43,10 +43,15 @@ pub fn build(b: *std.Build) void {
 
     const mzvalidate_options = b.addOptions();
     mzvalidate_options.addOption(bool, "enable_libdeflate", enable_libdeflate);
+    const sha1_x86_enabled = target.result.cpu.arch == .x86_64;
+    mzvalidate_options.addOption(bool, "sha1_x86_enabled", sha1_x86_enabled);
     mzvalidate_mod.addOptions("build_options", mzvalidate_options);
 
     if (enable_libdeflate) {
         addVendoredLibdeflateToModule(mzvalidate_mod, b, optimize, target);
+    }
+    if (sha1_x86_enabled) {
+        addSha1X86ToModule(mzvalidate_mod, b, optimize, target);
     }
 
     const exe = b.addExecutable(.{
@@ -170,6 +175,27 @@ pub fn build(b: *std.Build) void {
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
+}
+
+fn addSha1X86ToModule(
+    mod: *std.Build.Module,
+    b: *std.Build,
+    optimize: std.builtin.OptimizeMode,
+    target: std.Build.ResolvedTarget,
+) void {
+    var sha1_target_query = target.query;
+    sha1_target_query.cpu_features_add.addFeatureSet(std.Target.x86.featureSet(&.{ .sha, .ssse3 }));
+    const sha1_target = b.resolveTargetQuery(sha1_target_query);
+    const sha1_object = b.addObject(.{
+        .name = "mzvalidate_sha1_x86",
+        .root_module = b.createModule(.{
+            .root_source_file = b.path("src/checksum/sha1_x86.zig"),
+            .target = sha1_target,
+            .optimize = optimize,
+        }),
+        .use_llvm = true,
+    });
+    mod.addObject(sha1_object);
 }
 
 fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
