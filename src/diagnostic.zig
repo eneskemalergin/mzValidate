@@ -346,6 +346,33 @@ pub const DiagnosticSink = struct {
         return true;
     }
 
+    /// Orders retained groups for presentation and preserves index correctness.
+    pub fn sortGroups(sink: *DiagnosticSink) void {
+        if (sink.group_index.len == 0) {
+            std.mem.sort(Diagnostic, sink.items, {}, diagnosticGroupLessThan);
+            return;
+        }
+
+        std.debug.assert(sink.items.len <= sink.group_index.len / 2);
+        const order = sink.group_index[0..sink.items.len];
+        const destinations = sink.group_index[sink.items.len..][0..sink.items.len];
+        for (order, 0..) |*item_index, index| item_index.* = index;
+        std.mem.sort(usize, order, sink.items, diagnosticIndexLessThan);
+        for (order, 0..) |item_index, index| destinations[item_index] = index;
+        for (destinations, 0..) |*destination, index| {
+            while (destination.* != index) {
+                const other = destination.*;
+                std.mem.swap(Diagnostic, &sink.items[index], &sink.items[other]);
+                std.mem.swap(usize, destination, &destinations[other]);
+            }
+        }
+
+        @memset(sink.group_index, group_index_empty);
+        for (sink.items, 0..) |*item, index| {
+            sink.insertGroupIndex(diagnosticGroupHash(item), index);
+        }
+    }
+
     /// Grows the retained-detail buffer without exceeding max_diagnostics.
     pub fn ensureTotalCapacity(sink: *DiagnosticSink, allocator: std.mem.Allocator, requested: usize) !void {
         if (requested <= sink.capacity) return;
@@ -582,6 +609,25 @@ fn sameDiagnosticGroup(left: *const Diagnostic, right: *const Diagnostic) bool {
         std.mem.eql(u8, left.rule, right.rule) and
         optionalStringEql(left.path, right.path) and
         std.mem.eql(u8, left.message, right.message);
+}
+
+fn diagnosticGroupLessThan(_: void, left: Diagnostic, right: Diagnostic) bool {
+    const left_severity = severitySortOrder(left.severity);
+    const right_severity = severitySortOrder(right.severity);
+    if (left_severity != right_severity) return left_severity < right_severity;
+    return left.occurrences > right.occurrences;
+}
+
+fn diagnosticIndexLessThan(items: []Diagnostic, left: usize, right: usize) bool {
+    return diagnosticGroupLessThan({}, items[left], items[right]);
+}
+
+fn severitySortOrder(severity: Severity) u2 {
+    return switch (severity) {
+        .@"error" => 0,
+        .warning => 1,
+        .info => 2,
+    };
 }
 
 fn diagnosticGroupHash(item: *const Diagnostic) u64 {
@@ -1331,6 +1377,38 @@ test "[unit]: optional grouping index failure keeps exact linear grouping" {
 
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
     try std.testing.expectEqual(@as(usize, 2), sink.items[0].occurrences);
+}
+
+test "[unit]: grouped diagnostics sort by severity and count" {
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    const findings = [_]Diagnostic{
+        .{ .severity = .info, .rule = "info", .message = "finding" },
+        .{ .severity = .warning, .rule = "warning", .message = "finding" },
+        .{ .severity = .@"error", .rule = "z-error", .message = "finding" },
+        .{ .severity = .@"error", .rule = "b-error", .message = "finding" },
+        .{ .severity = .@"error", .rule = "a-error", .message = "finding" },
+    };
+    for (findings) |finding| _ = try sink.append(std.testing.allocator, finding);
+    for (0..19) |_| _ = try sink.append(std.testing.allocator, findings[1]);
+    for (0..2) |_| {
+        _ = try sink.append(std.testing.allocator, findings[3]);
+        _ = try sink.append(std.testing.allocator, findings[4]);
+    }
+
+    sink.sortGroups();
+
+    try std.testing.expectEqualStrings("b-error", sink.items[0].rule);
+    try std.testing.expectEqual(@as(usize, 3), sink.items[0].occurrences);
+    try std.testing.expectEqualStrings("a-error", sink.items[1].rule);
+    try std.testing.expectEqualStrings("z-error", sink.items[2].rule);
+    try std.testing.expectEqualStrings("warning", sink.items[3].rule);
+    try std.testing.expectEqual(@as(usize, 20), sink.items[3].occurrences);
+    try std.testing.expectEqualStrings("info", sink.items[4].rule);
+
+    _ = try sink.append(std.testing.allocator, findings[3]);
+    try std.testing.expectEqual(@as(usize, 4), sink.items[0].occurrences);
 }
 
 test "[unit]: verbose diagnostic records do not allocate aggregation storage" {
