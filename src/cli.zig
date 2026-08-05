@@ -3,12 +3,24 @@
 //! Regular-file validation uses bounded stream input.
 
 const std = @import("std");
+const builtin = @import("builtin");
 const diagnostic = @import("diagnostic.zig");
 const output = @import("output.zig");
 const validate = @import("validate.zig");
 const version = @import("version.zig");
 
 const DiagnosticSink = diagnostic.DiagnosticSink;
+
+const Presentation = struct {
+    is_tty: bool = false,
+    auto_color: bool = false,
+};
+
+pub const ColorMode = enum {
+    auto,
+    always,
+    never,
+};
 
 /// Parsed `check` subcommand flags and input paths.
 pub const CheckCommand = struct {
@@ -18,6 +30,7 @@ pub const CheckCommand = struct {
     skip_semantic: bool = false,
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
+    color_mode: ColorMode = .auto,
     inputs: []const []const u8,
 
     /// Releases the owned input-path list. Path bytes remain borrowed from argv.
@@ -47,6 +60,8 @@ const ParseError = error{
     MissingBinarySize,
     MissingOboPath,
     InvalidValue,
+    MissingColorMode,
+    InvalidColorMode,
     Overflow,
 };
 
@@ -65,7 +80,15 @@ pub fn run(init: std.process.Init) !u8 {
     var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
 
-    const exit_code = runArgs(gpa, init.io, stdout, stderr, args) catch |err| {
+    const stdout_file = std.Io.File.stdout();
+    const is_tty = try fileIsTty(init.io, stdout_file);
+    const no_color = if (init.environ_map.get("NO_COLOR")) |value| value.len > 0 else false;
+    const force_color = if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len > 0 else false;
+    const presentation = Presentation{
+        .is_tty = is_tty,
+        .auto_color = try autoColorEnabled(init.io, stdout_file, init.environ_map, is_tty, no_color, force_color),
+    };
+    const exit_code = runArgsWithPresentation(gpa, init.io, stdout, stderr, args, presentation) catch |err| {
         // Preserve the original failure; output after a failed run is best effort.
         flushWriters(stdout, stderr) catch {};
         return err;
@@ -85,6 +108,51 @@ fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) std.Io.Writer.Er
     if (first_error) |err| return err;
 }
 
+fn fileIsTty(io: std.Io, file: std.Io.File) std.Io.Cancelable!bool {
+    if (builtin.os.tag == .linux) {
+        while (true) {
+            var window_size: std.posix.winsize = undefined;
+            const fd: usize = @bitCast(@as(isize, file.handle));
+            const rc = std.os.linux.syscall3(
+                .ioctl,
+                fd,
+                std.os.linux.T.IOCGWINSZ,
+                @intFromPtr(&window_size),
+            );
+            switch (std.os.linux.errno(rc)) {
+                .SUCCESS => return true,
+                .INTR => continue,
+                else => return false,
+            }
+        }
+    }
+    if (builtin.link_libc and builtin.os.tag != .windows) {
+        return std.c.isatty(file.handle) == 1;
+    }
+    return file.isTty(io);
+}
+
+fn autoColorEnabled(
+    io: std.Io,
+    file: std.Io.File,
+    environ: *const std.process.Environ.Map,
+    is_tty: bool,
+    no_color: bool,
+    force_color: bool,
+) std.Io.Cancelable!bool {
+    if (no_color) return false;
+    if (force_color) return true;
+    if (!is_tty) return false;
+    if (builtin.os.tag == .windows) {
+        return switch (try std.Io.Terminal.Mode.detect(io, file, false, false)) {
+            .escape_codes => true,
+            .no_color, .windows_api => false,
+        };
+    }
+    if (environ.get("TERM")) |term| return !std.mem.eql(u8, term, "dumb");
+    return true;
+}
+
 /// Runs borrowed argv through caller-provided writers, returning a CLI exit code.
 pub fn runArgs(
     allocator: std.mem.Allocator,
@@ -92,6 +160,17 @@ pub fn runArgs(
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
     args: []const []const u8,
+) !u8 {
+    return runArgsWithPresentation(allocator, io, stdout, stderr, args, .{});
+}
+
+fn runArgsWithPresentation(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    args: []const []const u8,
+    presentation: Presentation,
 ) !u8 {
     if (wantsHelp(args)) {
         try writeUsage(stdout);
@@ -117,6 +196,8 @@ pub fn runArgs(
         error.MissingBinarySize,
         error.MissingOboPath,
         error.InvalidValue,
+        error.MissingColorMode,
+        error.InvalidColorMode,
         error.Overflow,
         => {
             const parse_err: ParseError = @errorCast(err);
@@ -129,7 +210,7 @@ pub fn runArgs(
     defer command.deinit(allocator);
 
     return switch (command) {
-        .check => |check| try runCheck(allocator, io, stdout, check),
+        .check => |check| try runCheck(allocator, io, stdout, check, presentation),
     };
 }
 
@@ -148,6 +229,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var skip_semantic = false;
     var max_binary_size: ?usize = null;
     var obo_path: ?[]const u8 = null;
+    var color_mode: ColorMode = .auto;
 
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
@@ -174,6 +256,12 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
             i += 1;
             if (i >= args.len) return error.MissingOboPath;
             obo_path = args[i];
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--color")) {
+            i += 1;
+            if (i >= args.len) return error.MissingColorMode;
+            color_mode = parseColorMode(args[i]) orelse return error.InvalidColorMode;
             continue;
         }
         if (std.mem.eql(u8, arg, "--json")) {
@@ -214,6 +302,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         .skip_semantic = skip_semantic,
         .max_binary_size = max_binary_size,
         .obo_path = obo_path,
+        .color_mode = color_mode,
         .inputs = try input_paths.toOwnedSlice(allocator),
     } };
 }
@@ -244,15 +333,16 @@ fn runCheck(
     io: std.Io,
     writer: *std.Io.Writer,
     check: CheckCommand,
+    presentation: Presentation,
 ) !u8 {
     // Keep each mode's fixed output state out of the other modes' stack frames.
     // Combining them regresses payload-heavy parsing under ReleaseFast.
     return switch (check.output_mode) {
-        .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check }),
-        .verbose => @call(.never_inline, runCheckMode, .{ .verbose, allocator, io, writer, check }),
-        .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check }),
-        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check }),
-        .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check }),
+        .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check, presentation }),
+        .verbose => @call(.never_inline, runCheckMode, .{ .verbose, allocator, io, writer, check, presentation }),
+        .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check, {} }),
+        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, {} }),
+        .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check, {} }),
     };
 }
 
@@ -267,6 +357,7 @@ fn runCheckMode(
     io: std.Io,
     writer: *std.Io.Writer,
     check: CheckCommand,
+    presentation: if (mode == .text or mode == .verbose) Presentation else void,
 ) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     const State = switch (mode) {
@@ -290,7 +381,11 @@ fn runCheckMode(
     var context = validate.InvocationContext.init(allocator, io, options);
     defer context.deinit();
 
-    for (check.inputs) |path| {
+    for (check.inputs, 0..) |path, input_index| {
+        const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text or mode == .verbose)
+            if (presentation.is_tty) .now(io, .awake) else null
+        else
+            null;
         var diagnostics = DiagnosticSink.init(.{
             .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
             .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
@@ -300,10 +395,21 @@ fn runCheckMode(
         defer diagnostics.deinit(allocator);
 
         const result = context.validateOne(&diagnostics, path);
+        if (mode == .text or mode == .json) diagnostics.sortGroups();
         switch (mode) {
             .text, .verbose => {
                 state.addResult(result);
-                try output.renderTextFile(writer, diagnostics.items, &result, path);
+                try output.renderTextFile(writer, diagnostics.items, &result, path, .{
+                    .input_index = input_index,
+                    .input_count = check.inputs.len,
+                    .grouped = mode == .text,
+                    .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
+                    .color = switch (check.color_mode) {
+                        .auto => presentation.auto_color,
+                        .always => true,
+                        .never => false,
+                    },
+                });
             },
             .json => try state.writeFile(diagnostics.items, &result, path),
             .summary => state.addResult(result),
@@ -316,7 +422,11 @@ fn runCheckMode(
 
     return switch (mode) {
         .text, .verbose => exit_code: {
-            try output.renderTextFinal(writer, state);
+            if (check.inputs.len > 1) try output.renderTextFinal(writer, state, switch (check.color_mode) {
+                .auto => presentation.auto_color,
+                .always => true,
+                .never => false,
+            });
             break :exit_code diagnostic.exitCodeForSummary(state);
         },
         .json => exit_code: {
@@ -349,6 +459,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  --brief      Emit a compact grouped table.\n" ++
             "  --summary    Emit only aggregate status and severity counts.\n" ++
             "  --json       Emit grouped JSON schema 1 for CI and pipelines.\n" ++
+            "  --color MODE Colorize default output: auto, always, or never.\n" ++
             "  --skip-binary\n" ++
             "               Skip binary payload checks.\n" ++
             "  --skip-index Skip index offset and checksum checks.\n" ++
@@ -408,6 +519,8 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
         error.MissingBinarySize => try writer.writeAll("error: --max-binary-size requires a value"),
         error.MissingOboPath => try writer.writeAll("error: --obo requires a path"),
         error.InvalidValue => try writer.writeAll("error: invalid --max-binary-size value"),
+        error.MissingColorMode => try writer.writeAll("error: --color requires auto, always, or never"),
+        error.InvalidColorMode => try writer.writeAll("error: invalid --color mode (expected auto, always, or never)"),
         error.Overflow => try writer.writeAll("error: --max-binary-size value overflow (too large)"),
     }
 }
@@ -427,10 +540,18 @@ fn isKnownFlag(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--skip-semantic") or
         std.mem.eql(u8, arg, "--max-binary-size") or
         std.mem.eql(u8, arg, "--obo") or
+        std.mem.eql(u8, arg, "--color") or
         std.mem.eql(u8, arg, "--json") or
         std.mem.eql(u8, arg, "--summary") or
         std.mem.eql(u8, arg, "--brief") or
         std.mem.eql(u8, arg, "--verbose");
+}
+
+fn parseColorMode(value: []const u8) ?ColorMode {
+    if (std.mem.eql(u8, value, "auto")) return .auto;
+    if (std.mem.eql(u8, value, "always")) return .always;
+    if (std.mem.eql(u8, value, "never")) return .never;
+    return null;
 }
 
 // Bare K/M/G/T suffixes use binary units; KB/MB/GB use decimal units.
@@ -1002,7 +1123,7 @@ test "external entities report an XML contract diagnostic" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.structure.xml]: DTD or unsupported XML construct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "x001  DTD or unsupported XML construct [mzml.structure.xml]") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1027,9 +1148,42 @@ test "text output groups clean and corrupt inputs" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "input: fixtures/mzml/invalid/invalid-base64.mzML") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.binary.base64]: binary payload is not valid base64") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "location: byte=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete: errors (info=0 warnings=0 errors=1)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "x001  binary payload is not valid base64 [mzml.binary.base64]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "examples:\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "byte ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "spectrum ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete: errors | info 0, warnings 0, errors 1 | 1 groups") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
+test "[unit]: default output ranks grouped findings" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/tiny.pwiz.1.1.mzML",
+    };
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+    const rendered = stdout_writer.written();
+    const error_ten = std.mem.indexOf(u8, rendered, "x010  default binary array must not declare dataProcessingRef [mzml.binary.default-array]");
+    const error_three = std.mem.indexOf(u8, rendered, "x003  attribute must be an XML Schema anyURI [mzml.structure.attribute]");
+    const warning_four = std.mem.indexOf(u8, rendered, "x004  CV term name does not match the catalog name or a synonym [mzml.cv.name-mismatch]");
+    const info_nine = std.mem.indexOf(u8, rendered, "x009  unitName does not match the term's canonical name [mzml.cv.unit]");
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expect(error_ten != null);
+    try std.testing.expect(error_three != null);
+    try std.testing.expect(warning_four != null);
+    try std.testing.expect(info_nine != null);
+    try std.testing.expect(error_ten.? < error_three.?);
+    try std.testing.expect(error_three.? < warning_four.?);
+    try std.testing.expect(warning_four.? < info_nine.?);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1080,6 +1234,45 @@ test "[unit]: canonical verbose flag selects occurrence output" {
             try std.testing.expect(check.skip_index);
         },
     }
+}
+
+test "[unit]: canonical color flag selects forced color" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "--color",
+        "always",
+    };
+    var command = try parseArgs(std.testing.allocator, &argv);
+    defer command.deinit(std.testing.allocator);
+
+    switch (command) {
+        .check => |check| try std.testing.expectEqual(ColorMode.always, check.color_mode),
+    }
+}
+
+test "[unit]: color flag requires a mode" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "--color",
+    };
+
+    try std.testing.expectError(error.MissingColorMode, parseArgs(std.testing.allocator, &argv));
+}
+
+test "[unit]: color flag rejects an unknown mode" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "--color",
+        "sometimes",
+    };
+
+    try std.testing.expectError(error.InvalidColorMode, parseArgs(std.testing.allocator, &argv));
 }
 
 test "skipping binary checks keeps valid structure clean" {
@@ -1150,7 +1343,7 @@ test "[unit]: multi-file summary does not retain completed file results" {
         .output_mode = .summary,
         .skip_semantic = true,
         .inputs = inputs,
-    });
+    }, .{});
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
