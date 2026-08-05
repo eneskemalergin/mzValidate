@@ -34,7 +34,6 @@ I built mzValidate as a focused native validator for mzML. It checks XML syntax,
 mzValidate check sample.mzML
 mzValidate check sample.mzML --summary
 mzValidate check sample.mzML --brief
-mzValidate check sample.mzML --verbose
 mzValidate check sample.mzML --json > report.json
 mzValidate check --summary file1.mzML file2.mzML
 ```
@@ -105,7 +104,6 @@ mzValidate check [flags] <paths...>
 
 Output modes are mutually exclusive. The default groups identical findings by path, severity, rule, and message. Each group keeps an exact occurrence count and at most three example locations.
 
-- `--verbose`: emit every diagnostic occurrence and location
 - `--brief`: collapse groups across inputs into a compact count table
 - `--summary`: emit only aggregate status and occurrence counts
 - `--json`: emit the grouped versioned report described below

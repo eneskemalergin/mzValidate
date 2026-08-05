@@ -12,7 +12,6 @@ const Severity = diagnostic.Severity;
 /// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,
-    verbose,
     json,
     summary,
     brief,
@@ -22,7 +21,6 @@ pub const OutputMode = enum {
 pub const TextFileOptions = struct {
     input_index: usize = 0,
     input_count: usize = 1,
-    grouped: bool = true,
     elapsed_ns: ?i96 = null,
     color: bool = false,
 };
@@ -98,7 +96,7 @@ pub fn renderTextFile(
         diagnostics.len,
         @intFromBool(result.needsEmergencyDiagnostic()),
     ) catch std.math.maxInt(usize);
-    try writeFileResultLine(writer, result.*, finding_groups, options.grouped, options.elapsed_ns, options.color);
+    try writeFileResultLine(writer, result.*, finding_groups, options.elapsed_ns, options.color);
 }
 
 /// Writes the final text result block for an invocation.
@@ -222,7 +220,6 @@ fn writeFileResultLine(
     writer: *std.Io.Writer,
     result: diagnostic.FileResult,
     finding_groups: usize,
-    grouped: bool,
     elapsed_ns: ?i96,
     color: bool,
 ) std.Io.Writer.Error!void {
@@ -243,7 +240,7 @@ fn writeFileResultLine(
             result.totals.warnings,
             result.totals.errors,
         });
-        if (grouped) try writer.print(" | {d} groups", .{finding_groups});
+        try writer.print(" | {d} groups", .{finding_groups});
     }
     if (elapsed_ns) |nanoseconds| {
         try writer.writeAll(" | ");

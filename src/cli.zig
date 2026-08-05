@@ -282,12 +282,6 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
             output_mode_set = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--verbose")) {
-            if (output_mode_set and output_mode != .verbose) return error.ConflictingOutputMode;
-            output_mode = .verbose;
-            output_mode_set = true;
-            continue;
-        }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnexpectedFlag;
 
         try input_paths.append(allocator, arg);
@@ -339,7 +333,6 @@ fn runCheck(
     // Combining them regresses payload-heavy parsing under ReleaseFast.
     return switch (check.output_mode) {
         .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check, presentation }),
-        .verbose => @call(.never_inline, runCheckMode, .{ .verbose, allocator, io, writer, check, presentation }),
         .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check, {} }),
         .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, {} }),
         .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check, {} }),
@@ -357,16 +350,16 @@ fn runCheckMode(
     io: std.Io,
     writer: *std.Io.Writer,
     check: CheckCommand,
-    presentation: if (mode == .text or mode == .verbose) Presentation else void,
+    presentation: if (mode == .text) Presentation else void,
 ) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     const State = switch (mode) {
-        .text, .verbose, .summary => diagnostic.Summary,
+        .text, .summary => diagnostic.Summary,
         .json => output.JsonStream,
         .brief => BriefRunState,
     };
     var state: State = switch (mode) {
-        .text, .verbose, .summary => .{},
+        .text, .summary => .{},
         .json => try output.JsonStream.init(writer),
         .brief => .{},
     };
@@ -382,7 +375,7 @@ fn runCheckMode(
     defer context.deinit();
 
     for (check.inputs, 0..) |path, input_index| {
-        const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text or mode == .verbose)
+        const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text)
             if (presentation.is_tty) .now(io, .awake) else null
         else
             null;
@@ -397,12 +390,11 @@ fn runCheckMode(
         const result = context.validateOne(&diagnostics, path);
         if (mode == .text or mode == .json) diagnostics.sortGroups();
         switch (mode) {
-            .text, .verbose => {
+            .text => {
                 state.addResult(result);
                 try output.renderTextFile(writer, diagnostics.items, &result, path, .{
                     .input_index = input_index,
                     .input_count = check.inputs.len,
-                    .grouped = mode == .text,
                     .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
                     .color = switch (check.color_mode) {
                         .auto => presentation.auto_color,
@@ -421,7 +413,7 @@ fn runCheckMode(
     }
 
     return switch (mode) {
-        .text, .verbose => exit_code: {
+        .text => exit_code: {
             if (check.inputs.len > 1) try output.renderTextFinal(writer, state, switch (check.color_mode) {
                 .auto => presentation.auto_color,
                 .always => true,
@@ -455,7 +447,6 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Commands\n" ++
             "  check        Validate one or more mzML inputs in a single run.\n\n" ++
             "Options\n" ++
-            "  --verbose    Emit every diagnostic occurrence instead of grouped findings.\n" ++
             "  --brief      Emit a compact grouped table.\n" ++
             "  --summary    Emit only aggregate status and severity counts.\n" ++
             "  --json       Emit grouped JSON schema 1 for CI and pipelines.\n" ++
@@ -489,7 +480,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  mzValidate check sample.mzML\n" ++
             "  mzValidate check run-a.mzML run-b.mzML --summary\n" ++
             "  mzValidate check sample.mzML --json --skip-binary\n" ++
-            "  mzValidate check sample.mzML --verbose\n",
+            "  mzValidate check sample.mzML --json > report.json\n",
     );
 }
 
@@ -515,7 +506,7 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
                 try writer.writeAll("error: unexpected flag");
             }
         },
-        error.ConflictingOutputMode => try writer.writeAll("error: choose one of --verbose, --brief, --summary, or --json"),
+        error.ConflictingOutputMode => try writer.writeAll("error: choose one of --brief, --summary, or --json"),
         error.MissingBinarySize => try writer.writeAll("error: --max-binary-size requires a value"),
         error.MissingOboPath => try writer.writeAll("error: --obo requires a path"),
         error.InvalidValue => try writer.writeAll("error: invalid --max-binary-size value"),
@@ -543,8 +534,7 @@ fn isKnownFlag(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--color") or
         std.mem.eql(u8, arg, "--json") or
         std.mem.eql(u8, arg, "--summary") or
-        std.mem.eql(u8, arg, "--brief") or
-        std.mem.eql(u8, arg, "--verbose");
+        std.mem.eql(u8, arg, "--brief");
 }
 
 fn parseColorMode(value: []const u8) ?ColorMode {
@@ -1024,7 +1014,7 @@ test "conflicting output modes report a usage error" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of --verbose, --brief, --summary, or --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of --brief, --summary, or --json") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
@@ -1217,23 +1207,15 @@ test "[unit]: brief output aggregates repeated findings across inputs" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "[unit]: canonical verbose flag selects occurrence output" {
+test "[unit]: verbose flag is rejected" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
         "sample.mzML",
         "--verbose",
-        "--skip-index",
     };
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
 
-    switch (command) {
-        .check => |check| {
-            try std.testing.expectEqual(output.OutputMode.verbose, check.output_mode);
-            try std.testing.expect(check.skip_index);
-        },
-    }
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
 }
 
 test "[unit]: canonical color flag selects forced color" {
