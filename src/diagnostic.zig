@@ -138,15 +138,106 @@ pub const Severity = enum {
 pub const Location = struct {
     byte_offset: ?u64 = null,
     spectrum_index: ?usize = null,
+
+    fn isEmpty(location: Location) bool {
+        return location.byte_offset == null and location.spectrum_index == null;
+    }
+
+    fn eql(left: Location, right: Location) bool {
+        return left.byte_offset == right.byte_offset and left.spectrum_index == right.spectrum_index;
+    }
 };
 
-/// Describes one validation result. String fields borrow caller-owned storage.
+pub const max_diagnostic_example_locations = 3;
+
+const aggregation_linear_group_limit = 32;
+const aggregation_metadata_first_block_len = 8;
+const aggregation_metadata_block_len = 64;
+const group_index_empty = std.math.maxInt(usize);
+const diagnostic_fixed_rendered_bytes = 192;
+const grouped_diagnostic_fixed_rendered_bytes = 640;
+
+const EncodedLocation = struct {
+    byte_offset: u64 = 0,
+    spectrum_index: usize = 0,
+};
+
+const AggregationMetadata = struct {
+    locations: [max_diagnostic_example_locations - 1]EncodedLocation = @splat(.{}),
+    byte_offset_mask: u8 = 0,
+    spectrum_index_mask: u8 = 0,
+    count: u8 = 0,
+
+    fn location(metadata: *const AggregationMetadata, index: usize) Location {
+        std.debug.assert(index < metadata.count);
+        const bit = @as(u8, 1) << @intCast(index);
+        return .{
+            .byte_offset = if (metadata.byte_offset_mask & bit != 0)
+                metadata.locations[index].byte_offset
+            else
+                null,
+            .spectrum_index = if (metadata.spectrum_index_mask & bit != 0)
+                metadata.locations[index].spectrum_index
+            else
+                null,
+        };
+    }
+
+    fn addLocation(metadata: *AggregationMetadata, primary: Location, location_value: Location) void {
+        if (location_value.isEmpty() or primary.eql(location_value)) return;
+        for (0..metadata.count) |index| {
+            if (metadata.location(index).eql(location_value)) return;
+        }
+        if (metadata.count == metadata.locations.len) return;
+
+        const index: usize = metadata.count;
+        const bit = @as(u8, 1) << @intCast(index);
+        if (location_value.byte_offset) |byte_offset| {
+            metadata.locations[index].byte_offset = byte_offset;
+            metadata.byte_offset_mask |= bit;
+        }
+        if (location_value.spectrum_index) |spectrum_index| {
+            metadata.locations[index].spectrum_index = spectrum_index;
+            metadata.spectrum_index_mask |= bit;
+        }
+        metadata.count += 1;
+    }
+};
+
+/// Describes one validation finding group. String fields borrow caller-owned storage.
 pub const Diagnostic = struct {
     severity: Severity,
     rule: []const u8,
     location: Location = .{},
     path: ?[]const u8 = null,
     message: []const u8,
+    occurrences: usize = 1,
+    aggregation: ?*AggregationMetadata = null,
+
+    pub fn exampleLocationCount(item: Diagnostic) usize {
+        const additional_count = if (item.aggregation) |metadata| metadata.count else 0;
+        return @intFromBool(!item.location.isEmpty()) + additional_count;
+    }
+
+    pub fn exampleLocation(item: Diagnostic, index: usize) Location {
+        std.debug.assert(index < item.exampleLocationCount());
+        if (!item.location.isEmpty()) {
+            if (index == 0) return item.location;
+            return item.aggregation.?.location(index - 1);
+        }
+        return item.aggregation.?.location(index);
+    }
+
+    fn addOccurrence(item: *Diagnostic, location: Location) void {
+        item.occurrences = saturatingAdd(item.occurrences, 1);
+        const metadata = item.aggregation orelse return;
+        if (location.isEmpty()) return;
+        if (item.location.isEmpty()) {
+            item.location = location;
+            return;
+        }
+        metadata.addLocation(item.location, location);
+    }
 };
 
 /// Per-file borrowed detail with bounded retention and complete severity totals.
@@ -156,6 +247,13 @@ pub const DiagnosticSink = struct {
     totals: Totals = .{},
     dropped: Totals = .{},
     retained_bytes: usize = 0,
+    aggregation_blocks: std.ArrayList([]AggregationMetadata) = .empty,
+    aggregation_count: usize = 0,
+    group_index: []usize = &.{},
+    group_index_disabled: bool = false,
+    peak_allocated_bytes: usize = 0,
+    peak_aggregation_metadata_bytes: usize = 0,
+    peak_group_index_bytes: usize = 0,
     limits: Limits = .{},
     configured: bool = false,
 
@@ -164,6 +262,7 @@ pub const DiagnosticSink = struct {
         max_diagnostics: usize = 4096,
         max_rendered_bytes: usize = 4 * 1024 * 1024,
         retain_details: bool = true,
+        aggregate_occurrences: bool = false,
     };
 
     /// Snapshot used to calculate totals for one validation scope.
@@ -196,7 +295,21 @@ pub const DiagnosticSink = struct {
             sink.addTotal(item.severity);
             return false;
         }
-        const item_bytes = diagnosticBytes(item);
+        var group_hash: ?u64 = null;
+        if (sink.limits.aggregate_occurrences) {
+            const existing_index = if (sink.group_index.len > 0) indexed: {
+                const hash = diagnosticGroupHash(&item);
+                group_hash = hash;
+                break :indexed sink.findIndexedGroup(&item, hash);
+            } else sink.findLinearGroup(&item);
+            if (existing_index) |index| {
+                const retained = &sink.items[index];
+                retained.addOccurrence(item.location);
+                sink.addTotal(item.severity);
+                return true;
+            }
+        }
+        const item_bytes = diagnosticBytes(item, sink.limits.aggregate_occurrences);
         const count_limit = sink.items.len >= sink.limits.max_diagnostics;
         const next_bytes = std.math.add(usize, sink.retained_bytes, item_bytes) catch {
             sink.addDropped(item.severity);
@@ -211,11 +324,24 @@ pub const DiagnosticSink = struct {
             sink.addDropped(item.severity);
             return false;
         };
+        if (sink.limits.aggregate_occurrences and !sink.group_index_disabled) {
+            sink.prepareGroupIndex(allocator, requested);
+        }
         try sink.ensureTotalCapacity(allocator, requested);
+        const aggregation = if (sink.limits.aggregate_occurrences)
+            try sink.allocateAggregationMetadata(allocator)
+        else
+            null;
         const index = sink.items.len;
         sink.items.len = requested;
         sink.items[index] = item;
+        sink.items[index].occurrences = 1;
+        sink.items[index].aggregation = aggregation;
+        if (sink.group_index.len > 0) {
+            sink.insertGroupIndex(group_hash orelse diagnosticGroupHash(&sink.items[index]), index);
+        }
         sink.retained_bytes = next_bytes;
+        sink.updateAllocationPeaks();
         sink.addTotal(item.severity);
         return true;
     }
@@ -234,20 +360,29 @@ pub const DiagnosticSink = struct {
             if (allocator.remap(old_memory, new_capacity)) |new_items| {
                 sink.items = new_items[0..old_len];
                 sink.capacity = new_items.len;
+                sink.updateAllocationPeaks();
                 return;
             }
         }
 
         const new_items = try allocator.alloc(Diagnostic, new_capacity);
+        sink.peak_allocated_bytes = @max(
+            sink.peak_allocated_bytes,
+            saturatingAdd(sink.allocatedBytes(), saturatingMul(new_capacity, @sizeOf(Diagnostic))),
+        );
         @memcpy(new_items[0..sink.items.len], sink.items);
         if (sink.capacity > 0) allocator.free(old_memory);
         sink.items = new_items[0..old_len];
         sink.capacity = new_capacity;
+        sink.updateAllocationPeaks();
     }
 
     /// Releases retained detail and resets the sink to its unconfigured state.
     pub fn deinit(sink: *DiagnosticSink, allocator: std.mem.Allocator) void {
         if (sink.capacity > 0) allocator.free(sink.items.ptr[0..sink.capacity]);
+        for (sink.aggregation_blocks.items) |block| allocator.free(block);
+        sink.aggregation_blocks.deinit(allocator);
+        if (sink.group_index.len > 0) allocator.free(sink.group_index);
         sink.* = .empty;
     }
 
@@ -257,6 +392,154 @@ pub const DiagnosticSink = struct {
         sink.totals = .{};
         sink.dropped = .{};
         sink.retained_bytes = 0;
+        sink.aggregation_count = 0;
+        if (sink.group_index.len > 0) @memset(sink.group_index, group_index_empty);
+    }
+
+    fn allocateAggregationMetadata(
+        sink: *DiagnosticSink,
+        allocator: std.mem.Allocator,
+    ) !*AggregationMetadata {
+        const block_index, const item_index = if (sink.aggregation_count < aggregation_metadata_first_block_len)
+            .{ 0, sink.aggregation_count }
+        else adjusted: {
+            const adjusted_count = sink.aggregation_count - aggregation_metadata_first_block_len;
+            break :adjusted .{
+                1 + adjusted_count / aggregation_metadata_block_len,
+                adjusted_count % aggregation_metadata_block_len,
+            };
+        };
+        if (block_index == sink.aggregation_blocks.items.len) {
+            const block_len: usize = if (block_index == 0)
+                aggregation_metadata_first_block_len
+            else
+                aggregation_metadata_block_len;
+            const block = try allocator.alloc(AggregationMetadata, block_len);
+            const block_bytes = saturatingMul(block_len, @sizeOf(AggregationMetadata));
+            sink.peak_aggregation_metadata_bytes = @max(
+                sink.peak_aggregation_metadata_bytes,
+                saturatingAdd(sink.aggregationMetadataCapacityBytes(), block_bytes),
+            );
+            sink.peak_allocated_bytes = @max(
+                sink.peak_allocated_bytes,
+                saturatingAdd(sink.allocatedBytes(), block_bytes),
+            );
+            errdefer allocator.free(block);
+            try sink.aggregation_blocks.append(allocator, block);
+        }
+        const metadata = &sink.aggregation_blocks.items[block_index][item_index];
+        metadata.* = .{};
+        sink.aggregation_count += 1;
+        return metadata;
+    }
+
+    fn findLinearGroup(sink: *const DiagnosticSink, item: *const Diagnostic) ?usize {
+        for (sink.items, 0..) |*retained, index| {
+            if (sameDiagnosticGroup(retained, item)) return index;
+        }
+        return null;
+    }
+
+    fn findIndexedGroup(sink: *const DiagnosticSink, item: *const Diagnostic, hash: u64) ?usize {
+        var slot = @as(usize, @truncate(hash)) & (sink.group_index.len - 1);
+        while (true) {
+            const item_index = sink.group_index[slot];
+            if (item_index == group_index_empty) return null;
+            if (sameDiagnosticGroup(&sink.items[item_index], item)) return item_index;
+            slot = (slot + 1) & (sink.group_index.len - 1);
+        }
+    }
+
+    fn disableGroupIndex(sink: *DiagnosticSink, allocator: std.mem.Allocator) void {
+        if (sink.group_index.len > 0) allocator.free(sink.group_index);
+        sink.group_index = &.{};
+        sink.group_index_disabled = true;
+    }
+
+    fn prepareGroupIndex(
+        sink: *DiagnosticSink,
+        allocator: std.mem.Allocator,
+        requested_groups: usize,
+    ) void {
+        sink.ensureGroupIndexCapacity(allocator, requested_groups) catch {
+            sink.disableGroupIndex(allocator);
+        };
+    }
+
+    fn ensureGroupIndexCapacity(
+        sink: *DiagnosticSink,
+        allocator: std.mem.Allocator,
+        requested_groups: usize,
+    ) !void {
+        if (sink.group_index.len == 0 and requested_groups < aggregation_linear_group_limit) return;
+        const required_slots = std.math.mul(usize, requested_groups, 2) catch return error.OutOfMemory;
+        if (required_slots <= sink.group_index.len) return;
+
+        var new_len: usize = aggregation_linear_group_limit * 2;
+        while (new_len < required_slots) {
+            new_len = std.math.mul(usize, new_len, 2) catch return error.OutOfMemory;
+        }
+        const new_index = try allocator.alloc(usize, new_len);
+        const new_index_bytes = saturatingMul(new_len, @sizeOf(usize));
+        sink.peak_group_index_bytes = @max(
+            sink.peak_group_index_bytes,
+            saturatingAdd(sink.groupIndexCapacityBytes(), new_index_bytes),
+        );
+        sink.peak_allocated_bytes = @max(
+            sink.peak_allocated_bytes,
+            saturatingAdd(sink.allocatedBytes(), new_index_bytes),
+        );
+        @memset(new_index, group_index_empty);
+        const old_index = sink.group_index;
+        sink.group_index = new_index;
+        for (sink.items, 0..) |*retained, index| {
+            sink.insertGroupIndex(diagnosticGroupHash(retained), index);
+        }
+        if (old_index.len > 0) allocator.free(old_index);
+    }
+
+    fn insertGroupIndex(sink: *DiagnosticSink, hash: u64, item_index: usize) void {
+        var slot = @as(usize, @truncate(hash)) & (sink.group_index.len - 1);
+        while (sink.group_index[slot] != group_index_empty) {
+            slot = (slot + 1) & (sink.group_index.len - 1);
+        }
+        sink.group_index[slot] = item_index;
+    }
+
+    fn diagnosticCapacityBytes(sink: *const DiagnosticSink) usize {
+        return saturatingMul(sink.capacity, @sizeOf(Diagnostic));
+    }
+
+    fn aggregationMetadataCapacityBytes(sink: *const DiagnosticSink) usize {
+        var bytes = saturatingMul(sink.aggregation_blocks.capacity, @sizeOf([]AggregationMetadata));
+        for (sink.aggregation_blocks.items) |block| {
+            bytes = saturatingAdd(bytes, saturatingMul(block.len, @sizeOf(AggregationMetadata)));
+        }
+        return bytes;
+    }
+
+    fn groupIndexCapacityBytes(sink: *const DiagnosticSink) usize {
+        return saturatingMul(sink.group_index.len, @sizeOf(usize));
+    }
+
+    pub fn allocatedBytes(sink: *const DiagnosticSink) usize {
+        return saturatingAdd(
+            sink.diagnosticCapacityBytes(),
+            saturatingAdd(sink.aggregationMetadataCapacityBytes(), sink.groupIndexCapacityBytes()),
+        );
+    }
+
+    pub fn peakAllocatedBytes(sink: *const DiagnosticSink) usize {
+        return sink.peak_allocated_bytes;
+    }
+
+    fn updateAllocationPeaks(sink: *DiagnosticSink) void {
+        sink.peak_allocated_bytes = @max(sink.peak_allocated_bytes, sink.allocatedBytes());
+        sink.peak_aggregation_metadata_bytes = @max(
+            sink.peak_aggregation_metadata_bytes,
+            sink.aggregationMetadataCapacityBytes(),
+        );
+        sink.peak_group_index_bytes = @max(sink.peak_group_index_bytes, sink.groupIndexCapacityBytes());
     }
 
     pub fn mark(sink: *const DiagnosticSink) Mark {
@@ -294,8 +577,49 @@ pub const DiagnosticSink = struct {
     }
 };
 
-fn diagnosticBytes(item: Diagnostic) usize {
-    var bytes: usize = 192;
+fn sameDiagnosticGroup(left: *const Diagnostic, right: *const Diagnostic) bool {
+    return left.severity == right.severity and
+        std.mem.eql(u8, left.rule, right.rule) and
+        optionalStringEql(left.path, right.path) and
+        std.mem.eql(u8, left.message, right.message);
+}
+
+fn diagnosticGroupHash(item: *const Diagnostic) u64 {
+    var hash: u64 = 0xcbf29ce484222325;
+    hashByte(&hash, @intFromEnum(item.severity));
+    hashSlice(&hash, item.rule);
+    if (item.path) |path| {
+        hashByte(&hash, 1);
+        hashSlice(&hash, path);
+    } else {
+        hashByte(&hash, 0);
+    }
+    hashSlice(&hash, item.message);
+    return hash;
+}
+
+fn hashSlice(hash: *u64, value: []const u8) void {
+    for (value) |byte| hashByte(hash, byte);
+    hashByte(hash, 0xff);
+}
+
+fn hashByte(hash: *u64, byte: u8) void {
+    hash.* = (hash.* ^ byte) *% 0x100000001b3;
+}
+
+fn optionalStringEql(left: ?[]const u8, right: ?[]const u8) bool {
+    if (left) |left_value| {
+        if (right) |right_value| return std.mem.eql(u8, left_value, right_value);
+        return false;
+    }
+    return right == null;
+}
+
+fn diagnosticBytes(item: Diagnostic, grouped: bool) usize {
+    var bytes: usize = if (grouped)
+        grouped_diagnostic_fixed_rendered_bytes
+    else
+        diagnostic_fixed_rendered_bytes;
     bytes = saturatingAdd(bytes, saturatingMul(item.rule.len, 6));
     bytes = saturatingAdd(bytes, saturatingMul(item.message.len, 6));
     if (item.path) |path| bytes = saturatingAdd(bytes, saturatingMul(path.len, 6));
@@ -395,7 +719,8 @@ pub const Totals = struct {
 /// cover allocator-owned compressed, flate, and libdeflate output capacities;
 /// the opaque allocation owned by libdeflate's decompressor is external and
 /// excluded because its ABI does not expose an allocation size. Diagnostic
-/// bytes cover the sink's retained record capacity at file finalization.
+/// bytes cover retained records plus aggregation metadata and the group index
+/// at file finalization. Aggregation subfields expose those side allocations.
 pub const ResourceUsage = struct {
     parser_current_bytes: usize = 0,
     parser_peak_bytes: usize = 0,
@@ -415,6 +740,10 @@ pub const ResourceUsage = struct {
     semantic_param_group_peak_bytes: usize = 0,
     diagnostic_current_bytes: usize = 0,
     diagnostic_peak_bytes: usize = 0,
+    diagnostic_group_metadata_current_bytes: usize = 0,
+    diagnostic_group_metadata_peak_bytes: usize = 0,
+    diagnostic_group_index_current_bytes: usize = 0,
+    diagnostic_group_index_peak_bytes: usize = 0,
 };
 
 fn BoundedFailureText(comptime capacity: usize) type {
@@ -557,9 +886,15 @@ pub const FileResult = struct {
         result.totals = sink.totalsSince(mark_value);
         result.dropped_diagnostics = sink.droppedSince(mark_value);
         result.diagnostics_truncated = result.diagnostics_truncated or sink.truncatedSince(mark_value);
-        const capacity_bytes = std.math.mul(usize, sink.capacity, @sizeOf(Diagnostic)) catch std.math.maxInt(usize);
+        const capacity_bytes = sink.allocatedBytes();
         result.resource_usage.diagnostic_current_bytes = capacity_bytes;
-        result.resource_usage.diagnostic_peak_bytes = capacity_bytes;
+        result.resource_usage.diagnostic_peak_bytes = sink.peak_allocated_bytes;
+        const metadata_bytes = sink.aggregationMetadataCapacityBytes();
+        result.resource_usage.diagnostic_group_metadata_current_bytes = metadata_bytes;
+        result.resource_usage.diagnostic_group_metadata_peak_bytes = sink.peak_aggregation_metadata_bytes;
+        const index_bytes = sink.groupIndexCapacityBytes();
+        result.resource_usage.diagnostic_group_index_current_bytes = index_bytes;
+        result.resource_usage.diagnostic_group_index_peak_bytes = sink.peak_group_index_bytes;
         result.finish();
     }
 
@@ -656,11 +991,11 @@ pub const Summary = struct {
 /// Tallies diagnostics by severity for renderers and exit-code mapping.
 pub fn count(diagnostics: []const Diagnostic) Totals {
     var totals: Totals = .{};
-    for (diagnostics) |diagnostic| {
-        switch (diagnostic.severity) {
-            .info => totals.info = saturatingAdd(totals.info, 1),
-            .warning => totals.warnings = saturatingAdd(totals.warnings, 1),
-            .@"error" => totals.errors = saturatingAdd(totals.errors, 1),
+    for (diagnostics) |item| {
+        switch (item.severity) {
+            .info => totals.info = saturatingAdd(totals.info, item.occurrences),
+            .warning => totals.warnings = saturatingAdd(totals.warnings, item.occurrences),
+            .@"error" => totals.errors = saturatingAdd(totals.errors, item.occurrences),
         }
     }
     return totals;
@@ -879,6 +1214,156 @@ test "[unit]: diagnostic sink cleans every growth allocation failure" {
         diagnosticGrowthAllocationCheck,
         .{},
     );
+}
+
+test "[unit]: diagnostic sink aggregates occurrences and bounds example locations" {
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    for (0..5) |index| {
+        _ = try sink.append(std.testing.allocator, .{
+            .severity = .@"error",
+            .rule = "test.repeated",
+            .path = "input.mzML",
+            .location = .{ .byte_offset = index, .spectrum_index = index },
+            .message = "repeated finding",
+        });
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expectEqual(@as(usize, 5), sink.items[0].occurrences);
+    try std.testing.expectEqual(@as(usize, max_diagnostic_example_locations), sink.items[0].exampleLocationCount());
+    try std.testing.expectEqual(@as(?u64, 0), sink.items[0].exampleLocation(0).byte_offset);
+    try std.testing.expectEqual(@as(?u64, 2), sink.items[0].exampleLocation(2).byte_offset);
+    try std.testing.expectEqual(@as(usize, 5), sink.totals.errors);
+}
+
+test "[unit]: diagnostic sink keeps distinct grouping keys separate" {
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+    _ = try sink.append(std.testing.allocator, .{
+        .severity = .warning,
+        .rule = "test.rule",
+        .path = "first.mzML",
+        .message = "finding",
+    });
+    _ = try sink.append(std.testing.allocator, .{
+        .severity = .warning,
+        .rule = "test.rule",
+        .path = "second.mzML",
+        .message = "finding",
+    });
+
+    try std.testing.expectEqual(@as(usize, 2), sink.items.len);
+}
+
+test "[unit]: diagnostic grouping index preserves exact keys and bounded allocation" {
+    const group_count = 128;
+    var keys: [group_count][16]u8 = undefined;
+    var lengths: [group_count]usize = undefined;
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+    const mark_value = sink.mark();
+
+    for (&keys, &lengths, 0..) |*key, *length, index| {
+        const rendered = try std.fmt.bufPrint(key, "rule-{d}", .{index});
+        length.* = rendered.len;
+        _ = try sink.append(std.testing.allocator, .{
+            .severity = .warning,
+            .rule = key[0..length.*],
+            .message = "indexed finding",
+            .location = .{ .spectrum_index = index },
+        });
+    }
+    for (&keys, lengths) |*key, length| {
+        _ = try sink.append(std.testing.allocator, .{
+            .severity = .warning,
+            .rule = key[0..length],
+            .message = "indexed finding",
+        });
+    }
+
+    try std.testing.expect(sink.group_index.len >= group_count * 2);
+    try std.testing.expectEqual(@as(usize, group_count), sink.items.len);
+    for (sink.items) |item| try std.testing.expectEqual(@as(usize, 2), item.occurrences);
+    try std.testing.expect(sink.allocatedBytes() <= 32 * 1024);
+
+    var result = FileResult.init(stageBit(.input));
+    result.completeStage(.input);
+    result.finalizeSink(&sink, mark_value);
+    try std.testing.expectEqual(sink.allocatedBytes(), result.resource_usage.diagnostic_current_bytes);
+    try std.testing.expect(result.resource_usage.diagnostic_peak_bytes >= result.resource_usage.diagnostic_current_bytes);
+    try std.testing.expectEqual(
+        sink.aggregationMetadataCapacityBytes(),
+        result.resource_usage.diagnostic_group_metadata_current_bytes,
+    );
+    try std.testing.expectEqual(
+        sink.groupIndexCapacityBytes(),
+        result.resource_usage.diagnostic_group_index_current_bytes,
+    );
+    try std.testing.expect(
+        result.resource_usage.diagnostic_group_index_peak_bytes >=
+            result.resource_usage.diagnostic_group_index_current_bytes,
+    );
+}
+
+test "[unit]: optional grouping index failure keeps exact linear grouping" {
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{
+        .fail_index = 0,
+    });
+    sink.prepareGroupIndex(failing.allocator(), aggregation_linear_group_limit);
+
+    try std.testing.expect(sink.group_index_disabled);
+    try std.testing.expectEqual(@as(usize, 0), sink.group_index.len);
+
+    const item = Diagnostic{
+        .severity = .warning,
+        .rule = "fallback",
+        .path = "test.mzML",
+        .message = "same finding",
+        .location = .{ .byte_offset = 1 },
+    };
+    _ = try sink.append(std.testing.allocator, item);
+    _ = try sink.append(std.testing.allocator, item);
+
+    try std.testing.expectEqual(@as(usize, 1), sink.items.len);
+    try std.testing.expectEqual(@as(usize, 2), sink.items[0].occurrences);
+}
+
+test "[unit]: verbose diagnostic records do not allocate aggregation storage" {
+    var sink = DiagnosticSink.init(.{});
+    defer sink.deinit(std.testing.allocator);
+
+    _ = try sink.append(std.testing.allocator, .{
+        .severity = .info,
+        .rule = "test.verbose",
+        .message = "one occurrence",
+    });
+
+    try std.testing.expectEqual(@as(usize, 0), sink.aggregationMetadataCapacityBytes());
+    try std.testing.expectEqual(@as(usize, 0), sink.groupIndexCapacityBytes());
+    try std.testing.expect(@sizeOf(Diagnostic) <= 112);
+}
+
+test "[unit]: grouped rendered-byte estimate reserves complete group syntax" {
+    var sink = DiagnosticSink.init(.{
+        .aggregate_occurrences = true,
+        .max_rendered_bytes = grouped_diagnostic_fixed_rendered_bytes - 1,
+    });
+    defer sink.deinit(std.testing.allocator);
+
+    const retained = try sink.append(std.testing.allocator, .{
+        .severity = .warning,
+        .rule = "r",
+        .message = "m",
+    });
+
+    try std.testing.expect(!retained);
+    try std.testing.expectEqual(@as(usize, 0), sink.items.len);
+    try std.testing.expectEqual(Totals{ .warnings = 1 }, sink.dropped);
 }
 
 test "[unit]: diagnostic sink preserves ownership when remap growth fails" {

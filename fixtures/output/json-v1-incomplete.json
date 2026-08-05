@@ -6,6 +6,7 @@
       "completion": "incomplete",
       "status": "errors-present",
       "totals": {"info": 0, "warnings": 0, "errors": 1},
+      "finding_groups": 1,
       "diagnostics_truncated": false,
       "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
       "first_failure": {
@@ -21,7 +22,8 @@
           "severity": "error",
           "rule": "runtime.file-open",
           "path": "missing-p51.mzML",
-          "location": {"byte_offset": null, "spectrum_index": null},
+          "occurrences": 1,
+          "example_locations": [],
           "message": "unable to stat input file"
         }
       ]
@@ -32,6 +34,7 @@
     "status": "errors-present",
     "files": 1,
     "incomplete_files": 1,
+    "finding_groups": 1,
     "totals": {"info": 0, "warnings": 0, "errors": 1},
     "diagnostics_truncated": false,
     "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},

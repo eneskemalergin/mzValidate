@@ -9,7 +9,7 @@
 </p>
 
 <p align="center">
-  <img src="https://img.shields.io/badge/version-0.1.8-blue?style=flat-square" alt="version 0.1.8">
+  <img src="https://img.shields.io/badge/version-0.1.10-blue?style=flat-square" alt="version 0.1.10">
   <img src="https://img.shields.io/badge/zig-0.16.0-F7A41D?style=flat-square&logo=zig&logoColor=white" alt="Zig 0.16.0">
   <img src="https://img.shields.io/badge/status-development-green?style=flat-square" alt="status: development">
   <br/>
@@ -32,10 +32,11 @@ I built mzValidate as a focused native validator for mzML. It checks XML syntax,
 
 ```sh
 mzValidate check sample.mzML
-mzValidate check sample.mzML -summary
-mzValidate check sample.mzML -brief
-mzValidate check sample.mzML -json > report.json
-mzValidate check -summary file1.mzML file2.mzML
+mzValidate check sample.mzML --summary
+mzValidate check sample.mzML --brief
+mzValidate check sample.mzML --verbose
+mzValidate check sample.mzML --json > report.json
+mzValidate check --summary file1.mzML file2.mzML
 ```
 
 Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
@@ -102,15 +103,16 @@ Add `-Denable-libdeflate=false` to the relevant command when changing the fallba
 mzValidate check [flags] <paths...>
 ```
 
-Output modes (pick one). The default format prints one line per diagnostic with the byte offset and rule ID:
+Output modes are mutually exclusive. The default groups identical findings by path, severity, rule, and message. Each group keeps an exact occurrence count and at most three example locations.
 
-- `-summary`: single-line aggregate status (clean/warnings-only/errors-present with counts)
-- `-brief`: groups identical diagnostics by rule with occurrence counts; useful for spotting patterns in files with thousands of findings
-- `-json`: emits the versioned result report described below; designed for CI pipelines and programmatic consumption
+- `--verbose`: emit every diagnostic occurrence and location
+- `--brief`: collapse groups across inputs into a compact count table
+- `--summary`: emit only aggregate status and occurrence counts
+- `--json`: emit the grouped versioned report described below
 
 ### JSON result contract
 
-JSON schema version 1 records every file result in input order and one invocation summary. Clean files remain visible with an empty `diagnostics` array.
+JSON schema version 1 records grouped findings for every file in input order and one invocation summary. Clean files remain visible with an empty `diagnostics` array.
 
 ```json
 {
@@ -120,6 +122,7 @@ JSON schema version 1 records every file result in input order and one invocatio
       "path": "sample.mzML",
       "completion": "complete",
       "status": "clean",
+      "finding_groups": 0,
       "totals": { "info": 0, "warnings": 0, "errors": 0 },
       "diagnostics_truncated": false,
       "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
@@ -132,6 +135,7 @@ JSON schema version 1 records every file result in input order and one invocatio
     "status": "clean",
     "files": 1,
     "incomplete_files": 0,
+    "finding_groups": 0,
     "totals": { "info": 0, "warnings": 0, "errors": 0 },
     "diagnostics_truncated": false,
     "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
@@ -140,7 +144,7 @@ JSON schema version 1 records every file result in input order and one invocatio
 }
 ```
 
-`completion` is `complete` only when every enabled stage finishes. `status` is `clean`, `warnings-only`, or `errors-present`; an incomplete result is always `errors-present`. Severity totals count every finding, including details omitted after a retention limit. `diagnostics_truncated` and `dropped_diagnostics` report that omission explicitly. When detail is dropped, `diagnostics` ends with a `runtime.diagnostics-truncated` renderer notice; that notice is not an additional finding and is not added to the totals. `first_failure` is either `null` or an object containing `stage`, `reason`, `rule`, `message`, `path`, and `location`.
+`completion` is `complete` only when every enabled stage finishes. `status` is `clean`, `warnings-only`, or `errors-present`; an incomplete result is always `errors-present`. `finding_groups` counts retained groups, while severity totals count every occurrence, including detail omitted after a retention limit. Each diagnostic group contains `occurrences` and up to three `example_locations`. `diagnostics_truncated` and `dropped_diagnostics` report omitted occurrences explicitly. When detail is dropped, `diagnostics` ends with a `runtime.diagnostics-truncated` renderer notice; that notice is not an additional finding and is not added to totals or `finding_groups`. `first_failure` is either `null` or an object containing `stage`, `reason`, `rule`, `message`, `path`, and `location`.
 
 Rule IDs are the stable machine contract. Human-readable `message` text is separate and may improve without changing the rule ID. A JSON schema version changes only when consumers must handle an incompatible shape or meaning change.
 
@@ -148,7 +152,7 @@ Rule IDs are the stable machine contract. Human-readable `message` text is separ
 
 `CheckOptions` contains values except for `obo_path`. `InvocationContext.init` borrows that optional path only while it builds the catalog, then owns the parsed catalog until `deinit`. The allocator and `std.Io` handle must remain valid for the context lifetime. Path validation reads regular files through a bounded stream.
 
-`InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array, but each retained diagnostic string still borrows its original storage and must be rendered or cleared before that storage expires. `DiagnosticSink.append` counts every item and returns `true` only when it retained that item's detail. A sink configured with `retain_details = false` returns `false` without incrementing its dropped-detail totals. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
+`InvocationContext.validateOne`, `checkSliceResult`, and `checkReaderResult` borrow their path, input slice, or reader for the call. A `DiagnosticSink` owns its retained record array and, when aggregation is enabled, bounded example-location blocks and an adaptive group index. Each retained diagnostic string still borrows its original storage. A copied grouped `Diagnostic` and its example-location accessors remain valid only until the owning sink is cleared or deinitialized, so retained detail must be rendered before then. `DiagnosticSink.append` counts every occurrence and returns `true` only when it retained that finding's detail. With `aggregate_occurrences = true`, findings sharing path, severity, rule, and message form one group with an exact occurrence count and at most three distinct example locations. Small group sets use a linear scan; larger sets use a collision-safe bounded index. If optional index allocation fails, grouping continues with the exact linear path. A sink configured with `retain_details = false` returns `false` without incrementing its dropped-detail totals. Parser events are shorter lived: their slices expire at the next `Parser.next()` call.
 
 `FileResult` is a self-contained value. It does not reference parser buffers, file-local validation state, the semantic catalog, or diagnostic storage. Its `FirstFailure` owns bounded copies of the rule, message, and path; the accessor slices borrow the `FirstFailure` value itself. The fixed capacities are 64 bytes for a rule ID, 512 bytes for a message, and `std.Io.Dir.max_path_bytes` for a path. An overlong value is copied as a prefix ending in `...`, and `FirstFailure.metadataTruncated()` reports that condition.
 
@@ -156,18 +160,18 @@ The CLI is the reference caller. It creates one invocation context, validates ex
 
 Validation phases (each flag disables one phase). By default all phases run:
 
-- `-skip-binary`: skip base64 decoding, zlib decompression, array length cross-checks, and precision validation
-- `-skip-index`: skip index offset verification and SHA-1 checksum validation
-- `-skip-semantic`: skip CV term resolution, contradiction detection, and reference resolution
+- `--skip-binary`: skip base64 decoding, zlib decompression, array length cross-checks, and precision validation
+- `--skip-index`: skip index offset verification and SHA-1 checksum validation
+- `--skip-semantic`: skip CV term resolution, contradiction detection, and reference resolution
 
 I/O and limits:
 
-- `-max-binary-size N`: reject any binary array whose `encodedLength` exceeds N; accepts K, M, G, T suffixes (1024-based)
-- `-obo <path>`: replace the embedded OBO catalog with a custom file; useful for testing a deliberate catalog snapshot
+- `--max-binary-size N`: reject any binary array whose `encodedLength` exceeds N; accepts K, M, G, T suffixes (1024-based)
+- `--obo <path>`: replace the embedded OBO catalog with a custom file; useful for testing a deliberate catalog snapshot
 
 Informational:
 
-- `-version`, `--version`: print the version number and exit
+- `--version`: print the version number and exit
 
 ## Performance
 
@@ -238,7 +242,7 @@ Category header rows align with the Validation sections above.
 | `mzml.binary.compression`        | error              | Conflicting or unsupported compression terms                                          |
 | `mzml.binary.precision-mismatch` | error              | Declared precision does not match payload                                             |
 | `mzml.binary.length-mismatch`    | error              | Encoded or decoded binary length does not match its declaration                       |
-| `mzml.binary.oversized`          | error              | Payload exceeds `-max-binary-size` limit                                              |
+| `mzml.binary.oversized`          | error              | Payload exceeds `--max-binary-size` limit                                             |
 | `mzml.binary.type-mismatch`      | error              | Invalid binary datatype declaration or duplicate array type                           |
 | `mzml.binary.default-array`      | error              | Default array declares a forbidden length or processing override                      |
 | **Index**                        |                    |                                                                                       |
@@ -280,7 +284,7 @@ Events are dispatched to four validators in one pass. Structural and binary vali
 
 ### Output modes
 
-Four renderers consume the same bounded result state. Text mode is for interactive use. JSON schema 1 carries file and invocation results for pipelines. Summary mode keeps only fixed counters. Brief mode groups identical diagnostics by rule with occurrence counts.
+Default text and JSON schema 1 group repeated findings per input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters. Brief mode collapses retained groups across inputs into a compact table.
 
 ### Memory model
 

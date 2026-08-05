@@ -152,45 +152,51 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
     var i: usize = 2;
     while (i < args.len) : (i += 1) {
         const arg = args[i];
-        if (std.mem.eql(u8, arg, "-max-binary-size")) {
+        if (std.mem.eql(u8, arg, "--max-binary-size")) {
             i += 1;
             if (i >= args.len) return error.MissingBinarySize;
             max_binary_size = try parseSize(args[i]);
             continue;
         }
-        if (std.mem.eql(u8, arg, "-skip-binary")) {
+        if (std.mem.eql(u8, arg, "--skip-binary")) {
             skip_binary = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-skip-index")) {
+        if (std.mem.eql(u8, arg, "--skip-index")) {
             skip_index = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-skip-semantic")) {
+        if (std.mem.eql(u8, arg, "--skip-semantic")) {
             skip_semantic = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-obo")) {
+        if (std.mem.eql(u8, arg, "--obo")) {
             i += 1;
             if (i >= args.len) return error.MissingOboPath;
             obo_path = args[i];
             continue;
         }
-        if (std.mem.eql(u8, arg, "-json")) {
+        if (std.mem.eql(u8, arg, "--json")) {
             if (output_mode_set and output_mode != .json) return error.ConflictingOutputMode;
             output_mode = .json;
             output_mode_set = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-summary")) {
+        if (std.mem.eql(u8, arg, "--summary")) {
             if (output_mode_set and output_mode != .summary) return error.ConflictingOutputMode;
             output_mode = .summary;
             output_mode_set = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "-brief")) {
+        if (std.mem.eql(u8, arg, "--brief")) {
             if (output_mode_set and output_mode != .brief) return error.ConflictingOutputMode;
             output_mode = .brief;
+            output_mode_set = true;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--verbose")) {
+            if (output_mode_set and output_mode != .verbose) return error.ConflictingOutputMode;
+            output_mode = .verbose;
             output_mode_set = true;
             continue;
         }
@@ -230,7 +236,7 @@ fn isHelpFlag(arg: []const u8) bool {
 }
 
 fn isVersionFlag(arg: []const u8) bool {
-    return std.mem.eql(u8, arg, "-version") or std.mem.eql(u8, arg, "--version");
+    return std.mem.eql(u8, arg, "--version");
 }
 
 fn runCheck(
@@ -243,6 +249,7 @@ fn runCheck(
     // Combining them regresses payload-heavy parsing under ReleaseFast.
     return switch (check.output_mode) {
         .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check }),
+        .verbose => @call(.never_inline, runCheckMode, .{ .verbose, allocator, io, writer, check }),
         .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check }),
         .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check }),
         .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check }),
@@ -263,12 +270,12 @@ fn runCheckMode(
 ) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     const State = switch (mode) {
-        .text, .summary => diagnostic.Summary,
+        .text, .verbose, .summary => diagnostic.Summary,
         .json => output.JsonStream,
         .brief => BriefRunState,
     };
     var state: State = switch (mode) {
-        .text, .summary => .{},
+        .text, .verbose, .summary => .{},
         .json => try output.JsonStream.init(writer),
         .brief => .{},
     };
@@ -288,12 +295,13 @@ fn runCheckMode(
             .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
             .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
             .retain_details = mode != .summary,
+            .aggregate_occurrences = mode == .text or mode == .json or mode == .brief,
         });
         defer diagnostics.deinit(allocator);
 
         const result = context.validateOne(&diagnostics, path);
         switch (mode) {
-            .text => {
+            .text, .verbose => {
                 state.addResult(result);
                 try output.renderTextFile(writer, diagnostics.items, &result, path);
             },
@@ -307,7 +315,7 @@ fn runCheckMode(
     }
 
     return switch (mode) {
-        .text => exit_code: {
+        .text, .verbose => exit_code: {
             try output.renderTextFinal(writer, state);
             break :exit_code diagnostic.exitCodeForSummary(state);
         },
@@ -337,39 +345,40 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Commands\n" ++
             "  check        Validate one or more mzML inputs in a single run.\n\n" ++
             "Options\n" ++
-            "  -json        Emit a versioned JSON result report for CI and pipelines.\n" ++
-            "  -summary     Emit only aggregate status and severity counts.\n" ++
-            "  -brief       Group diagnostics by rule with occurrence counts.\n" ++
-            "  -skip-binary Skip binary payload checks.\n" ++
-            "  -skip-index  Skip index offset and checksum checks.\n" ++
-            "  -skip-semantic\n" ++
+            "  --verbose    Emit every diagnostic occurrence instead of grouped findings.\n" ++
+            "  --brief      Emit a compact grouped table.\n" ++
+            "  --summary    Emit only aggregate status and severity counts.\n" ++
+            "  --json       Emit grouped JSON schema 1 for CI and pipelines.\n" ++
+            "  --skip-binary\n" ++
+            "               Skip binary payload checks.\n" ++
+            "  --skip-index Skip index offset and checksum checks.\n" ++
+            "  --skip-semantic\n" ++
             "               Skip CV term and semantic validation.\n" ++
-            "  -max-binary-size N\n" ++
+            "  --max-binary-size N\n" ++
             "               Reject any binary array whose encodedLength exceeds N.\n" ++
             "               Suffix: K/M/G/T for KiB/MiB/GiB/TiB (binary).\n" ++
-            "  -obo <path>  Replace the embedded OBO catalog with a custom file.\n" ++
-            "               Mapping policy remains the embedded mzML.xsd contract; see -version for its version.\n" ++
-            "  -version, --version\n" ++
-            "               Print the mzValidate version number and exit.\n" ++
-            "  -h, --help   Show this help text.\n\n" ++
+            "  --obo <path> Replace the embedded OBO catalog with a custom file.\n" ++
+            "               Mapping policy remains the embedded mzML.xsd contract; see --version for its version.\n" ++
+            "  --version    Print the mzValidate version number and exit.\n" ++
+            "  --help, -h   Show this help text.\n" ++
             "Behavior\n" ++
             "  Inputs are validated serially in command-line order. Use separate processes\n" ++
             "  when an external scheduler needs parallel file validation.\n" ++
             "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
             "  Human result lines show completion, status, and severity counts.\n" ++
-            "  Text mode groups diagnostics by input path and ends with the result.\n" ++
-            "  JSON mode records file results, diagnostics, and one summary.\n" ++
+            "  Default output groups identical findings per input and keeps three example locations.\n" ++
+            "  JSON records the same groups, exact occurrence counts, and one summary.\n" ++
             "  Summary mode reports the aggregate result for the whole invocation.\n" ++
-            "  Brief mode groups identical diagnostics by severity, rule, and message\n" ++
-            "  with occurrence counts. Ideal for spotting patterns in large files.\n\n" ++
+            "  Brief mode collapses groups across inputs into a compact table.\n\n" ++
             "Exit Codes\n" ++
             "  0  clean\n" ++
             "  1  warnings only\n" ++
             "  2  errors present or CLI usage failure\n\n" ++
             "Examples\n" ++
             "  mzValidate check sample.mzML\n" ++
-            "  mzValidate check run-a.mzML run-b.mzML -summary\n" ++
-            "  mzValidate check sample.mzML -json -skip-binary\n",
+            "  mzValidate check run-a.mzML run-b.mzML --summary\n" ++
+            "  mzValidate check sample.mzML --json --skip-binary\n" ++
+            "  mzValidate check sample.mzML --verbose\n",
     );
 }
 
@@ -395,11 +404,11 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
                 try writer.writeAll("error: unexpected flag");
             }
         },
-        error.ConflictingOutputMode => try writer.writeAll("error: choose one of -json, -summary, or -brief"),
-        error.MissingBinarySize => try writer.writeAll("error: -max-binary-size requires a value"),
-        error.MissingOboPath => try writer.writeAll("error: -obo requires a path"),
-        error.InvalidValue => try writer.writeAll("error: invalid -max-binary-size value"),
-        error.Overflow => try writer.writeAll("error: -max-binary-size value overflow (too large)"),
+        error.ConflictingOutputMode => try writer.writeAll("error: choose one of --verbose, --brief, --summary, or --json"),
+        error.MissingBinarySize => try writer.writeAll("error: --max-binary-size requires a value"),
+        error.MissingOboPath => try writer.writeAll("error: --obo requires a path"),
+        error.InvalidValue => try writer.writeAll("error: invalid --max-binary-size value"),
+        error.Overflow => try writer.writeAll("error: --max-binary-size value overflow (too large)"),
     }
 }
 
@@ -413,14 +422,15 @@ fn findUnexpectedFlag(args: []const []const u8) ?[]const u8 {
 fn isKnownFlag(arg: []const u8) bool {
     return isHelpFlag(arg) or
         isVersionFlag(arg) or
-        std.mem.eql(u8, arg, "-skip-binary") or
-        std.mem.eql(u8, arg, "-skip-index") or
-        std.mem.eql(u8, arg, "-skip-semantic") or
-        std.mem.eql(u8, arg, "-max-binary-size") or
-        std.mem.eql(u8, arg, "-obo") or
-        std.mem.eql(u8, arg, "-json") or
-        std.mem.eql(u8, arg, "-summary") or
-        std.mem.eql(u8, arg, "-brief");
+        std.mem.eql(u8, arg, "--skip-binary") or
+        std.mem.eql(u8, arg, "--skip-index") or
+        std.mem.eql(u8, arg, "--skip-semantic") or
+        std.mem.eql(u8, arg, "--max-binary-size") or
+        std.mem.eql(u8, arg, "--obo") or
+        std.mem.eql(u8, arg, "--json") or
+        std.mem.eql(u8, arg, "--summary") or
+        std.mem.eql(u8, arg, "--brief") or
+        std.mem.eql(u8, arg, "--verbose");
 }
 
 // Bare K/M/G/T suffixes use binary units; KB/MB/GB use decimal units.
@@ -518,8 +528,8 @@ test "parses flags and input paths" {
         "mzValidate",
         "check",
         "sample-a.mzML",
-        "-json",
-        "-skip-binary",
+        "--json",
+        "--skip-binary",
         "sample-b.mzML",
     };
 
@@ -600,8 +610,8 @@ test "rejects conflicting output modes" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-json",
-        "-summary",
+        "--json",
+        "--summary",
     };
 
     try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
@@ -611,8 +621,8 @@ test "requires an input path after check" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "-skip-binary",
-        "-summary",
+        "--skip-binary",
+        "--summary",
     };
 
     try std.testing.expectError(error.MissingInputPath, parseArgs(std.testing.allocator, &argv));
@@ -634,7 +644,7 @@ test "parses a raw binary size limit" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-max-binary-size",
+        "--max-binary-size",
         "1048576",
     };
 
@@ -653,7 +663,7 @@ test "parses a suffixed binary size limit" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-max-binary-size",
+        "--max-binary-size",
         "1M",
     };
 
@@ -672,7 +682,7 @@ test "rejects a missing binary size limit" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-max-binary-size",
+        "--max-binary-size",
     };
 
     try std.testing.expectError(error.MissingBinarySize, parseArgs(std.testing.allocator, &argv));
@@ -683,7 +693,7 @@ test "rejects a missing OBO path" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-obo",
+        "--obo",
     };
 
     try std.testing.expectError(error.MissingOboPath, parseArgs(std.testing.allocator, &argv));
@@ -694,7 +704,7 @@ test "rejects an invalid binary size suffix" {
         "mzValidate",
         "check",
         "sample.mzML",
-        "-max-binary-size",
+        "--max-binary-size",
         "1X",
     };
 
@@ -757,7 +767,7 @@ test "help writes usage to stdout" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-max-binary-size N") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--max-binary-size N") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Inputs are validated serially") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -766,7 +776,7 @@ test "help writes usage to stdout" {
 test "version reports the mapping policy" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "-version" };
+    const argv = [_][]const u8{ "mzValidate", "--version" };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
@@ -796,7 +806,7 @@ test "check help writes usage to stdout" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-skip-semantic") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--skip-semantic") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -843,7 +853,7 @@ test "unexpected flag reports a usage error" {
 test "missing input path reports a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "check", "-summary" };
+    const argv = [_][]const u8{ "mzValidate", "check", "--summary" };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
@@ -861,7 +871,7 @@ test "missing input path reports a usage error" {
 test "missing OBO path reports the correct flag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-obo" };
+    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "--obo" };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
@@ -873,7 +883,7 @@ test "missing OBO path reports the correct flag" {
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expectEqualStrings(
-        "error: -obo requires a path\n" ++
+        "error: --obo requires a path\n" ++
             "usage: mzValidate check <input.mzML> [more files...] [options]\n",
         stderr_writer.written(),
     );
@@ -882,7 +892,7 @@ test "missing OBO path reports the correct flag" {
 test "conflicting output modes report a usage error" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
-    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "-json", "-summary" };
+    const argv = [_][]const u8{ "mzValidate", "check", "sample.mzML", "--json", "--summary" };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
     defer stdout_writer.deinit();
@@ -893,7 +903,7 @@ test "conflicting output modes report a usage error" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of -json, -summary, or -brief") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of --verbose, --brief, --summary, or --json") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
@@ -905,9 +915,9 @@ test "summary aggregates clean and corrupt inputs" {
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-semantic",
-        "-skip-index",
-        "-summary",
+        "--skip-semantic",
+        "--skip-index",
+        "--summary",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -930,9 +940,9 @@ test "json contract: clean result matches golden" {
         "mzValidate",
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
-        "-skip-semantic",
-        "-skip-index",
-        "-json",
+        "--skip-semantic",
+        "--skip-index",
+        "--json",
     };
 
     try expectJsonGolden(&argv, 0, "fixtures/output/json-v1-clean.json");
@@ -943,8 +953,8 @@ test "json contract: findings result matches golden" {
         "mzValidate",
         "check",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-semantic",
-        "-json",
+        "--skip-semantic",
+        "--json",
     };
 
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
@@ -955,7 +965,7 @@ test "json contract: incomplete result matches golden" {
         "mzValidate",
         "check",
         "missing-p51.mzML",
-        "-json",
+        "--json",
     };
 
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-incomplete.json");
@@ -967,9 +977,9 @@ test "json contract: multi-file result matches golden" {
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-semantic",
-        "-skip-index",
-        "-json",
+        "--skip-semantic",
+        "--skip-index",
+        "--json",
     };
 
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-multi-file.json");
@@ -992,7 +1002,7 @@ test "external entities report an XML contract diagnostic" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.structure.xml] DTD or unsupported XML construct") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.structure.xml]: DTD or unsupported XML construct") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1004,8 +1014,8 @@ test "text output groups clean and corrupt inputs" {
         "check",
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-semantic",
-        "-skip-index",
+        "--skip-semantic",
+        "--skip-index",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1017,7 +1027,7 @@ test "text output groups clean and corrupt inputs" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "input: fixtures/mzml/invalid/invalid-base64.mzML") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.binary.base64] binary payload is not valid base64") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "error [mzml.binary.base64]: binary payload is not valid base64") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "location: byte=") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete: errors (info=0 warnings=0 errors=1)") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -1031,9 +1041,9 @@ test "[unit]: brief output aggregates repeated findings across inputs" {
         "check",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-semantic",
-        "-skip-index",
-        "-brief",
+        "--skip-semantic",
+        "--skip-index",
+        "--brief",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1053,6 +1063,25 @@ test "[unit]: brief output aggregates repeated findings across inputs" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
+test "[unit]: canonical verbose flag selects occurrence output" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "sample.mzML",
+        "--verbose",
+        "--skip-index",
+    };
+    var command = try parseArgs(std.testing.allocator, &argv);
+    defer command.deinit(std.testing.allocator);
+
+    switch (command) {
+        .check => |check| {
+            try std.testing.expectEqual(output.OutputMode.verbose, check.output_mode);
+            try std.testing.expect(check.skip_index);
+        },
+    }
+}
+
 test "skipping binary checks keeps valid structure clean" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1060,10 +1089,10 @@ test "skipping binary checks keeps valid structure clean" {
         "mzValidate",
         "check",
         "fixtures/mzml/invalid/invalid-base64.mzML",
-        "-skip-binary",
-        "-skip-semantic",
-        "-skip-index",
-        "-summary",
+        "--skip-binary",
+        "--skip-semantic",
+        "--skip-index",
+        "--summary",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
@@ -1089,7 +1118,7 @@ test "summary reports each missing input failure" {
         "check",
         "missing-a.mzML",
         "missing-b.mzML",
-        "-summary",
+        "--summary",
     };
 
     var stdout_writer: std.Io.Writer.Allocating = .init(allocator);

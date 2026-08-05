@@ -12,6 +12,7 @@ const Severity = diagnostic.Severity;
 /// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,
+    verbose,
     json,
     summary,
     brief,
@@ -110,15 +111,22 @@ fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic
             current_path = null;
         }
 
-        try writer.print("  {s} [{s}] {s}\n", .{ item.severity.label(), item.rule, item.message });
+        try writer.print("  {s} [{s}]", .{ item.severity.label(), item.rule });
+        if (item.occurrences > 1) try writer.print(" x{d}", .{item.occurrences});
+        try writer.print(": {s}\n", .{item.message});
 
-        if (item.location.byte_offset != null or item.location.spectrum_index != null) {
-            try writer.writeAll("    location:");
-            if (item.location.byte_offset) |byte_offset| {
-                try writer.print(" byte={d}", .{byte_offset});
-            }
-            if (item.location.spectrum_index) |spectrum_index| {
-                try writer.print(" spectrum={d}", .{spectrum_index});
+        const location_count = item.exampleLocationCount();
+        if (location_count > 0) {
+            try writer.writeAll(if (item.occurrences > 1) "    examples:" else "    location:");
+            for (0..location_count) |index| {
+                if (index > 0) try writer.writeByte(';');
+                const location = item.exampleLocation(index);
+                if (location.byte_offset) |byte_offset| {
+                    try writer.print(" byte={d}", .{byte_offset});
+                }
+                if (location.spectrum_index) |spectrum_index| {
+                    try writer.print(" spectrum={d}", .{spectrum_index});
+                }
             }
             try writer.writeByte('\n');
         }
@@ -183,7 +191,7 @@ pub const BriefGroups = struct {
                 std.mem.eql(u8, groups.rule[i], item.rule) and
                 std.mem.eql(u8, groups.message[i], item.message))
             {
-                groups.count[i] = std.math.add(usize, groups.count[i], 1) catch std.math.maxInt(usize);
+                groups.count[i] = std.math.add(usize, groups.count[i], item.occurrences) catch std.math.maxInt(usize);
                 return;
             }
         }
@@ -199,7 +207,7 @@ pub const BriefGroups = struct {
         groups.severity[index] = item.severity;
         groups.rule[index] = item.rule;
         groups.message[index] = item.message;
-        groups.count[index] = 1;
+        groups.count[index] = item.occurrences;
         groups.length = next_length;
     }
 
@@ -312,6 +320,7 @@ pub const JsonStream = struct {
     writer: *std.Io.Writer,
     first_file: bool = true,
     summary: diagnostic.Summary = .{},
+    finding_groups: usize = 0,
 
     /// Writes the report header and borrows the supplied writer.
     pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
@@ -327,6 +336,12 @@ pub const JsonStream = struct {
         path: []const u8,
     ) std.Io.Writer.Error!void {
         stream.summary.addResult(result.*);
+        const file_groups = std.math.add(
+            usize,
+            diagnostics.len,
+            @intFromBool(result.needsEmergencyDiagnostic()),
+        ) catch std.math.maxInt(usize);
+        stream.finding_groups = std.math.add(usize, stream.finding_groups, file_groups) catch std.math.maxInt(usize);
         if (!stream.first_file) try stream.writer.writeByte(',');
         try stream.writer.writeAll("\n    {\n      \"path\": ");
         try writeJsonString(stream.writer, path);
@@ -336,6 +351,7 @@ pub const JsonStream = struct {
         try writeJsonString(stream.writer, result.status().label());
         try stream.writer.writeAll(",\n      \"totals\": ");
         try writeJsonTotals(stream.writer, result.totals);
+        try stream.writer.print(",\n      \"finding_groups\": {d}", .{file_groups});
         try stream.writer.print(
             ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
             .{result.diagnostics_truncated},
@@ -353,7 +369,7 @@ pub const JsonStream = struct {
     pub fn finish(stream: *JsonStream) std.Io.Writer.Error!void {
         if (!stream.first_file) try stream.writer.writeByte('\n');
         try stream.writer.writeAll("  ],\n  \"summary\": ");
-        try writeJsonSummary(stream.writer, stream.summary);
+        try writeJsonSummary(stream.writer, stream.summary, stream.finding_groups);
         try stream.writer.writeAll("\n}\n");
     }
 };
@@ -415,8 +431,14 @@ fn writeJsonDiagnostic(writer: *std.Io.Writer, item: Diagnostic, indent: usize) 
     }
     try writer.writeAll(",\n");
     try writeIndent(writer, indent + 2);
-    try writer.writeAll("\"location\": ");
-    try writeJsonLocation(writer, item.location);
+    try writer.print("\"occurrences\": {d},\n", .{item.occurrences});
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"example_locations\": [");
+    for (0..item.exampleLocationCount()) |index| {
+        if (index > 0) try writer.writeAll(", ");
+        try writeJsonLocation(writer, item.exampleLocation(index));
+    }
+    try writer.writeByte(']');
     try writer.writeAll(",\n");
     try writeIndent(writer, indent + 2);
     try writer.writeAll("\"message\": ");
@@ -445,7 +467,9 @@ fn writeJsonTruncation(
     try writeJsonString(writer, path);
     try writer.writeAll(",\n");
     try writeIndent(writer, indent + 2);
-    try writer.writeAll("\"location\": {\"byte_offset\": null, \"spectrum_index\": null},\n");
+    try writer.writeAll("\"occurrences\": 1,\n");
+    try writeIndent(writer, indent + 2);
+    try writer.writeAll("\"example_locations\": [],\n");
     try writeIndent(writer, indent + 2);
     try writer.writeAll("\"message\": \"diagnostic detail truncated (dropped info=");
     try writer.print("{d}", .{dropped.info});
@@ -458,14 +482,19 @@ fn writeJsonTruncation(
     try writer.writeByte('}');
 }
 
-fn writeJsonSummary(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.Writer.Error!void {
+fn writeJsonSummary(
+    writer: *std.Io.Writer,
+    summary: diagnostic.Summary,
+    finding_groups: usize,
+) std.Io.Writer.Error!void {
     try writer.writeAll("{\n    \"completion\": ");
     try writeJsonString(writer, summary.completion.label());
     try writer.writeAll(",\n    \"status\": ");
     try writeJsonString(writer, summary.status().label());
-    try writer.print(",\n    \"files\": {d},\n    \"incomplete_files\": {d},\n    \"totals\": ", .{
+    try writer.print(",\n    \"files\": {d},\n    \"incomplete_files\": {d},\n    \"finding_groups\": {d},\n    \"totals\": ", .{
         summary.files,
         summary.incomplete_files,
+        finding_groups,
     });
     try writeJsonTotals(writer, summary.totals);
     try writer.print(
@@ -835,10 +864,10 @@ test "text output groups diagnostics by input" {
 
     try std.testing.expectEqualStrings(
         "input: sample-a.mzML\n" ++
-            "  warning [runtime.stub] stubbed warning message\n" ++
+            "  warning [runtime.stub]: stubbed warning message\n" ++
             "\n" ++
             "input: sample-b.mzML\n" ++
-            "  error [runtime.file-open] unable to open input file\n" ++
+            "  error [runtime.file-open]: unable to open input file\n" ++
             "    location: byte=12\n" ++
             "\n" ++
             "summary: errors-present (info=0 warnings=1 errors=1)\n",
@@ -859,7 +888,7 @@ test "text output separates pathless diagnostics" {
     try renderText(&allocating_writer.writer, &diagnostics);
 
     try std.testing.expectEqualStrings(
-        "  info [meta.note] standalone note\n" ++
+        "  info [meta.note]: standalone note\n" ++
             "\n" ++
             "summary: clean (info=1 warnings=0 errors=0)\n",
         allocating_writer.written(),
@@ -879,11 +908,35 @@ test "text output separates pathless diagnostics from the previous input" {
 
     try std.testing.expectEqualStrings(
         "input: sample.mzML\n" ++
-            "  warning [runtime.warning] warning\n" ++
+            "  warning [runtime.warning]: warning\n" ++
             "\n" ++
-            "  info [meta.note] standalone note\n" ++
+            "  info [meta.note]: standalone note\n" ++
             "\n" ++
             "summary: warnings-only (info=1 warnings=1 errors=0)\n",
+        allocating_writer.written(),
+    );
+}
+
+test "grouped text reports occurrence count and bounded examples" {
+    var sink = diagnostic.DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    for (1..5) |offset| {
+        try std.testing.expect(try sink.append(std.testing.allocator, .{
+            .severity = .warning,
+            .rule = "test.repeat",
+            .message = "repeated",
+            .location = .{ .byte_offset = offset },
+        }));
+    }
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+    try renderTextDiagnostics(&allocating_writer.writer, sink.items);
+
+    try std.testing.expectEqualStrings(
+        "  warning [test.repeat] x4: repeated\n" ++
+            "    examples: byte=1; byte=2; byte=3\n\n",
         allocating_writer.written(),
     );
 }
@@ -1069,4 +1122,31 @@ test "json contract: truncated result matches golden" {
     defer allocator.free(expected);
 
     try std.testing.expectEqualStrings(expected, allocating_writer.written());
+}
+
+test "[unit]: grouped byte estimate bounds maximum JSON diagnostic syntax" {
+    var sink = diagnostic.DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    const locations = [_]diagnostic.Location{
+        .{ .byte_offset = std.math.maxInt(u64), .spectrum_index = std.math.maxInt(usize) },
+        .{ .byte_offset = std.math.maxInt(u64) - 1, .spectrum_index = std.math.maxInt(usize) - 1 },
+        .{ .byte_offset = std.math.maxInt(u64) - 2, .spectrum_index = std.math.maxInt(usize) - 2 },
+    };
+    for (locations) |location| {
+        _ = try sink.append(std.testing.allocator, .{
+            .severity = .warning,
+            .rule = "\x01",
+            .path = "\x03",
+            .message = "\x02",
+            .location = location,
+        });
+    }
+    sink.items[0].occurrences = std.math.maxInt(usize);
+
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+    try writeJsonDiagnostic(&allocating_writer.writer, sink.items[0], 8);
+
+    try std.testing.expect(allocating_writer.written().len <= sink.retained_bytes);
 }

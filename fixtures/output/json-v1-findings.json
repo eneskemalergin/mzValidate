@@ -6,6 +6,7 @@
       "completion": "complete",
       "status": "errors-present",
       "totals": {"info": 0, "warnings": 0, "errors": 1},
+      "finding_groups": 1,
       "diagnostics_truncated": false,
       "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},
       "first_failure": null,
@@ -14,7 +15,8 @@
           "severity": "error",
           "rule": "mzml.binary.base64",
           "path": "fixtures/mzml/invalid/invalid-base64.mzML",
-          "location": {"byte_offset": 1970, "spectrum_index": 0},
+          "occurrences": 1,
+          "example_locations": [{"byte_offset": 1970, "spectrum_index": 0}],
           "message": "binary payload is not valid base64"
         }
       ]
@@ -25,6 +27,7 @@
     "status": "errors-present",
     "files": 1,
     "incomplete_files": 0,
+    "finding_groups": 1,
     "totals": {"info": 0, "warnings": 0, "errors": 1},
     "diagnostics_truncated": false,
     "dropped_diagnostics": {"info": 0, "warnings": 0, "errors": 0},

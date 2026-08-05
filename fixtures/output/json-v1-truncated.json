@@ -6,6 +6,7 @@
       "completion": "complete",
       "status": "errors-present",
       "totals": {"info": 1, "warnings": 1, "errors": 1},
+      "finding_groups": 1,
       "diagnostics_truncated": true,
       "dropped_diagnostics": {"info": 0, "warnings": 1, "errors": 1},
       "first_failure": null,
@@ -14,14 +15,16 @@
           "severity": "info",
           "rule": "test.retained",
           "path": "truncated.mzML",
-          "location": {"byte_offset": null, "spectrum_index": null},
+          "occurrences": 1,
+          "example_locations": [],
           "message": "retained detail"
         },
         {
           "severity": "warning",
           "rule": "runtime.diagnostics-truncated",
           "path": "truncated.mzML",
-          "location": {"byte_offset": null, "spectrum_index": null},
+          "occurrences": 1,
+          "example_locations": [],
           "message": "diagnostic detail truncated (dropped info=0 warnings=1 errors=1)"
         }
       ]
@@ -32,6 +35,7 @@
     "status": "errors-present",
     "files": 1,
     "incomplete_files": 0,
+    "finding_groups": 1,
     "totals": {"info": 1, "warnings": 1, "errors": 1},
     "diagnostics_truncated": true,
     "dropped_diagnostics": {"info": 0, "warnings": 1, "errors": 1},

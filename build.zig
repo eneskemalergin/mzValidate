@@ -107,18 +107,18 @@ pub fn build(b: *std.Build) void {
     cli_valid_cmd.addArg("fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML");
     cli_valid_cmd.addArg("fixtures/mzml/valid/small_miape.pwiz.1.1.mzML");
     cli_valid_cmd.addArg("fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
-    cli_valid_cmd.addArg("-skip-semantic");
-    cli_valid_cmd.addArg("-skip-index");
-    cli_valid_cmd.addArg("-summary");
+    cli_valid_cmd.addArg("--skip-semantic");
+    cli_valid_cmd.addArg("--skip-index");
+    cli_valid_cmd.addArg("--summary");
     cli_valid_cmd.expectStdOutEqual("complete: clean (info=0 warnings=0 errors=0)\n");
 
     const cli_known_findings_cmd = b.addRunArtifact(exe);
     cli_known_findings_cmd.step.dependOn(b.getInstallStep());
     cli_known_findings_cmd.addArg("check");
     cli_known_findings_cmd.addArg("fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
-    cli_known_findings_cmd.addArg("-skip-semantic");
-    cli_known_findings_cmd.addArg("-skip-index");
-    cli_known_findings_cmd.addArg("-summary");
+    cli_known_findings_cmd.addArg("--skip-semantic");
+    cli_known_findings_cmd.addArg("--skip-index");
+    cli_known_findings_cmd.addArg("--summary");
     cli_known_findings_cmd.expectExitCode(2);
     cli_known_findings_cmd.expectStdOutEqual("complete: errors (info=0 warnings=0 errors=13)\n");
 
@@ -126,8 +126,8 @@ pub fn build(b: *std.Build) void {
     cli_invalid_cmd.step.dependOn(b.getInstallStep());
     cli_invalid_cmd.addArg("check");
     addFixtureArgs(cli_invalid_cmd, invalid_fixtures);
-    cli_invalid_cmd.addArg("-skip-semantic");
-    cli_invalid_cmd.addArg("-summary");
+    cli_invalid_cmd.addArg("--skip-semantic");
+    cli_invalid_cmd.addArg("--summary");
     cli_invalid_cmd.expectExitCode(2);
     cli_invalid_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
 
@@ -135,9 +135,9 @@ pub fn build(b: *std.Build) void {
     cli_schema_finding_cmd.step.dependOn(b.getInstallStep());
     cli_schema_finding_cmd.addArg("check");
     cli_schema_finding_cmd.addArg("fixtures/mzml/adversarial/missing-default-array-length.mzML");
-    cli_schema_finding_cmd.addArg("-skip-semantic");
-    cli_schema_finding_cmd.addArg("-skip-index");
-    cli_schema_finding_cmd.addArg("-summary");
+    cli_schema_finding_cmd.addArg("--skip-semantic");
+    cli_schema_finding_cmd.addArg("--skip-index");
+    cli_schema_finding_cmd.addArg("--summary");
     cli_schema_finding_cmd.expectExitCode(2);
     cli_schema_finding_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
 
@@ -145,9 +145,9 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.step.dependOn(b.getInstallStep());
     cli_incomplete_cmd.addArg("check");
     cli_incomplete_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
-    cli_incomplete_cmd.addArg("-skip-binary");
-    cli_incomplete_cmd.addArg("-skip-semantic");
-    cli_incomplete_cmd.addArg("-summary");
+    cli_incomplete_cmd.addArg("--skip-binary");
+    cli_incomplete_cmd.addArg("--skip-semantic");
+    cli_incomplete_cmd.addArg("--summary");
     cli_incomplete_cmd.expectExitCode(2);
     cli_incomplete_cmd.expectStdOutMatch("incomplete: errors (info=0 warnings=0 errors=");
     cli_incomplete_cmd.expectStdOutMatch("failure: stage=index reason=resource");
@@ -156,9 +156,9 @@ pub fn build(b: *std.Build) void {
     cli_json_cmd.step.dependOn(b.getInstallStep());
     cli_json_cmd.addArg("check");
     cli_json_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
-    cli_json_cmd.addArg("-skip-binary");
-    cli_json_cmd.addArg("-skip-semantic");
-    cli_json_cmd.addArg("-json");
+    cli_json_cmd.addArg("--skip-binary");
+    cli_json_cmd.addArg("--skip-semantic");
+    cli_json_cmd.addArg("--json");
     cli_json_cmd.expectExitCode(2);
     cli_json_cmd.expectStdOutMatch("\"schema_version\": 1");
     cli_json_cmd.expectStdOutMatch("\"completion\": \"incomplete\"");
@@ -175,6 +175,7 @@ pub fn build(b: *std.Build) void {
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
+
 }
 
 fn addSha1X86ToModule(
