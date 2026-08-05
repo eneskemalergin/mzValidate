@@ -992,8 +992,6 @@ pub const Summary = struct {
     diagnostics_truncated: bool = false,
     dropped_diagnostics: Totals = .{},
     first_failure: ?FirstFailure = null,
-    first_emergency_failure: ?FirstFailure = null,
-    emergency_failures: usize = 0,
 
     pub fn addResult(summary: *Summary, result: FileResult) void {
         summary.files = saturatingAdd(summary.files, 1);
@@ -1017,12 +1015,6 @@ pub const Summary = struct {
             summary.completion = .incomplete;
             summary.incomplete_files = saturatingAdd(summary.incomplete_files, 1);
             if (summary.first_failure == null) summary.first_failure = result.first_failure;
-        }
-        if (result.needsEmergencyDiagnostic()) {
-            summary.emergency_failures = saturatingAdd(summary.emergency_failures, 1);
-            if (summary.first_emergency_failure == null) {
-                summary.first_emergency_failure = result.first_failure;
-            }
         }
     }
 
@@ -1140,7 +1132,6 @@ test "[unit]: result summary saturates invocation counts" {
         },
         .files = std.math.maxInt(usize),
         .incomplete_files = std.math.maxInt(usize),
-        .emergency_failures = std.math.maxInt(usize),
         .dropped_diagnostics = .{
             .info = std.math.maxInt(usize),
             .warnings = std.math.maxInt(usize),
@@ -1155,14 +1146,12 @@ test "[unit]: result summary saturates invocation counts" {
 
     try std.testing.expectEqual(std.math.maxInt(usize), summary.files);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.incomplete_files);
-    try std.testing.expectEqual(std.math.maxInt(usize), summary.emergency_failures);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.info);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.warnings);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.errors);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.info);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.warnings);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.errors);
-    try std.testing.expect(summary.first_emergency_failure != null);
 }
 
 test "file result stays incomplete until every enabled stage completes" {

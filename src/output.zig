@@ -429,7 +429,7 @@ pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.
 
 /// Fixed-capacity grouping state holding borrowed rule and message slices.
 /// Borrowed text must outlive the final call to `render`.
-pub const BriefGroups = struct {
+const BriefGroups = struct {
     const max_groups = 256;
 
     severity: [max_groups]Severity = undefined,
@@ -440,7 +440,7 @@ pub const BriefGroups = struct {
     dropped: usize = 0,
 
     /// Adds a diagnostic to the bounded grouping table without allocating.
-    pub fn add(groups: *BriefGroups, item: Diagnostic) void {
+    fn add(groups: *BriefGroups, item: Diagnostic) void {
         for (0..groups.length) |i| {
             if (groups.severity[i] == item.severity and
                 std.mem.eql(u8, groups.rule[i], item.rule) and
@@ -467,7 +467,7 @@ pub const BriefGroups = struct {
     }
 
     /// Sorts groups by severity and count, then writes the aligned table.
-    pub fn render(groups: *BriefGroups, writer: *std.Io.Writer) std.Io.Writer.Error!void {
+    fn render(groups: *BriefGroups, writer: *std.Io.Writer) std.Io.Writer.Error!void {
         if (groups.length == 0) return;
 
         for (1..groups.length) |i| {
@@ -538,24 +538,22 @@ pub fn renderBriefResult(
     }
 }
 
-/// Writes a result block using groups accumulated by the caller.
-pub fn renderBriefGroupsResult(
+/// Writes one attributed brief result while its borrowed diagnostics are alive.
+pub fn renderBriefFile(
     writer: *std.Io.Writer,
-    groups: *BriefGroups,
-    summary: diagnostic.Summary,
+    diagnostics: []const Diagnostic,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
+    input_index: usize,
+    input_count: usize,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, summary);
-    if (summary.first_emergency_failure) |failure| {
-        try renderFailureText(writer, failure);
-        if (summary.emergency_failures > 1) {
-            try writer.print("... and {d} more emergency failures\n", .{summary.emergency_failures - 1});
-        }
-        try writer.writeByte('\n');
+    if (input_index > 0) try writer.writeByte('\n');
+    if (input_count > 1) {
+        try writer.print("[{d}/{d}] input: {s}\n", .{ input_index + 1, input_count, path });
+    } else {
+        try writer.print("input: {s}\n", .{path});
     }
-    if (groups.length > 0) try groups.render(writer);
-    if (hasDroppedTotals(summary.dropped_diagnostics)) {
-        try renderTruncationText(writer, summary.dropped_diagnostics, null);
-    }
+    try renderBriefResult(writer, diagnostics, &.{result.*});
 }
 
 /// Writes one complete JSON report using the current schema version.
@@ -1337,6 +1335,28 @@ test "empty brief groups render no rows" {
     try std.testing.expectEqualStrings("", allocating_writer.written());
 }
 
+test "[unit]: brief file uses unnumbered single-input attribution" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .warning,
+        .rule = "test.rule",
+        .message = "human message",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderBriefFile(&allocating_writer.writer, &diagnostics, &result, "sample.mzML", 0, 1);
+
+    try std.testing.expectEqualStrings(
+        "input: sample.mzML\n" ++
+            "complete: warnings (info=0 warnings=1 errors=0)\n" ++
+            "\n" ++
+            "1  warning  test.rule  human message\n",
+        allocating_writer.written(),
+    );
+}
+
 test "brief result emits emergency failure" {
     var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
     result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
@@ -1349,71 +1369,6 @@ test "brief result emits emergency failure" {
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "runtime.incomplete") != null);
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "stage=parser reason=allocation") != null);
-}
-
-test "[unit]: pre-grouped brief renderer emits emergency failure" {
-    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
-    result.finalize(&.{});
-    var groups: BriefGroups = .{};
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefGroupsResult(
-        &allocating_writer.writer,
-        &groups,
-        diagnostic.summarizeResults(&.{result}),
-    );
-
-    try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n" ++
-            "input: sample.mzML\n" ++
-            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
-        allocating_writer.written(),
-    );
-}
-
-test "[unit]: brief summary counts emergency failures without retaining results" {
-    var first = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    first.recordEmergencyFailure(.parser, .allocation, "first.mzML");
-    first.finalize(&.{});
-    var second = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    second.recordEmergencyFailure(.parser, .allocation, "second.mzML");
-    second.finalize(&.{});
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefGroupsResult(
-        &allocating_writer.writer,
-        &groups,
-        diagnostic.summarizeResults(&.{ first, second }),
-    );
-
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input=first.mzML") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "... and 1 more emergency failures") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input: second.mzML") == null);
-}
-
-test "[unit]: brief summary reports aggregate dropped totals" {
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-    const summary = diagnostic.Summary{
-        .totals = .{ .warnings = 3, .errors = 4 },
-        .diagnostics_truncated = true,
-        .dropped_diagnostics = .{ .warnings = 2, .errors = 3 },
-    };
-
-    try renderBriefGroupsResult(&allocating_writer.writer, &groups, summary);
-
-    try std.testing.expectEqualStrings(
-        "complete: errors (info=0 warnings=3 errors=4)\n" ++
-            "  warning [runtime.diagnostics-truncated] diagnostic detail truncated (dropped info=0 warnings=2 errors=3)\n",
-        allocating_writer.written(),
-    );
 }
 
 test "bounded output reports dropped severity totals" {

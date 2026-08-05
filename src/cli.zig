@@ -339,11 +339,6 @@ fn runCheck(
     };
 }
 
-const BriefRunState = struct {
-    summary: diagnostic.Summary = .{},
-    groups: output.BriefGroups = .{},
-};
-
 fn runCheckMode(
     comptime mode: output.OutputMode,
     allocator: std.mem.Allocator,
@@ -356,7 +351,7 @@ fn runCheckMode(
     const State = switch (mode) {
         .text, .summary => diagnostic.Summary,
         .json => output.JsonStream,
-        .brief => BriefRunState,
+        .brief => diagnostic.Summary,
     };
     var state: State = switch (mode) {
         .text, .summary => .{},
@@ -406,8 +401,8 @@ fn runCheckMode(
             .json => try state.writeFile(diagnostics.items, &result, path),
             .summary => state.addResult(result),
             .brief => {
-                state.summary.addResult(result);
-                for (diagnostics.items) |item| state.groups.add(item);
+                state.addResult(result);
+                try output.renderBriefFile(writer, diagnostics.items, &result, path, input_index, check.inputs.len);
             },
         }
     }
@@ -430,8 +425,8 @@ fn runCheckMode(
             break :exit_code diagnostic.exitCodeForSummary(state);
         },
         .brief => exit_code: {
-            try output.renderBriefGroupsResult(writer, &state.groups, state.summary);
-            break :exit_code diagnostic.exitCodeForSummary(state.summary);
+            if (check.inputs.len > 1) try output.renderTextFinal(writer, state, false);
+            break :exit_code diagnostic.exitCodeForSummary(state);
         },
     };
 }
@@ -471,7 +466,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  Default output groups identical findings per input and keeps three example locations.\n" ++
             "  JSON records the same groups, exact occurrence counts, and one summary.\n" ++
             "  Summary mode reports the aggregate result for the whole invocation.\n" ++
-            "  Brief mode collapses groups across inputs into a compact table.\n\n" ++
+            "  Brief mode groups repeated findings within each input.\n\n" ++
             "Exit Codes\n" ++
             "  0  clean\n" ++
             "  1  warnings only\n" ++
@@ -881,6 +876,8 @@ test "help writes usage to stdout" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--max-binary-size N") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Inputs are validated serially") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Brief mode groups repeated findings within each input.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "collapses groups across inputs") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1177,7 +1174,7 @@ test "[unit]: default output ranks grouped findings" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "[unit]: brief output aggregates repeated findings across inputs" {
+test "[unit]: brief output attributes repeated findings to each input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -1196,12 +1193,19 @@ test "[unit]: brief output aggregates repeated findings across inputs" {
     defer stderr_writer.deinit();
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
-
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "complete: errors (info=0 warnings=0 errors=2)\n" ++
+        "[1/2] input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
+            "complete: errors (info=0 warnings=0 errors=1)\n" ++
             "\n" ++
-            "2  error  mzml.binary.base64  binary payload is not valid base64\n",
+            "1  error  mzml.binary.base64  binary payload is not valid base64\n" ++
+            "\n" ++
+            "[2/2] input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
+            "complete: errors (info=0 warnings=0 errors=1)\n" ++
+            "\n" ++
+            "1  error  mzml.binary.base64  binary payload is not valid base64\n" ++
+            "\n" ++
+            "summary: errors | 2 files | info 0, warnings 0, errors 2\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
