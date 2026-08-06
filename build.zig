@@ -163,6 +163,18 @@ pub fn build(b: *std.Build) void {
             "usage: mzValidate check <input.mzML> [options]\n",
     );
 
+    const cli_removed_brief_cmd = b.addRunArtifact(exe);
+    cli_removed_brief_cmd.step.dependOn(b.getInstallStep());
+    cli_removed_brief_cmd.addArg("check");
+    cli_removed_brief_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_removed_brief_cmd.addArg("--brief");
+    cli_removed_brief_cmd.expectExitCode(2);
+    cli_removed_brief_cmd.expectStdOutEqual("");
+    cli_removed_brief_cmd.expectStdErrEqual(
+        "error: unexpected flag: --brief\n" ++
+            "usage: mzValidate check <input.mzML> [options]\n",
+    );
+
     const cli_schema_finding_cmd = b.addRunArtifact(exe);
     cli_schema_finding_cmd.step.dependOn(b.getInstallStep());
     cli_schema_finding_cmd.addArg("check");
@@ -199,6 +211,7 @@ pub fn build(b: *std.Build) void {
     cli_contract_step.dependOn(&cli_known_findings_cmd.step);
     cli_contract_step.dependOn(&cli_missing_input_cmd.step);
     cli_contract_step.dependOn(&cli_multiple_inputs_cmd.step);
+    cli_contract_step.dependOn(&cli_removed_brief_cmd.step);
     cli_contract_step.dependOn(&cli_schema_finding_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);
     cli_contract_step.dependOn(&cli_json_cmd.step);

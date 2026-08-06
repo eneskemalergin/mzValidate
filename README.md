@@ -33,7 +33,6 @@ I built mzValidate as a focused native validator for mzML. It checks XML syntax,
 ```sh
 mzValidate check sample.mzML
 mzValidate check sample.mzML --summary
-mzValidate check sample.mzML --brief
 mzValidate check sample.mzML --json > report.json
 mzValidate check --summary file1.mzML file2.mzML
 ```
@@ -104,7 +103,6 @@ mzValidate check <input.mzML> [options]
 
 Output modes are mutually exclusive. The default groups identical findings by path, severity, rule, and message. Each group keeps an exact occurrence count and at most three example locations.
 
-- `--brief`: emit a compact count table without example locations
 - `--summary`: emit only status and occurrence counts
 - `--json`: emit the grouped versioned report described below
 
@@ -154,7 +152,7 @@ Rule IDs are the stable machine contract. Human-readable `message` text is separ
 
 `FileResult` is a self-contained value. It does not reference parser buffers, file-local validation state, the semantic catalog, or diagnostic storage. Its `FirstFailure` owns bounded copies of the rule, message, and path; the accessor slices borrow the `FirstFailure` value itself. The fixed capacities are 64 bytes for a rule ID, 512 bytes for a message, and `std.Io.Dir.max_path_bytes` for a path. An overlong value is copied as a prefix ending in `...`, and `FirstFailure.metadataTruncated()` reports that condition.
 
-The CLI is the reference caller. It creates one invocation context, validates explicit paths serially in input order, and releases each file's diagnostic sink and file-local state before starting the next path. One fixed `Summary` retains invocation totals, completion, truncation, and first-failure metadata. JSON file objects are written incrementally, and brief mode retains at most 256 borrowed rule and message groups until final rendering. Run independent mzValidate processes when an external scheduler needs parallel file validation; the built-in CLI does not schedule workers.
+The CLI is the reference caller. It creates one invocation context, validates one explicit path, and releases the diagnostic sink and file-local state before exit. Run independent mzValidate processes when an external scheduler needs parallel file validation; the built-in CLI does not schedule workers.
 
 Validation phases (each flag disables one phase). By default all phases run:
 
@@ -282,7 +280,7 @@ Events are dispatched to four validators in one pass. Structural and binary vali
 
 ### Output modes
 
-Default text and JSON schema 1 group repeated findings for one input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters. Brief mode emits a compact table without example locations.
+Default text and JSON schema 1 group repeated findings for one input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters.
 
 ### Memory model
 

@@ -1,6 +1,6 @@
 //! Renders diagnostics for humans and CI consumers.
 //!
-//! Text, JSON, summary, and brief modes share the same bounded result metadata.
+//! Text, JSON, and summary modes share the same bounded result metadata.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -14,7 +14,6 @@ pub const OutputMode = enum {
     text,
     json,
     summary,
-    brief,
 };
 
 /// Per-file context for compact human output.
@@ -383,143 +382,6 @@ pub fn renderSummaryResult(
     try writeResultBlock(writer, summary);
 }
 
-/// Groups diagnostics by severity+rule+message and prints compact counts.
-/// Columns auto-adjust to content width. Zero heap allocation.
-/// Groups are sorted: errors first (by count desc), then warnings, then info.
-pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    const summary = diagnostic.summarize(diagnostics);
-    try writer.print("status={s} info={d} warnings={d} errors={d}\n", .{
-        summary.status().label(),
-        summary.totals.info,
-        summary.totals.warnings,
-        summary.totals.errors,
-    });
-    if (diagnostics.len == 0) return;
-    try renderBriefGroups(writer, diagnostics);
-}
-
-/// Fixed-capacity grouping state holding borrowed rule and message slices.
-/// Borrowed text must outlive the final call to `render`.
-const BriefGroups = struct {
-    const max_groups = 256;
-
-    severity: [max_groups]Severity = undefined,
-    rule: [max_groups][]const u8 = undefined,
-    message: [max_groups][]const u8 = undefined,
-    count: [max_groups]usize = undefined,
-    length: usize = 0,
-    dropped: usize = 0,
-
-    /// Adds a diagnostic to the bounded grouping table without allocating.
-    fn add(groups: *BriefGroups, item: Diagnostic) void {
-        for (0..groups.length) |i| {
-            if (groups.severity[i] == item.severity and
-                std.mem.eql(u8, groups.rule[i], item.rule) and
-                std.mem.eql(u8, groups.message[i], item.message))
-            {
-                groups.count[i] = std.math.add(usize, groups.count[i], item.occurrences) catch std.math.maxInt(usize);
-                return;
-            }
-        }
-        if (groups.length >= max_groups) {
-            groups.dropped = std.math.add(usize, groups.dropped, 1) catch std.math.maxInt(usize);
-            return;
-        }
-        const next_length = std.math.add(usize, groups.length, 1) catch {
-            groups.dropped = std.math.maxInt(usize);
-            return;
-        };
-        const index = groups.length;
-        groups.severity[index] = item.severity;
-        groups.rule[index] = item.rule;
-        groups.message[index] = item.message;
-        groups.count[index] = item.occurrences;
-        groups.length = next_length;
-    }
-
-    /// Sorts groups by severity and count, then writes the aligned table.
-    fn render(groups: *BriefGroups, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (groups.length == 0) return;
-
-        for (1..groups.length) |i| {
-            var j = i;
-            while (j > 0) : (j -= 1) {
-                const a = @intFromEnum(groups.severity[j]);
-                const b = @intFromEnum(groups.severity[j - 1]);
-                const swap = if (a != b) a > b else groups.count[j] > groups.count[j - 1];
-                if (!swap) break;
-                std.mem.swap(Severity, &groups.severity[j], &groups.severity[j - 1]);
-                std.mem.swap([]const u8, &groups.rule[j], &groups.rule[j - 1]);
-                std.mem.swap([]const u8, &groups.message[j], &groups.message[j - 1]);
-                std.mem.swap(usize, &groups.count[j], &groups.count[j - 1]);
-            }
-        }
-
-        var count_width: usize = 1;
-        var severity_width: usize = 0;
-        var rule_width: usize = 0;
-        for (0..groups.length) |i| {
-            var n = groups.count[i];
-            var width: usize = 1;
-            while (n >= 10) : (n /= 10) width += 1;
-            if (width > count_width) count_width = width;
-            severity_width = @max(severity_width, groups.severity[i].label().len);
-            rule_width = @max(rule_width, groups.rule[i].len);
-        }
-
-        try writer.writeByte('\n');
-        for (0..groups.length) |i| {
-            var n = groups.count[i];
-            var width: usize = 1;
-            while (n >= 10) : (n /= 10) width += 1;
-            for (0..count_width - width) |_| try writer.writeByte(' ');
-            try writer.print("{d}  ", .{groups.count[i]});
-            try writer.writeAll(groups.severity[i].label());
-            for (0..severity_width - groups.severity[i].label().len) |_| try writer.writeByte(' ');
-            try writer.writeAll("  ");
-            try writer.writeAll(groups.rule[i]);
-            for (0..rule_width - groups.rule[i].len) |_| try writer.writeByte(' ');
-            try writer.writeAll("  ");
-            try writer.writeAll(groups.message[i]);
-            try writer.writeByte('\n');
-        }
-        if (groups.dropped > 0) {
-            try writer.print("... and {d} more unique diagnostic groups (brief limit)\n", .{groups.dropped});
-        }
-    }
-};
-
-fn renderBriefGroups(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    var groups: BriefGroups = .{};
-    for (diagnostics) |item| groups.add(item);
-    try groups.render(writer);
-}
-
-/// Writes a result block followed by grouped diagnostics and truncation details.
-pub fn renderBriefResult(
-    writer: *std.Io.Writer,
-    diagnostics: []const Diagnostic,
-    results: []const diagnostic.FileResult,
-) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
-    try renderEmergencyFailures(writer, results);
-    if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
-    for (results) |result| {
-        if (hasDroppedDiagnostics(result)) try renderTruncationText(writer, result.dropped_diagnostics, null);
-    }
-}
-
-/// Writes one attributed brief result while its borrowed diagnostics are alive.
-pub fn renderBriefFile(
-    writer: *std.Io.Writer,
-    diagnostics: []const Diagnostic,
-    result: *const diagnostic.FileResult,
-    path: []const u8,
-) std.Io.Writer.Error!void {
-    try writer.print("input: {s}\n", .{path});
-    try renderBriefResult(writer, diagnostics, &.{result.*});
-}
-
 /// Writes one complete JSON report using the current schema version.
 pub fn renderJsonResult(
     writer: *std.Io.Writer,
@@ -859,16 +721,6 @@ fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) s
         "  error [{s}] {s} (stage={s} reason={s})\n",
         .{ failure.rule(), failure.message(), failure.stage.label(), failure.reason.label() },
     );
-}
-
-fn renderEmergencyFailures(writer: *std.Io.Writer, results: []const diagnostic.FileResult) std.Io.Writer.Error!void {
-    var rendered = false;
-    for (results) |result| {
-        if (!result.needsEmergencyDiagnostic()) continue;
-        try renderFailureText(writer, result.first_failure.?);
-        rendered = true;
-    }
-    if (rendered) try writer.writeByte('\n');
 }
 
 fn renderTruncationText(writer: *std.Io.Writer, dropped: diagnostic.Totals, path: ?[]const u8) std.Io.Writer.Error!void {
@@ -1245,52 +1097,6 @@ test "json output replaces invalid UTF-8" {
     try renderJsonResult(&allocating_writer.writer, &diagnostics, &result, "invalid-utf8.mzML");
 
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"bad\\uFFFDvalue\"") != null);
-}
-
-test "empty brief groups render no rows" {
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try groups.render(&allocating_writer.writer);
-
-    try std.testing.expectEqualStrings("", allocating_writer.written());
-}
-
-test "[unit]: brief file uses unnumbered single-input attribution" {
-    const diagnostics = [_]Diagnostic{.{
-        .severity = .warning,
-        .rule = "test.rule",
-        .message = "human message",
-    }};
-    var result = diagnostic.FileResult.init(0);
-    result.finalize(&diagnostics);
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefFile(&allocating_writer.writer, &diagnostics, &result, "sample.mzML");
-
-    try std.testing.expectEqualStrings(
-        "input: sample.mzML\n" ++
-            "complete: warnings (info=0 warnings=1 errors=0)\n" ++
-            "\n" ++
-            "1  warning  test.rule  human message\n",
-        allocating_writer.written(),
-    );
-}
-
-test "brief result emits emergency failure" {
-    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
-    result.finalize(&.{});
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result});
-
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "runtime.incomplete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "stage=parser reason=allocation") != null);
 }
 
 test "bounded output reports dropped severity totals" {

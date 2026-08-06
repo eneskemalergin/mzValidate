@@ -260,12 +260,6 @@ pub fn parseArgs(args: []const []const u8) ParseError!Command {
             output_mode_set = true;
             continue;
         }
-        if (std.mem.eql(u8, arg, "--brief")) {
-            if (output_mode_set and output_mode != .brief) return error.ConflictingOutputMode;
-            output_mode = .brief;
-            output_mode_set = true;
-            continue;
-        }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnexpectedFlag;
 
         if (input_path != null) return error.MultipleInputPaths;
@@ -318,7 +312,6 @@ fn runCheck(
         .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check, presentation }),
         .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check, {} }),
         .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, {} }),
-        .brief => @call(.never_inline, runCheckMode, .{ .brief, allocator, io, writer, check, {} }),
     };
 }
 
@@ -349,7 +342,7 @@ fn runCheckMode(
         .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
         .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
         .retain_details = mode != .summary,
-        .aggregate_occurrences = mode == .text or mode == .json or mode == .brief,
+        .aggregate_occurrences = mode == .text or mode == .json,
     });
     defer diagnostics.deinit(allocator);
 
@@ -366,7 +359,6 @@ fn runCheckMode(
         }),
         .json => try output.renderJsonResult(writer, diagnostics.items, &result, check.input),
         .summary => try output.renderSummaryResult(writer, diagnostic.summarizeResults(&.{result})),
-        .brief => try output.renderBriefFile(writer, diagnostics.items, &result, check.input),
     }
     return diagnostic.exitCodeForResults(&.{result});
 }
@@ -382,7 +374,6 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Commands\n" ++
             "  check        Validate one mzML input.\n\n" ++
             "Options\n" ++
-            "  --brief      Emit a compact grouped table.\n" ++
             "  --summary    Emit only aggregate status and severity counts.\n" ++
             "  --json       Emit grouped JSON schema 1 for CI and pipelines.\n" ++
             "  --color MODE Colorize default output: auto, always, or never.\n" ++
@@ -403,8 +394,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  Human result lines show completion, status, and severity counts.\n" ++
             "  Default output groups identical findings per input and keeps three example locations.\n" ++
             "  JSON records the same groups, exact occurrence counts, and one summary.\n" ++
-            "  Summary mode reports the result for the input.\n" ++
-            "  Brief mode groups repeated findings for the input.\n\n" ++
+            "  Summary mode reports the result for the input.\n\n" ++
             "Exit Codes\n" ++
             "  0  clean\n" ++
             "  1  warnings only\n" ++
@@ -440,7 +430,7 @@ fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []cons
                 try writer.writeAll("error: unexpected flag");
             }
         },
-        error.ConflictingOutputMode => try writer.writeAll("error: choose one of --brief, --summary, or --json"),
+        error.ConflictingOutputMode => try writer.writeAll("error: choose either --summary or --json"),
         error.MissingBinarySize => try writer.writeAll("error: --max-binary-size requires a value"),
         error.MissingOboPath => try writer.writeAll("error: --obo requires a path"),
         error.InvalidValue => try writer.writeAll("error: invalid --max-binary-size value"),
@@ -467,8 +457,7 @@ fn isKnownFlag(arg: []const u8) bool {
         std.mem.eql(u8, arg, "--obo") or
         std.mem.eql(u8, arg, "--color") or
         std.mem.eql(u8, arg, "--json") or
-        std.mem.eql(u8, arg, "--summary") or
-        std.mem.eql(u8, arg, "--brief");
+        std.mem.eql(u8, arg, "--summary");
 }
 
 fn parseColorMode(value: []const u8) ?ColorMode {
@@ -771,7 +760,7 @@ test "help writes usage to stdout" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "One input is validated per invocation.") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "[more files...]") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Brief mode groups repeated findings for the input.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--brief") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "collapses groups across inputs") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
@@ -927,7 +916,7 @@ test "conflicting output modes report a usage error" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings("", stdout_writer.written());
-    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose one of --brief, --summary, or --json") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "choose either --summary or --json") != null);
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
@@ -1074,33 +1063,15 @@ test "[unit]: default output ranks grouped findings" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "[unit]: brief output renders one input" {
-    const allocator = std.testing.allocator;
-    const io = std.testing.io;
+test "[unit]: brief flag is rejected" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/mzml/invalid/invalid-base64.mzML",
-        "--skip-semantic",
-        "--skip-index",
+        "sample.mzML",
         "--brief",
     };
 
-    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stdout_writer.deinit();
-    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
-    defer stderr_writer.deinit();
-
-    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expectEqualStrings(
-        "input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
-            "complete: errors (info=0 warnings=0 errors=1)\n" ++
-            "\n" ++
-            "1  error  mzml.binary.base64  binary payload is not valid base64\n",
-        stdout_writer.written(),
-    );
-    try std.testing.expectEqualStrings("", stderr_writer.written());
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(&argv));
 }
 
 test "[unit]: verbose flag is rejected" {
