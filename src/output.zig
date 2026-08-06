@@ -4,7 +4,6 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
-const terminal_text = @import("terminal_text.zig");
 const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
@@ -23,6 +22,42 @@ pub const HumanResultOptions = struct {
     color: bool = false,
     terminal_columns: ?usize = null,
 };
+
+/// Counts terminal cells for common zero-width and wide Unicode scalars.
+pub fn displayWidth(text: []const u8) usize {
+    var index: usize = 0;
+    var width: usize = 0;
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        index += unit.byte_length;
+        width += unit.cell_width;
+    }
+    return width;
+}
+
+/// Returns a terminal-width suffix, retaining one visible scalar when none fits.
+pub fn suffixStartForWidth(text: []const u8, max_width: usize) usize {
+    const width = displayWidth(text);
+    if (width <= max_width) return 0;
+
+    var index: usize = 0;
+    var skipped: usize = 0;
+    var last_visible_start: usize = 0;
+    const skip = width - max_width;
+    while (index < text.len and skipped < skip) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width != 0) last_visible_start = index;
+        index += unit.byte_length;
+        skipped += unit.cell_width;
+    }
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width != 0) break;
+        index += unit.byte_length;
+    }
+    if (index == text.len and max_width > 0) return last_visible_start;
+    return index;
+}
 
 /// Writes grouped text diagnostics followed by one aggregate summary.
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -111,6 +146,84 @@ pub fn renderTextFile(
     try writeFailureMetadata(writer, summary.first_failure);
 }
 
+const DisplayUnit = struct {
+    byte_length: usize,
+    cell_width: usize,
+};
+
+fn prefixBytesForWidth(text: []const u8, max_width: usize) usize {
+    if (max_width == 0) return 0;
+
+    var index: usize = 0;
+    var width: usize = 0;
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width > max_width - width) break;
+        index += unit.byte_length;
+        width += unit.cell_width;
+    }
+    return index;
+}
+
+fn firstDisplayUnitBytes(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    return readDisplayUnit(text).byte_length;
+}
+
+fn readDisplayUnit(text: []const u8) DisplayUnit {
+    const byte_length: usize = std.unicode.utf8ByteSequenceLength(text[0]) catch
+        return .{ .byte_length = 1, .cell_width = 1 };
+    if (byte_length > text.len) return .{ .byte_length = 1, .cell_width = 1 };
+    const codepoint = std.unicode.utf8Decode(text[0..byte_length]) catch
+        return .{ .byte_length = 1, .cell_width = 1 };
+    return .{ .byte_length = byte_length, .cell_width = scalarCellWidth(codepoint) };
+}
+
+fn scalarCellWidth(codepoint: u21) usize {
+    if (codepoint < 0xff) return 1;
+    if (isZeroWidth(codepoint)) return 0;
+    return if (isWide(codepoint)) 2 else 1;
+}
+
+fn isZeroWidth(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x0300...0x036f,
+        0x1ab0...0x1aff,
+        0x1dc0...0x1dff,
+        0x200b...0x200f,
+        0x2060,
+        0x20d0...0x20ff,
+        0xfe00...0xfe0f,
+        0xfe20...0xfe2f,
+        0xfeff,
+        0xe0001,
+        0xe0020...0xe007f,
+        0xe0100...0xe01ef,
+        => true,
+        else => false,
+    };
+}
+
+fn isWide(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x1100...0x115f,
+        0x2329...0x232a,
+        0x2e80...0x303e,
+        0x3040...0xa4cf,
+        0xac00...0xd7a3,
+        0xf900...0xfaff,
+        0xfe10...0xfe19,
+        0xfe30...0xfe6f,
+        0xff00...0xff60,
+        0xffe0...0xffe6,
+        0x1f1e6...0x1f1ff,
+        0x1f300...0x1faff,
+        0x20000...0x3fffd,
+        => true,
+        else => false,
+    };
+}
+
 fn renderCompactDiagnostics(
     writer: *std.Io.Writer,
     diagnostics: []const Diagnostic,
@@ -143,8 +256,7 @@ fn renderCompactMessageRule(
     style_padding: bool,
 ) std.Io.Writer.Error!void {
     if (terminal_columns) |columns| {
-        const line_width = indent + terminal_text.displayWidth(message) + 3 +
-            terminal_text.displayWidth(rule);
+        const line_width = indent + displayWidth(message) + 3 + displayWidth(rule);
         if (line_width > columns) {
             try writer.writeAll("  ");
             try renderWrappedMessage(writer, message, indent, columns, color);
@@ -195,7 +307,7 @@ fn renderWrappedMessage(
         const word_start = index;
         while (index < message.len and message[index] != ' ') index += 1;
         var word = message[word_start..index];
-        const word_width = terminal_text.displayWidth(word);
+        const word_width = displayWidth(word);
 
         if (column > indent and column + 1 + word_width > line_limit) {
             try writer.writeByte('\n');
@@ -210,16 +322,16 @@ fn renderWrappedMessage(
 
         while (word.len > 0) {
             const available = line_limit - column;
-            const fitting_end = terminal_text.prefixBytesForWidth(word, available);
+            const fitting_end = prefixBytesForWidth(word, available);
             const chunk_end = if (fitting_end > 0)
                 fitting_end
             else
-                terminal_text.prefixBytesForWidth(word, 1);
+                firstDisplayUnitBytes(word);
             const chunk = word[0..chunk_end];
             try writeAnsi(writer, color, ansi_bold);
             try writer.writeAll(chunk);
             try writeAnsi(writer, color, ansi_reset);
-            column += terminal_text.displayWidth(chunk);
+            column += displayWidth(chunk);
             word = word[chunk.len..];
             if (word.len > 0) {
                 try writer.writeByte('\n');
@@ -1255,6 +1367,45 @@ test "[unit]: compact output wraps messages and preserves rule IDs" {
             "complete: errors | errors 1 | 1 group\n",
         allocating_writer.written(),
     );
+}
+
+test "[unit]: display width handles common Unicode cell sizes" {
+    const combining = "e\u{0301}";
+
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("é"));
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(combining));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("日"));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("Ａ"));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("🙂"));
+}
+
+test "[unit]: display width slicing preserves text boundaries" {
+    const valid = "ab日z";
+    const combining = "e\u{0301}z";
+    const invalid = "ab\xffz";
+
+    try std.testing.expectEqualStrings("ab", valid[0..prefixBytesForWidth(valid, 3)]);
+    try std.testing.expectEqualStrings("ab日", valid[0..prefixBytesForWidth(valid, 4)]);
+    try std.testing.expectEqualStrings("日z", valid[suffixStartForWidth(valid, 3)..]);
+    try std.testing.expectEqualStrings("e\u{0301}", combining[0..prefixBytesForWidth(combining, 1)]);
+    try std.testing.expectEqualStrings("z", combining[suffixStartForWidth(combining, 1)..]);
+    try std.testing.expectEqualStrings("\xffz", invalid[suffixStartForWidth(invalid, 2)..]);
+}
+
+test "[unit]: narrow suffix retains one wide scalar" {
+    const wide = "日";
+
+    try std.testing.expectEqual(@as(usize, 0), suffixStartForWidth(wide, 1));
+    try std.testing.expectEqual(wide.len, suffixStartForWidth(wide, 0));
+}
+
+test "[unit]: wrapped messages use terminal cell widths" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderWrappedMessage(&allocating_writer.writer, "a日b", 0, 3, false);
+
+    try std.testing.expectEqualStrings("a日\nb", allocating_writer.written());
 }
 
 test "[unit]: compact output retains exact wide colored output" {

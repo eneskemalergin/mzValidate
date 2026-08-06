@@ -7,7 +7,6 @@ const builtin = @import("builtin");
 const diagnostic = @import("diagnostic.zig");
 const output = @import("output.zig");
 const progress = @import("progress.zig");
-const terminal_text = @import("terminal_text.zig");
 const validate = @import("validate.zig");
 const version = @import("version.zig");
 
@@ -601,16 +600,16 @@ fn writeProgressPath(
         return;
     };
     const available = if (columns > prefix_width) columns - prefix_width else 1;
-    if (terminal_text.displayWidth(path) <= available) {
+    if (output.displayWidth(path) <= available) {
         try writer.writeAll(path);
         return;
     }
     if (available <= 3) {
-        try writer.writeAll(path[terminal_text.suffixStartForWidth(path, available)..]);
+        try writer.writeAll(path[output.suffixStartForWidth(path, available)..]);
         return;
     }
     try writer.writeAll("...");
-    try writer.writeAll(path[terminal_text.suffixStartForWidth(path, available - 3)..]);
+    try writer.writeAll(path[output.suffixStartForWidth(path, available - 3)..]);
 }
 
 fn progressPrefixWidth(update: progress.Update, elapsed_ns: i96) usize {
@@ -917,14 +916,16 @@ test "[unit]: progress keeps fields and fits paths on UTF-8 boundaries" {
         progress_writer.written(),
     );
 
-    const cases = [_]struct { path: []const u8, expected: []const u8 }{
-        .{ .path = "prefix/café.mzML", .expected = "...café.mzML" },
-        .{ .path = "prefix/bad\xff.mzML", .expected = "...bad\xff.mzML" },
+    const cases = [_]struct { path: []const u8, columns: usize, expected: []const u8 }{
+        .{ .path = "prefix/café.mzML", .columns = 12, .expected = "...café.mzML" },
+        .{ .path = "prefix/bad\xff.mzML", .columns = 12, .expected = "...bad\xff.mzML" },
+        .{ .path = "prefix/日.mzML", .columns = 12, .expected = "...x/日.mzML" },
+        .{ .path = "日", .columns = 1, .expected = "日" },
     };
     for (cases) |case| {
         var path_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
         defer path_writer.deinit();
-        try writeProgressPath(&path_writer.writer, case.path, 12, 0);
+        try writeProgressPath(&path_writer.writer, case.path, case.columns, 0);
         try std.testing.expectEqualStrings(case.expected, path_writer.written());
     }
 }
