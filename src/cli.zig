@@ -311,7 +311,7 @@ fn runCheck(
     return switch (check.output_mode) {
         .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check, presentation }),
         .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check, {} }),
-        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, {} }),
+        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, presentation }),
     };
 }
 
@@ -321,7 +321,7 @@ fn runCheckMode(
     io: std.Io,
     writer: *std.Io.Writer,
     check: CheckCommand,
-    presentation: if (mode == .text) Presentation else void,
+    presentation: if (mode == .json) void else Presentation,
 ) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
     const options = validate.CheckOptions{
@@ -334,7 +334,7 @@ fn runCheckMode(
     var context = validate.InvocationContext.init(allocator, io, options);
     defer context.deinit();
 
-    const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text)
+    const started: ?std.Io.Clock.Timestamp = if (comptime mode != .json)
         if (presentation.is_tty) .now(io, .awake) else null
     else
         null;
@@ -348,17 +348,18 @@ fn runCheckMode(
 
     const result = context.validateOne(&diagnostics, check.input);
     if (mode == .text or mode == .json) diagnostics.sortGroups();
+    const human_options: if (mode == .json) void else output.HumanResultOptions = if (mode == .json) {} else .{
+        .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
+        .color = switch (check.color_mode) {
+            .auto => presentation.auto_color,
+            .always => true,
+            .never => false,
+        },
+    };
     switch (mode) {
-        .text => try output.renderTextFile(writer, diagnostics.items, &result, check.input, .{
-            .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
-            .color = switch (check.color_mode) {
-                .auto => presentation.auto_color,
-                .always => true,
-                .never => false,
-            },
-        }),
+        .text => try output.renderTextFile(writer, diagnostics.items, &result, check.input, human_options),
         .json => try output.renderJsonResult(writer, diagnostics.items, &result, check.input),
-        .summary => try output.renderSummaryResult(writer, diagnostic.summarizeResults(&.{result})),
+        .summary => try output.renderSummaryResult(writer, diagnostic.summarizeResults(&.{result}), human_options),
     }
     return diagnostic.exitCodeForResults(&.{result});
 }
@@ -376,7 +377,7 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "Options\n" ++
             "  --summary    Emit only aggregate status and severity counts.\n" ++
             "  --json       Emit grouped JSON schema 1 for CI and pipelines.\n" ++
-            "  --color MODE Colorize default output: auto, always, or never.\n" ++
+            "  --color MODE Colorize human output: auto, always, or never.\n" ++
             "  --skip-binary\n" ++
             "               Skip binary payload checks.\n" ++
             "  --skip-index Skip index offset and checksum checks.\n" ++
@@ -941,7 +942,7 @@ test "[unit]: summary reports one corrupt input" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "complete: errors (info=0 warnings=0 errors=1)\n",
+        "complete: errors | errors 1\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -967,6 +968,20 @@ test "json contract: findings result matches golden" {
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "--skip-semantic",
         "--json",
+    };
+
+    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
+}
+
+test "json contract: color presentation does not change output" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/invalid/invalid-base64.mzML",
+        "--skip-semantic",
+        "--json",
+        "--color",
+        "always",
     };
 
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
@@ -1004,6 +1019,33 @@ test "external entities report an XML contract diagnostic" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
+test "[unit]: summary uses interactive timing and automatic color" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
+        "--skip-semantic",
+        "--skip-index",
+        "--summary",
+    };
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgsWithPresentation(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv, .{
+        .is_tty = true,
+        .auto_color = true,
+    });
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.startsWith(u8, stdout_writer.written(), "\x1b[42;30;1mcomplete: clean\x1b[0m | no findings | "));
+    try std.testing.expect(std.mem.endsWith(u8, stdout_writer.written(), "s\n"));
+    try std.testing.expectEqualStrings("", stderr_writer.written());
+}
+
 test "[unit]: text output groups one corrupt input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1028,7 +1070,7 @@ test "[unit]: text output groups one corrupt input" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "examples:\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "byte ") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "spectrum ") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete: errors | info 0, warnings 0, errors 1 | 1 groups") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete: errors | errors 1 | 1 group") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -1145,13 +1187,13 @@ test "skipping binary checks keeps valid structure clean" {
 
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expectEqualStrings(
-        "complete: clean (info=0 warnings=0 errors=0)\n",
+        "complete: clean | no findings\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "[unit]: summary reports one missing input failure" {
+test "[unit]: summary reports one missing input as incomplete" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
@@ -1170,8 +1212,7 @@ test "[unit]: summary reports one missing input failure" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=input reason=input rule=runtime.file-open input=missing-a.mzML\n",
+        "incomplete: errors | errors 1\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());

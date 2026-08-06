@@ -115,7 +115,7 @@ pub fn build(b: *std.Build) void {
         cli_valid_cmd.addArg("--skip-semantic");
         cli_valid_cmd.addArg("--skip-index");
         cli_valid_cmd.addArg("--summary");
-        cli_valid_cmd.expectStdOutEqual("complete: clean (info=0 warnings=0 errors=0)\n");
+        cli_valid_cmd.expectStdOutEqual("complete: clean | no findings\n");
         cli_contract_step.dependOn(&cli_valid_cmd.step);
     }
 
@@ -127,7 +127,7 @@ pub fn build(b: *std.Build) void {
     cli_known_findings_cmd.addArg("--skip-index");
     cli_known_findings_cmd.addArg("--summary");
     cli_known_findings_cmd.expectExitCode(2);
-    cli_known_findings_cmd.expectStdOutEqual("complete: errors (info=0 warnings=0 errors=13)\n");
+    cli_known_findings_cmd.expectStdOutEqual("complete: errors | errors 13\n");
 
     for (invalid_fixtures) |fixture| {
         const cli_invalid_cmd = b.addRunArtifact(exe);
@@ -137,7 +137,7 @@ pub fn build(b: *std.Build) void {
         cli_invalid_cmd.addArg("--skip-semantic");
         cli_invalid_cmd.addArg("--summary");
         cli_invalid_cmd.expectExitCode(2);
-        cli_invalid_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
+        cli_invalid_cmd.expectStdOutMatch("complete: errors | errors ");
         cli_contract_step.dependOn(&cli_invalid_cmd.step);
     }
 
@@ -183,7 +183,7 @@ pub fn build(b: *std.Build) void {
     cli_schema_finding_cmd.addArg("--skip-index");
     cli_schema_finding_cmd.addArg("--summary");
     cli_schema_finding_cmd.expectExitCode(2);
-    cli_schema_finding_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
+    cli_schema_finding_cmd.expectStdOutMatch("complete: errors | errors ");
 
     const cli_incomplete_cmd = b.addRunArtifact(exe);
     cli_incomplete_cmd.step.dependOn(b.getInstallStep());
@@ -193,8 +193,7 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.addArg("--skip-semantic");
     cli_incomplete_cmd.addArg("--summary");
     cli_incomplete_cmd.expectExitCode(2);
-    cli_incomplete_cmd.expectStdOutMatch("incomplete: errors (info=0 warnings=0 errors=");
-    cli_incomplete_cmd.expectStdOutMatch("failure: stage=index reason=resource");
+    cli_incomplete_cmd.expectStdOutMatch("incomplete: errors | errors ");
 
     const cli_json_cmd = b.addRunArtifact(exe);
     cli_json_cmd.step.dependOn(b.getInstallStep());

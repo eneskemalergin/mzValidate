@@ -16,8 +16,8 @@ pub const OutputMode = enum {
     summary,
 };
 
-/// Per-file context for compact human output.
-pub const TextFileOptions = struct {
+/// Presentation values for human result lines.
+pub const HumanResultOptions = struct {
     elapsed_ns: ?i96 = null,
     color: bool = false,
 };
@@ -49,16 +49,20 @@ pub fn renderTextResult(
         }
     }
     var rendered_failure = false;
+    var finding_groups = diagnostics.len;
     for (results) |result| {
         if (result.first_failure) |failure| {
             if (!result.failure_diagnostic_emitted) {
                 try renderFailureText(writer, failure);
                 rendered_failure = true;
+                finding_groups = std.math.add(usize, finding_groups, 1) catch std.math.maxInt(usize);
             }
         }
     }
     if (rendered_failure) try writer.writeByte('\n');
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
+    const summary = diagnostic.summarizeResults(results);
+    try writeHumanResultLine(writer, summary, finding_groups, .{});
+    try writeFailureMetadata(writer, summary.first_failure);
 }
 
 /// Writes one file's text diagnostics and any retained failure metadata.
@@ -67,7 +71,7 @@ pub fn renderTextFile(
     diagnostics: []const Diagnostic,
     result: *const diagnostic.FileResult,
     path: []const u8,
-    options: TextFileOptions,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
     try writer.print("input: {s}\n\n", .{path});
 
@@ -88,7 +92,9 @@ pub fn renderTextFile(
         diagnostics.len,
         @intFromBool(result.needsEmergencyDiagnostic()),
     ) catch std.math.maxInt(usize);
-    try writeFileResultLine(writer, result.*, finding_groups, options.elapsed_ns, options.color);
+    const summary = diagnostic.summarizeResults(&.{result.*});
+    try writeHumanResultLine(writer, summary, finding_groups, options);
+    try writeFailureMetadata(writer, summary.first_failure);
 }
 
 fn renderCompactDiagnostics(
@@ -186,42 +192,53 @@ fn renderCompactFailure(
     try writer.writeByte('\n');
 }
 
-fn writeFileResultLine(
+fn writeHumanResultLine(
     writer: *std.Io.Writer,
-    result: diagnostic.FileResult,
-    finding_groups: usize,
-    elapsed_ns: ?i96,
-    color: bool,
+    summary: diagnostic.Summary,
+    finding_groups: ?usize,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
-    const no_findings = result.totals.info == 0 and result.totals.warnings == 0 and result.totals.errors == 0;
+    const no_findings = summary.totals.info == 0 and summary.totals.warnings == 0 and summary.totals.errors == 0;
     if (no_findings) {
-        try writeResultHighlight(writer, result.completion.label(), "clean", null, color);
+        try writeResultHighlight(writer, summary.completion.label(), "clean", null, options.color);
         try writer.writeAll(" | no findings");
     } else {
         try writeResultHighlight(
             writer,
-            result.completion.label(),
-            humanStatusLabel(result.status()),
-            resultSeverity(result.totals),
-            color,
+            summary.completion.label(),
+            humanStatusLabel(summary.totals),
+            resultSeverity(summary.totals),
+            options.color,
         );
-        try writer.print(" | info {d}, warnings {d}, errors {d}", .{
-            result.totals.info,
-            result.totals.warnings,
-            result.totals.errors,
-        });
-        try writer.print(" | {d} groups", .{finding_groups});
+        try writer.writeAll(" | ");
+        var separator: []const u8 = "";
+        if (summary.totals.errors > 0) {
+            try writer.print("errors {d}", .{summary.totals.errors});
+            separator = ", ";
+        }
+        if (summary.totals.warnings > 0) {
+            try writer.print("{s}warnings {d}", .{ separator, summary.totals.warnings });
+            separator = ", ";
+        }
+        if (summary.totals.info > 0) {
+            try writer.print("{s}info {d}", .{ separator, summary.totals.info });
+        }
+        if (finding_groups) |count| {
+            try writer.print(" | {d} {s}", .{ count, if (count == 1) "group" else "groups" });
+        }
     }
-    if (elapsed_ns) |nanoseconds| {
+    if (options.elapsed_ns) |nanoseconds| {
         try writer.writeAll(" | ");
         try writeElapsed(writer, nanoseconds);
     }
     try writer.writeByte('\n');
-    if (result.first_failure) |failure| {
-        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
-        if (failure.path()) |path| try writer.print(" input={s}", .{path});
-        try writer.writeByte('\n');
-    }
+}
+
+fn writeFailureMetadata(writer: *std.Io.Writer, first_failure: ?diagnostic.FirstFailure) std.Io.Writer.Error!void {
+    const failure = first_failure orelse return;
+    try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
+    if (failure.path()) |path| try writer.print(" input={s}", .{path});
+    try writer.writeByte('\n');
 }
 
 const ansi_reset = "\x1b[0m";
@@ -378,8 +395,9 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
 pub fn renderSummaryResult(
     writer: *std.Io.Writer,
     summary: diagnostic.Summary,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, summary);
+    try writeHumanResultLine(writer, summary, null, options);
 }
 
 /// Writes one complete JSON report using the current schema version.
@@ -681,7 +699,7 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     try writer.print(
         "summary: {s} (info={d} warnings={d} errors={d})\n",
         .{
-            summary.status().label(),
+            humanStatusLabel(summary.totals),
             summary.totals.info,
             summary.totals.warnings,
             summary.totals.errors,
@@ -689,30 +707,11 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     );
 }
 
-fn writeResultBlock(
-    writer: *std.Io.Writer,
-    summary: diagnostic.Summary,
-) std.Io.Writer.Error!void {
-    try writer.print("{s}: {s} (info={d} warnings={d} errors={d})\n", .{
-        summary.completion.label(),
-        humanStatusLabel(summary.status()),
-        summary.totals.info,
-        summary.totals.warnings,
-        summary.totals.errors,
-    });
-    if (summary.first_failure) |failure| {
-        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
-        if (failure.path()) |path| try writer.print(" input={s}", .{path});
-        try writer.writeByte('\n');
-    }
-}
-
-fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
-    return switch (status) {
-        .clean => "clean",
-        .warnings_only => "warnings",
-        .errors_present => "errors",
-    };
+fn humanStatusLabel(totals: diagnostic.Totals) []const u8 {
+    if (totals.errors > 0) return "errors";
+    if (totals.warnings > 0) return "warnings";
+    if (totals.info > 0) return "info";
+    return "clean";
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
@@ -778,18 +777,17 @@ test "summary reports severity counts" {
     );
 }
 
-test "summary result reports incomplete failure" {
+test "summary result reports incomplete status" {
     var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
     result.recordFailure(.parser, .parser, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
     result.finalize(&.{});
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{});
 
     try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=parser reason=parser rule=runtime.incomplete input=sample.mzML\n",
+        "incomplete: errors | errors 1\n",
         allocating_writer.written(),
     );
 }
@@ -806,12 +804,45 @@ test "summary result uses human warning status" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{ .color = true });
 
     try std.testing.expectEqualStrings(
-        "complete: warnings (info=2 warnings=1 errors=0)\n",
+        "\x1b[43;30;1mcomplete: warnings\x1b[0m | warnings 1, info 2\n",
         allocating_writer.written(),
     );
+}
+
+test "[unit]: summary result uses info status timing and color" {
+    const diagnostics = [_]Diagnostic{.{ .severity = .info, .rule = "test.info", .message = "note", .occurrences = 2 }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{
+        .elapsed_ns = 420_000_000,
+        .color = true,
+    });
+
+    try std.testing.expectEqualStrings(
+        "\x1b[46;30;1mcomplete: info\x1b[0m | info 2 | 0.42s\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: elapsed time handles centisecond boundaries" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try writeElapsed(&allocating_writer.writer, -1);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 9_999_999);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 10_000_000);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 1_000_000_000);
+
+    try std.testing.expectEqualStrings("0.00s 0.00s 0.01s 1.00s", allocating_writer.written());
 }
 
 test "[unit]: text result emits emergency failure" {
@@ -827,7 +858,7 @@ test "[unit]: text result emits emergency failure" {
     try std.testing.expectEqualStrings(
         "input: sample.mzML\n" ++
             "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n" ++
-            "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "incomplete: errors | errors 1 | 1 group\n" ++
             "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n",
         allocating_writer.written(),
     );
@@ -847,7 +878,7 @@ test "[unit]: per-file text renderer emits emergency failure" {
         "input: sample.mzML\n\n" ++
             "  ERROR   x001  validation stopped (stage=parser reason=allocation) [runtime.incomplete]\n" ++
             "\n" ++
-            "incomplete: errors | info 0, warnings 0, errors 1 | 1 groups\n" ++
+            "incomplete: errors | errors 1 | 1 group\n" ++
             "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n",
         allocating_writer.written(),
     );
@@ -918,7 +949,7 @@ test "text output groups diagnostics by input" {
             "  error [runtime.file-open]: unable to open input file\n" ++
             "    location: byte=12\n" ++
             "\n" ++
-            "summary: errors-present (info=0 warnings=1 errors=1)\n",
+            "summary: errors (info=0 warnings=1 errors=1)\n",
         allocating_writer.written(),
     );
 }
@@ -938,7 +969,7 @@ test "text output separates pathless diagnostics" {
     try std.testing.expectEqualStrings(
         "  info [meta.note]: standalone note\n" ++
             "\n" ++
-            "summary: clean (info=1 warnings=0 errors=0)\n",
+            "summary: info (info=1 warnings=0 errors=0)\n",
         allocating_writer.written(),
     );
 }
@@ -960,7 +991,7 @@ test "text output separates pathless diagnostics from the previous input" {
             "\n" ++
             "  info [meta.note]: standalone note\n" ++
             "\n" ++
-            "summary: warnings-only (info=1 warnings=1 errors=0)\n",
+            "summary: warnings (info=1 warnings=1 errors=0)\n",
         allocating_writer.written(),
     );
 }
@@ -1021,7 +1052,7 @@ test "[unit]: compact file output aligns counts and keeps byte examples inline" 
             "  WARNING x030  repeated finding [test.repeated]\n" ++
             "                 examples: bytes 20\n" ++
             "\n" ++
-            "complete: errors | info 0, warnings 30, errors 1 | 2 groups\n",
+            "complete: errors | errors 1, warnings 30 | 2 groups\n",
         allocating_writer.written(),
     );
 }
