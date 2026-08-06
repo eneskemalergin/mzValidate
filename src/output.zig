@@ -19,8 +19,6 @@ pub const OutputMode = enum {
 
 /// Per-file context for compact human output.
 pub const TextFileOptions = struct {
-    input_index: usize = 0,
-    input_count: usize = 1,
     elapsed_ns: ?i96 = null,
     color: bool = false,
 };
@@ -72,12 +70,7 @@ pub fn renderTextFile(
     path: []const u8,
     options: TextFileOptions,
 ) std.Io.Writer.Error!void {
-    if (options.input_index > 0) try writer.writeByte('\n');
-    if (options.input_count > 1) {
-        try writer.print("[{d}/{d}] input: {s}\n\n", .{ options.input_index + 1, options.input_count, path });
-    } else {
-        try writer.print("input: {s}\n\n", .{path});
-    }
+    try writer.print("input: {s}\n\n", .{path});
 
     const count_width = occurrenceWidth(diagnostics);
     try renderCompactDiagnostics(writer, diagnostics, count_width, options.color);
@@ -97,28 +90,6 @@ pub fn renderTextFile(
         @intFromBool(result.needsEmergencyDiagnostic()),
     ) catch std.math.maxInt(usize);
     try writeFileResultLine(writer, result.*, finding_groups, options.elapsed_ns, options.color);
-}
-
-/// Writes the final text result block for an invocation.
-pub fn renderTextFinal(
-    writer: *std.Io.Writer,
-    summary: diagnostic.Summary,
-    color: bool,
-) std.Io.Writer.Error!void {
-    if (summary.totals.info == 0 and summary.totals.warnings == 0 and summary.totals.errors == 0) {
-        try writer.writeByte('\n');
-        try writeResultHighlight(writer, "summary", "clean", null, color);
-        try writer.print(" | {d} files | no findings\n", .{summary.files});
-        return;
-    }
-    try writer.writeByte('\n');
-    try writeResultHighlight(writer, "summary", humanStatusLabel(summary.status()), resultSeverity(summary.totals), color);
-    try writer.print(" | {d} files | info {d}, warnings {d}, errors {d}\n", .{
-        summary.files,
-        summary.totals.info,
-        summary.totals.warnings,
-        summary.totals.errors,
-    });
 }
 
 fn renderCompactDiagnostics(
@@ -544,15 +515,8 @@ pub fn renderBriefFile(
     diagnostics: []const Diagnostic,
     result: *const diagnostic.FileResult,
     path: []const u8,
-    input_index: usize,
-    input_count: usize,
 ) std.Io.Writer.Error!void {
-    if (input_index > 0) try writer.writeByte('\n');
-    if (input_count > 1) {
-        try writer.print("[{d}/{d}] input: {s}\n", .{ input_index + 1, input_count, path });
-    } else {
-        try writer.print("input: {s}\n", .{path});
-    }
+    try writer.print("input: {s}\n", .{path});
     try renderBriefResult(writer, diagnostics, &.{result.*});
 }
 
@@ -563,69 +527,45 @@ pub fn renderJsonResult(
     result: *const diagnostic.FileResult,
     path: []const u8,
 ) std.Io.Writer.Error!void {
-    var stream = try JsonStream.init(writer);
-    try stream.writeFile(diagnostics, result, path);
-    try stream.finish();
+    const finding_groups = std.math.add(
+        usize,
+        diagnostics.len,
+        @intFromBool(result.needsEmergencyDiagnostic()),
+    ) catch std.math.maxInt(usize);
+    try writer.print("{{\n  \"schema_version\": {d},\n  \"files\": [", .{version.json_schema});
+    try writeJsonFile(writer, diagnostics, result, path, finding_groups);
+    try writer.writeAll("\n  ],\n  \"summary\": ");
+    try writeJsonSummary(writer, diagnostic.summarizeResults(&.{result.*}), finding_groups);
+    try writer.writeAll("\n}\n");
 }
 
-/// Incrementally writes one versioned report without retaining file diagnostics.
-pub const JsonStream = struct {
+fn writeJsonFile(
     writer: *std.Io.Writer,
-    first_file: bool = true,
-    summary: diagnostic.Summary = .{},
-    finding_groups: usize = 0,
-
-    /// Writes the report header and borrows the supplied writer.
-    pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
-        try writer.print("{{\n  \"schema_version\": {d},\n  \"files\": [", .{version.json_schema});
-        return .{ .writer = writer };
-    }
-
-    /// Appends one file result and its bounded diagnostic detail.
-    pub fn writeFile(
-        stream: *JsonStream,
-        diagnostics: []const Diagnostic,
-        result: *const diagnostic.FileResult,
-        path: []const u8,
-    ) std.Io.Writer.Error!void {
-        stream.summary.addResult(result.*);
-        const file_groups = std.math.add(
-            usize,
-            diagnostics.len,
-            @intFromBool(result.needsEmergencyDiagnostic()),
-        ) catch std.math.maxInt(usize);
-        stream.finding_groups = std.math.add(usize, stream.finding_groups, file_groups) catch std.math.maxInt(usize);
-        if (!stream.first_file) try stream.writer.writeByte(',');
-        try stream.writer.writeAll("\n    {\n      \"path\": ");
-        try writeJsonString(stream.writer, path);
-        try stream.writer.writeAll(",\n      \"completion\": ");
-        try writeJsonString(stream.writer, result.completion.label());
-        try stream.writer.writeAll(",\n      \"status\": ");
-        try writeJsonString(stream.writer, result.status().label());
-        try stream.writer.writeAll(",\n      \"totals\": ");
-        try writeJsonTotals(stream.writer, result.totals);
-        try stream.writer.print(",\n      \"finding_groups\": {d}", .{file_groups});
-        try stream.writer.print(
-            ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
-            .{result.diagnostics_truncated},
-        );
-        try writeJsonTotals(stream.writer, result.dropped_diagnostics);
-        try stream.writer.writeAll(",\n      \"first_failure\": ");
-        try writeJsonFirstFailure(stream.writer, result.first_failure, 8);
-        try stream.writer.writeAll(",\n      \"diagnostics\": ");
-        try writeJsonDiagnostics(stream.writer, diagnostics, result, path);
-        try stream.writer.writeAll("\n    }");
-        stream.first_file = false;
-    }
-
-    /// Writes the aggregate summary and closes the report.
-    pub fn finish(stream: *JsonStream) std.Io.Writer.Error!void {
-        if (!stream.first_file) try stream.writer.writeByte('\n');
-        try stream.writer.writeAll("  ],\n  \"summary\": ");
-        try writeJsonSummary(stream.writer, stream.summary, stream.finding_groups);
-        try stream.writer.writeAll("\n}\n");
-    }
-};
+    diagnostics: []const Diagnostic,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
+    finding_groups: usize,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("\n    {\n      \"path\": ");
+    try writeJsonString(writer, path);
+    try writer.writeAll(",\n      \"completion\": ");
+    try writeJsonString(writer, result.completion.label());
+    try writer.writeAll(",\n      \"status\": ");
+    try writeJsonString(writer, result.status().label());
+    try writer.writeAll(",\n      \"totals\": ");
+    try writeJsonTotals(writer, result.totals);
+    try writer.print(",\n      \"finding_groups\": {d}", .{finding_groups});
+    try writer.print(
+        ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
+        .{result.diagnostics_truncated},
+    );
+    try writeJsonTotals(writer, result.dropped_diagnostics);
+    try writer.writeAll(",\n      \"first_failure\": ");
+    try writeJsonFirstFailure(writer, result.first_failure, 8);
+    try writer.writeAll(",\n      \"diagnostics\": ");
+    try writeJsonDiagnostics(writer, diagnostics, result, path);
+    try writer.writeAll("\n    }");
+}
 
 fn writeJsonDiagnostics(
     writer: *std.Io.Writer,
@@ -1251,24 +1191,6 @@ test "[unit]: compact clean result includes elapsed time when supplied" {
     );
 }
 
-test "[unit]: compact multi-file block prefixes and separates later input" {
-    var result = diagnostic.FileResult.init(0);
-    result.finalize(&.{});
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderTextFile(&allocating_writer.writer, &.{}, &result, "second.mzML", .{
-        .input_index = 1,
-        .input_count = 5,
-    });
-
-    try std.testing.expectEqualStrings(
-        "\n[2/5] input: second.mzML\n\n" ++
-            "complete: clean | no findings\n",
-        allocating_writer.written(),
-    );
-}
-
 test "[unit]: compact color styles severity message rule and result" {
     const diagnostics = [_]Diagnostic{.{
         .severity = .@"error",
@@ -1346,7 +1268,7 @@ test "[unit]: brief file uses unnumbered single-input attribution" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderBriefFile(&allocating_writer.writer, &diagnostics, &result, "sample.mzML", 0, 1);
+    try renderBriefFile(&allocating_writer.writer, &diagnostics, &result, "sample.mzML");
 
     try std.testing.expectEqualStrings(
         "input: sample.mzML\n" ++
@@ -1384,9 +1306,7 @@ test "bounded output reports dropped severity totals" {
 
     var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer json_writer.deinit();
-    var stream = try JsonStream.init(&json_writer.writer);
-    try stream.writeFile(&.{}, &result, "sample.mzML");
-    try stream.finish();
+    try renderJsonResult(&json_writer.writer, &.{}, &result, "sample.mzML");
     try std.testing.expect(std.mem.indexOf(u8, json_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
 }
 

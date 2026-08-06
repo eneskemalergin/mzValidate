@@ -22,7 +22,7 @@ pub const ColorMode = enum {
     never,
 };
 
-/// Parsed `check` subcommand flags and input paths.
+/// Parsed `check` subcommand flags and borrowed input path.
 pub const CheckCommand = struct {
     output_mode: output.OutputMode = .text,
     skip_binary: bool = false,
@@ -31,29 +31,18 @@ pub const CheckCommand = struct {
     max_binary_size: ?usize = null,
     obo_path: ?[]const u8 = null,
     color_mode: ColorMode = .auto,
-    inputs: []const []const u8,
-
-    /// Releases the owned input-path list. Path bytes remain borrowed from argv.
-    pub fn deinit(command: *CheckCommand, allocator: std.mem.Allocator) void {
-        allocator.free(command.inputs);
-        command.* = undefined;
-    }
+    input: []const u8,
 };
 
 /// Top-level CLI command after parsing.
 pub const Command = union(enum) {
     check: CheckCommand,
-
-    pub fn deinit(command: *Command, allocator: std.mem.Allocator) void {
-        switch (command.*) {
-            .check => |*check| check.deinit(allocator),
-        }
-    }
 };
 
 const ParseError = error{
     MissingCommand,
     MissingInputPath,
+    MultipleInputPaths,
     UnsupportedCommand,
     UnexpectedFlag,
     ConflictingOutputMode,
@@ -64,8 +53,6 @@ const ParseError = error{
     InvalidColorMode,
     Overflow,
 };
-
-const ParseArgsError = ParseError || std.mem.Allocator.Error;
 
 /// Parses process arguments, runs validation, flushes output, and returns the exit code.
 pub fn run(init: std.process.Init) !u8 {
@@ -186,10 +173,10 @@ fn runArgsWithPresentation(
         return 0;
     }
 
-    var command = parseArgs(allocator, args) catch |err| switch (err) {
-        error.OutOfMemory => return error.OutOfMemory,
+    const command = parseArgs(args) catch |err| switch (err) {
         error.MissingCommand,
         error.MissingInputPath,
+        error.MultipleInputPaths,
         error.UnsupportedCommand,
         error.UnexpectedFlag,
         error.ConflictingOutputMode,
@@ -207,21 +194,18 @@ fn runArgsWithPresentation(
             return 2;
         },
     };
-    defer command.deinit(allocator);
 
     return switch (command) {
         .check => |check| try runCheck(allocator, io, stdout, check, presentation),
     };
 }
 
-/// Parses argv into an allocator-owned command; path strings borrow `args`.
-pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseArgsError!Command {
+/// Parses argv into a command that borrows its input path from `args`.
+pub fn parseArgs(args: []const []const u8) ParseError!Command {
     if (args.len < 2) return error.MissingCommand;
     if (!std.mem.eql(u8, args[1], "check")) return error.UnsupportedCommand;
 
-    var input_paths: std.ArrayList([]const u8) = .empty;
-    defer input_paths.deinit(allocator);
-
+    var input_path: ?[]const u8 = null;
     var output_mode: output.OutputMode = .text;
     var output_mode_set = false;
     var skip_binary = false;
@@ -284,10 +268,9 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         }
         if (std.mem.startsWith(u8, arg, "-")) return error.UnexpectedFlag;
 
-        try input_paths.append(allocator, arg);
+        if (input_path != null) return error.MultipleInputPaths;
+        input_path = arg;
     }
-
-    if (input_paths.items.len == 0) return error.MissingInputPath;
 
     return .{ .check = .{
         .output_mode = output_mode,
@@ -297,7 +280,7 @@ pub fn parseArgs(allocator: std.mem.Allocator, args: []const []const u8) ParseAr
         .max_binary_size = max_binary_size,
         .obo_path = obo_path,
         .color_mode = color_mode,
-        .inputs = try input_paths.toOwnedSlice(allocator),
+        .input = input_path orelse return error.MissingInputPath,
     } };
 }
 
@@ -348,17 +331,6 @@ fn runCheckMode(
     presentation: if (mode == .text) Presentation else void,
 ) !u8 {
     const diagnostic_defaults = diagnostic.ResourceLimits{};
-    const State = switch (mode) {
-        .text, .summary => diagnostic.Summary,
-        .json => output.JsonStream,
-        .brief => diagnostic.Summary,
-    };
-    var state: State = switch (mode) {
-        .text, .summary => .{},
-        .json => try output.JsonStream.init(writer),
-        .brief => .{},
-    };
-
     const options = validate.CheckOptions{
         .skip_binary = check.skip_binary,
         .skip_index = check.skip_index,
@@ -369,78 +341,46 @@ fn runCheckMode(
     var context = validate.InvocationContext.init(allocator, io, options);
     defer context.deinit();
 
-    for (check.inputs, 0..) |path, input_index| {
-        const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text)
-            if (presentation.is_tty) .now(io, .awake) else null
-        else
-            null;
-        var diagnostics = DiagnosticSink.init(.{
-            .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
-            .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
-            .retain_details = mode != .summary,
-            .aggregate_occurrences = mode == .text or mode == .json or mode == .brief,
-        });
-        defer diagnostics.deinit(allocator);
+    const started: ?std.Io.Clock.Timestamp = if (comptime mode == .text)
+        if (presentation.is_tty) .now(io, .awake) else null
+    else
+        null;
+    var diagnostics = DiagnosticSink.init(.{
+        .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
+        .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
+        .retain_details = mode != .summary,
+        .aggregate_occurrences = mode == .text or mode == .json or mode == .brief,
+    });
+    defer diagnostics.deinit(allocator);
 
-        const result = context.validateOne(&diagnostics, path);
-        if (mode == .text or mode == .json) diagnostics.sortGroups();
-        switch (mode) {
-            .text => {
-                state.addResult(result);
-                try output.renderTextFile(writer, diagnostics.items, &result, path, .{
-                    .input_index = input_index,
-                    .input_count = check.inputs.len,
-                    .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
-                    .color = switch (check.color_mode) {
-                        .auto => presentation.auto_color,
-                        .always => true,
-                        .never => false,
-                    },
-                });
-            },
-            .json => try state.writeFile(diagnostics.items, &result, path),
-            .summary => state.addResult(result),
-            .brief => {
-                state.addResult(result);
-                try output.renderBriefFile(writer, diagnostics.items, &result, path, input_index, check.inputs.len);
-            },
-        }
-    }
-
-    return switch (mode) {
-        .text => exit_code: {
-            if (check.inputs.len > 1) try output.renderTextFinal(writer, state, switch (check.color_mode) {
+    const result = context.validateOne(&diagnostics, check.input);
+    if (mode == .text or mode == .json) diagnostics.sortGroups();
+    switch (mode) {
+        .text => try output.renderTextFile(writer, diagnostics.items, &result, check.input, .{
+            .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
+            .color = switch (check.color_mode) {
                 .auto => presentation.auto_color,
                 .always => true,
                 .never => false,
-            });
-            break :exit_code diagnostic.exitCodeForSummary(state);
-        },
-        .json => exit_code: {
-            try state.finish();
-            break :exit_code diagnostic.exitCodeForSummary(state.summary);
-        },
-        .summary => exit_code: {
-            try output.renderSummaryResult(writer, state);
-            break :exit_code diagnostic.exitCodeForSummary(state);
-        },
-        .brief => exit_code: {
-            if (check.inputs.len > 1) try output.renderTextFinal(writer, state, false);
-            break :exit_code diagnostic.exitCodeForSummary(state);
-        },
-    };
+            },
+        }),
+        .json => try output.renderJsonResult(writer, diagnostics.items, &result, check.input),
+        .summary => try output.renderSummaryResult(writer, diagnostic.summarizeResults(&.{result})),
+        .brief => try output.renderBriefFile(writer, diagnostics.items, &result, check.input),
+    }
+    return diagnostic.exitCodeForResults(&.{result});
 }
 
 // --- Private Helpers ---
 
 fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
     try writer.writeAll(
-        "mzValidate validates mzML inputs in one primary forward pass without building an XML tree.\n\n" ++
+        "mzValidate validates one mzML input in a primary forward pass without building an XML tree.\n\n" ++
             "Usage\n" ++
-            "  mzValidate check <input.mzML> [more files...] [options]\n" ++
+            "  mzValidate check <input.mzML> [options]\n" ++
             "  mzValidate --help\n\n" ++
             "Commands\n" ++
-            "  check        Validate one or more mzML inputs in a single run.\n\n" ++
+            "  check        Validate one mzML input.\n\n" ++
             "Options\n" ++
             "  --brief      Emit a compact grouped table.\n" ++
             "  --summary    Emit only aggregate status and severity counts.\n" ++
@@ -459,34 +399,33 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  --version    Print the mzValidate version number and exit.\n" ++
             "  --help, -h   Show this help text.\n" ++
             "Behavior\n" ++
-            "  Inputs are validated serially in command-line order. Use separate processes\n" ++
-            "  when an external scheduler needs parallel file validation.\n" ++
-            "  Every input is attempted, even if an earlier input produces diagnostics.\n" ++
+            "  One input is validated per invocation.\n" ++
             "  Human result lines show completion, status, and severity counts.\n" ++
             "  Default output groups identical findings per input and keeps three example locations.\n" ++
             "  JSON records the same groups, exact occurrence counts, and one summary.\n" ++
-            "  Summary mode reports the aggregate result for the whole invocation.\n" ++
-            "  Brief mode groups repeated findings within each input.\n\n" ++
+            "  Summary mode reports the result for the input.\n" ++
+            "  Brief mode groups repeated findings for the input.\n\n" ++
             "Exit Codes\n" ++
             "  0  clean\n" ++
             "  1  warnings only\n" ++
             "  2  errors present or CLI usage failure\n\n" ++
             "Examples\n" ++
             "  mzValidate check sample.mzML\n" ++
-            "  mzValidate check run-a.mzML run-b.mzML --summary\n" ++
+            "  mzValidate check sample.mzML --summary\n" ++
             "  mzValidate check sample.mzML --json --skip-binary\n" ++
             "  mzValidate check sample.mzML --json > report.json\n",
     );
 }
 
 fn writeUsageHint(writer: *std.Io.Writer) std.Io.Writer.Error!void {
-    try writer.writeAll("usage: mzValidate check <input.mzML> [more files...] [options]\n");
+    try writer.writeAll("usage: mzValidate check <input.mzML> [options]\n");
 }
 
 fn writeParseError(writer: *std.Io.Writer, err: ParseError, args: []const []const u8) std.Io.Writer.Error!void {
     switch (err) {
         error.MissingCommand => try writer.writeAll("error: missing command"),
         error.MissingInputPath => try writer.writeAll("error: missing input path after `check`"),
+        error.MultipleInputPaths => try writer.writeAll("error: check accepts exactly one input path"),
         error.UnsupportedCommand => {
             if (args.len >= 2) {
                 try writer.print("error: unsupported command: {s}", .{args[1]});
@@ -628,75 +567,32 @@ test "flush attempts stderr after stdout failure" {
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
 }
 
-test "parses flags and input paths" {
-    const allocator = std.testing.allocator;
+test "[unit]: parser accepts one input path with options" {
     const argv = [_][]const u8{
         "mzValidate",
         "check",
         "sample-a.mzML",
         "--json",
         "--skip-binary",
-        "sample-b.mzML",
     };
 
-    var command = try parseArgs(allocator, &argv);
-    defer command.deinit(allocator);
+    const command = try parseArgs(&argv);
 
     switch (command) {
         .check => |check| {
             try std.testing.expectEqual(output.OutputMode.json, check.output_mode);
             try std.testing.expect(check.skip_binary);
-            try std.testing.expectEqual(@as(usize, 2), check.inputs.len);
-            try std.testing.expectEqualStrings("sample-a.mzML", check.inputs[0]);
-            try std.testing.expectEqualStrings("sample-b.mzML", check.inputs[1]);
+            try std.testing.expectEqualStrings("sample-a.mzML", check.input);
         },
     }
 }
 
-fn parseArgsAllocationCheck(allocator: std.mem.Allocator) !void {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "one.mzML",
-        "two.mzML",
-        "three.mzML",
-        "four.mzML",
-        "five.mzML",
-    };
-    var command = try parseArgs(allocator, &argv);
-    defer command.deinit(allocator);
-}
+test "[unit]: rejects a second input path even when separated by options" {
+    const adjacent = [_][]const u8{ "mzValidate", "check", "one.mzML", "two.mzML" };
+    const separated = [_][]const u8{ "mzValidate", "check", "one.mzML", "--skip-index", "two.mzML" };
 
-test "[unit]: command parsing cleans every allocation failure" {
-    try std.testing.checkAllAllocationFailures(
-        std.testing.allocator,
-        parseArgsAllocationCheck,
-        .{},
-    );
-}
-
-test "[unit]: command parsing owns the result when shrinking cannot remap" {
-    var backing: [4096]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&backing);
-    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
-        .resize_fail_index = 0,
-    });
-    try parseArgsAllocationCheck(allocator.allocator());
-    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
-}
-
-test "[unit]: command parsing cleans the list when remap and fallback allocation fail" {
-    const argv = [_][]const u8{ "mzValidate", "check", "one.mzML" };
-    var backing: [4096]u8 = undefined;
-    var fixed = std.heap.FixedBufferAllocator.init(&backing);
-    var allocator = std.testing.FailingAllocator.init(fixed.allocator(), .{
-        .fail_index = 1,
-        .resize_fail_index = 0,
-    });
-
-    try std.testing.expectError(error.OutOfMemory, parseArgs(allocator.allocator(), &argv));
-    try std.testing.expect(allocator.has_induced_failure);
-    try std.testing.expectEqual(allocator.allocated_bytes, allocator.freed_bytes);
+    try std.testing.expectError(error.MultipleInputPaths, parseArgs(&adjacent));
+    try std.testing.expectError(error.MultipleInputPaths, parseArgs(&separated));
 }
 
 test "rejects the removed memory limit flag" {
@@ -708,7 +604,7 @@ test "rejects the removed memory limit flag" {
         "2M",
     };
 
-    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(&argv));
 }
 
 test "rejects conflicting output modes" {
@@ -720,7 +616,7 @@ test "rejects conflicting output modes" {
         "--summary",
     };
 
-    try std.testing.expectError(error.ConflictingOutputMode, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.ConflictingOutputMode, parseArgs(&argv));
 }
 
 test "requires an input path after check" {
@@ -731,7 +627,7 @@ test "requires an input path after check" {
         "--summary",
     };
 
-    try std.testing.expectError(error.MissingInputPath, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MissingInputPath, parseArgs(&argv));
 }
 
 test "rejects an unknown flag" {
@@ -742,7 +638,7 @@ test "rejects an unknown flag" {
         "sample.mzML",
     };
 
-    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(&argv));
 }
 
 test "parses a raw binary size limit" {
@@ -754,8 +650,7 @@ test "parses a raw binary size limit" {
         "1048576",
     };
 
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
+    const command = try parseArgs(&argv);
 
     switch (command) {
         .check => |check| {
@@ -773,8 +668,7 @@ test "parses a suffixed binary size limit" {
         "1M",
     };
 
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
+    const command = try parseArgs(&argv);
 
     switch (command) {
         .check => |check| {
@@ -791,7 +685,7 @@ test "rejects a missing binary size limit" {
         "--max-binary-size",
     };
 
-    try std.testing.expectError(error.MissingBinarySize, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MissingBinarySize, parseArgs(&argv));
 }
 
 test "rejects a missing OBO path" {
@@ -802,7 +696,7 @@ test "rejects a missing OBO path" {
         "--obo",
     };
 
-    try std.testing.expectError(error.MissingOboPath, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MissingOboPath, parseArgs(&argv));
 }
 
 test "rejects an invalid binary size suffix" {
@@ -814,7 +708,7 @@ test "rejects an invalid binary size suffix" {
         "1X",
     };
 
-    try std.testing.expectError(error.InvalidValue, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.InvalidValue, parseArgs(&argv));
 }
 
 test "parses raw byte sizes" {
@@ -875,8 +769,9 @@ test "help writes usage to stdout" {
     try std.testing.expectEqual(@as(u8, 0), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--max-binary-size N") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "-memory-limit") == null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Inputs are validated serially") != null);
-    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Brief mode groups repeated findings within each input.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "One input is validated per invocation.") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "[more files...]") == null);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "Brief mode groups repeated findings for the input.") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "collapses groups across inputs") == null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
@@ -935,7 +830,7 @@ test "unsupported command reports a usage error" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "unsupported command: scan") != null);
     try std.testing.expectEqualStrings(
         "error: unsupported command: scan\n" ++
-            "usage: mzValidate check <input.mzML> [more files...] [options]\n",
+            "usage: mzValidate check <input.mzML> [options]\n",
         stderr_writer.written(),
     );
 }
@@ -976,6 +871,27 @@ test "missing input path reports a usage error" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
+test "[unit]: multiple input paths report a usage error" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{ "mzValidate", "check", "one.mzML", "--summary", "two.mzML" };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
+    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqualStrings("", stdout_writer.written());
+    try std.testing.expectEqualStrings(
+        "error: check accepts exactly one input path\n" ++
+            "usage: mzValidate check <input.mzML> [options]\n",
+        stderr_writer.written(),
+    );
+}
+
 test "missing OBO path reports the correct flag" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -992,7 +908,7 @@ test "missing OBO path reports the correct flag" {
     try std.testing.expectEqualStrings("", stdout_writer.written());
     try std.testing.expectEqualStrings(
         "error: --obo requires a path\n" ++
-            "usage: mzValidate check <input.mzML> [more files...] [options]\n",
+            "usage: mzValidate check <input.mzML> [options]\n",
         stderr_writer.written(),
     );
 }
@@ -1015,13 +931,12 @@ test "conflicting output modes report a usage error" {
     try std.testing.expect(std.mem.indexOf(u8, stderr_writer.written(), "usage: mzValidate check") != null);
 }
 
-test "summary aggregates clean and corrupt inputs" {
+test "[unit]: summary reports one corrupt input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "--skip-semantic",
         "--skip-index",
@@ -1079,20 +994,6 @@ test "json contract: incomplete result matches golden" {
     try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-incomplete.json");
 }
 
-test "json contract: multi-file result matches golden" {
-    const argv = [_][]const u8{
-        "mzValidate",
-        "check",
-        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
-        "fixtures/mzml/invalid/invalid-base64.mzML",
-        "--skip-semantic",
-        "--skip-index",
-        "--json",
-    };
-
-    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-multi-file.json");
-}
-
 test "external entities report an XML contract diagnostic" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
@@ -1114,13 +1015,12 @@ test "external entities report an XML contract diagnostic" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "text output groups clean and corrupt inputs" {
+test "[unit]: text output groups one corrupt input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "--skip-semantic",
         "--skip-index",
@@ -1174,13 +1074,12 @@ test "[unit]: default output ranks grouped findings" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "[unit]: brief output attributes repeated findings to each input" {
+test "[unit]: brief output renders one input" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
         "mzValidate",
         "check",
-        "fixtures/mzml/invalid/invalid-base64.mzML",
         "fixtures/mzml/invalid/invalid-base64.mzML",
         "--skip-semantic",
         "--skip-index",
@@ -1195,17 +1094,10 @@ test "[unit]: brief output attributes repeated findings to each input" {
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "[1/2] input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
+        "input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
             "complete: errors (info=0 warnings=0 errors=1)\n" ++
             "\n" ++
-            "1  error  mzml.binary.base64  binary payload is not valid base64\n" ++
-            "\n" ++
-            "[2/2] input: fixtures/mzml/invalid/invalid-base64.mzML\n" ++
-            "complete: errors (info=0 warnings=0 errors=1)\n" ++
-            "\n" ++
-            "1  error  mzml.binary.base64  binary payload is not valid base64\n" ++
-            "\n" ++
-            "summary: errors | 2 files | info 0, warnings 0, errors 2\n",
+            "1  error  mzml.binary.base64  binary payload is not valid base64\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
@@ -1219,7 +1111,7 @@ test "[unit]: verbose flag is rejected" {
         "--verbose",
     };
 
-    try std.testing.expectError(error.UnexpectedFlag, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.UnexpectedFlag, parseArgs(&argv));
 }
 
 test "[unit]: canonical color flag selects forced color" {
@@ -1230,8 +1122,7 @@ test "[unit]: canonical color flag selects forced color" {
         "--color",
         "always",
     };
-    var command = try parseArgs(std.testing.allocator, &argv);
-    defer command.deinit(std.testing.allocator);
+    const command = try parseArgs(&argv);
 
     switch (command) {
         .check => |check| try std.testing.expectEqual(ColorMode.always, check.color_mode),
@@ -1246,7 +1137,7 @@ test "[unit]: color flag requires a mode" {
         "--color",
     };
 
-    try std.testing.expectError(error.MissingColorMode, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.MissingColorMode, parseArgs(&argv));
 }
 
 test "[unit]: color flag rejects an unknown mode" {
@@ -1258,7 +1149,7 @@ test "[unit]: color flag rejects an unknown mode" {
         "sometimes",
     };
 
-    try std.testing.expectError(error.InvalidColorMode, parseArgs(std.testing.allocator, &argv));
+    try std.testing.expectError(error.InvalidColorMode, parseArgs(&argv));
 }
 
 test "skipping binary checks keeps valid structure clean" {
@@ -1289,14 +1180,13 @@ test "skipping binary checks keeps valid structure clean" {
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
-test "summary reports each missing input failure" {
+test "[unit]: summary reports one missing input failure" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
     const argv = [_][]const u8{
         "mzValidate",
         "check",
         "missing-a.mzML",
-        "missing-b.mzML",
         "--summary",
     };
 
@@ -1309,32 +1199,9 @@ test "summary reports each missing input failure" {
 
     try std.testing.expectEqual(@as(u8, 2), exit_code);
     try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=2)\n" ++
+        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
             "failure: stage=input reason=input rule=runtime.file-open input=missing-a.mzML\n",
         stdout_writer.written(),
     );
     try std.testing.expectEqualStrings("", stderr_writer.written());
-}
-
-test "[unit]: multi-file summary does not retain completed file results" {
-    const input_count = 4096;
-    const inputs = try std.testing.allocator.alloc([]const u8, input_count);
-    defer std.testing.allocator.free(inputs);
-    @memset(inputs, "missing-bounded-input.mzML");
-
-    var stdout_buffer: [256]u8 = undefined;
-    var stdout = std.Io.Writer.fixed(&stdout_buffer);
-
-    const exit_code = try runCheck(std.testing.failing_allocator, std.testing.io, &stdout, .{
-        .output_mode = .summary,
-        .skip_semantic = true,
-        .inputs = inputs,
-    }, .{});
-
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
-    try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=4096)\n" ++
-            "failure: stage=input reason=input rule=runtime.file-open input=missing-bounded-input.mzML\n",
-        stdout_buffer[0..stdout.end],
-    );
 }

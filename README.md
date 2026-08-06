@@ -99,18 +99,18 @@ Add `-Denable-libdeflate=false` to the relevant command when changing the fallba
 ## CLI reference
 
 ```bash
-mzValidate check [flags] <paths...>
+mzValidate check <input.mzML> [options]
 ```
 
 Output modes are mutually exclusive. The default groups identical findings by path, severity, rule, and message. Each group keeps an exact occurrence count and at most three example locations.
 
-- `--brief`: collapse groups across inputs into a compact count table
-- `--summary`: emit only aggregate status and occurrence counts
+- `--brief`: emit a compact count table without example locations
+- `--summary`: emit only status and occurrence counts
 - `--json`: emit the grouped versioned report described below
 
 ### JSON result contract
 
-JSON schema version 1 records grouped findings for every file in input order and one invocation summary. Clean files remain visible with an empty `diagnostics` array.
+JSON schema version 1 records grouped findings for one file and a report summary. A clean file remains visible with an empty `diagnostics` array.
 
 ```json
 {
@@ -282,7 +282,7 @@ Events are dispatched to four validators in one pass. Structural and binary vali
 
 ### Output modes
 
-Default text and JSON schema 1 group repeated findings per input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters. Brief mode collapses retained groups across inputs into a compact table.
+Default text and JSON schema 1 group repeated findings for one input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters. Brief mode emits a compact table without example locations.
 
 ### Memory model
 
