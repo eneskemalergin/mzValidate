@@ -119,6 +119,15 @@ pub fn build(b: *std.Build) void {
         cli_contract_step.dependOn(&cli_valid_cmd.step);
     }
 
+    const cli_warning_cmd = b.addRunArtifact(exe);
+    cli_warning_cmd.step.dependOn(b.getInstallStep());
+    cli_warning_cmd.addArg("check");
+    cli_warning_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_warning_cmd.addArg("--summary");
+    cli_warning_cmd.expectExitCode(0);
+    cli_warning_cmd.expectStdOutEqual("complete: warnings | warnings 3, info 97\n");
+    cli_contract_step.dependOn(&cli_warning_cmd.step);
+
     const cli_known_findings_cmd = b.addRunArtifact(exe);
     cli_known_findings_cmd.step.dependOn(b.getInstallStep());
     cli_known_findings_cmd.addArg("check");
@@ -126,7 +135,7 @@ pub fn build(b: *std.Build) void {
     cli_known_findings_cmd.addArg("--skip-semantic");
     cli_known_findings_cmd.addArg("--skip-index");
     cli_known_findings_cmd.addArg("--summary");
-    cli_known_findings_cmd.expectExitCode(2);
+    cli_known_findings_cmd.expectExitCode(1);
     cli_known_findings_cmd.expectStdOutEqual("complete: errors | errors 13\n");
 
     for (invalid_fixtures) |fixture| {
@@ -136,7 +145,7 @@ pub fn build(b: *std.Build) void {
         cli_invalid_cmd.addArg(fixture);
         cli_invalid_cmd.addArg("--skip-semantic");
         cli_invalid_cmd.addArg("--summary");
-        cli_invalid_cmd.expectExitCode(2);
+        cli_invalid_cmd.expectExitCode(1);
         cli_invalid_cmd.expectStdOutMatch("complete: errors | errors ");
         cli_contract_step.dependOn(&cli_invalid_cmd.step);
     }
@@ -182,7 +191,7 @@ pub fn build(b: *std.Build) void {
     cli_schema_finding_cmd.addArg("--skip-semantic");
     cli_schema_finding_cmd.addArg("--skip-index");
     cli_schema_finding_cmd.addArg("--summary");
-    cli_schema_finding_cmd.expectExitCode(2);
+    cli_schema_finding_cmd.expectExitCode(1);
     cli_schema_finding_cmd.expectStdOutMatch("complete: errors | errors ");
 
     const cli_incomplete_cmd = b.addRunArtifact(exe);
@@ -192,7 +201,7 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.addArg("--skip-binary");
     cli_incomplete_cmd.addArg("--skip-semantic");
     cli_incomplete_cmd.addArg("--summary");
-    cli_incomplete_cmd.expectExitCode(2);
+    cli_incomplete_cmd.expectExitCode(3);
     cli_incomplete_cmd.expectStdOutMatch("incomplete: errors | errors ");
 
     const cli_json_cmd = b.addRunArtifact(exe);
@@ -202,7 +211,7 @@ pub fn build(b: *std.Build) void {
     cli_json_cmd.addArg("--skip-binary");
     cli_json_cmd.addArg("--skip-semantic");
     cli_json_cmd.addArg("--json");
-    cli_json_cmd.expectExitCode(2);
+    cli_json_cmd.expectExitCode(3);
     cli_json_cmd.expectStdOutMatch("\"schema_version\": 1");
     cli_json_cmd.expectStdOutMatch("\"completion\": \"incomplete\"");
     cli_json_cmd.expectStdOutMatch("\"reason\": \"resource\"");

@@ -397,9 +397,10 @@ fn writeUsage(writer: *std.Io.Writer) std.Io.Writer.Error!void {
             "  JSON records the same groups, exact occurrence counts, and one summary.\n" ++
             "  Summary mode reports the result for the input.\n\n" ++
             "Exit Codes\n" ++
-            "  0  clean\n" ++
-            "  1  warnings only\n" ++
-            "  2  errors present or CLI usage failure\n\n" ++
+            "  0  Validation completed without error findings.\n" ++
+            "  1  Validation completed with error findings.\n" ++
+            "  2  Invalid invocation or option value.\n" ++
+            "  3  Validation could not complete.\n\n" ++
             "Examples\n" ++
             "  mzValidate check sample.mzML\n" ++
             "  mzValidate check sample.mzML --summary\n" ++
@@ -763,6 +764,15 @@ test "help writes usage to stdout" {
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "[more files...]") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "--brief") == null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "collapses groups across inputs") == null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        stdout_writer.written(),
+        "Exit Codes\n" ++
+            "  0  Validation completed without error findings.\n" ++
+            "  1  Validation completed with error findings.\n" ++
+            "  2  Invalid invocation or option value.\n" ++
+            "  3  Validation could not complete.\n",
+    ) != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
@@ -823,6 +833,31 @@ test "unsupported command reports a usage error" {
             "usage: mzValidate check <input.mzML> [options]\n",
         stderr_writer.written(),
     );
+}
+
+test "[unit]: summary keeps warning-only validation successful" {
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        "--summary",
+    };
+
+    var stdout_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(allocator);
+    defer stderr_writer.deinit();
+
+    const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expectEqualStrings(
+        "complete: warnings | warnings 3, info 97\n",
+        stdout_writer.written(),
+    );
+    try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
 test "unexpected flag reports a usage error" {
@@ -940,7 +975,7 @@ test "[unit]: summary reports one corrupt input" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expectEqualStrings(
         "complete: errors | errors 1\n",
         stdout_writer.written(),
@@ -970,7 +1005,7 @@ test "json contract: findings result matches golden" {
         "--json",
     };
 
-    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
+    try expectJsonGolden(&argv, 1, "fixtures/output/json-v1-findings.json");
 }
 
 test "json contract: color presentation does not change output" {
@@ -984,7 +1019,7 @@ test "json contract: color presentation does not change output" {
         "always",
     };
 
-    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-findings.json");
+    try expectJsonGolden(&argv, 1, "fixtures/output/json-v1-findings.json");
 }
 
 test "json contract: incomplete result matches golden" {
@@ -995,7 +1030,7 @@ test "json contract: incomplete result matches golden" {
         "--json",
     };
 
-    try expectJsonGolden(&argv, 2, "fixtures/output/json-v1-incomplete.json");
+    try expectJsonGolden(&argv, 3, "fixtures/output/json-v1-incomplete.json");
 }
 
 test "external entities report an XML contract diagnostic" {
@@ -1014,7 +1049,7 @@ test "external entities report an XML contract diagnostic" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqual(@as(u8, 3), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "x001  DTD or unsupported XML construct [mzml.structure.xml]") != null);
     try std.testing.expectEqualStrings("", stderr_writer.written());
 }
@@ -1064,7 +1099,7 @@ test "[unit]: text output groups one corrupt input" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "input: fixtures/mzml/invalid/invalid-base64.mzML") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "x001  binary payload is not valid base64 [mzml.binary.base64]") != null);
     try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "examples:\n") != null);
@@ -1094,7 +1129,7 @@ test "[unit]: default output ranks grouped findings" {
     const warning_four = std.mem.indexOf(u8, rendered, "x004  CV term name does not match the catalog name or a synonym [mzml.cv.name-mismatch]");
     const info_nine = std.mem.indexOf(u8, rendered, "x009  unitName does not match the term's canonical name [mzml.cv.unit]");
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqual(@as(u8, 1), exit_code);
     try std.testing.expect(error_ten != null);
     try std.testing.expect(error_three != null);
     try std.testing.expect(warning_four != null);
@@ -1210,7 +1245,7 @@ test "[unit]: summary reports one missing input as incomplete" {
 
     const exit_code = try runArgs(allocator, io, &stdout_writer.writer, &stderr_writer.writer, &argv);
 
-    try std.testing.expectEqual(@as(u8, 2), exit_code);
+    try std.testing.expectEqual(@as(u8, 3), exit_code);
     try std.testing.expectEqualStrings(
         "incomplete: errors | errors 1\n",
         stdout_writer.written(),

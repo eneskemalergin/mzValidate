@@ -1050,15 +1050,9 @@ pub fn summarizeResults(results: []const FileResult) Summary {
     return summary;
 }
 
-/// Maps diagnostics to the process exit code contract.
-///
-/// 0 = clean, 1 = warnings only, 2 = any errors present.
+/// Maps a completed diagnostic set to the process exit code contract.
 pub fn exitCode(diagnostics: []const Diagnostic) u8 {
-    return switch (summarize(diagnostics).status()) {
-        .clean => 0,
-        .warnings_only => 1,
-        .errors_present => 2,
-    };
+    return exitCodeForSummary(summarize(diagnostics));
 }
 
 /// Maps per-file completion and severity results to the process exit code.
@@ -1068,22 +1062,32 @@ pub fn exitCodeForResults(results: []const FileResult) u8 {
 
 /// Maps an incrementally aggregated invocation summary to the process exit code.
 pub fn exitCodeForSummary(summary: Summary) u8 {
-    return switch (summary.status()) {
-        .clean => 0,
-        .warnings_only => 1,
-        .errors_present => 2,
-    };
+    if (summary.completion == .incomplete) return 3;
+    return if (summary.totals.errors > 0) 1 else 0;
 }
 
 // --- Unit Tests ---
 
-test "errors take precedence over warnings in exit codes" {
+test "[unit]: completed validation succeeds for clean info and warning findings" {
+    const info_diagnostics = [_]Diagnostic{
+        .{ .severity = .info, .rule = RuleId.runtime_stub, .message = "stub" },
+    };
+    const warning_diagnostics = [_]Diagnostic{
+        .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&.{}));
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&info_diagnostics));
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&warning_diagnostics));
+}
+
+test "[unit]: completed errors use the findings exit code" {
     const diagnostics = [_]Diagnostic{
         .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
 
-    try std.testing.expectEqual(@as(u8, 2), exitCode(&diagnostics));
+    try std.testing.expectEqual(@as(u8, 1), exitCode(&diagnostics));
 }
 
 test "summary status follows diagnostic severity" {
@@ -1161,7 +1165,7 @@ test "file result stays incomplete until every enabled stage completes" {
     result.finalize(&.{});
 
     try std.testing.expectEqual(CompletionState.incomplete, result.completion);
-    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), exitCodeForResults(&.{result}));
 }
 
 test "file result records first failure without normal diagnostic storage" {
@@ -1174,7 +1178,7 @@ test "file result records first failure without normal diagnostic storage" {
     try std.testing.expectEqual(CompletionState.incomplete, result.completion);
     try std.testing.expect(result.needsEmergencyDiagnostic());
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
-    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), exitCodeForResults(&.{result}));
 }
 
 test "file result marks the fixed emergency failure path" {

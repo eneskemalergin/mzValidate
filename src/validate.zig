@@ -1663,7 +1663,7 @@ test "reader result: marks truncated XML incomplete" {
     try std.testing.expectEqual(diagnostic.ValidationStage.parser, result.first_failure.?.stage);
     try std.testing.expectEqual(diagnostic.FailureReason.parser, result.first_failure.?.reason);
     try std.testing.expectEqual(diagnostic.stageBit(.input), result.completed_stages);
-    try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), diagnostic.exitCodeForResults(&.{result}));
 }
 
 test "[unit]: reader I/O failure is classified as an input failure" {
@@ -1935,7 +1935,7 @@ test "path result: missing catalog is incomplete" {
 
     try std.testing.expectEqual(diagnostic.CompletionState.incomplete, result.completion);
     try std.testing.expectEqual(diagnostic.FailureReason.catalog, result.first_failure.?.reason);
-    try std.testing.expectEqual(@as(u8, 2), diagnostic.exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), diagnostic.exitCodeForResults(&.{result}));
 }
 
 test "invocation context: owns the catalog across multiple paths" {
