@@ -7,6 +7,7 @@ const builtin = @import("builtin");
 const diagnostic = @import("diagnostic.zig");
 const output = @import("output.zig");
 const progress = @import("progress.zig");
+const terminal_text = @import("terminal_text.zig");
 const validate = @import("validate.zig");
 const version = @import("version.zig");
 
@@ -15,7 +16,9 @@ const DiagnosticSink = diagnostic.DiagnosticSink;
 const Presentation = struct {
     is_tty: bool = false,
     auto_color: bool = false,
+    terminal_columns: ?usize = null,
     stderr_progress: bool = false,
+    progress_columns: ?usize = null,
     progress_delay_ns: i96 = 500_000_000,
     progress_refresh_ns: i96 = 150_000_000,
 };
@@ -76,14 +79,16 @@ pub fn run(init: std.process.Init) !u8 {
 
     const stdout_file = std.Io.File.stdout();
     const stderr_file = std.Io.File.stderr();
-    const is_tty = try fileIsTty(init.io, stdout_file);
-    const stderr_is_tty = try fileIsTty(init.io, stderr_file);
+    const stdout_terminal = try detectTerminal(init.io, stdout_file);
+    const stderr_terminal = try detectTerminal(init.io, stderr_file);
     const no_color = if (init.environ_map.get("NO_COLOR")) |value| value.len > 0 else false;
     const force_color = if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len > 0 else false;
     const presentation = Presentation{
-        .is_tty = is_tty,
-        .auto_color = try autoColorEnabled(init.io, stdout_file, init.environ_map, is_tty, no_color, force_color),
-        .stderr_progress = try terminalSupportsEscapeCodes(init.io, stderr_file, init.environ_map, stderr_is_tty),
+        .is_tty = stdout_terminal.is_tty,
+        .auto_color = try autoColorEnabled(init.io, stdout_file, init.environ_map, stdout_terminal.is_tty, no_color, force_color),
+        .terminal_columns = stdout_terminal.columns,
+        .stderr_progress = try terminalSupportsEscapeCodes(init.io, stderr_file, init.environ_map, stderr_terminal.is_tty),
+        .progress_columns = stderr_terminal.columns,
     };
     const exit_code = runArgsWithProgressWriter(gpa, init.io, stdout, stderr, progress_stderr, args, presentation) catch |err| {
         // Preserve the original failure; output after a failed run is best effort.
@@ -105,28 +110,39 @@ fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) std.Io.Writer.Er
     if (first_error) |err| return err;
 }
 
-fn fileIsTty(io: std.Io, file: std.Io.File) std.Io.Cancelable!bool {
-    if (builtin.os.tag == .linux) {
-        while (true) {
-            var window_size: std.posix.winsize = undefined;
-            const fd: usize = @bitCast(@as(isize, file.handle));
-            const rc = std.os.linux.syscall3(
-                .ioctl,
-                fd,
-                std.os.linux.T.IOCGWINSZ,
-                @intFromPtr(&window_size),
-            );
-            switch (std.os.linux.errno(rc)) {
-                .SUCCESS => return true,
-                .INTR => continue,
-                else => return false,
-            }
-        }
+const Terminal = struct {
+    is_tty: bool,
+    columns: ?usize,
+};
+
+fn detectTerminal(io: std.Io, file: std.Io.File) std.Io.Cancelable!Terminal {
+    if (builtin.os.tag == .windows) {
+        if (!try file.isTty(io)) return .{ .is_tty = false, .columns = null };
+
+        var console_info = std.os.windows.CONSOLE.USER_IO.GET_SCREEN_BUFFER_INFO;
+        const columns: ?usize = switch (try console_info.operate(io, file)) {
+            .SUCCESS => if (console_info.Data.dwWindowSize.X > 0) @intCast(console_info.Data.dwWindowSize.X) else null,
+            else => null,
+        };
+        return .{ .is_tty = true, .columns = columns };
     }
-    if (builtin.link_libc and builtin.os.tag != .windows) {
-        return std.c.isatty(file.handle) == 1;
-    }
-    return file.isTty(io);
+
+    var window_size: std.posix.winsize = .{
+        .row = 0,
+        .col = 0,
+        .xpixel = 0,
+        .ypixel = 0,
+    };
+    const result = (try io.operate(.{ .device_io_control = .{
+        .file = file,
+        .code = std.posix.T.IOCGWINSZ,
+        .arg = &window_size,
+    } })).device_io_control;
+    if (result < 0) return .{ .is_tty = false, .columns = null };
+    return .{
+        .is_tty = true,
+        .columns = if (window_size.col > 0) @intCast(window_size.col) else null,
+    };
 }
 
 fn autoColorEnabled(
@@ -377,6 +393,7 @@ fn runCheckMode(
             progress_writer,
             check.input,
             started.?,
+            presentation.progress_columns,
             presentation.progress_delay_ns,
             presentation.progress_refresh_ns,
         )
@@ -410,6 +427,7 @@ fn runCheckMode(
             .always => true,
             .never => false,
         },
+        .terminal_columns = presentation.terminal_columns,
     };
     switch (mode) {
         .text => try output.renderTextFile(writer, diagnostics.items, &result, check.input, human_options),
@@ -424,6 +442,7 @@ const ProgressRenderer = struct {
     writer: *std.Io.Writer,
     path: []const u8,
     started: std.Io.Clock.Timestamp,
+    terminal_columns: ?usize,
     delay_ns: i96,
     refresh_ns: i96,
     last_render_ns: ?i96 = null,
@@ -435,6 +454,7 @@ const ProgressRenderer = struct {
         writer: *std.Io.Writer,
         path: []const u8,
         started: std.Io.Clock.Timestamp,
+        terminal_columns: ?usize,
         delay_ns: i96,
         refresh_ns: i96,
     ) ProgressRenderer {
@@ -443,6 +463,7 @@ const ProgressRenderer = struct {
             .writer = writer,
             .path = path,
             .started = started,
+            .terminal_columns = terminal_columns,
             .delay_ns = delay_ns,
             .refresh_ns = refresh_ns,
         };
@@ -498,7 +519,13 @@ const ProgressRenderer = struct {
         try writeProgressBytes(renderer.writer, update.total_bytes);
         try renderer.writer.writeAll(" | ");
         try writeProgressElapsed(renderer.writer, elapsed_ns);
-        try renderer.writer.print(" | {s}", .{renderer.path});
+        try renderer.writer.writeAll(" | ");
+        try writeProgressPath(
+            renderer.writer,
+            renderer.path,
+            renderer.terminal_columns,
+            progressPrefixWidth(update, elapsed_ns),
+        );
         try renderer.writer.flush();
     }
 
@@ -541,6 +568,60 @@ fn writeProgressElapsed(writer: *std.Io.Writer, elapsed_ns: i96) std.Io.Writer.E
     const nanoseconds: u96 = @intCast(@max(elapsed_ns, 0));
     const tenths = nanoseconds / 100_000_000;
     try writer.print("{d}.{d}s", .{ tenths / 10, tenths % 10 });
+}
+
+fn writeProgressPath(
+    writer: *std.Io.Writer,
+    path: []const u8,
+    terminal_columns: ?usize,
+    prefix_width: usize,
+) std.Io.Writer.Error!void {
+    const columns = terminal_columns orelse {
+        try writer.writeAll(path);
+        return;
+    };
+    const available = if (columns > prefix_width) columns - prefix_width else 1;
+    if (terminal_text.displayWidth(path) <= available) {
+        try writer.writeAll(path);
+        return;
+    }
+    if (available <= 3) {
+        try writer.writeAll(path[terminal_text.suffixStartForWidth(path, available)..]);
+        return;
+    }
+    try writer.writeAll("...");
+    try writer.writeAll(path[terminal_text.suffixStartForWidth(path, available - 3)..]);
+}
+
+fn progressPrefixWidth(update: progress.Update, elapsed_ns: i96) usize {
+    return 27 + progressBytesWidth(update.completed_bytes) +
+        progressBytesWidth(update.total_bytes) + progressElapsedWidth(elapsed_ns);
+}
+
+fn progressBytesWidth(bytes: u64) usize {
+    const units = [_]struct { bytes: u64, label: []const u8 }{
+        .{ .bytes = 1_000_000_000, .label = "GB" },
+        .{ .bytes = 1_000_000, .label = "MB" },
+        .{ .bytes = 1_000, .label = "KB" },
+    };
+    for (units) |unit| {
+        if (bytes < unit.bytes) continue;
+        const tenths: u64 = @intCast((@as(u128, bytes) * 10 + unit.bytes / 2) / unit.bytes);
+        return decimalDigits(tenths / 10) + 3 + unit.label.len;
+    }
+    return decimalDigits(bytes) + 2;
+}
+
+fn progressElapsedWidth(elapsed_ns: i96) usize {
+    const nanoseconds: u96 = @intCast(@max(elapsed_ns, 0));
+    return decimalDigits(nanoseconds / 1_000_000_000) + 3;
+}
+
+fn decimalDigits(value: anytype) usize {
+    var remaining = value;
+    var width: usize = 1;
+    while (remaining >= 10) : (remaining /= 10) width += 1;
+    return width;
 }
 
 // --- Private Helpers ---
@@ -745,6 +826,7 @@ test "[unit]: progress is delayed, rate limited, attributed, and cleared" {
         &progress_writer.writer,
         "sample.mzML",
         .now(std.testing.io, .awake),
+        null,
         500_000_000,
         150_000_000,
     );
@@ -780,6 +862,41 @@ test "[unit]: progress is delayed, rate limited, attributed, and cleared" {
     renderer.clear();
     try std.testing.expect(std.mem.indexOf(u8, progress_writer.written(), "checksum |  42%") != null);
     try std.testing.expect(std.mem.endsWith(u8, progress_writer.written(), "\r\x1b[2K"));
+}
+
+test "[unit]: progress keeps fields and fits paths on UTF-8 boundaries" {
+    var progress_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer progress_writer.deinit();
+    var renderer = ProgressRenderer.init(
+        std.testing.io,
+        &progress_writer.writer,
+        "very/long/sample.mzML",
+        .now(std.testing.io, .awake),
+        56,
+        0,
+        0,
+    );
+    try renderer.renderAt(.{
+        .phase = .parse,
+        .completed_bytes = 2_840_000_000,
+        .total_bytes = 4_000_000_000,
+    }, 15_400_000_000);
+
+    try std.testing.expectEqualStrings(
+        "\r\x1b[2Kparse    |  71% | 2.8 GB / 4.0 GB | 15.4s | ...mple.mzML",
+        progress_writer.written(),
+    );
+
+    const cases = [_]struct { path: []const u8, expected: []const u8 }{
+        .{ .path = "prefix/café.mzML", .expected = "...café.mzML" },
+        .{ .path = "prefix/bad\xff.mzML", .expected = "...bad\xff.mzML" },
+    };
+    for (cases) |case| {
+        var path_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer path_writer.deinit();
+        try writeProgressPath(&path_writer.writer, case.path, 12, 0);
+        try std.testing.expectEqualStrings(case.expected, path_writer.written());
+    }
 }
 
 test "[unit]: default and summary render parse and checksum progress on stderr" {

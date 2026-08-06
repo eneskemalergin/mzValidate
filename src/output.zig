@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
+const terminal_text = @import("terminal_text.zig");
 const version = @import("version.zig");
 
 const Diagnostic = diagnostic.Diagnostic;
@@ -20,6 +21,7 @@ pub const OutputMode = enum {
 pub const HumanResultOptions = struct {
     elapsed_ns: ?i96 = null,
     color: bool = false,
+    terminal_columns: ?usize = null,
 };
 
 /// Writes grouped text diagnostics followed by one aggregate summary.
@@ -76,12 +78,24 @@ pub fn renderTextFile(
     try writer.print("input: {s}\n\n", .{path});
 
     const count_width = occurrenceWidth(diagnostics);
-    try renderCompactDiagnostics(writer, diagnostics, count_width, options.color);
+    try renderCompactDiagnostics(writer, diagnostics, count_width, options.color, options.terminal_columns);
     if (hasDroppedDiagnostics(result.*)) {
-        try renderCompactTruncation(writer, result.dropped_diagnostics, count_width, options.color);
+        try renderCompactTruncation(
+            writer,
+            result.dropped_diagnostics,
+            count_width,
+            options.color,
+            options.terminal_columns,
+        );
     }
     if (result.needsEmergencyDiagnostic()) {
-        try renderCompactFailure(writer, result.first_failure.?, count_width, options.color);
+        try renderCompactFailure(
+            writer,
+            result.first_failure.?,
+            count_width,
+            options.color,
+            options.terminal_columns,
+        );
     }
 
     if (diagnostics.len > 0 or hasDroppedDiagnostics(result.*) or result.needsEmergencyDiagnostic()) {
@@ -102,19 +116,117 @@ fn renderCompactDiagnostics(
     diagnostics: []const Diagnostic,
     count_width: usize,
     color: bool,
+    terminal_columns: ?usize,
 ) std.Io.Writer.Error!void {
     for (diagnostics) |item| {
         try writeSeverityCount(writer, item.severity, item.occurrences, count_width, color);
+        try renderCompactMessageRule(
+            writer,
+            item.message,
+            item.rule,
+            13 + count_width,
+            terminal_columns,
+            color,
+            false,
+        );
+        try renderCompactLocations(writer, item);
+    }
+}
+
+fn renderCompactMessageRule(
+    writer: *std.Io.Writer,
+    message: []const u8,
+    rule: []const u8,
+    indent: usize,
+    terminal_columns: ?usize,
+    color: bool,
+    style_padding: bool,
+) std.Io.Writer.Error!void {
+    if (terminal_columns) |columns| {
+        const line_width = indent + terminal_text.displayWidth(message) + 3 +
+            terminal_text.displayWidth(rule);
+        if (line_width > columns) {
+            try writer.writeAll("  ");
+            try renderWrappedMessage(writer, message, indent, columns, color);
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent);
+            try writeAnsi(writer, color, ansi_dim);
+            try writer.print("[{s}]", .{rule});
+            try writeAnsi(writer, color, ansi_reset);
+            try writer.writeByte('\n');
+            return;
+        }
+    }
+
+    if (style_padding) {
+        try writeAnsi(writer, color, ansi_bold);
+        try writer.writeAll("  ");
+        try writer.writeAll(message);
+        try writer.writeByte(' ');
+        try writeAnsi(writer, color, ansi_reset);
+    } else {
         try writer.writeAll("  ");
         try writeAnsi(writer, color, ansi_bold);
-        try writer.writeAll(item.message);
+        try writer.writeAll(message);
         try writeAnsi(writer, color, ansi_reset);
         try writer.writeByte(' ');
-        try writeAnsi(writer, color, ansi_dim);
-        try writer.print("[{s}]", .{item.rule});
-        try writeAnsi(writer, color, ansi_reset);
-        try writer.writeByte('\n');
-        try renderCompactLocations(writer, item);
+    }
+    try writeAnsi(writer, color, ansi_dim);
+    try writer.print("[{s}]", .{rule});
+    try writeAnsi(writer, color, ansi_reset);
+    try writer.writeByte('\n');
+}
+
+fn renderWrappedMessage(
+    writer: *std.Io.Writer,
+    message: []const u8,
+    indent: usize,
+    terminal_columns: usize,
+    color: bool,
+) std.Io.Writer.Error!void {
+    const line_limit = @max(terminal_columns, indent + 1);
+    var column = indent;
+    var index: usize = 0;
+
+    while (index < message.len) {
+        while (index < message.len and message[index] == ' ') index += 1;
+        if (index == message.len) break;
+
+        const word_start = index;
+        while (index < message.len and message[index] != ' ') index += 1;
+        var word = message[word_start..index];
+        const word_width = terminal_text.displayWidth(word);
+
+        if (column > indent and column + 1 + word_width > line_limit) {
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent);
+            column = indent;
+        } else if (column > indent) {
+            try writeAnsi(writer, color, ansi_bold);
+            try writer.writeByte(' ');
+            try writeAnsi(writer, color, ansi_reset);
+            column += 1;
+        }
+
+        while (word.len > 0) {
+            const available = line_limit - column;
+            const fitting_end = terminal_text.prefixBytesForWidth(word, available);
+            const chunk_end = if (fitting_end > 0)
+                fitting_end
+            else
+                terminal_text.prefixBytesForWidth(word, 1);
+            const chunk = word[0..chunk_end];
+            try writeAnsi(writer, color, ansi_bold);
+            try writer.writeAll(chunk);
+            try writeAnsi(writer, color, ansi_reset);
+            column += terminal_text.displayWidth(chunk);
+            word = word[chunk.len..];
+            if (word.len > 0) {
+                try writer.writeByte('\n');
+                try writeIndent(writer, indent);
+                column = indent;
+            }
+        }
     }
 }
 
@@ -165,15 +277,26 @@ fn renderCompactTruncation(
     dropped: diagnostic.Totals,
     count_width: usize,
     color: bool,
+    terminal_columns: ?usize,
 ) std.Io.Writer.Error!void {
+    var message_buffer: [256]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buffer);
+    try message_writer.print("diagnostic detail truncated (dropped info={d} warnings={d} errors={d})", .{
+        dropped.info,
+        dropped.warnings,
+        dropped.errors,
+    });
+
     try writeSeverityCount(writer, .warning, 1, count_width, color);
-    try writeAnsi(writer, color, ansi_bold);
-    try writer.print("  diagnostic detail truncated (dropped info={d} warnings={d} errors={d}) ", .{ dropped.info, dropped.warnings, dropped.errors });
-    try writeAnsi(writer, color, ansi_reset);
-    try writeAnsi(writer, color, ansi_dim);
-    try writer.print("[{s}]", .{diagnostic.RuleId.runtime_diagnostics_truncated});
-    try writeAnsi(writer, color, ansi_reset);
-    try writer.writeByte('\n');
+    try renderCompactMessageRule(
+        writer,
+        message_buffer[0..message_writer.end],
+        diagnostic.RuleId.runtime_diagnostics_truncated,
+        13 + count_width,
+        terminal_columns,
+        color,
+        true,
+    );
 }
 
 fn renderCompactFailure(
@@ -181,15 +304,27 @@ fn renderCompactFailure(
     failure: diagnostic.FirstFailure,
     count_width: usize,
     color: bool,
+    terminal_columns: ?usize,
 ) std.Io.Writer.Error!void {
+    // FirstFailure bounds its message at 512 bytes; 64 bytes covers the closed stage/reason suffix.
+    var message_buffer: [diagnostic.first_failure_message_capacity + 64]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buffer);
+    try message_writer.print("{s} (stage={s} reason={s})", .{
+        failure.message(),
+        failure.stage.label(),
+        failure.reason.label(),
+    });
+
     try writeSeverityCount(writer, .@"error", 1, count_width, color);
-    try writeAnsi(writer, color, ansi_bold);
-    try writer.print("  {s} (stage={s} reason={s}) ", .{ failure.message(), failure.stage.label(), failure.reason.label() });
-    try writeAnsi(writer, color, ansi_reset);
-    try writeAnsi(writer, color, ansi_dim);
-    try writer.print("[{s}]", .{failure.rule()});
-    try writeAnsi(writer, color, ansi_reset);
-    try writer.writeByte('\n');
+    try renderCompactMessageRule(
+        writer,
+        message_buffer[0..message_writer.end],
+        failure.rule(),
+        13 + count_width,
+        terminal_columns,
+        color,
+        true,
+    );
 }
 
 fn writeHumanResultLine(
@@ -1094,6 +1229,136 @@ test "[unit]: compact color styles severity message rule and result" {
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[1mhuman message\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[2m[test.rule]\x1b[0m") != null);
     try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[41;97;1mcomplete: errors\x1b[0m") != null);
+}
+
+test "[unit]: compact output wraps messages and preserves rule IDs" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .@"error",
+        .rule = "test.long-rule",
+        .message = "alpha beta gamma delta",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "wrap.mzML", .{
+        .terminal_columns = 32,
+    });
+
+    try std.testing.expectEqualStrings(
+        "input: wrap.mzML\n\n" ++
+            "  ERROR   x001  alpha beta gamma\n" ++
+            "                delta\n" ++
+            "                [test.long-rule]\n" ++
+            "\n" ++
+            "complete: errors | errors 1 | 1 group\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: compact output retains exact wide colored output" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .warning,
+        .rule = "test.utf8",
+        .message = "valid café message",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var baseline: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer baseline.deinit();
+    var wide: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer wide.deinit();
+
+    try renderTextFile(&baseline.writer, &diagnostics, &result, "wide.mzML", .{ .color = true });
+    try renderTextFile(&wide.writer, &diagnostics, &result, "wide.mzML", .{
+        .color = true,
+        .terminal_columns = 120,
+    });
+
+    try std.testing.expectEqualStrings(baseline.written(), wide.written());
+}
+
+test "[unit]: wrapped color resets before newlines" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .info,
+        .rule = "test.color-wrap",
+        .message = "alpha beta gamma delta",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "color-wrap.mzML", .{
+        .color = true,
+        .terminal_columns = 32,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "gamma\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "delta\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[test.color-wrap]\x1b[0m\n") != null);
+}
+
+test "[unit]: compact truncation uses the shared terminal wrapper" {
+    var result = diagnostic.FileResult.init(0);
+    result.diagnostics_truncated = true;
+    result.dropped_diagnostics = .{ .info = 2, .warnings = 3, .errors = 4 };
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "truncated.mzML", .{
+        .terminal_columns = 40,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "  WARNING x001  diagnostic detail\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered,
+        "                [runtime.diagnostics-truncated]\n",
+    ) != null);
+
+    var colored_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer colored_writer.deinit();
+    try renderTextFile(&colored_writer.writer, &.{}, &result, "truncated.mzML", .{ .color = true });
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        colored_writer.written(),
+        "\x1b[93mWARNING x001\x1b[0m\x1b[1m  diagnostic detail truncated " ++
+            "(dropped info=2 warnings=3 errors=4) \x1b[0m" ++
+            "\x1b[2m[runtime.diagnostics-truncated]\x1b[0m\n",
+    ) != null);
+}
+
+test "[unit]: compact failure wraps the maximum retained message" {
+    var message: [diagnostic.first_failure_message_capacity]u8 = @splat('q');
+    var result = diagnostic.FileResult.init(0);
+    result.recordFailure(
+        .parser,
+        .file_stability,
+        "runtime.long-failure",
+        &message,
+        .{},
+        null,
+        false,
+    );
+    result.finalize(&.{});
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "failure.mzML", .{
+        .terminal_columns = 40,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expectEqual(
+        @as(usize, diagnostic.first_failure_message_capacity),
+        std.mem.count(u8, rendered, "q"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[runtime.long-failure]\n") != null);
 }
 
 test "json output escapes control characters" {
