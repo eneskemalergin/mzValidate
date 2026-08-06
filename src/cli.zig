@@ -91,12 +91,32 @@ pub fn run(init: std.process.Init) !u8 {
         .progress_columns = stderr_terminal.columns,
     };
     const exit_code = runArgsWithProgressWriter(gpa, init.io, stdout, stderr, progress_stderr, args, presentation) catch |err| {
+        if (isBrokenPipeFailure(err, stdout_file_writer.err, stderr_file_writer.err)) return 0;
         // Preserve the original failure; output after a failed run is best effort.
         flushWriters(stdout, stderr) catch {};
         return err;
     };
-    try flushWriters(stdout, stderr);
+    flushWriters(stdout, stderr) catch |err| {
+        if (isBrokenPipeFailure(err, stdout_file_writer.err, stderr_file_writer.err)) return 0;
+        return err;
+    };
     return exit_code;
+}
+
+fn isBrokenPipeFailure(
+    write_error: anyerror,
+    stdout_error: ?std.Io.File.Writer.Error,
+    stderr_error: ?std.Io.File.Writer.Error,
+) bool {
+    if (write_error != error.WriteFailed) return false;
+
+    var found = false;
+    for ([_]?std.Io.File.Writer.Error{ stdout_error, stderr_error }) |optional_error| {
+        const err = optional_error orelse continue;
+        if (err != error.BrokenPipe) return false;
+        found = true;
+    }
+    return found;
 }
 
 fn flushWriters(stdout: *std.Io.Writer, stderr: *std.Io.Writer) std.Io.Writer.Error!void {
@@ -816,6 +836,16 @@ test "flush attempts stderr after stdout failure" {
 
     try std.testing.expectError(error.WriteFailed, flushWriters(&stdout, &stderr));
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "[unit]: only broken-pipe write failures stop cleanly" {
+    try std.testing.expect(isBrokenPipeFailure(error.WriteFailed, error.BrokenPipe, null));
+    try std.testing.expect(isBrokenPipeFailure(error.WriteFailed, null, error.BrokenPipe));
+    try std.testing.expect(isBrokenPipeFailure(error.WriteFailed, error.BrokenPipe, error.BrokenPipe));
+    try std.testing.expect(!isBrokenPipeFailure(error.WriteFailed, null, null));
+    try std.testing.expect(!isBrokenPipeFailure(error.WriteFailed, error.InputOutput, null));
+    try std.testing.expect(!isBrokenPipeFailure(error.WriteFailed, error.BrokenPipe, error.InputOutput));
+    try std.testing.expect(!isBrokenPipeFailure(error.OutOfMemory, error.BrokenPipe, null));
 }
 
 test "[unit]: progress is delayed, rate limited, attributed, and cleared" {
