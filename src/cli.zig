@@ -6,6 +6,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const diagnostic = @import("diagnostic.zig");
 const output = @import("output.zig");
+const progress = @import("progress.zig");
 const validate = @import("validate.zig");
 const version = @import("version.zig");
 
@@ -14,6 +15,9 @@ const DiagnosticSink = diagnostic.DiagnosticSink;
 const Presentation = struct {
     is_tty: bool = false,
     auto_color: bool = false,
+    stderr_progress: bool = false,
+    progress_delay_ns: i96 = 500_000_000,
+    progress_refresh_ns: i96 = 150_000_000,
 };
 
 pub const ColorMode = enum {
@@ -66,16 +70,22 @@ pub fn run(init: std.process.Init) !u8 {
     var stderr_buffer: [1024]u8 = undefined;
     var stderr_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &stderr_buffer);
     const stderr = &stderr_file_writer.interface;
+    var progress_buffer: [512]u8 = undefined;
+    var progress_file_writer: std.Io.File.Writer = .init(.stderr(), init.io, &progress_buffer);
+    const progress_stderr = &progress_file_writer.interface;
 
     const stdout_file = std.Io.File.stdout();
+    const stderr_file = std.Io.File.stderr();
     const is_tty = try fileIsTty(init.io, stdout_file);
+    const stderr_is_tty = try fileIsTty(init.io, stderr_file);
     const no_color = if (init.environ_map.get("NO_COLOR")) |value| value.len > 0 else false;
     const force_color = if (init.environ_map.get("CLICOLOR_FORCE")) |value| value.len > 0 else false;
     const presentation = Presentation{
         .is_tty = is_tty,
         .auto_color = try autoColorEnabled(init.io, stdout_file, init.environ_map, is_tty, no_color, force_color),
+        .stderr_progress = try terminalSupportsEscapeCodes(init.io, stderr_file, init.environ_map, stderr_is_tty),
     };
-    const exit_code = runArgsWithPresentation(gpa, init.io, stdout, stderr, args, presentation) catch |err| {
+    const exit_code = runArgsWithProgressWriter(gpa, init.io, stdout, stderr, progress_stderr, args, presentation) catch |err| {
         // Preserve the original failure; output after a failed run is best effort.
         flushWriters(stdout, stderr) catch {};
         return err;
@@ -129,6 +139,15 @@ fn autoColorEnabled(
 ) std.Io.Cancelable!bool {
     if (no_color) return false;
     if (force_color) return true;
+    return terminalSupportsEscapeCodes(io, file, environ, is_tty);
+}
+
+fn terminalSupportsEscapeCodes(
+    io: std.Io,
+    file: std.Io.File,
+    environ: *const std.process.Environ.Map,
+    is_tty: bool,
+) std.Io.Cancelable!bool {
     if (!is_tty) return false;
     if (builtin.os.tag == .windows) {
         return switch (try std.Io.Terminal.Mode.detect(io, file, false, false)) {
@@ -156,6 +175,18 @@ fn runArgsWithPresentation(
     io: std.Io,
     stdout: *std.Io.Writer,
     stderr: *std.Io.Writer,
+    args: []const []const u8,
+    presentation: Presentation,
+) !u8 {
+    return runArgsWithProgressWriter(allocator, io, stdout, stderr, stderr, args, presentation);
+}
+
+fn runArgsWithProgressWriter(
+    allocator: std.mem.Allocator,
+    io: std.Io,
+    stdout: *std.Io.Writer,
+    stderr: *std.Io.Writer,
+    progress_writer: *std.Io.Writer,
     args: []const []const u8,
     presentation: Presentation,
 ) !u8 {
@@ -196,7 +227,7 @@ fn runArgsWithPresentation(
     };
 
     return switch (command) {
-        .check => |check| try runCheck(allocator, io, stdout, check, presentation),
+        .check => |check| try runCheck(allocator, io, stdout, progress_writer, check, presentation),
     };
 }
 
@@ -303,15 +334,16 @@ fn runCheck(
     allocator: std.mem.Allocator,
     io: std.Io,
     writer: *std.Io.Writer,
+    progress_writer: *std.Io.Writer,
     check: CheckCommand,
     presentation: Presentation,
 ) !u8 {
     // Keep each mode's fixed output state out of the other modes' stack frames.
     // Combining them regresses payload-heavy parsing under ReleaseFast.
     return switch (check.output_mode) {
-        .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, check, presentation }),
-        .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, check, {} }),
-        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, check, presentation }),
+        .text => @call(.never_inline, runCheckMode, .{ .text, allocator, io, writer, progress_writer, check, presentation }),
+        .json => @call(.never_inline, runCheckMode, .{ .json, allocator, io, writer, {}, check, {} }),
+        .summary => @call(.never_inline, runCheckMode, .{ .summary, allocator, io, writer, progress_writer, check, presentation }),
     };
 }
 
@@ -320,6 +352,7 @@ fn runCheckMode(
     allocator: std.mem.Allocator,
     io: std.Io,
     writer: *std.Io.Writer,
+    progress_writer: if (mode == .json) void else *std.Io.Writer,
     check: CheckCommand,
     presentation: if (mode == .json) void else Presentation,
 ) !u8 {
@@ -335,9 +368,23 @@ fn runCheckMode(
     defer context.deinit();
 
     const started: ?std.Io.Clock.Timestamp = if (comptime mode != .json)
-        if (presentation.is_tty) .now(io, .awake) else null
+        if (presentation.is_tty or presentation.stderr_progress) .now(io, .awake) else null
     else
         null;
+    var progress_renderer: if (mode == .json) void else ?ProgressRenderer = if (mode == .json) {} else if (presentation.stderr_progress)
+        ProgressRenderer.init(
+            io,
+            progress_writer,
+            check.input,
+            started.?,
+            presentation.progress_delay_ns,
+            presentation.progress_refresh_ns,
+        )
+    else
+        null;
+    defer if (comptime mode != .json) {
+        if (progress_renderer) |*renderer| renderer.clear();
+    };
     var diagnostics = DiagnosticSink.init(.{
         .max_diagnostics = if (mode == .summary) 0 else diagnostic_defaults.max_diagnostics,
         .max_rendered_bytes = if (mode == .summary) 0 else diagnostic_defaults.max_rendered_bytes,
@@ -346,10 +393,18 @@ fn runCheckMode(
     });
     defer diagnostics.deinit(allocator);
 
-    const result = context.validateOne(&diagnostics, check.input);
+    const result = if (comptime mode == .json)
+        context.validateOne(&diagnostics, check.input)
+    else if (progress_renderer) |*renderer|
+        context.validateOneWithProgress(&diagnostics, check.input, renderer.observer())
+    else
+        context.validateOne(&diagnostics, check.input);
+    if (comptime mode != .json) {
+        if (progress_renderer) |*renderer| renderer.clear();
+    }
     if (mode == .text or mode == .json) diagnostics.sortGroups();
     const human_options: if (mode == .json) void else output.HumanResultOptions = if (mode == .json) {} else .{
-        .elapsed_ns = if (started) |timestamp| timestamp.untilNow(io).raw.nanoseconds else null,
+        .elapsed_ns = if (presentation.is_tty) started.?.untilNow(io).raw.nanoseconds else null,
         .color = switch (check.color_mode) {
             .auto => presentation.auto_color,
             .always => true,
@@ -362,6 +417,130 @@ fn runCheckMode(
         .summary => try output.renderSummaryResult(writer, diagnostic.summarizeResults(&.{result}), human_options),
     }
     return diagnostic.exitCodeForResults(&.{result});
+}
+
+const ProgressRenderer = struct {
+    io: std.Io,
+    writer: *std.Io.Writer,
+    path: []const u8,
+    started: std.Io.Clock.Timestamp,
+    delay_ns: i96,
+    refresh_ns: i96,
+    last_render_ns: ?i96 = null,
+    visible: bool = false,
+    disabled: bool = false,
+
+    fn init(
+        io: std.Io,
+        writer: *std.Io.Writer,
+        path: []const u8,
+        started: std.Io.Clock.Timestamp,
+        delay_ns: i96,
+        refresh_ns: i96,
+    ) ProgressRenderer {
+        return .{
+            .io = io,
+            .writer = writer,
+            .path = path,
+            .started = started,
+            .delay_ns = delay_ns,
+            .refresh_ns = refresh_ns,
+        };
+    }
+
+    fn observer(renderer: *ProgressRenderer) progress.Observer {
+        return .{
+            .context = renderer,
+            .update_fn = observe,
+        };
+    }
+
+    fn observe(context: *anyopaque, update: progress.Update) void {
+        const renderer: *ProgressRenderer = @ptrCast(@alignCast(context));
+        if (renderer.disabled) return;
+        renderer.updateAt(update, renderer.started.untilNow(renderer.io).raw.nanoseconds);
+    }
+
+    fn updateAt(renderer: *ProgressRenderer, update: progress.Update, elapsed_ns: i96) void {
+        if (renderer.disabled or elapsed_ns < renderer.delay_ns) return;
+        if (renderer.last_render_ns) |last_render_ns| {
+            if (elapsed_ns >= last_render_ns and
+                elapsed_ns - last_render_ns < renderer.refresh_ns)
+            {
+                return;
+            }
+        }
+        renderer.renderAt(update, elapsed_ns) catch {
+            // Terminal progress is optional; reporting failures must not weaken validation.
+            renderer.disabled = true;
+            return;
+        };
+        renderer.last_render_ns = elapsed_ns;
+        renderer.visible = true;
+    }
+
+    fn renderAt(
+        renderer: *ProgressRenderer,
+        update: progress.Update,
+        elapsed_ns: i96,
+    ) std.Io.Writer.Error!void {
+        try renderer.writer.writeAll("\r\x1b[2K");
+        try renderer.writer.writeAll(switch (update.phase) {
+            .parse => "parse   ",
+            .checksum => "checksum",
+        });
+        try renderer.writer.writeAll(" | ");
+        const percent = progressPercent(update.completed_bytes, update.total_bytes);
+        if (percent < 10) try renderer.writer.writeAll("  ") else if (percent < 100) try renderer.writer.writeByte(' ');
+        try renderer.writer.print("{d}% | ", .{percent});
+        try writeProgressBytes(renderer.writer, update.completed_bytes);
+        try renderer.writer.writeAll(" / ");
+        try writeProgressBytes(renderer.writer, update.total_bytes);
+        try renderer.writer.writeAll(" | ");
+        try writeProgressElapsed(renderer.writer, elapsed_ns);
+        try renderer.writer.print(" | {s}", .{renderer.path});
+        try renderer.writer.flush();
+    }
+
+    fn clear(renderer: *ProgressRenderer) void {
+        if (renderer.disabled or !renderer.visible) return;
+        renderer.writer.writeAll("\r\x1b[2K") catch {
+            renderer.disabled = true;
+            return;
+        };
+        renderer.writer.flush() catch {
+            renderer.disabled = true;
+            return;
+        };
+        renderer.visible = false;
+    }
+};
+
+fn progressPercent(completed_bytes: u64, total_bytes: u64) u8 {
+    if (total_bytes == 0) return 100;
+    const bounded = @min(completed_bytes, total_bytes);
+    return @intCast((@as(u128, bounded) * 100) / total_bytes);
+}
+
+fn writeProgressBytes(writer: *std.Io.Writer, bytes: u64) std.Io.Writer.Error!void {
+    const units = [_]struct { bytes: u64, label: []const u8 }{
+        .{ .bytes = 1_000_000_000, .label = "GB" },
+        .{ .bytes = 1_000_000, .label = "MB" },
+        .{ .bytes = 1_000, .label = "KB" },
+    };
+    for (units) |unit| {
+        if (bytes < unit.bytes) continue;
+        const tenths: u64 = @intCast((@as(u128, bytes) * 10 + unit.bytes / 2) / unit.bytes);
+        try writer.print("{d}.{d} {s}", .{ tenths / 10, tenths % 10, unit.label });
+        return;
+    }
+    try writer.print("{d} B", .{bytes});
+}
+
+fn writeProgressElapsed(writer: *std.Io.Writer, elapsed_ns: i96) std.Io.Writer.Error!void {
+    const nanoseconds: u96 = @intCast(@max(elapsed_ns, 0));
+    const tenths = nanoseconds / 100_000_000;
+    try writer.print("{d}.{d}s", .{ tenths / 10, tenths % 10 });
 }
 
 // --- Private Helpers ---
@@ -556,6 +735,181 @@ test "flush attempts stderr after stdout failure" {
 
     try std.testing.expectError(error.WriteFailed, flushWriters(&stdout, &stderr));
     try std.testing.expectEqual(@as(usize, 0), stderr.end);
+}
+
+test "[unit]: progress is delayed, rate limited, attributed, and cleared" {
+    var progress_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer progress_writer.deinit();
+    var renderer = ProgressRenderer.init(
+        std.testing.io,
+        &progress_writer.writer,
+        "sample.mzML",
+        .now(std.testing.io, .awake),
+        500_000_000,
+        150_000_000,
+    );
+    const first = progress.Update{
+        .phase = .parse,
+        .completed_bytes = 2_840_000_000,
+        .total_bytes = 4_000_000_000,
+    };
+
+    renderer.updateAt(first, 499_000_000);
+    try std.testing.expectEqualStrings("", progress_writer.written());
+    renderer.updateAt(first, 15_400_000_000);
+    renderer.updateAt(.{
+        .phase = .parse,
+        .completed_bytes = 3_200_000_000,
+        .total_bytes = 4_000_000_000,
+    }, 15_500_000_000);
+    try std.testing.expectEqualStrings(
+        "\r\x1b[2Kparse    |  71% | 2.8 GB / 4.0 GB | 15.4s | sample.mzML",
+        progress_writer.written(),
+    );
+    renderer.updateAt(.{
+        .phase = .checksum,
+        .completed_bytes = 1_680_000_000,
+        .total_bytes = 4_000_000_000,
+    }, 15_500_000_000);
+    try std.testing.expect(std.mem.indexOf(u8, progress_writer.written(), "checksum") == null);
+    renderer.updateAt(.{
+        .phase = .checksum,
+        .completed_bytes = 1_680_000_000,
+        .total_bytes = 4_000_000_000,
+    }, 15_550_000_000);
+    renderer.clear();
+    try std.testing.expect(std.mem.indexOf(u8, progress_writer.written(), "checksum |  42%") != null);
+    try std.testing.expect(std.mem.endsWith(u8, progress_writer.written(), "\r\x1b[2K"));
+}
+
+test "[unit]: default and summary render parse and checksum progress on stderr" {
+    const default_argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        "--skip-semantic",
+    };
+    const summary_argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        "--skip-semantic",
+        "--summary",
+    };
+    const cases = [_][]const []const u8{ &default_argv, &summary_argv };
+
+    for (cases) |argv| {
+        var stdout_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stdout_writer.deinit();
+        var stderr_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer stderr_writer.deinit();
+        var progress_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+        defer progress_writer.deinit();
+
+        const exit_code = try runArgsWithProgressWriter(
+            std.testing.allocator,
+            std.testing.io,
+            &stdout_writer.writer,
+            &stderr_writer.writer,
+            &progress_writer.writer,
+            argv,
+            .{
+                .stderr_progress = true,
+                .progress_delay_ns = 0,
+                .progress_refresh_ns = 0,
+            },
+        );
+        const rendered = progress_writer.written();
+
+        try std.testing.expectEqual(@as(u8, 0), exit_code);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "parse    |") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "checksum |") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, " / 5.1 MB |") != null);
+        try std.testing.expect(std.mem.indexOf(u8, rendered, "fixtures/mzml/valid/small.pwiz.1.1.mzML") != null);
+        try std.testing.expect(std.mem.endsWith(u8, rendered, "\r\x1b[2K"));
+        try std.testing.expectEqualStrings("", stderr_writer.written());
+    }
+}
+
+test "[unit]: JSON and redirected stderr disable progress" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
+        "--skip-semantic",
+        "--skip-index",
+        "--json",
+    };
+    var stdout_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr_writer.deinit();
+    var progress_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer progress_writer.deinit();
+
+    _ = try runArgsWithProgressWriter(
+        std.testing.allocator,
+        std.testing.io,
+        &stdout_writer.writer,
+        &stderr_writer.writer,
+        &progress_writer.writer,
+        &argv,
+        .{ .stderr_progress = true, .progress_delay_ns = 0 },
+    );
+    try std.testing.expectEqualStrings("", progress_writer.written());
+
+    progress_writer.writer.end = 0;
+    const summary_argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
+        "--skip-semantic",
+        "--skip-index",
+        "--summary",
+    };
+    _ = try runArgsWithProgressWriter(
+        std.testing.allocator,
+        std.testing.io,
+        &stdout_writer.writer,
+        &stderr_writer.writer,
+        &progress_writer.writer,
+        &summary_argv,
+        .{},
+    );
+    try std.testing.expectEqualStrings("", progress_writer.written());
+}
+
+test "[unit]: progress writer failure does not weaken validation" {
+    const argv = [_][]const u8{
+        "mzValidate",
+        "check",
+        "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        "--skip-semantic",
+        "--summary",
+    };
+    var stdout_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stdout_writer.deinit();
+    var stderr_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer stderr_writer.deinit();
+    var progress_writer: std.Io.Writer = .failing;
+
+    const exit_code = try runArgsWithProgressWriter(
+        std.testing.allocator,
+        std.testing.io,
+        &stdout_writer.writer,
+        &stderr_writer.writer,
+        &progress_writer,
+        &argv,
+        .{
+            .stderr_progress = true,
+            .progress_delay_ns = 0,
+            .progress_refresh_ns = 0,
+        },
+    );
+
+    try std.testing.expectEqual(@as(u8, 0), exit_code);
+    try std.testing.expect(std.mem.indexOf(u8, stdout_writer.written(), "complete:") != null);
+    try std.testing.expectEqualStrings("", stderr_writer.written());
 }
 
 test "[unit]: parser accepts one input path with options" {

@@ -11,6 +11,7 @@ const diagnostic = @import("diagnostic.zig");
 const elements = @import("mzml/elements.zig");
 const mzml_index = @import("mzml/index.zig");
 const obo_parser = @import("obo/parser.zig");
+const progress = @import("progress.zig");
 const rule_engine = @import("obo/rule_engine.zig");
 const semantic = @import("mzml/semantic.zig");
 const structural = @import("mzml/structural.zig");
@@ -25,6 +26,8 @@ const FailureReason = diagnostic.FailureReason;
 const FileResult = diagnostic.FileResult;
 const RuleId = diagnostic.RuleId;
 const ValidationStage = diagnostic.ValidationStage;
+/// Synchronous, caller-owned byte-progress callback for regular-file validation.
+pub const ProgressObserver = progress.Observer;
 const max_validation_token_bytes = 1024 * 1024;
 const stream_input_buffer_bytes = 64 * 1024;
 
@@ -118,12 +121,32 @@ pub const InvocationContext = struct {
         diagnostics: *DiagnosticSink,
         path: []const u8,
     ) FileResult {
+        return context.validateOneMode(false, diagnostics, path, {});
+    }
+
+    /// Validates one regular-file path while synchronously reporting bounded byte progress.
+    pub fn validateOneWithProgress(
+        context: *InvocationContext,
+        diagnostics: *DiagnosticSink,
+        path: []const u8,
+        observer: ProgressObserver,
+    ) FileResult {
+        return context.validateOneMode(true, diagnostics, path, observer);
+    }
+
+    fn validateOneMode(
+        context: *InvocationContext,
+        comptime report_progress: bool,
+        diagnostics: *DiagnosticSink,
+        path: []const u8,
+        observer: if (report_progress) ProgressObserver else void,
+    ) FileResult {
         diagnostics.configureFromResourceLimits(context.options.resource_limits);
         if (context.catalog_failure != null) return context.catalogFailureResult(diagnostics, path);
 
         var result = FileResult.init(enabledStages(context.options));
         const diagnostic_mark = diagnostics.mark();
-        checkPathInternal(context, diagnostics, path, &result) catch |err| {
+        checkPathInternal(report_progress, context, diagnostics, path, &result, observer) catch |err| {
             recordUnhandledFailure(&result, err, path);
         };
         result.finalizeSink(diagnostics, diagnostic_mark);
@@ -315,10 +338,12 @@ pub fn checkPathResult(
 }
 
 fn checkPathInternal(
+    comptime report_progress: bool,
     context: *InvocationContext,
     diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
+    observer: if (report_progress) ProgressObserver else void,
 ) !void {
     result.beginStage(.input);
     const cwd = std.Io.Dir.cwd();
@@ -393,22 +418,24 @@ fn checkPathInternal(
         return;
     }
 
-    try checkPathStream(context, file, opened_stat, diagnostics, path, result);
+    try checkPathStream(report_progress, context, file, opened_stat, diagnostics, path, result, observer);
 }
 
 fn checkPathStream(
+    comptime report_progress: bool,
     context: *InvocationContext,
     file: std.Io.File,
     initial_stat: std.Io.File.Stat,
     diagnostics: *DiagnosticSink,
     path: []const u8,
     result: *FileResult,
+    observer: if (report_progress) ProgressObserver else void,
 ) !void {
     var input_buffer: [stream_input_buffer_bytes]u8 = undefined;
     var file_reader = file.readerStreaming(context.io, &input_buffer);
 
     result.completeStage(.input);
-    try runValidation(context, diagnostics, path, null, .{ .reader = &file_reader.interface }, result, file, initial_stat.size);
+    try runValidationMode(report_progress, context, diagnostics, path, null, .{ .reader = &file_reader.interface }, result, file, initial_stat.size, observer);
     try checkFileStability(context, file, initial_stat, diagnostics, path, result);
 }
 
@@ -540,6 +567,21 @@ fn runValidation(
     stream_file: ?std.Io.File,
     stream_size: ?u64,
 ) !void {
+    return runValidationMode(false, context, diagnostics, path, file_bytes, source, result, stream_file, stream_size, {});
+}
+
+fn runValidationMode(
+    comptime report_progress: bool,
+    context: *InvocationContext,
+    diagnostics: *DiagnosticSink,
+    path: []const u8,
+    file_bytes: ?[]const u8,
+    source: ParserSource,
+    result: *FileResult,
+    stream_file: ?std.Io.File,
+    stream_size: ?u64,
+    observer: if (report_progress) ProgressObserver else void,
+) !void {
     result.beginStage(.parser);
     // Parser token slices borrow caller-owned storage until the next event.
     // Allocate the fixed bound once per file so every event reuses it without
@@ -570,6 +612,9 @@ fn runValidation(
         .reader => |reader| xml_parser.Parser.init(reader, parser_buffers),
         .slice => |bytes| xml_parser.Parser.initSlice(bytes, parser_buffers),
     };
+    var parse_progress: if (report_progress) progress.Reporter else void = if (report_progress)
+        progress.Reporter.init(observer, .parse, stream_size orelse return error.InputOutput)
+    else {};
 
     var structural_validator = structural.StructuralValidator.init(context.allocator, diagnostics, path);
     defer structural_validator.deinit();
@@ -671,7 +716,11 @@ fn runValidation(
             );
             return;
         };
+        if (comptime report_progress) {
+            parse_progress.checkpoint(parser.byteOffset() +| 1);
+        }
         const event = maybe_event orelse {
+            if (comptime report_progress) parse_progress.complete();
             result.completeStage(.parser);
             if (semantic_validator) |*sv| {
                 result.beginStage(.semantic);
@@ -680,7 +729,10 @@ fn runValidation(
             }
             if (index_validator) |*iv| {
                 result.beginStage(.index);
-                iv.finish(file_bytes) catch |err| {
+                (if (comptime report_progress)
+                    iv.finishWithProgress(file_bytes, observer)
+                else
+                    iv.finish(file_bytes)) catch |err| {
                     if (err == error.InputIntegrityUnavailable) {
                         try appendFailureDiagnostic(
                             context.allocator,
@@ -821,6 +873,59 @@ fn appendFailureDiagnostic(
     };
     result.recordFailure(stage, reason, item.rule, item.message, item.location, item.path, emitted);
     if (!emitted) result.failure_diagnostic_counted = true;
+}
+
+test "[unit]: path progress reports monotonic parse and checksum bytes" {
+    const Recorder = struct {
+        updates: [8]progress.Update = undefined,
+        len: usize = 0,
+
+        fn observe(context: *anyopaque, update: progress.Update) void {
+            const recorder: *@This() = @ptrCast(@alignCast(context));
+            recorder.updates[recorder.len] = update;
+            recorder.len += 1;
+        }
+    };
+
+    const allocator = std.testing.allocator;
+    const io = std.testing.io;
+    const path = "fixtures/mzml/valid/small.pwiz.1.1.mzML";
+    const stat = try std.Io.Dir.cwd().statFile(io, path, .{});
+    var recorder = Recorder{};
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var context = InvocationContext.init(allocator, io, .{ .skip_semantic = true });
+    defer context.deinit();
+
+    _ = context.validateOneWithProgress(&diagnostics, path, .{
+        .context = &recorder,
+        .update_fn = Recorder.observe,
+    });
+
+    var parse_bytes: u64 = 0;
+    var checksum_bytes: u64 = 0;
+    var saw_parse = false;
+    var saw_checksum = false;
+    for (recorder.updates[0..recorder.len]) |update| {
+        try std.testing.expectEqual(stat.size, update.total_bytes);
+        switch (update.phase) {
+            .parse => {
+                try std.testing.expect(!saw_checksum);
+                try std.testing.expect(update.completed_bytes >= parse_bytes);
+                parse_bytes = update.completed_bytes;
+                saw_parse = true;
+            },
+            .checksum => {
+                try std.testing.expect(update.completed_bytes >= checksum_bytes);
+                checksum_bytes = update.completed_bytes;
+                saw_checksum = true;
+            },
+        }
+    }
+    try std.testing.expect(saw_parse);
+    try std.testing.expect(saw_checksum);
+    try std.testing.expectEqual(stat.size, parse_bytes);
+    try std.testing.expectEqual(stat.size, checksum_bytes);
 }
 
 fn expectAllocationFailuresIncomplete(
