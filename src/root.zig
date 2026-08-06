@@ -7,6 +7,7 @@ const std = @import("std");
 pub const cli = @import("cli.zig");
 pub const diagnostic = @import("diagnostic.zig");
 pub const output = @import("output.zig");
+pub const progress = @import("progress.zig");
 pub const version = @import("version.zig");
 pub const validate = @import("validate.zig");
 
@@ -40,6 +41,7 @@ pub const CompletionState = diagnostic.CompletionState;
 pub const Severity = diagnostic.Severity;
 pub const ResourceLimits = diagnostic.ResourceLimits;
 pub const OutputMode = output.OutputMode;
+pub const ProgressObserver = progress.Observer;
 pub const CheckOptions = validate.CheckOptions;
 pub const InvocationContext = validate.InvocationContext;
 pub const InvocationResourceUsage = validate.InvocationResourceUsage;
@@ -55,6 +57,7 @@ pub fn run(init: std.process.Init) !u8 {
 test "library imports compile" {
     _ = @import("cli.zig");
     _ = @import("output.zig");
+    _ = @import("progress.zig");
     _ = @import("xml/events.zig");
     _ = @import("xml/parse_errors.zig");
     _ = @import("xml/parser.zig");

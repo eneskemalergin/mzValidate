@@ -7,6 +7,7 @@
 const std = @import("std");
 const sha1 = @import("../checksum/sha1.zig");
 const diagnostic = @import("../diagnostic.zig");
+const progress = @import("../progress.zig");
 const xml_events = @import("../xml/events.zig");
 
 const DiagnosticSink = diagnostic.DiagnosticSink;
@@ -402,6 +403,21 @@ pub const IndexValidator = struct {
 
     /// Recomputes fileChecksum from the seekable stream source without retaining input bytes.
     pub fn completeStreamChecksum(validator: *IndexValidator) !void {
+        return validator.completeStreamChecksumMode(false, {});
+    }
+
+    fn completeStreamChecksumWithProgress(
+        validator: *IndexValidator,
+        observer: progress.Observer,
+    ) !void {
+        return validator.completeStreamChecksumMode(true, observer);
+    }
+
+    fn completeStreamChecksumMode(
+        validator: *IndexValidator,
+        comptime report_progress: bool,
+        observer: if (report_progress) progress.Observer else void,
+    ) !void {
         if (!validator.file_checksum_ok or validator.sha_complete) return;
         const checksum_offset = validator.file_checksum_byte_offset orelse return;
         const size = validator.input_size orelse return;
@@ -419,6 +435,9 @@ pub const IndexValidator = struct {
         var buffer: [64 * 1024]u8 = undefined;
         var hashed: u64 = 0;
         var ctx = sha1.Sha1.init();
+        var checksum_progress: if (report_progress) progress.Reporter else void = if (report_progress)
+            progress.Reporter.init(observer, .checksum, checksum_offset)
+        else {};
         while (hashed < checksum_offset) {
             const remaining = checksum_offset - hashed;
             const want: usize = @intCast(@min(remaining, @as(u64, buffer.len)));
@@ -433,9 +452,11 @@ pub const IndexValidator = struct {
             }
             ctx.update(buffer[0..n]);
             hashed = std.math.add(u64, hashed, n) catch return error.InputOutput;
+            if (comptime report_progress) checksum_progress.checkpoint(hashed);
         }
         ctx.final(&validator.sha_computed);
         validator.sha_complete = true;
+        if (comptime report_progress) checksum_progress.complete();
     }
 
     /// After the document is fully parsed, cross-check all collected data.
@@ -446,6 +467,24 @@ pub const IndexValidator = struct {
     pub fn finish(
         validator: *IndexValidator,
         file_bytes: ?[]const u8,
+    ) !void {
+        return validator.finishMode(false, file_bytes, {});
+    }
+
+    /// Like `finish`, with bounded updates during positional checksum reads.
+    pub fn finishWithProgress(
+        validator: *IndexValidator,
+        file_bytes: ?[]const u8,
+        observer: progress.Observer,
+    ) !void {
+        return validator.finishMode(true, file_bytes, observer);
+    }
+
+    fn finishMode(
+        validator: *IndexValidator,
+        comptime report_progress: bool,
+        file_bytes: ?[]const u8,
+        observer: if (report_progress) progress.Observer else void,
     ) !void {
         if (!validator.saw_index_elements) return;
 
@@ -484,7 +523,13 @@ pub const IndexValidator = struct {
             }
         }
 
-        if (file_bytes == null) try validator.completeStreamChecksum();
+        if (file_bytes == null) {
+            if (comptime report_progress) {
+                try validator.completeStreamChecksumWithProgress(observer);
+            } else {
+                try validator.completeStreamChecksum();
+            }
+        }
         if (file_bytes) |bytes| {
             if (validator.file_checksum_ok) {
                 if (validator.file_checksum_byte_offset) |checksum_offset| {

@@ -346,6 +346,33 @@ pub const DiagnosticSink = struct {
         return true;
     }
 
+    /// Orders retained groups for presentation and preserves index correctness.
+    pub fn sortGroups(sink: *DiagnosticSink) void {
+        if (sink.group_index.len == 0) {
+            std.mem.sort(Diagnostic, sink.items, {}, diagnosticGroupLessThan);
+            return;
+        }
+
+        std.debug.assert(sink.items.len <= sink.group_index.len / 2);
+        const order = sink.group_index[0..sink.items.len];
+        const destinations = sink.group_index[sink.items.len..][0..sink.items.len];
+        for (order, 0..) |*item_index, index| item_index.* = index;
+        std.mem.sort(usize, order, sink.items, diagnosticIndexLessThan);
+        for (order, 0..) |item_index, index| destinations[item_index] = index;
+        for (destinations, 0..) |*destination, index| {
+            while (destination.* != index) {
+                const other = destination.*;
+                std.mem.swap(Diagnostic, &sink.items[index], &sink.items[other]);
+                std.mem.swap(usize, destination, &destinations[other]);
+            }
+        }
+
+        @memset(sink.group_index, group_index_empty);
+        for (sink.items, 0..) |*item, index| {
+            sink.insertGroupIndex(diagnosticGroupHash(item), index);
+        }
+    }
+
     /// Grows the retained-detail buffer without exceeding max_diagnostics.
     pub fn ensureTotalCapacity(sink: *DiagnosticSink, allocator: std.mem.Allocator, requested: usize) !void {
         if (requested <= sink.capacity) return;
@@ -582,6 +609,25 @@ fn sameDiagnosticGroup(left: *const Diagnostic, right: *const Diagnostic) bool {
         std.mem.eql(u8, left.rule, right.rule) and
         optionalStringEql(left.path, right.path) and
         std.mem.eql(u8, left.message, right.message);
+}
+
+fn diagnosticGroupLessThan(_: void, left: Diagnostic, right: Diagnostic) bool {
+    const left_severity = severitySortOrder(left.severity);
+    const right_severity = severitySortOrder(right.severity);
+    if (left_severity != right_severity) return left_severity < right_severity;
+    return left.occurrences > right.occurrences;
+}
+
+fn diagnosticIndexLessThan(items: []Diagnostic, left: usize, right: usize) bool {
+    return diagnosticGroupLessThan({}, items[left], items[right]);
+}
+
+fn severitySortOrder(severity: Severity) u2 {
+    return switch (severity) {
+        .@"error" => 0,
+        .warning => 1,
+        .info => 2,
+    };
 }
 
 fn diagnosticGroupHash(item: *const Diagnostic) u64 {
@@ -946,8 +992,6 @@ pub const Summary = struct {
     diagnostics_truncated: bool = false,
     dropped_diagnostics: Totals = .{},
     first_failure: ?FirstFailure = null,
-    first_emergency_failure: ?FirstFailure = null,
-    emergency_failures: usize = 0,
 
     pub fn addResult(summary: *Summary, result: FileResult) void {
         summary.files = saturatingAdd(summary.files, 1);
@@ -971,12 +1015,6 @@ pub const Summary = struct {
             summary.completion = .incomplete;
             summary.incomplete_files = saturatingAdd(summary.incomplete_files, 1);
             if (summary.first_failure == null) summary.first_failure = result.first_failure;
-        }
-        if (result.needsEmergencyDiagnostic()) {
-            summary.emergency_failures = saturatingAdd(summary.emergency_failures, 1);
-            if (summary.first_emergency_failure == null) {
-                summary.first_emergency_failure = result.first_failure;
-            }
         }
     }
 
@@ -1012,15 +1050,9 @@ pub fn summarizeResults(results: []const FileResult) Summary {
     return summary;
 }
 
-/// Maps diagnostics to the process exit code contract.
-///
-/// 0 = clean, 1 = warnings only, 2 = any errors present.
+/// Maps a completed diagnostic set to the process exit code contract.
 pub fn exitCode(diagnostics: []const Diagnostic) u8 {
-    return switch (summarize(diagnostics).status()) {
-        .clean => 0,
-        .warnings_only => 1,
-        .errors_present => 2,
-    };
+    return exitCodeForSummary(summarize(diagnostics));
 }
 
 /// Maps per-file completion and severity results to the process exit code.
@@ -1030,22 +1062,32 @@ pub fn exitCodeForResults(results: []const FileResult) u8 {
 
 /// Maps an incrementally aggregated invocation summary to the process exit code.
 pub fn exitCodeForSummary(summary: Summary) u8 {
-    return switch (summary.status()) {
-        .clean => 0,
-        .warnings_only => 1,
-        .errors_present => 2,
-    };
+    if (summary.completion == .incomplete) return 3;
+    return if (summary.totals.errors > 0) 1 else 0;
 }
 
 // --- Unit Tests ---
 
-test "errors take precedence over warnings in exit codes" {
+test "[unit]: completed validation succeeds for clean info and warning findings" {
+    const info_diagnostics = [_]Diagnostic{
+        .{ .severity = .info, .rule = RuleId.runtime_stub, .message = "stub" },
+    };
+    const warning_diagnostics = [_]Diagnostic{
+        .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
+    };
+
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&.{}));
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&info_diagnostics));
+    try std.testing.expectEqual(@as(u8, 0), exitCode(&warning_diagnostics));
+}
+
+test "[unit]: completed errors use the findings exit code" {
     const diagnostics = [_]Diagnostic{
         .{ .severity = .warning, .rule = RuleId.runtime_stub, .message = "stub" },
         .{ .severity = .@"error", .rule = RuleId.runtime_file_open, .message = "open failed" },
     };
 
-    try std.testing.expectEqual(@as(u8, 2), exitCode(&diagnostics));
+    try std.testing.expectEqual(@as(u8, 1), exitCode(&diagnostics));
 }
 
 test "summary status follows diagnostic severity" {
@@ -1094,7 +1136,6 @@ test "[unit]: result summary saturates invocation counts" {
         },
         .files = std.math.maxInt(usize),
         .incomplete_files = std.math.maxInt(usize),
-        .emergency_failures = std.math.maxInt(usize),
         .dropped_diagnostics = .{
             .info = std.math.maxInt(usize),
             .warnings = std.math.maxInt(usize),
@@ -1109,14 +1150,12 @@ test "[unit]: result summary saturates invocation counts" {
 
     try std.testing.expectEqual(std.math.maxInt(usize), summary.files);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.incomplete_files);
-    try std.testing.expectEqual(std.math.maxInt(usize), summary.emergency_failures);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.info);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.warnings);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.totals.errors);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.info);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.warnings);
     try std.testing.expectEqual(std.math.maxInt(usize), summary.dropped_diagnostics.errors);
-    try std.testing.expect(summary.first_emergency_failure != null);
 }
 
 test "file result stays incomplete until every enabled stage completes" {
@@ -1126,7 +1165,7 @@ test "file result stays incomplete until every enabled stage completes" {
     result.finalize(&.{});
 
     try std.testing.expectEqual(CompletionState.incomplete, result.completion);
-    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), exitCodeForResults(&.{result}));
 }
 
 test "file result records first failure without normal diagnostic storage" {
@@ -1139,7 +1178,7 @@ test "file result records first failure without normal diagnostic storage" {
     try std.testing.expectEqual(CompletionState.incomplete, result.completion);
     try std.testing.expect(result.needsEmergencyDiagnostic());
     try std.testing.expectEqual(@as(usize, 1), result.totals.errors);
-    try std.testing.expectEqual(@as(u8, 2), exitCodeForResults(&.{result}));
+    try std.testing.expectEqual(@as(u8, 3), exitCodeForResults(&.{result}));
 }
 
 test "file result marks the fixed emergency failure path" {
@@ -1331,6 +1370,38 @@ test "[unit]: optional grouping index failure keeps exact linear grouping" {
 
     try std.testing.expectEqual(@as(usize, 1), sink.items.len);
     try std.testing.expectEqual(@as(usize, 2), sink.items[0].occurrences);
+}
+
+test "[unit]: grouped diagnostics sort by severity and count" {
+    var sink = DiagnosticSink.init(.{ .aggregate_occurrences = true });
+    defer sink.deinit(std.testing.allocator);
+
+    const findings = [_]Diagnostic{
+        .{ .severity = .info, .rule = "info", .message = "finding" },
+        .{ .severity = .warning, .rule = "warning", .message = "finding" },
+        .{ .severity = .@"error", .rule = "z-error", .message = "finding" },
+        .{ .severity = .@"error", .rule = "b-error", .message = "finding" },
+        .{ .severity = .@"error", .rule = "a-error", .message = "finding" },
+    };
+    for (findings) |finding| _ = try sink.append(std.testing.allocator, finding);
+    for (0..19) |_| _ = try sink.append(std.testing.allocator, findings[1]);
+    for (0..2) |_| {
+        _ = try sink.append(std.testing.allocator, findings[3]);
+        _ = try sink.append(std.testing.allocator, findings[4]);
+    }
+
+    sink.sortGroups();
+
+    try std.testing.expectEqualStrings("b-error", sink.items[0].rule);
+    try std.testing.expectEqual(@as(usize, 3), sink.items[0].occurrences);
+    try std.testing.expectEqualStrings("a-error", sink.items[1].rule);
+    try std.testing.expectEqualStrings("z-error", sink.items[2].rule);
+    try std.testing.expectEqualStrings("warning", sink.items[3].rule);
+    try std.testing.expectEqual(@as(usize, 20), sink.items[3].occurrences);
+    try std.testing.expectEqualStrings("info", sink.items[4].rule);
+
+    _ = try sink.append(std.testing.allocator, findings[3]);
+    try std.testing.expectEqual(@as(usize, 4), sink.items[0].occurrences);
 }
 
 test "[unit]: verbose diagnostic records do not allocate aggregation storage" {

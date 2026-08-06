@@ -100,17 +100,33 @@ pub fn build(b: *std.Build) void {
     const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch
         @panic("failed to collect invalid mzML fixtures");
 
-    const cli_valid_cmd = b.addRunArtifact(exe);
-    cli_valid_cmd.step.dependOn(b.getInstallStep());
-    cli_valid_cmd.addArg("check");
-    cli_valid_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
-    cli_valid_cmd.addArg("fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML");
-    cli_valid_cmd.addArg("fixtures/mzml/valid/small_miape.pwiz.1.1.mzML");
-    cli_valid_cmd.addArg("fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML");
-    cli_valid_cmd.addArg("--skip-semantic");
-    cli_valid_cmd.addArg("--skip-index");
-    cli_valid_cmd.addArg("--summary");
-    cli_valid_cmd.expectStdOutEqual("complete: clean (info=0 warnings=0 errors=0)\n");
+    const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
+    const valid_fixtures = [_][]const u8{
+        "fixtures/mzml/valid/small.pwiz.1.1.mzML",
+        "fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML",
+        "fixtures/mzml/valid/small_miape.pwiz.1.1.mzML",
+        "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
+    };
+    for (valid_fixtures) |fixture| {
+        const cli_valid_cmd = b.addRunArtifact(exe);
+        cli_valid_cmd.step.dependOn(b.getInstallStep());
+        cli_valid_cmd.addArg("check");
+        cli_valid_cmd.addArg(fixture);
+        cli_valid_cmd.addArg("--skip-semantic");
+        cli_valid_cmd.addArg("--skip-index");
+        cli_valid_cmd.addArg("--summary");
+        cli_valid_cmd.expectStdOutEqual("complete: clean | no findings\n");
+        cli_contract_step.dependOn(&cli_valid_cmd.step);
+    }
+
+    const cli_warning_cmd = b.addRunArtifact(exe);
+    cli_warning_cmd.step.dependOn(b.getInstallStep());
+    cli_warning_cmd.addArg("check");
+    cli_warning_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_warning_cmd.addArg("--summary");
+    cli_warning_cmd.expectExitCode(0);
+    cli_warning_cmd.expectStdOutEqual("complete: warnings | warnings 3, info 97\n");
+    cli_contract_step.dependOn(&cli_warning_cmd.step);
 
     const cli_known_findings_cmd = b.addRunArtifact(exe);
     cli_known_findings_cmd.step.dependOn(b.getInstallStep());
@@ -119,17 +135,54 @@ pub fn build(b: *std.Build) void {
     cli_known_findings_cmd.addArg("--skip-semantic");
     cli_known_findings_cmd.addArg("--skip-index");
     cli_known_findings_cmd.addArg("--summary");
-    cli_known_findings_cmd.expectExitCode(2);
-    cli_known_findings_cmd.expectStdOutEqual("complete: errors (info=0 warnings=0 errors=13)\n");
+    cli_known_findings_cmd.expectExitCode(1);
+    cli_known_findings_cmd.expectStdOutEqual("complete: errors | errors 13\n");
 
-    const cli_invalid_cmd = b.addRunArtifact(exe);
-    cli_invalid_cmd.step.dependOn(b.getInstallStep());
-    cli_invalid_cmd.addArg("check");
-    addFixtureArgs(cli_invalid_cmd, invalid_fixtures);
-    cli_invalid_cmd.addArg("--skip-semantic");
-    cli_invalid_cmd.addArg("--summary");
-    cli_invalid_cmd.expectExitCode(2);
-    cli_invalid_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
+    for (invalid_fixtures) |fixture| {
+        const cli_invalid_cmd = b.addRunArtifact(exe);
+        cli_invalid_cmd.step.dependOn(b.getInstallStep());
+        cli_invalid_cmd.addArg("check");
+        cli_invalid_cmd.addArg(fixture);
+        cli_invalid_cmd.addArg("--skip-semantic");
+        cli_invalid_cmd.addArg("--summary");
+        cli_invalid_cmd.expectExitCode(1);
+        cli_invalid_cmd.expectStdOutMatch("complete: errors | errors ");
+        cli_contract_step.dependOn(&cli_invalid_cmd.step);
+    }
+
+    const cli_multiple_inputs_cmd = b.addRunArtifact(exe);
+    cli_multiple_inputs_cmd.step.dependOn(b.getInstallStep());
+    cli_multiple_inputs_cmd.addArg("check");
+    cli_multiple_inputs_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_multiple_inputs_cmd.addArg("--summary");
+    cli_multiple_inputs_cmd.addArg("fixtures/mzml/valid/small_zlib.pwiz.1.1.mzML");
+    cli_multiple_inputs_cmd.expectExitCode(2);
+    cli_multiple_inputs_cmd.expectStdErrEqual(
+        "error: check accepts exactly one input path\n" ++
+            "usage: mzValidate check <input.mzML> [options]\n",
+    );
+
+    const cli_missing_input_cmd = b.addRunArtifact(exe);
+    cli_missing_input_cmd.step.dependOn(b.getInstallStep());
+    cli_missing_input_cmd.addArg("check");
+    cli_missing_input_cmd.addArg("--summary");
+    cli_missing_input_cmd.expectExitCode(2);
+    cli_missing_input_cmd.expectStdErrEqual(
+        "error: missing input path after `check`\n" ++
+            "usage: mzValidate check <input.mzML> [options]\n",
+    );
+
+    const cli_removed_brief_cmd = b.addRunArtifact(exe);
+    cli_removed_brief_cmd.step.dependOn(b.getInstallStep());
+    cli_removed_brief_cmd.addArg("check");
+    cli_removed_brief_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
+    cli_removed_brief_cmd.addArg("--brief");
+    cli_removed_brief_cmd.expectExitCode(2);
+    cli_removed_brief_cmd.expectStdOutEqual("");
+    cli_removed_brief_cmd.expectStdErrEqual(
+        "error: unexpected flag: --brief\n" ++
+            "usage: mzValidate check <input.mzML> [options]\n",
+    );
 
     const cli_schema_finding_cmd = b.addRunArtifact(exe);
     cli_schema_finding_cmd.step.dependOn(b.getInstallStep());
@@ -138,8 +191,8 @@ pub fn build(b: *std.Build) void {
     cli_schema_finding_cmd.addArg("--skip-semantic");
     cli_schema_finding_cmd.addArg("--skip-index");
     cli_schema_finding_cmd.addArg("--summary");
-    cli_schema_finding_cmd.expectExitCode(2);
-    cli_schema_finding_cmd.expectStdOutMatch("complete: errors (info=0 warnings=0 errors=");
+    cli_schema_finding_cmd.expectExitCode(1);
+    cli_schema_finding_cmd.expectStdOutMatch("complete: errors | errors ");
 
     const cli_incomplete_cmd = b.addRunArtifact(exe);
     cli_incomplete_cmd.step.dependOn(b.getInstallStep());
@@ -148,9 +201,8 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.addArg("--skip-binary");
     cli_incomplete_cmd.addArg("--skip-semantic");
     cli_incomplete_cmd.addArg("--summary");
-    cli_incomplete_cmd.expectExitCode(2);
-    cli_incomplete_cmd.expectStdOutMatch("incomplete: errors (info=0 warnings=0 errors=");
-    cli_incomplete_cmd.expectStdOutMatch("failure: stage=index reason=resource");
+    cli_incomplete_cmd.expectExitCode(3);
+    cli_incomplete_cmd.expectStdOutMatch("incomplete: errors | errors ");
 
     const cli_json_cmd = b.addRunArtifact(exe);
     cli_json_cmd.step.dependOn(b.getInstallStep());
@@ -159,15 +211,15 @@ pub fn build(b: *std.Build) void {
     cli_json_cmd.addArg("--skip-binary");
     cli_json_cmd.addArg("--skip-semantic");
     cli_json_cmd.addArg("--json");
-    cli_json_cmd.expectExitCode(2);
+    cli_json_cmd.expectExitCode(3);
     cli_json_cmd.expectStdOutMatch("\"schema_version\": 1");
     cli_json_cmd.expectStdOutMatch("\"completion\": \"incomplete\"");
     cli_json_cmd.expectStdOutMatch("\"reason\": \"resource\"");
 
-    const cli_contract_step = b.step("cli-contract", "Run CLI contract checks for valid and expected-invalid fixtures");
-    cli_contract_step.dependOn(&cli_valid_cmd.step);
     cli_contract_step.dependOn(&cli_known_findings_cmd.step);
-    cli_contract_step.dependOn(&cli_invalid_cmd.step);
+    cli_contract_step.dependOn(&cli_missing_input_cmd.step);
+    cli_contract_step.dependOn(&cli_multiple_inputs_cmd.step);
+    cli_contract_step.dependOn(&cli_removed_brief_cmd.step);
     cli_contract_step.dependOn(&cli_schema_finding_cmd.step);
     cli_contract_step.dependOn(&cli_incomplete_cmd.step);
     cli_contract_step.dependOn(&cli_json_cmd.step);
@@ -175,7 +227,6 @@ pub fn build(b: *std.Build) void {
     const ci_step = b.step("ci", "test + cli-contract");
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
-
 }
 
 fn addSha1X86ToModule(
@@ -197,10 +248,6 @@ fn addSha1X86ToModule(
         .use_llvm = true,
     });
     mod.addObject(sha1_object);
-}
-
-fn addFixtureArgs(run: *std.Build.Step.Run, fixtures: []const []const u8) void {
-    for (fixtures) |fixture| run.addArg(fixture);
 }
 
 fn addVendoredLibdeflateToModule(

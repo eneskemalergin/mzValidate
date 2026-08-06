@@ -1,6 +1,6 @@
 //! Renders diagnostics for humans and CI consumers.
 //!
-//! Text, JSON, summary, and brief modes share the same bounded result metadata.
+//! Text, JSON, and summary modes share the same bounded result metadata.
 
 const std = @import("std");
 const diagnostic = @import("diagnostic.zig");
@@ -12,11 +12,52 @@ const Severity = diagnostic.Severity;
 /// Selects how diagnostics are rendered for humans or CI.
 pub const OutputMode = enum {
     text,
-    verbose,
     json,
     summary,
-    brief,
 };
+
+/// Presentation values for human result lines.
+pub const HumanResultOptions = struct {
+    elapsed_ns: ?i96 = null,
+    color: bool = false,
+    terminal_columns: ?usize = null,
+};
+
+/// Counts terminal cells for common zero-width and wide Unicode scalars.
+pub fn displayWidth(text: []const u8) usize {
+    var index: usize = 0;
+    var width: usize = 0;
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        index += unit.byte_length;
+        width += unit.cell_width;
+    }
+    return width;
+}
+
+/// Returns a terminal-width suffix, retaining one visible scalar when none fits.
+pub fn suffixStartForWidth(text: []const u8, max_width: usize) usize {
+    const width = displayWidth(text);
+    if (width <= max_width) return 0;
+
+    var index: usize = 0;
+    var skipped: usize = 0;
+    var last_visible_start: usize = 0;
+    const skip = width - max_width;
+    while (index < text.len and skipped < skip) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width != 0) last_visible_start = index;
+        index += unit.byte_length;
+        skipped += unit.cell_width;
+    }
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width != 0) break;
+        index += unit.byte_length;
+    }
+    if (index == text.len and max_width > 0) return last_visible_start;
+    return index;
+}
 
 /// Writes grouped text diagnostics followed by one aggregate summary.
 pub fn renderText(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -45,16 +86,20 @@ pub fn renderTextResult(
         }
     }
     var rendered_failure = false;
+    var finding_groups = diagnostics.len;
     for (results) |result| {
         if (result.first_failure) |failure| {
             if (!result.failure_diagnostic_emitted) {
                 try renderFailureText(writer, failure);
                 rendered_failure = true;
+                finding_groups = std.math.add(usize, finding_groups, 1) catch std.math.maxInt(usize);
             }
         }
     }
     if (rendered_failure) try writer.writeByte('\n');
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
+    const summary = diagnostic.summarizeResults(results);
+    try writeHumanResultLine(writer, summary, finding_groups, .{});
+    try writeFailureMetadata(writer, summary.first_failure);
 }
 
 /// Writes one file's text diagnostics and any retained failure metadata.
@@ -63,32 +108,476 @@ pub fn renderTextFile(
     diagnostics: []const Diagnostic,
     result: *const diagnostic.FileResult,
     path: []const u8,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
-    var rendered = false;
-    if (diagnostics.len > 0) {
-        try renderTextDiagnostics(writer, diagnostics);
-        rendered = true;
-    }
+    try writer.print("input: {s}\n\n", .{path});
+
+    const count_width = occurrenceWidth(diagnostics);
+    try renderCompactDiagnostics(writer, diagnostics, count_width, options.color, options.terminal_columns);
     if (hasDroppedDiagnostics(result.*)) {
-        try renderTruncationText(writer, result.dropped_diagnostics, path);
-        rendered = true;
+        try renderCompactTruncation(
+            writer,
+            result.dropped_diagnostics,
+            count_width,
+            options.color,
+            options.terminal_columns,
+        );
     }
     if (result.needsEmergencyDiagnostic()) {
-        if (rendered) try writer.writeByte('\n');
-        try renderFailureText(writer, result.first_failure.?);
+        try renderCompactFailure(
+            writer,
+            result.first_failure.?,
+            count_width,
+            options.color,
+            options.terminal_columns,
+        );
+    }
+
+    if (diagnostics.len > 0 or hasDroppedDiagnostics(result.*) or result.needsEmergencyDiagnostic()) {
+        try writer.writeByte('\n');
+    }
+    const finding_groups = std.math.add(
+        usize,
+        diagnostics.len,
+        @intFromBool(result.needsEmergencyDiagnostic()),
+    ) catch std.math.maxInt(usize);
+    const summary = diagnostic.summarizeResults(&.{result.*});
+    try writeHumanResultLine(writer, summary, finding_groups, options);
+    try writeFailureMetadata(writer, summary.first_failure);
+}
+
+const DisplayUnit = struct {
+    byte_length: usize,
+    cell_width: usize,
+};
+
+fn prefixBytesForWidth(text: []const u8, max_width: usize) usize {
+    if (max_width == 0) return 0;
+
+    var index: usize = 0;
+    var width: usize = 0;
+    while (index < text.len) {
+        const unit = readDisplayUnit(text[index..]);
+        if (unit.cell_width > max_width - width) break;
+        index += unit.byte_length;
+        width += unit.cell_width;
+    }
+    return index;
+}
+
+fn firstDisplayUnitBytes(text: []const u8) usize {
+    if (text.len == 0) return 0;
+    return readDisplayUnit(text).byte_length;
+}
+
+fn readDisplayUnit(text: []const u8) DisplayUnit {
+    const byte_length: usize = std.unicode.utf8ByteSequenceLength(text[0]) catch
+        return .{ .byte_length = 1, .cell_width = 1 };
+    if (byte_length > text.len) return .{ .byte_length = 1, .cell_width = 1 };
+    const codepoint = std.unicode.utf8Decode(text[0..byte_length]) catch
+        return .{ .byte_length = 1, .cell_width = 1 };
+    return .{ .byte_length = byte_length, .cell_width = scalarCellWidth(codepoint) };
+}
+
+fn scalarCellWidth(codepoint: u21) usize {
+    if (codepoint < 0xff) return 1;
+    if (isZeroWidth(codepoint)) return 0;
+    return if (isWide(codepoint)) 2 else 1;
+}
+
+fn isZeroWidth(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x0300...0x036f,
+        0x1ab0...0x1aff,
+        0x1dc0...0x1dff,
+        0x200b...0x200f,
+        0x2060,
+        0x20d0...0x20ff,
+        0xfe00...0xfe0f,
+        0xfe20...0xfe2f,
+        0xfeff,
+        0xe0001,
+        0xe0020...0xe007f,
+        0xe0100...0xe01ef,
+        => true,
+        else => false,
+    };
+}
+
+fn isWide(codepoint: u21) bool {
+    return switch (codepoint) {
+        0x1100...0x115f,
+        0x2329...0x232a,
+        0x2e80...0x303e,
+        0x3040...0xa4cf,
+        0xac00...0xd7a3,
+        0xf900...0xfaff,
+        0xfe10...0xfe19,
+        0xfe30...0xfe6f,
+        0xff00...0xff60,
+        0xffe0...0xffe6,
+        0x1f1e6...0x1f1ff,
+        0x1f300...0x1faff,
+        0x20000...0x3fffd,
+        => true,
+        else => false,
+    };
+}
+
+fn renderCompactDiagnostics(
+    writer: *std.Io.Writer,
+    diagnostics: []const Diagnostic,
+    count_width: usize,
+    color: bool,
+    terminal_columns: ?usize,
+) std.Io.Writer.Error!void {
+    for (diagnostics) |item| {
+        try writeSeverityCount(writer, item.severity, item.occurrences, count_width, color);
+        try renderCompactMessageRule(
+            writer,
+            item.message,
+            item.rule,
+            13 + count_width,
+            terminal_columns,
+            color,
+            false,
+        );
+        try renderCompactLocations(writer, item);
+    }
+}
+
+fn renderCompactMessageRule(
+    writer: *std.Io.Writer,
+    message: []const u8,
+    rule: []const u8,
+    indent: usize,
+    terminal_columns: ?usize,
+    color: bool,
+    style_padding: bool,
+) std.Io.Writer.Error!void {
+    if (terminal_columns) |columns| {
+        const line_width = indent + displayWidth(message) + 3 + displayWidth(rule);
+        if (line_width > columns) {
+            try writer.writeAll("  ");
+            try renderWrappedMessage(writer, message, indent, columns, color);
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent);
+            try writeAnsi(writer, color, ansi_dim);
+            try writer.print("[{s}]", .{rule});
+            try writeAnsi(writer, color, ansi_reset);
+            try writer.writeByte('\n');
+            return;
+        }
+    }
+
+    if (style_padding) {
+        try writeAnsi(writer, color, ansi_bold);
+        try writer.writeAll("  ");
+        try writer.writeAll(message);
+        try writer.writeByte(' ');
+        try writeAnsi(writer, color, ansi_reset);
+    } else {
+        try writer.writeAll("  ");
+        try writeAnsi(writer, color, ansi_bold);
+        try writer.writeAll(message);
+        try writeAnsi(writer, color, ansi_reset);
+        try writer.writeByte(' ');
+    }
+    try writeAnsi(writer, color, ansi_dim);
+    try writer.print("[{s}]", .{rule});
+    try writeAnsi(writer, color, ansi_reset);
+    try writer.writeByte('\n');
+}
+
+fn renderWrappedMessage(
+    writer: *std.Io.Writer,
+    message: []const u8,
+    indent: usize,
+    terminal_columns: usize,
+    color: bool,
+) std.Io.Writer.Error!void {
+    const line_limit = @max(terminal_columns, indent + 1);
+    var column = indent;
+    var index: usize = 0;
+
+    while (index < message.len) {
+        while (index < message.len and message[index] == ' ') index += 1;
+        if (index == message.len) break;
+
+        const word_start = index;
+        while (index < message.len and message[index] != ' ') index += 1;
+        var word = message[word_start..index];
+        const word_width = displayWidth(word);
+
+        if (column > indent and column + 1 + word_width > line_limit) {
+            try writer.writeByte('\n');
+            try writeIndent(writer, indent);
+            column = indent;
+        } else if (column > indent) {
+            try writeAnsi(writer, color, ansi_bold);
+            try writer.writeByte(' ');
+            try writeAnsi(writer, color, ansi_reset);
+            column += 1;
+        }
+
+        while (word.len > 0) {
+            const available = line_limit - column;
+            const fitting_end = prefixBytesForWidth(word, available);
+            const chunk_end = if (fitting_end > 0)
+                fitting_end
+            else
+                firstDisplayUnitBytes(word);
+            const chunk = word[0..chunk_end];
+            try writeAnsi(writer, color, ansi_bold);
+            try writer.writeAll(chunk);
+            try writeAnsi(writer, color, ansi_reset);
+            column += displayWidth(chunk);
+            word = word[chunk.len..];
+            if (word.len > 0) {
+                try writer.writeByte('\n');
+                try writeIndent(writer, indent);
+                column = indent;
+            }
+        }
+    }
+}
+
+fn renderCompactLocations(writer: *std.Io.Writer, item: Diagnostic) std.Io.Writer.Error!void {
+    const count = item.exampleLocationCount();
+    if (count == 0) return;
+
+    var has_bytes = false;
+    var has_spectra = false;
+    for (0..count) |index| {
+        const location = item.exampleLocation(index);
+        has_bytes = has_bytes or location.byte_offset != null;
+        has_spectra = has_spectra or location.spectrum_index != null;
+    }
+
+    if (has_bytes and !has_spectra) {
+        try writer.writeAll("                 examples: bytes ");
+        for (0..count) |index| {
+            if (index > 0) try writer.writeAll(", ");
+            try writer.print("{d}", .{item.exampleLocation(index).byte_offset.?});
+        }
+        try writer.writeByte('\n');
+        return;
+    }
+    if (has_spectra and !has_bytes) {
+        try writer.writeAll("                 examples: spectra ");
+        for (0..count) |index| {
+            if (index > 0) try writer.writeAll(", ");
+            try writer.print("{d}", .{item.exampleLocation(index).spectrum_index.?});
+        }
+        try writer.writeByte('\n');
+        return;
+    }
+
+    try writer.writeAll("                 examples:\n");
+    for (0..count) |index| {
+        const location = item.exampleLocation(index);
+        try writer.writeAll("                   ");
+        if (location.byte_offset) |byte_offset| try writer.print("byte {d}", .{byte_offset});
+        if (location.byte_offset != null and location.spectrum_index != null) try writer.writeAll(", ");
+        if (location.spectrum_index) |spectrum_index| try writer.print("spectrum {d}", .{spectrum_index});
         try writer.writeByte('\n');
     }
 }
 
-/// Writes the final text result block for an invocation.
-pub fn renderTextFinal(
+fn renderCompactTruncation(
+    writer: *std.Io.Writer,
+    dropped: diagnostic.Totals,
+    count_width: usize,
+    color: bool,
+    terminal_columns: ?usize,
+) std.Io.Writer.Error!void {
+    var message_buffer: [256]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buffer);
+    try message_writer.print("diagnostic detail truncated (dropped info={d} warnings={d} errors={d})", .{
+        dropped.info,
+        dropped.warnings,
+        dropped.errors,
+    });
+
+    try writeSeverityCount(writer, .warning, 1, count_width, color);
+    try renderCompactMessageRule(
+        writer,
+        message_buffer[0..message_writer.end],
+        diagnostic.RuleId.runtime_diagnostics_truncated,
+        13 + count_width,
+        terminal_columns,
+        color,
+        true,
+    );
+}
+
+fn renderCompactFailure(
+    writer: *std.Io.Writer,
+    failure: diagnostic.FirstFailure,
+    count_width: usize,
+    color: bool,
+    terminal_columns: ?usize,
+) std.Io.Writer.Error!void {
+    // FirstFailure bounds its message at 512 bytes; 64 bytes covers the closed stage/reason suffix.
+    var message_buffer: [diagnostic.first_failure_message_capacity + 64]u8 = undefined;
+    var message_writer = std.Io.Writer.fixed(&message_buffer);
+    try message_writer.print("{s} (stage={s} reason={s})", .{
+        failure.message(),
+        failure.stage.label(),
+        failure.reason.label(),
+    });
+
+    try writeSeverityCount(writer, .@"error", 1, count_width, color);
+    try renderCompactMessageRule(
+        writer,
+        message_buffer[0..message_writer.end],
+        failure.rule(),
+        13 + count_width,
+        terminal_columns,
+        color,
+        true,
+    );
+}
+
+fn writeHumanResultLine(
     writer: *std.Io.Writer,
     summary: diagnostic.Summary,
+    finding_groups: ?usize,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
-    if (summary.totals.info == 0 and summary.totals.warnings == 0 and summary.totals.errors == 0) {
-        try writer.writeAll("OK: no diagnostics emitted\n\n");
+    const no_findings = summary.totals.info == 0 and summary.totals.warnings == 0 and summary.totals.errors == 0;
+    if (no_findings) {
+        try writeResultHighlight(writer, summary.completion.label(), "clean", null, options.color);
+        try writer.writeAll(" | no findings");
+    } else {
+        try writeResultHighlight(
+            writer,
+            summary.completion.label(),
+            humanStatusLabel(summary.totals),
+            resultSeverity(summary.totals),
+            options.color,
+        );
+        try writer.writeAll(" | ");
+        var separator: []const u8 = "";
+        if (summary.totals.errors > 0) {
+            try writer.print("errors {d}", .{summary.totals.errors});
+            separator = ", ";
+        }
+        if (summary.totals.warnings > 0) {
+            try writer.print("{s}warnings {d}", .{ separator, summary.totals.warnings });
+            separator = ", ";
+        }
+        if (summary.totals.info > 0) {
+            try writer.print("{s}info {d}", .{ separator, summary.totals.info });
+        }
+        if (finding_groups) |count| {
+            try writer.print(" | {d} {s}", .{ count, if (count == 1) "group" else "groups" });
+        }
     }
-    try writeResultBlock(writer, summary);
+    if (options.elapsed_ns) |nanoseconds| {
+        try writer.writeAll(" | ");
+        try writeElapsed(writer, nanoseconds);
+    }
+    try writer.writeByte('\n');
+}
+
+fn writeFailureMetadata(writer: *std.Io.Writer, first_failure: ?diagnostic.FirstFailure) std.Io.Writer.Error!void {
+    const failure = first_failure orelse return;
+    try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
+    if (failure.path()) |path| try writer.print(" input={s}", .{path});
+    try writer.writeByte('\n');
+}
+
+const ansi_reset = "\x1b[0m";
+const ansi_bold = "\x1b[1m";
+const ansi_dim = "\x1b[2m";
+
+fn severityAnsi(severity: Severity) []const u8 {
+    return switch (severity) {
+        .@"error" => "\x1b[91m",
+        .warning => "\x1b[93m",
+        .info => "\x1b[96m",
+    };
+}
+
+fn resultSeverity(totals: diagnostic.Totals) Severity {
+    if (totals.errors > 0) return .@"error";
+    if (totals.warnings > 0) return .warning;
+    return .info;
+}
+
+fn resultHighlight(severity: ?Severity) []const u8 {
+    const value = severity orelse return "\x1b[42;30;1m";
+    return switch (value) {
+        .@"error" => "\x1b[41;97;1m",
+        .warning => "\x1b[43;30;1m",
+        .info => "\x1b[46;30;1m",
+    };
+}
+
+fn writeResultHighlight(
+    writer: *std.Io.Writer,
+    completion: []const u8,
+    status: []const u8,
+    severity: ?Severity,
+    color: bool,
+) std.Io.Writer.Error!void {
+    try writeAnsi(writer, color, resultHighlight(severity));
+    try writer.print("{s}: {s}", .{ completion, status });
+    try writeAnsi(writer, color, ansi_reset);
+}
+
+fn writeAnsi(writer: *std.Io.Writer, color: bool, sequence: []const u8) std.Io.Writer.Error!void {
+    if (color) try writer.writeAll(sequence);
+}
+
+fn writeElapsed(writer: *std.Io.Writer, elapsed_ns: i96) std.Io.Writer.Error!void {
+    const nanoseconds: u96 = @intCast(@max(elapsed_ns, 0));
+    const centiseconds = nanoseconds / 10_000_000;
+    try writer.print("{d}.{d:0>2}s", .{ centiseconds / 100, centiseconds % 100 });
+}
+
+fn occurrenceWidth(diagnostics: []const Diagnostic) usize {
+    var width: usize = 3;
+    for (diagnostics) |item| width = @max(width, decimalWidth(item.occurrences));
+    return width;
+}
+
+fn decimalWidth(value: usize) usize {
+    var remaining = value;
+    var width: usize = 1;
+    while (remaining >= 10) : (remaining /= 10) width += 1;
+    return width;
+}
+
+fn writePaddedCount(writer: *std.Io.Writer, value: usize, width: usize) std.Io.Writer.Error!void {
+    for (decimalWidth(value)..width) |_| try writer.writeByte('0');
+    try writer.print("{d}", .{value});
+}
+
+fn writeSeverityCount(
+    writer: *std.Io.Writer,
+    severity: Severity,
+    occurrences: usize,
+    count_width: usize,
+    color: bool,
+) std.Io.Writer.Error!void {
+    const label = humanSeverityLabel(severity);
+    try writer.writeAll("  ");
+    try writeAnsi(writer, color, severityAnsi(severity));
+    try writer.writeAll(label);
+    for (label.len..7) |_| try writer.writeByte(' ');
+    try writer.writeAll(" x");
+    try writePaddedCount(writer, occurrences, count_width);
+    try writeAnsi(writer, color, ansi_reset);
+}
+
+fn humanSeverityLabel(severity: Severity) []const u8 {
+    return switch (severity) {
+        .@"error" => "ERROR",
+        .warning => "WARNING",
+        .info => "INFO",
+    };
 }
 
 fn renderTextDiagnostics(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
@@ -153,154 +642,9 @@ pub fn renderSummary(writer: *std.Io.Writer, diagnostics: []const Diagnostic) st
 pub fn renderSummaryResult(
     writer: *std.Io.Writer,
     summary: diagnostic.Summary,
+    options: HumanResultOptions,
 ) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, summary);
-}
-
-/// Groups diagnostics by severity+rule+message and prints compact counts.
-/// Columns auto-adjust to content width. Zero heap allocation.
-/// Groups are sorted: errors first (by count desc), then warnings, then info.
-pub fn renderBrief(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    const summary = diagnostic.summarize(diagnostics);
-    try writer.print("status={s} info={d} warnings={d} errors={d}\n", .{
-        summary.status().label(),
-        summary.totals.info,
-        summary.totals.warnings,
-        summary.totals.errors,
-    });
-    if (diagnostics.len == 0) return;
-    try renderBriefGroups(writer, diagnostics);
-}
-
-/// Fixed-capacity grouping state holding borrowed rule and message slices.
-/// Borrowed text must outlive the final call to `render`.
-pub const BriefGroups = struct {
-    const max_groups = 256;
-
-    severity: [max_groups]Severity = undefined,
-    rule: [max_groups][]const u8 = undefined,
-    message: [max_groups][]const u8 = undefined,
-    count: [max_groups]usize = undefined,
-    length: usize = 0,
-    dropped: usize = 0,
-
-    /// Adds a diagnostic to the bounded grouping table without allocating.
-    pub fn add(groups: *BriefGroups, item: Diagnostic) void {
-        for (0..groups.length) |i| {
-            if (groups.severity[i] == item.severity and
-                std.mem.eql(u8, groups.rule[i], item.rule) and
-                std.mem.eql(u8, groups.message[i], item.message))
-            {
-                groups.count[i] = std.math.add(usize, groups.count[i], item.occurrences) catch std.math.maxInt(usize);
-                return;
-            }
-        }
-        if (groups.length >= max_groups) {
-            groups.dropped = std.math.add(usize, groups.dropped, 1) catch std.math.maxInt(usize);
-            return;
-        }
-        const next_length = std.math.add(usize, groups.length, 1) catch {
-            groups.dropped = std.math.maxInt(usize);
-            return;
-        };
-        const index = groups.length;
-        groups.severity[index] = item.severity;
-        groups.rule[index] = item.rule;
-        groups.message[index] = item.message;
-        groups.count[index] = item.occurrences;
-        groups.length = next_length;
-    }
-
-    /// Sorts groups by severity and count, then writes the aligned table.
-    pub fn render(groups: *BriefGroups, writer: *std.Io.Writer) std.Io.Writer.Error!void {
-        if (groups.length == 0) return;
-
-        for (1..groups.length) |i| {
-            var j = i;
-            while (j > 0) : (j -= 1) {
-                const a = @intFromEnum(groups.severity[j]);
-                const b = @intFromEnum(groups.severity[j - 1]);
-                const swap = if (a != b) a > b else groups.count[j] > groups.count[j - 1];
-                if (!swap) break;
-                std.mem.swap(Severity, &groups.severity[j], &groups.severity[j - 1]);
-                std.mem.swap([]const u8, &groups.rule[j], &groups.rule[j - 1]);
-                std.mem.swap([]const u8, &groups.message[j], &groups.message[j - 1]);
-                std.mem.swap(usize, &groups.count[j], &groups.count[j - 1]);
-            }
-        }
-
-        var count_width: usize = 1;
-        var severity_width: usize = 0;
-        var rule_width: usize = 0;
-        for (0..groups.length) |i| {
-            var n = groups.count[i];
-            var width: usize = 1;
-            while (n >= 10) : (n /= 10) width += 1;
-            if (width > count_width) count_width = width;
-            severity_width = @max(severity_width, groups.severity[i].label().len);
-            rule_width = @max(rule_width, groups.rule[i].len);
-        }
-
-        try writer.writeByte('\n');
-        for (0..groups.length) |i| {
-            var n = groups.count[i];
-            var width: usize = 1;
-            while (n >= 10) : (n /= 10) width += 1;
-            for (0..count_width - width) |_| try writer.writeByte(' ');
-            try writer.print("{d}  ", .{groups.count[i]});
-            try writer.writeAll(groups.severity[i].label());
-            for (0..severity_width - groups.severity[i].label().len) |_| try writer.writeByte(' ');
-            try writer.writeAll("  ");
-            try writer.writeAll(groups.rule[i]);
-            for (0..rule_width - groups.rule[i].len) |_| try writer.writeByte(' ');
-            try writer.writeAll("  ");
-            try writer.writeAll(groups.message[i]);
-            try writer.writeByte('\n');
-        }
-        if (groups.dropped > 0) {
-            try writer.print("... and {d} more unique diagnostic groups (brief limit)\n", .{groups.dropped});
-        }
-    }
-};
-
-fn renderBriefGroups(writer: *std.Io.Writer, diagnostics: []const Diagnostic) std.Io.Writer.Error!void {
-    var groups: BriefGroups = .{};
-    for (diagnostics) |item| groups.add(item);
-    try groups.render(writer);
-}
-
-/// Writes a result block followed by grouped diagnostics and truncation details.
-pub fn renderBriefResult(
-    writer: *std.Io.Writer,
-    diagnostics: []const Diagnostic,
-    results: []const diagnostic.FileResult,
-) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, diagnostic.summarizeResults(results));
-    try renderEmergencyFailures(writer, results);
-    if (diagnostics.len > 0) try renderBriefGroups(writer, diagnostics);
-    for (results) |result| {
-        if (hasDroppedDiagnostics(result)) try renderTruncationText(writer, result.dropped_diagnostics, null);
-    }
-}
-
-/// Writes a result block using groups accumulated by the caller.
-pub fn renderBriefGroupsResult(
-    writer: *std.Io.Writer,
-    groups: *BriefGroups,
-    summary: diagnostic.Summary,
-) std.Io.Writer.Error!void {
-    try writeResultBlock(writer, summary);
-    if (summary.first_emergency_failure) |failure| {
-        try renderFailureText(writer, failure);
-        if (summary.emergency_failures > 1) {
-            try writer.print("... and {d} more emergency failures\n", .{summary.emergency_failures - 1});
-        }
-        try writer.writeByte('\n');
-    }
-    if (groups.length > 0) try groups.render(writer);
-    if (hasDroppedTotals(summary.dropped_diagnostics)) {
-        try renderTruncationText(writer, summary.dropped_diagnostics, null);
-    }
+    try writeHumanResultLine(writer, summary, null, options);
 }
 
 /// Writes one complete JSON report using the current schema version.
@@ -310,69 +654,45 @@ pub fn renderJsonResult(
     result: *const diagnostic.FileResult,
     path: []const u8,
 ) std.Io.Writer.Error!void {
-    var stream = try JsonStream.init(writer);
-    try stream.writeFile(diagnostics, result, path);
-    try stream.finish();
+    const finding_groups = std.math.add(
+        usize,
+        diagnostics.len,
+        @intFromBool(result.needsEmergencyDiagnostic()),
+    ) catch std.math.maxInt(usize);
+    try writer.print("{{\n  \"schema_version\": {d},\n  \"files\": [", .{version.json_schema});
+    try writeJsonFile(writer, diagnostics, result, path, finding_groups);
+    try writer.writeAll("\n  ],\n  \"summary\": ");
+    try writeJsonSummary(writer, diagnostic.summarizeResults(&.{result.*}), finding_groups);
+    try writer.writeAll("\n}\n");
 }
 
-/// Incrementally writes one versioned report without retaining file diagnostics.
-pub const JsonStream = struct {
+fn writeJsonFile(
     writer: *std.Io.Writer,
-    first_file: bool = true,
-    summary: diagnostic.Summary = .{},
-    finding_groups: usize = 0,
-
-    /// Writes the report header and borrows the supplied writer.
-    pub fn init(writer: *std.Io.Writer) std.Io.Writer.Error!JsonStream {
-        try writer.print("{{\n  \"schema_version\": {d},\n  \"files\": [", .{version.json_schema});
-        return .{ .writer = writer };
-    }
-
-    /// Appends one file result and its bounded diagnostic detail.
-    pub fn writeFile(
-        stream: *JsonStream,
-        diagnostics: []const Diagnostic,
-        result: *const diagnostic.FileResult,
-        path: []const u8,
-    ) std.Io.Writer.Error!void {
-        stream.summary.addResult(result.*);
-        const file_groups = std.math.add(
-            usize,
-            diagnostics.len,
-            @intFromBool(result.needsEmergencyDiagnostic()),
-        ) catch std.math.maxInt(usize);
-        stream.finding_groups = std.math.add(usize, stream.finding_groups, file_groups) catch std.math.maxInt(usize);
-        if (!stream.first_file) try stream.writer.writeByte(',');
-        try stream.writer.writeAll("\n    {\n      \"path\": ");
-        try writeJsonString(stream.writer, path);
-        try stream.writer.writeAll(",\n      \"completion\": ");
-        try writeJsonString(stream.writer, result.completion.label());
-        try stream.writer.writeAll(",\n      \"status\": ");
-        try writeJsonString(stream.writer, result.status().label());
-        try stream.writer.writeAll(",\n      \"totals\": ");
-        try writeJsonTotals(stream.writer, result.totals);
-        try stream.writer.print(",\n      \"finding_groups\": {d}", .{file_groups});
-        try stream.writer.print(
-            ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
-            .{result.diagnostics_truncated},
-        );
-        try writeJsonTotals(stream.writer, result.dropped_diagnostics);
-        try stream.writer.writeAll(",\n      \"first_failure\": ");
-        try writeJsonFirstFailure(stream.writer, result.first_failure, 8);
-        try stream.writer.writeAll(",\n      \"diagnostics\": ");
-        try writeJsonDiagnostics(stream.writer, diagnostics, result, path);
-        try stream.writer.writeAll("\n    }");
-        stream.first_file = false;
-    }
-
-    /// Writes the aggregate summary and closes the report.
-    pub fn finish(stream: *JsonStream) std.Io.Writer.Error!void {
-        if (!stream.first_file) try stream.writer.writeByte('\n');
-        try stream.writer.writeAll("  ],\n  \"summary\": ");
-        try writeJsonSummary(stream.writer, stream.summary, stream.finding_groups);
-        try stream.writer.writeAll("\n}\n");
-    }
-};
+    diagnostics: []const Diagnostic,
+    result: *const diagnostic.FileResult,
+    path: []const u8,
+    finding_groups: usize,
+) std.Io.Writer.Error!void {
+    try writer.writeAll("\n    {\n      \"path\": ");
+    try writeJsonString(writer, path);
+    try writer.writeAll(",\n      \"completion\": ");
+    try writeJsonString(writer, result.completion.label());
+    try writer.writeAll(",\n      \"status\": ");
+    try writeJsonString(writer, result.status().label());
+    try writer.writeAll(",\n      \"totals\": ");
+    try writeJsonTotals(writer, result.totals);
+    try writer.print(",\n      \"finding_groups\": {d}", .{finding_groups});
+    try writer.print(
+        ",\n      \"diagnostics_truncated\": {},\n      \"dropped_diagnostics\": ",
+        .{result.diagnostics_truncated},
+    );
+    try writeJsonTotals(writer, result.dropped_diagnostics);
+    try writer.writeAll(",\n      \"first_failure\": ");
+    try writeJsonFirstFailure(writer, result.first_failure, 8);
+    try writer.writeAll(",\n      \"diagnostics\": ");
+    try writeJsonDiagnostics(writer, diagnostics, result, path);
+    try writer.writeAll("\n    }");
+}
 
 fn writeJsonDiagnostics(
     writer: *std.Io.Writer,
@@ -626,7 +946,7 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     try writer.print(
         "summary: {s} (info={d} warnings={d} errors={d})\n",
         .{
-            summary.status().label(),
+            humanStatusLabel(summary.totals),
             summary.totals.info,
             summary.totals.warnings,
             summary.totals.errors,
@@ -634,30 +954,11 @@ fn writeSummaryLine(writer: *std.Io.Writer, summary: diagnostic.Summary) std.Io.
     );
 }
 
-fn writeResultBlock(
-    writer: *std.Io.Writer,
-    summary: diagnostic.Summary,
-) std.Io.Writer.Error!void {
-    try writer.print("{s}: {s} (info={d} warnings={d} errors={d})\n", .{
-        summary.completion.label(),
-        humanStatusLabel(summary.status()),
-        summary.totals.info,
-        summary.totals.warnings,
-        summary.totals.errors,
-    });
-    if (summary.first_failure) |failure| {
-        try writer.print("failure: stage={s} reason={s} rule={s}", .{ failure.stage.label(), failure.reason.label(), failure.rule() });
-        if (failure.path()) |path| try writer.print(" input={s}", .{path});
-        try writer.writeByte('\n');
-    }
-}
-
-fn humanStatusLabel(status: diagnostic.ResultStatus) []const u8 {
-    return switch (status) {
-        .clean => "clean",
-        .warnings_only => "warnings",
-        .errors_present => "errors",
-    };
+fn humanStatusLabel(totals: diagnostic.Totals) []const u8 {
+    if (totals.errors > 0) return "errors";
+    if (totals.warnings > 0) return "warnings";
+    if (totals.info > 0) return "info";
+    return "clean";
 }
 
 fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) std.Io.Writer.Error!void {
@@ -666,16 +967,6 @@ fn renderFailureText(writer: *std.Io.Writer, failure: diagnostic.FirstFailure) s
         "  error [{s}] {s} (stage={s} reason={s})\n",
         .{ failure.rule(), failure.message(), failure.stage.label(), failure.reason.label() },
     );
-}
-
-fn renderEmergencyFailures(writer: *std.Io.Writer, results: []const diagnostic.FileResult) std.Io.Writer.Error!void {
-    var rendered = false;
-    for (results) |result| {
-        if (!result.needsEmergencyDiagnostic()) continue;
-        try renderFailureText(writer, result.first_failure.?);
-        rendered = true;
-    }
-    if (rendered) try writer.writeByte('\n');
 }
 
 fn renderTruncationText(writer: *std.Io.Writer, dropped: diagnostic.Totals, path: ?[]const u8) std.Io.Writer.Error!void {
@@ -733,18 +1024,17 @@ test "summary reports severity counts" {
     );
 }
 
-test "summary result reports incomplete failure" {
+test "summary result reports incomplete status" {
     var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
     result.recordFailure(.parser, .parser, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
     result.finalize(&.{});
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{});
 
     try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=parser reason=parser rule=runtime.incomplete input=sample.mzML\n",
+        "incomplete: errors | errors 1\n",
         allocating_writer.written(),
     );
 }
@@ -761,12 +1051,45 @@ test "summary result uses human warning status" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}));
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{ .color = true });
 
     try std.testing.expectEqualStrings(
-        "complete: warnings (info=2 warnings=1 errors=0)\n",
+        "\x1b[43;30;1mcomplete: warnings\x1b[0m | warnings 1, info 2\n",
         allocating_writer.written(),
     );
+}
+
+test "[unit]: summary result uses info status timing and color" {
+    const diagnostics = [_]Diagnostic{.{ .severity = .info, .rule = "test.info", .message = "note", .occurrences = 2 }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderSummaryResult(&allocating_writer.writer, diagnostic.summarizeResults(&.{result}), .{
+        .elapsed_ns = 420_000_000,
+        .color = true,
+    });
+
+    try std.testing.expectEqualStrings(
+        "\x1b[46;30;1mcomplete: info\x1b[0m | info 2 | 0.42s\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: elapsed time handles centisecond boundaries" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try writeElapsed(&allocating_writer.writer, -1);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 9_999_999);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 10_000_000);
+    try allocating_writer.writer.writeByte(' ');
+    try writeElapsed(&allocating_writer.writer, 1_000_000_000);
+
+    try std.testing.expectEqualStrings("0.00s 0.00s 0.01s 1.00s", allocating_writer.written());
 }
 
 test "[unit]: text result emits emergency failure" {
@@ -782,7 +1105,7 @@ test "[unit]: text result emits emergency failure" {
     try std.testing.expectEqualStrings(
         "input: sample.mzML\n" ++
             "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n" ++
-            "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
+            "incomplete: errors | errors 1 | 1 group\n" ++
             "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n",
         allocating_writer.written(),
     );
@@ -796,11 +1119,14 @@ test "[unit]: per-file text renderer emits emergency failure" {
     var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer allocating_writer.deinit();
 
-    try renderTextFile(&allocating_writer.writer, &.{}, &result, "sample.mzML");
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "sample.mzML", .{});
 
     try std.testing.expectEqualStrings(
-        "input: sample.mzML\n" ++
-            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
+        "input: sample.mzML\n\n" ++
+            "  ERROR   x001  validation stopped (stage=parser reason=allocation) [runtime.incomplete]\n" ++
+            "\n" ++
+            "incomplete: errors | errors 1 | 1 group\n" ++
+            "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n",
         allocating_writer.written(),
     );
 }
@@ -870,7 +1196,7 @@ test "text output groups diagnostics by input" {
             "  error [runtime.file-open]: unable to open input file\n" ++
             "    location: byte=12\n" ++
             "\n" ++
-            "summary: errors-present (info=0 warnings=1 errors=1)\n",
+            "summary: errors (info=0 warnings=1 errors=1)\n",
         allocating_writer.written(),
     );
 }
@@ -890,7 +1216,7 @@ test "text output separates pathless diagnostics" {
     try std.testing.expectEqualStrings(
         "  info [meta.note]: standalone note\n" ++
             "\n" ++
-            "summary: clean (info=1 warnings=0 errors=0)\n",
+            "summary: info (info=1 warnings=0 errors=0)\n",
         allocating_writer.written(),
     );
 }
@@ -912,7 +1238,7 @@ test "text output separates pathless diagnostics from the previous input" {
             "\n" ++
             "  info [meta.note]: standalone note\n" ++
             "\n" ++
-            "summary: warnings-only (info=1 warnings=1 errors=0)\n",
+            "summary: warnings (info=1 warnings=1 errors=0)\n",
         allocating_writer.written(),
     );
 }
@@ -939,6 +1265,251 @@ test "grouped text reports occurrence count and bounded examples" {
             "    examples: byte=1; byte=2; byte=3\n\n",
         allocating_writer.written(),
     );
+}
+
+test "[unit]: compact file output aligns counts and keeps byte examples inline" {
+    const diagnostics = [_]Diagnostic{
+        .{
+            .severity = .@"error",
+            .rule = "test.single",
+            .path = "sample.mzML",
+            .message = "single finding",
+            .location = .{ .byte_offset = 12 },
+        },
+        .{
+            .severity = .warning,
+            .rule = "test.repeated",
+            .path = "sample.mzML",
+            .message = "repeated finding",
+            .location = .{ .byte_offset = 20 },
+            .occurrences = 30,
+        },
+    };
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "sample.mzML", .{});
+
+    try std.testing.expectEqualStrings(
+        "input: sample.mzML\n\n" ++
+            "  ERROR   x001  single finding [test.single]\n" ++
+            "                 examples: bytes 12\n" ++
+            "  WARNING x030  repeated finding [test.repeated]\n" ++
+            "                 examples: bytes 20\n" ++
+            "\n" ++
+            "complete: errors | errors 1, warnings 30 | 2 groups\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: compact clean result includes elapsed time when supplied" {
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&.{});
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "clean.mzML", .{
+        .elapsed_ns = 420_000_000,
+    });
+
+    try std.testing.expectEqualStrings(
+        "input: clean.mzML\n\n" ++
+            "complete: clean | no findings | 0.42s\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: compact color styles severity message rule and result" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .@"error",
+        .rule = "test.rule",
+        .message = "human message",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "color.mzML", .{
+        .color = true,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "  \x1b[91mERROR   x001\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[1mhuman message\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[2m[test.rule]\x1b[0m") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "\x1b[41;97;1mcomplete: errors\x1b[0m") != null);
+}
+
+test "[unit]: compact output wraps messages and preserves rule IDs" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .@"error",
+        .rule = "test.long-rule",
+        .message = "alpha beta gamma delta",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "wrap.mzML", .{
+        .terminal_columns = 32,
+    });
+
+    try std.testing.expectEqualStrings(
+        "input: wrap.mzML\n\n" ++
+            "  ERROR   x001  alpha beta gamma\n" ++
+            "                delta\n" ++
+            "                [test.long-rule]\n" ++
+            "\n" ++
+            "complete: errors | errors 1 | 1 group\n",
+        allocating_writer.written(),
+    );
+}
+
+test "[unit]: display width handles common Unicode cell sizes" {
+    const combining = "e\u{0301}";
+
+    try std.testing.expectEqual(@as(usize, 1), displayWidth("é"));
+    try std.testing.expectEqual(@as(usize, 1), displayWidth(combining));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("日"));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("Ａ"));
+    try std.testing.expectEqual(@as(usize, 2), displayWidth("🙂"));
+}
+
+test "[unit]: display width slicing preserves text boundaries" {
+    const valid = "ab日z";
+    const combining = "e\u{0301}z";
+    const invalid = "ab\xffz";
+
+    try std.testing.expectEqualStrings("ab", valid[0..prefixBytesForWidth(valid, 3)]);
+    try std.testing.expectEqualStrings("ab日", valid[0..prefixBytesForWidth(valid, 4)]);
+    try std.testing.expectEqualStrings("日z", valid[suffixStartForWidth(valid, 3)..]);
+    try std.testing.expectEqualStrings("e\u{0301}", combining[0..prefixBytesForWidth(combining, 1)]);
+    try std.testing.expectEqualStrings("z", combining[suffixStartForWidth(combining, 1)..]);
+    try std.testing.expectEqualStrings("\xffz", invalid[suffixStartForWidth(invalid, 2)..]);
+}
+
+test "[unit]: narrow suffix retains one wide scalar" {
+    const wide = "日";
+
+    try std.testing.expectEqual(@as(usize, 0), suffixStartForWidth(wide, 1));
+    try std.testing.expectEqual(wide.len, suffixStartForWidth(wide, 0));
+}
+
+test "[unit]: wrapped messages use terminal cell widths" {
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderWrappedMessage(&allocating_writer.writer, "a日b", 0, 3, false);
+
+    try std.testing.expectEqualStrings("a日\nb", allocating_writer.written());
+}
+
+test "[unit]: compact output retains exact wide colored output" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .warning,
+        .rule = "test.utf8",
+        .message = "valid café message",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var baseline: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer baseline.deinit();
+    var wide: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer wide.deinit();
+
+    try renderTextFile(&baseline.writer, &diagnostics, &result, "wide.mzML", .{ .color = true });
+    try renderTextFile(&wide.writer, &diagnostics, &result, "wide.mzML", .{
+        .color = true,
+        .terminal_columns = 120,
+    });
+
+    try std.testing.expectEqualStrings(baseline.written(), wide.written());
+}
+
+test "[unit]: wrapped color resets before newlines" {
+    const diagnostics = [_]Diagnostic{.{
+        .severity = .info,
+        .rule = "test.color-wrap",
+        .message = "alpha beta gamma delta",
+    }};
+    var result = diagnostic.FileResult.init(0);
+    result.finalize(&diagnostics);
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &diagnostics, &result, "color-wrap.mzML", .{
+        .color = true,
+        .terminal_columns = 32,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "gamma\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "delta\x1b[0m\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[test.color-wrap]\x1b[0m\n") != null);
+}
+
+test "[unit]: compact truncation uses the shared terminal wrapper" {
+    var result = diagnostic.FileResult.init(0);
+    result.diagnostics_truncated = true;
+    result.dropped_diagnostics = .{ .info = 2, .warnings = 3, .errors = 4 };
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "truncated.mzML", .{
+        .terminal_columns = 40,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "  WARNING x001  diagnostic detail\n") != null);
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        rendered,
+        "                [runtime.diagnostics-truncated]\n",
+    ) != null);
+
+    var colored_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer colored_writer.deinit();
+    try renderTextFile(&colored_writer.writer, &.{}, &result, "truncated.mzML", .{ .color = true });
+
+    try std.testing.expect(std.mem.indexOf(
+        u8,
+        colored_writer.written(),
+        "\x1b[93mWARNING x001\x1b[0m\x1b[1m  diagnostic detail truncated " ++
+            "(dropped info=2 warnings=3 errors=4) \x1b[0m" ++
+            "\x1b[2m[runtime.diagnostics-truncated]\x1b[0m\n",
+    ) != null);
+}
+
+test "[unit]: compact failure wraps the maximum retained message" {
+    var message: [diagnostic.first_failure_message_capacity]u8 = @splat('q');
+    var result = diagnostic.FileResult.init(0);
+    result.recordFailure(
+        .parser,
+        .file_stability,
+        "runtime.long-failure",
+        &message,
+        .{},
+        null,
+        false,
+    );
+    result.finalize(&.{});
+    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
+    defer allocating_writer.deinit();
+
+    try renderTextFile(&allocating_writer.writer, &.{}, &result, "failure.mzML", .{
+        .terminal_columns = 40,
+    });
+    const rendered = allocating_writer.written();
+
+    try std.testing.expectEqual(
+        @as(usize, diagnostic.first_failure_message_capacity),
+        std.mem.count(u8, rendered, "q"),
+    );
+    try std.testing.expect(std.mem.indexOf(u8, rendered, "[runtime.long-failure]\n") != null);
 }
 
 test "json output escapes control characters" {
@@ -975,95 +1546,6 @@ test "json output replaces invalid UTF-8" {
     try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "\"message\": \"bad\\uFFFDvalue\"") != null);
 }
 
-test "empty brief groups render no rows" {
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try groups.render(&allocating_writer.writer);
-
-    try std.testing.expectEqualStrings("", allocating_writer.written());
-}
-
-test "brief result emits emergency failure" {
-    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
-    result.finalize(&.{});
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefResult(&allocating_writer.writer, &.{}, &.{result});
-
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "runtime.incomplete") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "stage=parser reason=allocation") != null);
-}
-
-test "[unit]: pre-grouped brief renderer emits emergency failure" {
-    var result = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    result.recordFailure(.parser, .allocation, diagnostic.RuleId.runtime_incomplete, "validation stopped", .{}, "sample.mzML", false);
-    result.finalize(&.{});
-    var groups: BriefGroups = .{};
-
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefGroupsResult(
-        &allocating_writer.writer,
-        &groups,
-        diagnostic.summarizeResults(&.{result}),
-    );
-
-    try std.testing.expectEqualStrings(
-        "incomplete: errors (info=0 warnings=0 errors=1)\n" ++
-            "failure: stage=parser reason=allocation rule=runtime.incomplete input=sample.mzML\n" ++
-            "input: sample.mzML\n" ++
-            "  error [runtime.incomplete] validation stopped (stage=parser reason=allocation)\n\n",
-        allocating_writer.written(),
-    );
-}
-
-test "[unit]: brief summary counts emergency failures without retaining results" {
-    var first = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    first.recordEmergencyFailure(.parser, .allocation, "first.mzML");
-    first.finalize(&.{});
-    var second = diagnostic.FileResult.init(diagnostic.stageBit(.parser));
-    second.recordEmergencyFailure(.parser, .allocation, "second.mzML");
-    second.finalize(&.{});
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-
-    try renderBriefGroupsResult(
-        &allocating_writer.writer,
-        &groups,
-        diagnostic.summarizeResults(&.{ first, second }),
-    );
-
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input=first.mzML") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "... and 1 more emergency failures") != null);
-    try std.testing.expect(std.mem.indexOf(u8, allocating_writer.written(), "input: second.mzML") == null);
-}
-
-test "[unit]: brief summary reports aggregate dropped totals" {
-    var groups: BriefGroups = .{};
-    var allocating_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    defer allocating_writer.deinit();
-    const summary = diagnostic.Summary{
-        .totals = .{ .warnings = 3, .errors = 4 },
-        .diagnostics_truncated = true,
-        .dropped_diagnostics = .{ .warnings = 2, .errors = 3 },
-    };
-
-    try renderBriefGroupsResult(&allocating_writer.writer, &groups, summary);
-
-    try std.testing.expectEqualStrings(
-        "complete: errors (info=0 warnings=3 errors=4)\n" ++
-            "  warning [runtime.diagnostics-truncated] diagnostic detail truncated (dropped info=0 warnings=2 errors=3)\n",
-        allocating_writer.written(),
-    );
-}
-
 test "bounded output reports dropped severity totals" {
     var result = diagnostic.FileResult.init(0);
     result.totals = .{ .info = 2, .warnings = 3, .errors = 4 };
@@ -1077,9 +1559,7 @@ test "bounded output reports dropped severity totals" {
 
     var json_writer: std.Io.Writer.Allocating = .init(std.testing.allocator);
     defer json_writer.deinit();
-    var stream = try JsonStream.init(&json_writer.writer);
-    try stream.writeFile(&.{}, &result, "sample.mzML");
-    try stream.finish();
+    try renderJsonResult(&json_writer.writer, &.{}, &result, "sample.mzML");
     try std.testing.expect(std.mem.indexOf(u8, json_writer.written(), "dropped info=1 warnings=2 errors=3") != null);
 }
 
