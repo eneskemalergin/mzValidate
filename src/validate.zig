@@ -904,18 +904,26 @@ test "[unit]: path progress reports monotonic parse and checksum bytes" {
 
     var parse_bytes: u64 = 0;
     var checksum_bytes: u64 = 0;
+    var checksum_total: ?u64 = null;
     var saw_parse = false;
     var saw_checksum = false;
     for (recorder.updates[0..recorder.len]) |update| {
-        try std.testing.expectEqual(stat.size, update.total_bytes);
         switch (update.phase) {
             .parse => {
                 try std.testing.expect(!saw_checksum);
+                try std.testing.expectEqual(stat.size, update.total_bytes);
                 try std.testing.expect(update.completed_bytes >= parse_bytes);
                 parse_bytes = update.completed_bytes;
                 saw_parse = true;
             },
             .checksum => {
+                try std.testing.expect(update.total_bytes < stat.size);
+                if (checksum_total) |total| {
+                    try std.testing.expectEqual(total, update.total_bytes);
+                } else {
+                    checksum_total = update.total_bytes;
+                }
+                try std.testing.expect(update.completed_bytes <= update.total_bytes);
                 try std.testing.expect(update.completed_bytes >= checksum_bytes);
                 checksum_bytes = update.completed_bytes;
                 saw_checksum = true;
@@ -925,7 +933,7 @@ test "[unit]: path progress reports monotonic parse and checksum bytes" {
     try std.testing.expect(saw_parse);
     try std.testing.expect(saw_checksum);
     try std.testing.expectEqual(stat.size, parse_bytes);
-    try std.testing.expectEqual(stat.size, checksum_bytes);
+    try std.testing.expectEqual(checksum_total.?, checksum_bytes);
 }
 
 fn expectAllocationFailuresIncomplete(

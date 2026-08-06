@@ -436,7 +436,7 @@ pub const IndexValidator = struct {
         var hashed: u64 = 0;
         var ctx = sha1.Sha1.init();
         var checksum_progress: if (report_progress) progress.Reporter else void = if (report_progress)
-            progress.Reporter.init(observer, .checksum, size)
+            progress.Reporter.init(observer, .checksum, checksum_offset)
         else {};
         while (hashed < checksum_offset) {
             const remaining = checksum_offset - hashed;
