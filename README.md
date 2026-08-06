@@ -34,10 +34,9 @@ I built mzValidate as a focused native validator for mzML. It checks XML syntax,
 mzValidate check sample.mzML
 mzValidate check sample.mzML --summary
 mzValidate check sample.mzML --json > report.json
-mzValidate check --summary file1.mzML file2.mzML
 ```
 
-Exit codes: `0` = clean, `1` = warnings only, `2` = errors present.
+Exit codes: `0` = completed without error findings, `1` = completed with error findings, `2` = invalid invocation, `3` = incomplete validation. Info and warning findings remain successful.
 
 ## Installation
 
@@ -103,46 +102,22 @@ mzValidate check <input.mzML> [options]
 
 Output modes are mutually exclusive. The default groups identical findings by path, severity, rule, and message. Each group keeps an exact occurrence count and at most three example locations.
 
-- `--summary`: emit only status and occurrence counts
-- `--json`: emit the grouped versioned report described below
+- Default: emit grouped human findings and example locations
+- `--summary`: emit one human result line with severity occurrence totals
+- `--json`: emit deterministic JSON schema 1 for CI, pipelines, and detailed reports
+- `--color auto|always|never`: control ANSI color in human output
+
+Default and summary output use `clean`, `info`, `warnings`, `errors`, and `incomplete` result words. Interactive human output includes monotonic elapsed time; redirected human output omits it. Under `--color auto`, a nonempty `NO_COLOR` disables color and takes priority over `CLICOLOR_FORCE`. Otherwise, a nonempty `CLICOLOR_FORCE` forces color; without either override, stdout must be a suitable terminal and `TERM` must not be `dumb`. `--color always` forces color and `--color never` disables it.
+
+Reports use stdout. Invalid invocations and usage text use stderr. Default and summary progress uses stderr only when it is a suitable terminal, starts after 500 ms, and reports separate parse and checksum phases. JSON and redirected stderr never receive progress. A closed stdout or stderr pipe stops quietly; other writer failures remain process failures.
 
 ### JSON result contract
 
-JSON schema version 1 records grouped findings for one file and a report summary. A clean file remains visible with an empty `diagnostics` array.
+JSON schema version 1 contains `schema_version`, one file entry in `files`, and an invocation `summary`. Each file entry records `path`, `completion`, `status`, severity `totals`, `finding_groups`, truncation metadata, `first_failure`, and grouped `diagnostics`. Each diagnostic group records `severity`, `rule`, `path`, exact `occurrences`, up to three `example_locations`, and `message`.
 
-```json
-{
-  "schema_version": 1,
-  "files": [
-    {
-      "path": "sample.mzML",
-      "completion": "complete",
-      "status": "clean",
-      "finding_groups": 0,
-      "totals": { "info": 0, "warnings": 0, "errors": 0 },
-      "diagnostics_truncated": false,
-      "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
-      "first_failure": null,
-      "diagnostics": []
-    }
-  ],
-  "summary": {
-    "completion": "complete",
-    "status": "clean",
-    "files": 1,
-    "incomplete_files": 0,
-    "finding_groups": 0,
-    "totals": { "info": 0, "warnings": 0, "errors": 0 },
-    "diagnostics_truncated": false,
-    "dropped_diagnostics": { "info": 0, "warnings": 0, "errors": 0 },
-    "first_failure": null
-  }
-}
-```
+`completion` is `complete` or `incomplete`. `status` is `clean`, `warnings-only`, or `errors-present`; info-only validation remains `clean` in schema 1. Totals count every occurrence, including detail omitted after a retention limit. When detail is dropped, `diagnostics_truncated` and `dropped_diagnostics` report it and `diagnostics` ends with a `runtime.diagnostics-truncated` renderer notice. That notice is not a finding and does not change totals or `finding_groups`. `first_failure` is `null` for completed validation or contains `stage`, `reason`, `rule`, `message`, `path`, and `location` for the first incomplete stage.
 
-`completion` is `complete` only when every enabled stage finishes. `status` is `clean`, `warnings-only`, or `errors-present`; an incomplete result is always `errors-present`. `finding_groups` counts retained groups, while severity totals count every occurrence, including detail omitted after a retention limit. Each diagnostic group contains `occurrences` and up to three `example_locations`. `diagnostics_truncated` and `dropped_diagnostics` report omitted occurrences explicitly. When detail is dropped, `diagnostics` ends with a `runtime.diagnostics-truncated` renderer notice; that notice is not an additional finding and is not added to totals or `finding_groups`. `first_failure` is either `null` or an object containing `stage`, `reason`, `rule`, `message`, `path`, and `location`.
-
-Rule IDs are the stable machine contract. Human-readable `message` text is separate and may improve without changing the rule ID. A JSON schema version changes only when consumers must handle an incompatible shape or meaning change.
+Rule IDs are the stable machine contract. Human-readable messages may improve without changing their rule IDs. JSON contains no ANSI color, interactive timing, or progress output, including when `--color always` is present.
 
 ### Library ownership contract
 
@@ -280,7 +255,7 @@ Events are dispatched to four validators in one pass. Structural and binary vali
 
 ### Output modes
 
-Default text and JSON schema 1 group repeated findings for one input. Verbose text emits every retained occurrence. Summary mode keeps only fixed counters.
+Default text groups repeated findings for one input. Summary mode emits one human result line. JSON schema 1 emits the grouped machine-readable report.
 
 ### Memory model
 
