@@ -3,13 +3,22 @@
 const std = @import("std");
 
 pub fn build(b: *std.Build) void {
-    // Zig 0.16 exposes an unimplemented uninstall step that panics when invoked.
+    // HACK: Zig 0.16's uninstall step panics because ziglang/zig#14943 is
+    // unimplemented. Remove this after the pinned Zig implements uninstall.
     _ = b.top_level_steps.orderedRemove("uninstall");
 
     const target = b.standardTargetOptions(.{
         .default_target = .{ .cpu_model = .baseline },
     });
     const optimize = b.standardOptimizeOption(.{});
+    if (optimize != .Debug and optimize != .ReleaseFast) {
+        std.log.err(
+            "mzValidate supports only Debug and ReleaseFast optimization modes",
+            .{},
+        );
+        b.invalid_user_input = true;
+        return;
+    }
     const enable_libdeflate = b.option(
         bool,
         "enable-libdeflate",
@@ -18,14 +27,19 @@ pub fn build(b: *std.Build) void {
     const enable_lto = b.option(
         bool,
         "lto",
-        "Use full LTO for mzValidate (default: true outside Debug)",
-    ) orelse (optimize != .Debug);
+        "Use full LTO for mzValidate (default: true in ReleaseFast)",
+    ) orelse (optimize == .ReleaseFast);
     const single_threaded = b.option(
         bool,
         "single-threaded",
         "Compile CLI executables for a single-threaded runtime (default: true)",
     ) orelse true;
     const test_filter = b.option([]const u8, "test-filter", "Run only tests whose names contain this text");
+    if (target.result.os.tag == .windows) {
+        std.log.err("mzValidate does not support Windows targets", .{});
+        b.invalid_user_input = true;
+        return;
+    }
     if (target.result.ptrBitWidth() != 64) {
         std.log.err(
             "mzValidate supports only 64-bit targets; {s} uses {d}-bit pointers",
@@ -60,7 +74,7 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/main.zig"),
             .target = target,
             .optimize = optimize,
-            .strip = optimize == .ReleaseFast or optimize == .ReleaseSmall,
+            .strip = optimize == .ReleaseFast,
             .single_threaded = single_threaded,
             .imports = &.{
                 .{ .name = "mzvalidate", .module = mzvalidate_mod },
@@ -97,6 +111,8 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(&run_mod_tests.step);
     test_step.dependOn(&run_exe_tests.step);
 
+    // --- CLI contract ---
+
     const invalid_fixtures = collectMzmlFixturePaths(b, "fixtures/mzml/invalid") catch
         @panic("failed to collect invalid mzML fixtures");
 
@@ -108,8 +124,7 @@ pub fn build(b: *std.Build) void {
         "fixtures/examples/mzml/single-spectrum-missing-cv-terms.mzML",
     };
     for (valid_fixtures) |fixture| {
-        const cli_valid_cmd = b.addRunArtifact(exe);
-        cli_valid_cmd.step.dependOn(b.getInstallStep());
+        const cli_valid_cmd = addCliContractCommand(b, exe);
         cli_valid_cmd.addArg("check");
         cli_valid_cmd.addArg(fixture);
         cli_valid_cmd.addArg("--skip-semantic");
@@ -119,8 +134,7 @@ pub fn build(b: *std.Build) void {
         cli_contract_step.dependOn(&cli_valid_cmd.step);
     }
 
-    const cli_warning_cmd = b.addRunArtifact(exe);
-    cli_warning_cmd.step.dependOn(b.getInstallStep());
+    const cli_warning_cmd = addCliContractCommand(b, exe);
     cli_warning_cmd.addArg("check");
     cli_warning_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
     cli_warning_cmd.addArg("--summary");
@@ -128,8 +142,7 @@ pub fn build(b: *std.Build) void {
     cli_warning_cmd.expectStdOutEqual("complete: warnings | warnings 3, info 97\n");
     cli_contract_step.dependOn(&cli_warning_cmd.step);
 
-    const cli_known_findings_cmd = b.addRunArtifact(exe);
-    cli_known_findings_cmd.step.dependOn(b.getInstallStep());
+    const cli_known_findings_cmd = addCliContractCommand(b, exe);
     cli_known_findings_cmd.addArg("check");
     cli_known_findings_cmd.addArg("fixtures/mzml/valid/tiny.pwiz.1.1.mzML");
     cli_known_findings_cmd.addArg("--skip-semantic");
@@ -139,8 +152,7 @@ pub fn build(b: *std.Build) void {
     cli_known_findings_cmd.expectStdOutEqual("complete: errors | errors 13\n");
 
     for (invalid_fixtures) |fixture| {
-        const cli_invalid_cmd = b.addRunArtifact(exe);
-        cli_invalid_cmd.step.dependOn(b.getInstallStep());
+        const cli_invalid_cmd = addCliContractCommand(b, exe);
         cli_invalid_cmd.addArg("check");
         cli_invalid_cmd.addArg(fixture);
         cli_invalid_cmd.addArg("--skip-semantic");
@@ -150,8 +162,7 @@ pub fn build(b: *std.Build) void {
         cli_contract_step.dependOn(&cli_invalid_cmd.step);
     }
 
-    const cli_multiple_inputs_cmd = b.addRunArtifact(exe);
-    cli_multiple_inputs_cmd.step.dependOn(b.getInstallStep());
+    const cli_multiple_inputs_cmd = addCliContractCommand(b, exe);
     cli_multiple_inputs_cmd.addArg("check");
     cli_multiple_inputs_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
     cli_multiple_inputs_cmd.addArg("--summary");
@@ -162,8 +173,7 @@ pub fn build(b: *std.Build) void {
             "usage: mzValidate check <input.mzML> [options]\n",
     );
 
-    const cli_missing_input_cmd = b.addRunArtifact(exe);
-    cli_missing_input_cmd.step.dependOn(b.getInstallStep());
+    const cli_missing_input_cmd = addCliContractCommand(b, exe);
     cli_missing_input_cmd.addArg("check");
     cli_missing_input_cmd.addArg("--summary");
     cli_missing_input_cmd.expectExitCode(2);
@@ -172,8 +182,7 @@ pub fn build(b: *std.Build) void {
             "usage: mzValidate check <input.mzML> [options]\n",
     );
 
-    const cli_removed_brief_cmd = b.addRunArtifact(exe);
-    cli_removed_brief_cmd.step.dependOn(b.getInstallStep());
+    const cli_removed_brief_cmd = addCliContractCommand(b, exe);
     cli_removed_brief_cmd.addArg("check");
     cli_removed_brief_cmd.addArg("fixtures/mzml/valid/small.pwiz.1.1.mzML");
     cli_removed_brief_cmd.addArg("--brief");
@@ -184,8 +193,7 @@ pub fn build(b: *std.Build) void {
             "usage: mzValidate check <input.mzML> [options]\n",
     );
 
-    const cli_schema_finding_cmd = b.addRunArtifact(exe);
-    cli_schema_finding_cmd.step.dependOn(b.getInstallStep());
+    const cli_schema_finding_cmd = addCliContractCommand(b, exe);
     cli_schema_finding_cmd.addArg("check");
     cli_schema_finding_cmd.addArg("fixtures/mzml/adversarial/missing-default-array-length.mzML");
     cli_schema_finding_cmd.addArg("--skip-semantic");
@@ -194,8 +202,7 @@ pub fn build(b: *std.Build) void {
     cli_schema_finding_cmd.expectExitCode(1);
     cli_schema_finding_cmd.expectStdOutMatch("complete: errors | errors ");
 
-    const cli_incomplete_cmd = b.addRunArtifact(exe);
-    cli_incomplete_cmd.step.dependOn(b.getInstallStep());
+    const cli_incomplete_cmd = addCliContractCommand(b, exe);
     cli_incomplete_cmd.addArg("check");
     cli_incomplete_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
     cli_incomplete_cmd.addArg("--skip-binary");
@@ -204,8 +211,7 @@ pub fn build(b: *std.Build) void {
     cli_incomplete_cmd.expectExitCode(3);
     cli_incomplete_cmd.expectStdOutMatch("incomplete: errors | errors ");
 
-    const cli_json_cmd = b.addRunArtifact(exe);
-    cli_json_cmd.step.dependOn(b.getInstallStep());
+    const cli_json_cmd = addCliContractCommand(b, exe);
     cli_json_cmd.addArg("check");
     cli_json_cmd.addArg("fixtures/mzml/adversarial/huge-count.mzML");
     cli_json_cmd.addArg("--skip-binary");
@@ -228,6 +234,17 @@ pub fn build(b: *std.Build) void {
     ci_step.dependOn(test_step);
     ci_step.dependOn(cli_contract_step);
 }
+
+fn addCliContractCommand(
+    b: *std.Build,
+    exe: *std.Build.Step.Compile,
+) *std.Build.Step.Run {
+    const command = b.addRunArtifact(exe);
+    command.step.dependOn(b.getInstallStep());
+    return command;
+}
+
+// --- Accelerated dependencies ---
 
 fn addSha1X86ToModule(
     mod: *std.Build.Module,
@@ -262,8 +279,8 @@ fn addVendoredLibdeflateToModule(
 
     const opt = switch (optimize) {
         .Debug => "-Og",
-        .ReleaseSafe => "-O2",
-        .ReleaseFast, .ReleaseSmall => "-O3",
+        .ReleaseFast => "-O3",
+        else => @panic("unsupported optimization mode reached libdeflate configuration"),
     };
 
     const common_flags: []const []const u8 = switch (target.result.cpu.arch) {
@@ -286,7 +303,7 @@ fn addVendoredLibdeflateToModule(
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = adler32_flags });
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = common_flags });
         },
-        .aarch64, .arm => {
+        .aarch64 => {
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = common_flags });
             mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = common_flags });
         },
@@ -295,6 +312,8 @@ fn addVendoredLibdeflateToModule(
         },
     }
 }
+
+// --- Fixture discovery ---
 
 fn collectMzmlFixturePaths(b: *std.Build, root: []const u8) ![]const []const u8 {
     const io = b.graph.io;

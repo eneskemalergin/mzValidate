@@ -77,19 +77,20 @@ rm zig-x86_64-linux-0.16.0.tar.xz
 
 mzValidate requires targets with 64-bit pointers. The build rejects 32-bit targets during configuration, before compiling Zig or vendored C sources.
 
-The Debug build matrix I currently verify is:
+The build matrix I currently verify is:
 
-- `x86_64-linux`: native build and runtime tests
-- `x86_64-windows`: cross-build only
-- `aarch64-linux`: cross-build only
+- `x86_64-linux`: native Debug and ReleaseFast builds and runtime tests
+- `aarch64-linux`: Debug and ReleaseFast cross-builds only
 
-Vendored libdeflate is enabled by default on every listed target and links that target's C runtime. `-Denable-libdeflate=false` is also supported on every listed target and removes the vendored C sources and C runtime link. Other 64-bit Zig targets may build, but they are not part of the verified matrix. Routine development runs native Debug tests only; run the cross-build smoke checks when target, pointer-width, or vendor integration changes.
+Windows targets are explicitly unsupported and rejected during build configuration. Vendored libdeflate is enabled by default on every listed target and links that target's C runtime. `-Denable-libdeflate=false` is also supported on every listed target and removes the vendored C sources and C runtime link. Other non-Windows 64-bit Zig targets may build, but they are not part of the verified matrix. Routine development runs native Debug tests only; run the cross-build smoke checks when target, pointer-width, or vendor integration changes.
+
+The standard `-Dcpu` option specializes Zig modules. Vendored libdeflate remains at the portable architecture baseline and performs its own runtime feature dispatch.
 
 Focused cross-build smoke commands:
 
 ```sh
-./zig-0.16.0/zig build -Dtarget=x86_64-windows -Doptimize=Debug
 ./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=Debug
+./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast
 ```
 
 Add `-Denable-libdeflate=false` to the relevant command when changing the fallback decompression build path.
@@ -269,13 +270,14 @@ Default text groups repeated findings for one input. Summary mode emits one huma
 
 ## Build steps
 
+The project supports two optimization modes: Debug for development, diagnosis, and correctness work; ReleaseFast for release artifacts and measurement. The ReleaseFast executable uses the portable CPU baseline, full LTO, a single-threaded runtime, stripping, and the optimized vendored libdeflate build by default.
+
 - `./zig-0.16.0/zig build`: routine Debug binary
 - `./zig-0.16.0/zig build test`: routine Debug unit tests with leak detection
 - `./zig-0.16.0/zig build cli-contract`: CLI output and exit-code tests on known fixtures
 - `./zig-0.16.0/zig build ci`: combined `test` and `cli-contract` when both contracts are in scope
 - `./zig-0.16.0/zig build run -- check file.mzML`: build and run
-- `./zig-0.16.0/zig build -Doptimize=ReleaseSafe`: targeted safety-oriented release evidence
-- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: stripped release build for deliberate throughput or RSS measurement
+- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: stripped, full-LTO, single-threaded release build for packaging, throughput, RSS, and binary-size measurement
 
 ## Roadmap
 

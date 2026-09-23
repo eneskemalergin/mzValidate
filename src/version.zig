@@ -1,5 +1,5 @@
 //! One version string, two places, zero excuses.
-//! Keep `semantic` in sync with `build.zig.zon` or the build breaks.
+//! Keep `semantic` in sync with `build.zig.zon` or release verification fails.
 
 /// Release version for `--version` and `build.zig` package metadata.
 pub const semantic = "0.1.10";
