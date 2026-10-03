@@ -51,6 +51,8 @@ pub const IndexValidator = struct {
 
     current_index_kind: ?IndexKind = null,
     offset_id_ref: ?[]const u8 = null,
+    /// Holds `offset_id_ref`, reused for every offset; its capacity is charged as index state.
+    id_ref_buf: std.ArrayList(u8) = .empty,
     index_entry_count: usize = 0,
 
     // --- indexListOffset ---
@@ -155,7 +157,8 @@ pub const IndexValidator = struct {
     pub fn deinit(validator: *IndexValidator) void {
         freeHashMap(validator.allocator, &validator.spectrum_offsets);
         freeHashMap(validator.allocator, &validator.chromatogram_offsets);
-        if (validator.offset_id_ref) |ref| validator.allocator.free(ref);
+        validator.releaseIndexBytes(validator.id_ref_buf.capacity);
+        validator.id_ref_buf.deinit(validator.allocator);
         validator.text_buf.deinit(validator.allocator);
         validator.* = undefined;
     }
@@ -251,19 +254,21 @@ pub const IndexValidator = struct {
             .offset => {
                 if (validator.current_index_kind == null) return;
                 const id_ref = start.attr("idRef") orelse return;
-                if (validator.offset_id_ref) |old_ref| {
-                    validator.releaseIndexBytes(old_ref.len);
-                    validator.allocator.free(old_ref);
-                }
                 validator.offset_id_ref = null;
                 if (id_ref.len > validator.limits.max_index_id_ref_bytes) {
                     try validator.limitDiagnostic(start.byte_offset, "index idRef exceeds the configured field limit");
                     return error.ResourceLimitExceeded;
                 }
-                try validator.reserveIndexBytes(id_ref.len, start.byte_offset);
-                errdefer validator.releaseIndexBytes(id_ref.len);
-                const retained = try validator.allocator.dupe(u8, id_ref);
-                validator.offset_id_ref = retained;
+                const buffer = &validator.id_ref_buf;
+                if (id_ref.len > buffer.capacity) {
+                    const extra = id_ref.len - buffer.capacity;
+                    try validator.reserveIndexBytes(extra, start.byte_offset);
+                    errdefer validator.releaseIndexBytes(extra);
+                    try buffer.ensureTotalCapacityPrecise(validator.allocator, id_ref.len);
+                }
+                buffer.clearRetainingCapacity();
+                buffer.appendSliceAssumeCapacity(id_ref);
+                validator.offset_id_ref = buffer.items;
                 validator.text_buf.clearRetainingCapacity();
             },
             .indexListOffset => {
@@ -304,10 +309,6 @@ pub const IndexValidator = struct {
                 if (validator.current_index_kind == null or validator.offset_id_ref == null) return;
                 const id_ref = validator.offset_id_ref.?;
                 validator.offset_id_ref = null;
-                defer {
-                    validator.releaseIndexBytes(id_ref.len);
-                    validator.allocator.free(id_ref);
-                }
                 const offset = std.fmt.parseUnsigned(u64, validator.text_buf.items, 10) catch {
                     try validator.appendDiagnostic(
                         end.byte_offset,

@@ -192,12 +192,13 @@ const Declaration = struct {
 const ScopeItem = struct {
     accession: []const u8,
     mapping_match: MappingMatch = mapping_match_unclassified,
-    // Parser-backed accessions are borrowed; copied accessions are freed at scope exit.
+    // Parser-backed accessions are borrowed; copied ones live in `scope_bytes` until scope exit.
     owned: bool,
 };
 
 const ScopeFrame = struct {
     scope_start: usize,
+    scope_bytes_start: usize = 0,
     rules: []const MappingRule,
     element_id: ElementId,
     path_state: ?rule_engine.PathState,
@@ -492,6 +493,9 @@ pub const SemanticValidator = struct {
 
     scope_frames: std.ArrayList(ScopeFrame),
     scope_items: std.ArrayList(ScopeItem),
+    /// Copied accessions of open scopes, in scope order: one charged buffer instead of a heap
+    /// block per parameter. Owned items are rebased when it grows.
+    scope_bytes: std.ArrayList(u8) = .empty,
     path_state: ?rule_engine.PathState,
 
     ref_table: RefTable,
@@ -558,17 +562,13 @@ pub const SemanticValidator = struct {
             std.math.mul(usize, validator.scope_frames.capacity, @sizeOf(ScopeFrame)) catch unreachable,
         );
         validator.scope_frames.deinit(validator.allocator);
-        for (validator.scope_items.items) |item| {
-            if (item.owned) {
-                validator.budget.release(.scope, item.accession.len);
-                validator.allocator.free(item.accession);
-            }
-        }
         validator.budget.release(
             .scope,
             std.math.mul(usize, validator.scope_items.capacity, @sizeOf(ScopeItem)) catch unreachable,
         );
         validator.scope_items.deinit(validator.allocator);
+        validator.budget.release(.scope, validator.scope_bytes.capacity);
+        validator.scope_bytes.deinit(validator.allocator);
         if (validator.current_group_id) |id| {
             validator.budget.release(.param_group, id.len);
             validator.allocator.free(id);
@@ -606,11 +606,23 @@ pub const SemanticValidator = struct {
             return item_index;
         }
 
-        try validator.budget.reserve(.scope, accession.len, byte_offset);
-        errdefer validator.budget.release(.scope, accession.len);
-        const owned_accession = try validator.allocator.dupe(u8, accession);
-        errdefer validator.allocator.free(owned_accession);
-        try validator.scope_items.append(validator.allocator, .{ .accession = owned_accession, .owned = true });
+        const bytes = &validator.scope_bytes;
+        const required = std.math.add(usize, bytes.items.len, accession.len) catch {
+            try validator.budget.limitDiagnostic(byte_offset);
+            return error.ResourceLimitExceeded;
+        };
+        if (required > bytes.capacity) {
+            const old = bytes.items.ptr;
+            const target = @max(required, bytes.capacity *| 2, 256);
+            try ensureListCapacity(bytes, &validator.budget, .scope, target, byte_offset);
+            if (bytes.items.ptr != old) for (validator.scope_items.items) |*item| if (item.owned) {
+                const offset = @intFromPtr(item.accession.ptr) - @intFromPtr(old);
+                item.accession = bytes.items.ptr[offset..][0..item.accession.len];
+            };
+        }
+        const start = bytes.items.len;
+        bytes.appendSliceAssumeCapacity(accession);
+        validator.scope_items.appendAssumeCapacity(.{ .accession = bytes.items[start..], .owned = true });
         return item_index;
     }
 
@@ -763,6 +775,7 @@ pub const SemanticValidator = struct {
             );
             try validator.scope_frames.append(validator.allocator, ScopeFrame{
                 .scope_start = scope_start,
+                .scope_bytes_start = validator.scope_bytes.items.len,
                 .rules = rules,
                 .element_id = tag,
                 .path_state = path_state,
@@ -1253,14 +1266,7 @@ pub const SemanticValidator = struct {
         defer validator.path_state = frame.parent_path_state;
         const scope = validator.scope_items.items[frame.scope_start..validator.scope_items.items.len];
         defer validator.scope_items.items.len = frame.scope_start;
-        defer {
-            for (scope) |item| {
-                if (item.owned) {
-                    validator.budget.release(.scope, item.accession.len);
-                    validator.allocator.free(item.accession);
-                }
-            }
-        }
+        defer validator.scope_bytes.items.len = frame.scope_bytes_start;
 
         if (tag == .binaryDataArray) {
             try validator.validateBinaryDataType(scope, end.byte_offset);
