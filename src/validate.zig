@@ -583,16 +583,6 @@ fn runValidationMode(
     observer: if (report_progress) ProgressObserver else void,
 ) !void {
     result.beginStage(.parser);
-    // Parser token slices borrow caller-owned storage until the next event.
-    // Allocate the fixed bound once per file so every event reuses it without
-    // event-level allocation or parser API complexity.
-    const token_buffer = try context.allocator.alloc(u8, max_validation_token_bytes);
-    defer {
-        result.resource_usage.parser_current_bytes = token_buffer.len;
-        result.resource_usage.parser_peak_bytes = token_buffer.len;
-        context.allocator.free(token_buffer);
-    }
-
     var attributes: [64]Attribute = undefined;
     var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
     var namespace_bytes: [2048]u8 = undefined;
@@ -600,7 +590,6 @@ fn runValidationMode(
     var element_bytes: [4096]u8 = undefined;
 
     const parser_buffers = xml_parser.Buffers{
-        .token = token_buffer,
         .attributes = &attributes,
         .namespace_bindings = &namespace_bindings,
         .namespace_bytes = &namespace_bytes,
@@ -612,6 +601,7 @@ fn runValidationMode(
         .reader => |reader| xml_parser.Parser.init(reader, parser_buffers),
         .slice => |bytes| xml_parser.Parser.initSlice(bytes, parser_buffers),
     };
+    defer parser.deinit();
     var parse_progress: if (report_progress) progress.Reporter else void = if (report_progress)
         progress.Reporter.init(observer, .parse, stream_size orelse return error.InputOutput)
     else {};
@@ -1831,8 +1821,9 @@ test "reader result: marks clean input complete" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(result.enabled_stages, result.completed_stages);
     try std.testing.expectEqual(diagnostic.ResultStatus.clean, result.status());
-    try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_current_bytes);
-    try std.testing.expectEqual(@as(usize, max_validation_token_bytes), result.resource_usage.parser_peak_bytes);
+    // zmz's parser keeps its own bounded buffers; no caller-owned token buffer remains.
+    try std.testing.expectEqual(@as(usize, 0), result.resource_usage.parser_current_bytes);
+    try std.testing.expectEqual(@as(usize, 0), result.resource_usage.parser_peak_bytes);
 }
 
 test "reader result: indexed input without integrity source is incomplete" {
@@ -2012,7 +2003,8 @@ test "[unit]: forward-reference allocation failures remain incomplete" {
 
 test "failure diagnostics: allocation failure uses emergency metadata" {
     const xml = "<?xml version=\"1.0\"?><mzML><run";
-    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 1 });
+    // The parser's first allocation; no token buffer precedes it.
+    var failing_allocator = std.testing.FailingAllocator.init(std.testing.allocator, .{ .fail_index = 0 });
     var diagnostics: DiagnosticSink = .empty;
 
     const result = checkSliceResult(failing_allocator.allocator(), std.testing.io, xml, &diagnostics, "diagnostic-oom.mzML", .{
@@ -2780,10 +2772,11 @@ test "reader check: reports an oversized attribute" {
 
     try checkReader(allocator, io, &reader, &diagnostics, "inline-oversized-text.mzML", .{ .skip_binary = true, .skip_semantic = true }, null);
 
+    // An attribute this size also fills the whole start-tag budget, which zmz checks first.
     try expectSingleDiagnostic(
         diagnostics.items,
         RuleId.mzml_structure_xml,
-        "XML attribute exceeds the configured attribute limit",
+        "XML start tag exceeds the configured start-tag limit",
     );
 }
 
@@ -2825,7 +2818,7 @@ test "reader check: reports too many namespace bindings" {
     );
 }
 
-test "reader check: reports excessive element-name storage" {
+test "reader check: reports excessive nesting" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
@@ -2840,7 +2833,7 @@ test "reader check: reports excessive element-name storage" {
     var found_limit = false;
     for (diagnostics.items) |item| {
         if (std.mem.eql(u8, item.rule, RuleId.mzml_structure_xml) and
-            std.mem.eql(u8, item.message, "XML element name storage exceeds the configured parser limit"))
+            std.mem.eql(u8, item.message, "XML element nesting exceeds the configured parser limit"))
         {
             found_limit = true;
         }

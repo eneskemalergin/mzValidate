@@ -31,6 +31,7 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.UnsupportedXmlVersion => "unsupported XML version declaration",
         error.ReadFailed => "failed while reading XML input",
         error.MalformedXml => "malformed XML input",
+        error.OutOfMemory => "out of memory while parsing XML",
     };
 }
 

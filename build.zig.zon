@@ -9,7 +9,7 @@
     .version = "0.1.10",
     .fingerprint = 0x852e43c03f8a10d3,
     .minimum_zig_version = "0.16.0",
-    .dependencies = .{},
+    .dependencies = .{ .zmz = .{ .path = "../zmz" } },
     .paths = .{
         "build.zig",
         "build.zig.zon",

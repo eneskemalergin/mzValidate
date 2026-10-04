@@ -252,8 +252,6 @@ test "dispatch masks align with tiny mzML fixture tags" {
     const allocator = std.testing.allocator;
     const xml = try std.Io.Dir.cwd().readFileAlloc(io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML", allocator, .limited(64 * 1024));
     defer allocator.free(xml);
-    const token_buffer = try allocator.alloc(u8, 1024 * 1024);
-    defer allocator.free(token_buffer);
     var attributes: [64]xml_events.Attribute = undefined;
     var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
     var namespace_bytes: [2048]u8 = undefined;
@@ -261,13 +259,13 @@ test "dispatch masks align with tiny mzML fixture tags" {
     var element_bytes: [4096]u8 = undefined;
 
     var parser = xml_parser.Parser.initSlice(xml, .{
-        .token = token_buffer,
         .attributes = &attributes,
         .namespace_bindings = &namespace_bindings,
         .namespace_bytes = &namespace_bytes,
         .element_stack = &element_stack,
         .element_bytes = &element_bytes,
     });
+    defer parser.deinit();
 
     while (try parser.next()) |event| {
         switch (event) {
