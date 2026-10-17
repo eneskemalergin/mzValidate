@@ -42,7 +42,6 @@ fn scratchCapacityClass(required: usize) usize {
     return required;
 }
 
-
 const Compression = enum {
     none,
     zlib,
@@ -221,11 +220,11 @@ pub const BinaryValidator = struct {
     /// Ordinary capacity is reused; one-off capacity above the retention bound
     /// is released after the owning binaryDataArray is validated.
     compressed_payload: std.ArrayList(u8) = .empty,
-    /// zmz's streaming zlib decoder, allocated on the first zlib array. Like libdeflate's
-    /// decompressor before it, its fixed allocation is not counted as scratch.
+    /// zmz's streaming zlib decoder, allocated on the first zlib array. Its fixed
+    /// allocation is not counted as scratch.
     decompressor: ?zmz.zlib.Decompressor = null,
     /// Decoded Base64 of non-zlib arrays, reused piece by piece; allocated on first use and,
-    /// like the decompressor, a fixed allocation outside scratch.
+    /// like the decompressor, not counted as scratch.
     base64_window: []u8 = &.{},
     scratch_current_bytes: usize = 0,
     scratch_peak_bytes: usize = 0,
@@ -302,17 +301,9 @@ pub const BinaryValidator = struct {
         limits: diagnostic.ResourceLimits,
     ) !void {
         var attributes: [64]Attribute = undefined;
-        var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
-        var namespace_bytes: [2048]u8 = undefined;
-        var element_stack: [128]xml_parser.ElementFrame = undefined;
-        var element_bytes: [4096]u8 = undefined;
 
-        var parser = xml_parser.Parser.init(reader, .{
+        var parser = xml_parser.Parser.init(allocator, reader, .{
             .attributes = &attributes,
-            .namespace_bindings = &namespace_bindings,
-            .namespace_bytes = &namespace_bytes,
-            .element_stack = &element_stack,
-            .element_bytes = &element_bytes,
         });
         defer parser.deinit();
 
@@ -2765,17 +2756,9 @@ test "binary validator oversized payload produces diagnostic" {
     var reader = std.Io.Reader.fixed(xml);
 
     var attributes: [64]Attribute = undefined;
-    var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
-    var namespace_bytes: [2048]u8 = undefined;
-    var element_stack: [128]xml_parser.ElementFrame = undefined;
-    var element_bytes: [4096]u8 = undefined;
 
-    var parser = xml_parser.Parser.init(&reader, .{
+    var parser = xml_parser.Parser.init(allocator, &reader, .{
         .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
     });
     defer parser.deinit();
 
@@ -2804,17 +2787,9 @@ test "binary validator oversized limit is inclusive" {
     var reader = std.Io.Reader.fixed(xml);
 
     var attributes: [64]Attribute = undefined;
-    var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
-    var namespace_bytes: [2048]u8 = undefined;
-    var element_stack: [128]xml_parser.ElementFrame = undefined;
-    var element_bytes: [4096]u8 = undefined;
 
-    var parser = xml_parser.Parser.init(&reader, .{
+    var parser = xml_parser.Parser.init(allocator, &reader, .{
         .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
     });
     defer parser.deinit();
 

@@ -28,7 +28,6 @@ const RuleId = diagnostic.RuleId;
 const ValidationStage = diagnostic.ValidationStage;
 /// Synchronous, caller-owned byte-progress callback for regular-file validation.
 pub const ProgressObserver = progress.Observer;
-const max_validation_token_bytes = 1024 * 1024;
 const stream_input_buffer_bytes = 64 * 1024;
 
 // --- Public entry points ---
@@ -584,22 +583,14 @@ fn runValidationMode(
 ) !void {
     result.beginStage(.parser);
     var attributes: [64]Attribute = undefined;
-    var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
-    var namespace_bytes: [2048]u8 = undefined;
-    var element_stack: [128]xml_parser.ElementFrame = undefined;
-    var element_bytes: [4096]u8 = undefined;
 
     const parser_buffers = xml_parser.Buffers{
         .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
     };
 
     var parser = switch (source) {
-        .reader => |reader| xml_parser.Parser.init(reader, parser_buffers),
-        .slice => |bytes| xml_parser.Parser.initSlice(bytes, parser_buffers),
+        .reader => |reader| xml_parser.Parser.init(context.allocator, reader, parser_buffers),
+        .slice => |bytes| xml_parser.Parser.initSlice(context.allocator, bytes, parser_buffers),
     };
     defer parser.deinit();
     var parse_progress: if (report_progress) progress.Reporter else void = if (report_progress)
@@ -695,7 +686,11 @@ fn runValidationMode(
                 diagnostics,
                 result,
                 .parser,
-                if (err == error.ReadFailed) .input else .parser,
+                switch (err) {
+                    error.ReadFailed => .input,
+                    error.OutOfMemory => .allocation,
+                    else => .parser,
+                },
                 .{
                     .severity = .@"error",
                     .rule = RuleId.mzml_structure_xml,
@@ -1821,9 +1816,6 @@ test "reader result: marks clean input complete" {
     try std.testing.expectEqual(diagnostic.CompletionState.complete, result.completion);
     try std.testing.expectEqual(result.enabled_stages, result.completed_stages);
     try std.testing.expectEqual(diagnostic.ResultStatus.clean, result.status());
-    // zmz's parser keeps its own bounded buffers; no caller-owned token buffer remains.
-    try std.testing.expectEqual(@as(usize, 0), result.resource_usage.parser_current_bytes);
-    try std.testing.expectEqual(@as(usize, 0), result.resource_usage.parser_peak_bytes);
 }
 
 test "reader result: indexed input without integrity source is incomplete" {
@@ -2764,7 +2756,7 @@ test "reader check: reports an oversized attribute" {
     const allocator = std.testing.allocator;
     const io = std.testing.io;
 
-    const xml = try oversizedAttributeValueMzml(allocator, max_validation_token_bytes + 1);
+    const xml = try oversizedAttributeValueMzml(allocator, (xml_parser.Limits{}).max_start_tag_bytes + 1);
     defer allocator.free(xml);
     var diagnostics: DiagnosticSink = .empty;
     defer diagnostics.deinit(allocator);

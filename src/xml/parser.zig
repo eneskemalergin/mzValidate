@@ -1,9 +1,11 @@
 //! Pull parser for XML input, backed by zmz's event stream.
 //!
 //! Emits the borrowed events mzValidate's validators consume. zmz checks
-//! well-formedness and resolves namespaces; this layer converts its events,
-//! skips whitespace-only text as before, and applies mzValidate's text and
-//! attribute limits. Call `deinit` when done.
+//! well-formedness, resolves namespaces, and bounds nesting at
+//! `zmz.MAX_DEPTH`; this layer converts its events, skips whitespace-only
+//! text, and applies mzValidate's text, attribute, and namespace limits. zmz
+//! allocates its buffers from the caller's allocator on the first read; call
+//! `deinit` to release them.
 
 const std = @import("std");
 const zmz = @import("zmz").mzml;
@@ -18,16 +20,13 @@ pub const ParseError = error{
     UnexpectedEof,
     MalformedXml,
     InvalidUtf8,
-    TokenTooLong,
     StartTagTooLong,
     AttributeTooLong,
     ScalarTextTooLong,
     BinaryTextTooLong,
     TooManyAttributes,
     TooManyNamespaces,
-    NamespaceStorageExceeded,
     ElementNestingTooDeep,
-    ElementStorageExceeded,
     UnknownEntity,
     InvalidCharacterReference,
     InvalidXmlCharacter,
@@ -37,22 +36,16 @@ pub const ParseError = error{
     OutOfMemory,
 } || error{ReadFailed};
 
-/// Kept so callers can size their buffers as before; zmz keeps its own bindings.
-pub const NamespaceBinding = struct {};
-pub const ElementFrame = struct {};
-
 /// Caller-owned scratch. `attributes` bounds attributes per element and receives
-/// each event's attributes; the other buffers are no longer used.
+/// each event's attributes.
 pub const Buffers = struct {
     attributes: []Attribute,
-    namespace_bindings: []NamespaceBinding = &.{},
-    namespace_bytes: []u8 = &.{},
-    element_stack: []ElementFrame = &.{},
-    element_bytes: []u8 = &.{},
     limits: Limits = .{},
 };
 
 pub const Limits = struct {
+    /// Namespace bindings in scope at once.
+    max_namespaces: usize = 32,
     max_start_tag_bytes: usize = 1024 * 1024,
     max_attribute_bytes: usize = 64 * 1024,
     max_scalar_text_bytes: usize = 64 * 1024,
@@ -66,12 +59,11 @@ pub const Input = union(enum) {
 
 /// Streaming pull parser. Emits borrowed events; call `next()` until `null`.
 pub const Parser = struct {
+    allocator: std.mem.Allocator,
     input: Input,
     slice_reader: std.Io.Reader = undefined,
     zmz_events: ?zmz.Events = null,
     attributes: []Attribute,
-    /// The most namespace bindings in scope at once, as the caller's binding buffer allowed.
-    max_namespaces: usize,
     limits: Limits,
     /// Depth of the open binary element, to choose the text limit.
     binary_depth: ?usize = null,
@@ -83,12 +75,12 @@ pub const Parser = struct {
     text_significant: bool = false,
     text_bytes: usize = 0,
 
-    pub fn init(reader: *std.Io.Reader, buffers: Buffers) Parser {
-        return .{ .input = .{ .reader = reader }, .attributes = buffers.attributes, .max_namespaces = buffers.namespace_bindings.len, .limits = buffers.limits };
+    pub fn init(allocator: std.mem.Allocator, reader: *std.Io.Reader, buffers: Buffers) Parser {
+        return .{ .allocator = allocator, .input = .{ .reader = reader }, .attributes = buffers.attributes, .limits = buffers.limits };
     }
 
-    pub fn initSlice(bytes: []const u8, buffers: Buffers) Parser {
-        return .{ .input = .{ .slice = bytes }, .attributes = buffers.attributes, .max_namespaces = buffers.namespace_bindings.len, .limits = buffers.limits };
+    pub fn initSlice(allocator: std.mem.Allocator, bytes: []const u8, buffers: Buffers) Parser {
+        return .{ .allocator = allocator, .input = .{ .slice = bytes }, .attributes = buffers.attributes, .limits = buffers.limits };
     }
 
     pub fn deinit(parser: *Parser) void {
@@ -117,7 +109,7 @@ pub const Parser = struct {
                     parser.text_start = null;
                     if (parser.binary_depth == parser.depth) parser.binary_depth = null;
                     parser.depth -= 1;
-                    // An empty element's end sits at its "/>" slash, as before.
+                    // An empty element's end sits at its "/>" slash.
                     const offset = if (value.span.start == value.span.end) value.span.start -| 2 else value.span.start;
                     return .{ .end_element = .{
                         .byte_offset = offset,
@@ -152,7 +144,7 @@ pub const Parser = struct {
                 break :blk &parser.slice_reader;
             },
         };
-        parser.zmz_events = zmz.Events.init(std.heap.page_allocator, reader, .{
+        parser.zmz_events = zmz.Events.init(parser.allocator, reader, .{
             .attributes = @max(parser.attributes.len, 1),
             .attribute_bytes = parser.limits.max_start_tag_bytes,
         }) catch return error.MalformedXml;
@@ -164,7 +156,7 @@ pub const Parser = struct {
         var position: usize = 0;
         var bindings: usize = 0;
         while (parser.zmz_events.?.namespaceAt(&position)) |_| bindings += 1;
-        if (bindings > parser.max_namespaces) return error.TooManyNamespaces;
+        if (bindings > parser.limits.max_namespaces) return error.TooManyNamespaces;
         for (start.attributes, 0..) |attribute, i| {
             if (attribute.value.len > parser.limits.max_attribute_bytes) return error.AttributeTooLong;
             parser.attributes[i] = .{ .byte_offset = attribute.offset, .name = qname(attribute.name), .value = attribute.value };

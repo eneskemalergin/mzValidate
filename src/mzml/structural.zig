@@ -271,17 +271,9 @@ pub const StructuralValidator = struct {
         path: ?[]const u8,
     ) !void {
         var attributes: [64]Attribute = undefined;
-        var namespace_bindings: [32]xml_parser.NamespaceBinding = undefined;
-        var namespace_bytes: [2048]u8 = undefined;
-        var element_stack: [128]xml_parser.ElementFrame = undefined;
-        var element_bytes: [4096]u8 = undefined;
 
-        var parser = xml_parser.Parser.init(reader, .{
+        var parser = xml_parser.Parser.init(allocator, reader, .{
             .attributes = &attributes,
-            .namespace_bindings = &namespace_bindings,
-            .namespace_bytes = &namespace_bytes,
-            .element_stack = &element_stack,
-            .element_bytes = &element_bytes,
         });
         defer parser.deinit();
 

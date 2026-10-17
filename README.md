@@ -23,7 +23,7 @@ I built mzValidate as a focused native validator for mzML. It checks XML syntax,
 - No JVM, no Python, no .NET, no libxml2
 - Streaming XML parser in one primary forward pass
 - Regular files use bounded stream input with file-stability checks around validation.
-- Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
+- Uncompressed arrays decoded piece by piece through a fixed 48 KiB window, never as a whole payload
 - Zlib arrays validated through bounded compressed and decompressed workspaces
 - Picks AVX2 Base64, checksum, and zlib kernels at run time on x86-64 CPUs that support them
 - Unit tests, CLI contract fixtures, and focused adversarial boundary cases
@@ -258,10 +258,10 @@ Default text groups repeated findings for one input. Summary mode emits one huma
 
 ### Memory model
 
-- Regular-file input uses a fixed 64 KiB stack buffer. Parser structural scratch is also fixed stack storage: 64 attributes, 32 namespace bindings, 2 KiB of namespace text, 128 element frames, and 4 KiB of element-name text.
-- The parser token buffer is an eager 1 MiB heap allocation per active file, reused across all events and reported in `ResourceUsage`
-- Compressed and libdeflate output buffers reuse capacities through 1 MiB; larger one-off capacities are freed after their binary array. The fixed 128 KiB flate workspace is reused.
-- Binary scratch telemetry covers allocator-owned compressed, flate, and libdeflate output capacities. It excludes the opaque external libdeflate decompressor allocation because the library ABI does not report its size.
+- Regular-file input uses a fixed 64 KiB stack buffer, and the parser fills a fixed 64-entry attribute array.
+- zmz allocates its event, text, and declaration buffers from the validation allocator on the first read and reuses them. A start tag is bounded at 1 MiB and text arrives in chunks of at most 64 KiB; elements nest at most 64 deep, with at most 32 namespace bindings in scope.
+- The compressed-payload buffer reuses capacity up to 1 MiB; a larger one-off capacity is freed after its binary array. zmz's streaming zlib decompressor and the 48 KiB Base64 window are allocated once, on first use, and reused.
+- Binary scratch telemetry in `ResourceUsage` covers the compressed-payload capacity; the decompressor and Base64 window are fixed allocations outside it.
 - Transient element, scope, and binary state is released or reused, while semantic declarations, unresolved references, parameter-group state, and index entries are retained across the file within owner-specific limits.
 - Diagnostic details are retained within count and rendered-byte limits; totals and first-failure metadata remain available when detail retention is exhausted.
 - Input files use bounded stream input, so input size does not become a file-sized validator allocation.
