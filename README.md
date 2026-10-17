@@ -42,12 +42,11 @@ Exit codes: `0` = completed without error findings, `1` = completed with error f
 
 Build from source. You need **Zig 0.16.0** exactly. Other Zig versions will not work.
 
-1. Get Zig 0.16.0 from the [Zig download page](https://ziglang.org/download/#release-0.16.0) for your OS and CPU.
-2. Keep the portable runner at `./zig-0.16.0/zig` in the repository, or obtain the exact Zig 0.16.0 runner for your platform.
-3. Check the version:
+1. Get Zig 0.16.0 from the [Zig download page](https://ziglang.org/download/#release-0.16.0) for your OS and CPU, and put it on your `PATH` as `zig`.
+2. Check the version:
 
 ```sh
-./zig-0.16.0/zig version
+zig version
 # 0.16.0
 ```
 
@@ -56,22 +55,10 @@ Then:
 ```sh
 git clone https://github.com/eneskemalergin/mzValidate.git
 cd mzValidate
-./zig-0.16.0/zig build -Doptimize=ReleaseFast
+zig build -Doptimize=ReleaseFast
 ```
 
 The binary is at `zig-out/bin/mzValidate`. The first build fetches zmz 0.1.0 and its zlib dependency by hash into `zig-pkg/`, so it needs network access once.
-
-If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. This is how I work on Zig projects. It leaves a few compiler copies around, but I always know which version a project uses and can change it without touching the rest of my system.
-
-**Linux x86_64 local-copy example:**
-
-```sh
-curl -LO https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz
-tar xf zig-x86_64-linux-0.16.0.tar.xz
-mv zig-x86_64-linux-0.16.0 zig-0.16.0
-rm zig-x86_64-linux-0.16.0.tar.xz
-./zig-0.16.0/zig version
-```
 
 ## Supported targets
 
@@ -89,8 +76,8 @@ The default build targets the portable CPU baseline and picks CPU-specific kerne
 Focused cross-build smoke commands:
 
 ```sh
-./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=Debug
-./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast
+zig build -Dtarget=aarch64-linux -Doptimize=Debug
+zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast
 ```
 
 ## CLI reference
@@ -270,12 +257,12 @@ Default text groups repeated findings for one input. Summary mode emits one huma
 
 The project supports two optimization modes: Debug for development, diagnosis, and correctness work; ReleaseFast for release artifacts and measurement. The ReleaseFast executable uses the portable CPU baseline, full LTO, a single-threaded runtime, and stripping by default.
 
-- `./zig-0.16.0/zig build`: routine Debug binary
-- `./zig-0.16.0/zig build test`: routine Debug unit tests with leak detection
-- `./zig-0.16.0/zig build cli-contract`: CLI output and exit-code tests on known fixtures
-- `./zig-0.16.0/zig build ci`: combined `test` and `cli-contract` when both contracts are in scope
-- `./zig-0.16.0/zig build run -- check file.mzML`: build and run
-- `./zig-0.16.0/zig build -Doptimize=ReleaseFast`: stripped, full-LTO, single-threaded release build for packaging, throughput, RSS, and binary-size measurement
+- `zig build`: routine Debug binary
+- `zig build test`: routine Debug unit tests with leak detection
+- `zig build cli-contract`: CLI output and exit-code tests on known fixtures
+- `zig build ci`: combined `test` and `cli-contract` when both contracts are in scope
+- `zig build run -- check file.mzML`: build and run
+- `zig build -Doptimize=ReleaseFast`: stripped, full-LTO, single-threaded release build for packaging, throughput, RSS, and binary-size measurement
 
 ## Roadmap
 
