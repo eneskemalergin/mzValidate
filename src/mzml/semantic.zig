@@ -10,7 +10,6 @@ const diagnostic = @import("../diagnostic.zig");
 const obo = @import("../obo/parser.zig");
 const rule_engine = @import("../obo/rule_engine.zig");
 const xml_events = @import("../xml/events.zig");
-const xml_scan = @import("../xml/scan.zig");
 const elements = @import("elements.zig");
 const structural = @import("structural.zig");
 
@@ -192,8 +191,6 @@ const Declaration = struct {
 const ScopeItem = struct {
     accession: []const u8,
     mapping_match: MappingMatch = mapping_match_unclassified,
-    // Parser-backed accessions are borrowed; copied ones live in `scope_bytes` until scope exit.
-    owned: bool,
 };
 
 const ScopeFrame = struct {
@@ -598,14 +595,10 @@ pub const SemanticValidator = struct {
         std.debug.assert(validator.budget.current_bytes == 0);
     }
 
-    fn appendScopeItem(validator: *SemanticValidator, accession: []const u8, owned: bool, byte_offset: u64) !usize {
+    /// Copies `accession` into `scope_bytes`, where it lives until its scope exits.
+    fn appendScopeItem(validator: *SemanticValidator, accession: []const u8, byte_offset: u64) !usize {
         try ensureListAppendCapacity(&validator.scope_items, &validator.budget, .scope, byte_offset);
         const item_index = validator.scope_items.items.len;
-        if (!owned) {
-            try validator.scope_items.append(validator.allocator, .{ .accession = accession, .owned = false });
-            return item_index;
-        }
-
         const bytes = &validator.scope_bytes;
         const required = std.math.add(usize, bytes.items.len, accession.len) catch {
             try validator.budget.limitDiagnostic(byte_offset);
@@ -615,14 +608,14 @@ pub const SemanticValidator = struct {
             const old = bytes.items.ptr;
             const target = @max(required, bytes.capacity *| 2, 256);
             try ensureListCapacity(bytes, &validator.budget, .scope, target, byte_offset);
-            if (bytes.items.ptr != old) for (validator.scope_items.items) |*item| if (item.owned) {
+            if (bytes.items.ptr != old) for (validator.scope_items.items) |*item| {
                 const offset = @intFromPtr(item.accession.ptr) - @intFromPtr(old);
                 item.accession = bytes.items.ptr[offset..][0..item.accession.len];
             };
         }
         const start = bytes.items.len;
         bytes.appendSliceAssumeCapacity(accession);
-        validator.scope_items.appendAssumeCapacity(.{ .accession = bytes.items[start..], .owned = true });
+        validator.scope_items.appendAssumeCapacity(.{ .accession = bytes.items[start..] });
         return item_index;
     }
 
@@ -638,18 +631,9 @@ pub const SemanticValidator = struct {
         var pv: ?[]const u8 = null;
         var mapping_scope_item: ?usize = null;
         if (tag == .cvParam or tag == .userParam) {
-            if (start.attributes.len > 0) {
-                for (start.attributes) |attribute| {
-                    if (attribute.is_namespace_declaration or attribute.name.prefix != null or attribute.name.namespace_uri != null) continue;
-                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, &pn, &pv, attribute.name.local_name, attribute.value);
-                }
-            } else if (start.raw_tag.len > 0) {
-                var raw_scanner = xml_scan.RawAttributeScanner.init(start.raw_tag);
-                while (try raw_scanner.next()) |attribute| {
-                    if (attribute.is_namespace_declaration) continue;
-                    if (!std.mem.eql(u8, attribute.name, attribute.local_name)) continue;
-                    setParamAttribute(&pa, &cvr, &ua, &ucr, &un, &pn, &pv, attribute.local_name, attribute.value);
-                }
+            for (start.attributes) |attribute| {
+                if (attribute.is_namespace_declaration or attribute.name.prefix != null or attribute.name.namespace_uri != null) continue;
+                setParamAttribute(&pa, &cvr, &ua, &ucr, &un, &pn, &pv, attribute.name.local_name, attribute.value);
             }
         }
 
@@ -692,12 +676,7 @@ pub const SemanticValidator = struct {
         if (tag == .cvParam or tag == .userParam) {
             if (pa) |acc| {
                 if (validator.scope_frames.items.len > 0) {
-                    const on_slice = start.raw_tag.len > 0;
-                    if (on_slice) {
-                        mapping_scope_item = try validator.appendScopeItem(acc, false, start.byte_offset);
-                    } else {
-                        mapping_scope_item = try validator.appendScopeItem(acc, true, start.byte_offset);
-                    }
+                    mapping_scope_item = try validator.appendScopeItem(acc, start.byte_offset);
                 }
             }
         } else {
@@ -745,7 +724,7 @@ pub const SemanticValidator = struct {
                     if (validator.param_groups.get(trimSchemaWhitespace(ref_id))) |group_terms| {
                         if (validator.scope_frames.items.len >= 1) {
                             for (group_terms.items) |acc| {
-                                const scope_item = try validator.appendScopeItem(acc, true, start.byte_offset);
+                                const scope_item = try validator.appendScopeItem(acc, start.byte_offset);
                                 try validator.validateMappingLocation(acc, scope_item, start.byte_offset);
                             }
                         }
@@ -2055,28 +2034,6 @@ test "SemanticValidator: ancestry traversal exhaustion stops semantic validation
     try testing.expectEqual(@as(u64, 23), diagnostics.items[0].location.byte_offset);
 }
 
-test "SemanticValidator: raw attribute fallback ignores foreign attributes" {
-    const allocator = testing.allocator;
-    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
-    var cv_table = try CvTable.init(allocator, obo_text);
-    defer cv_table.deinit();
-
-    var diagnostics: DiagnosticSink = .empty;
-    defer diagnostics.deinit(allocator);
-
-    var engine = try testEngine(allocator);
-    defer engine.deinit();
-    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
-    defer sv.deinit();
-    try consumeCv(&sv, "MS");
-
-    var start = test_events.startUnknown("cvParam", &.{}, 10);
-    start.raw_tag = " accession=\"MS:1000001\" xmlns:p=\"urn:test\" p:accession=\"MS:9999999\" cvRef=\"MS\"";
-    try sv.consumeStart(start);
-
-    try expectEqual(@as(usize, 0), diagnostics.items.len);
-}
-
 test "SemanticValidator: eager attributes ignore foreign names" {
     const allocator = testing.allocator;
     const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
@@ -2560,9 +2517,7 @@ test "[unit]: empty required CV term name is rejected" {
         .attributes = &attributes,
         .self_closing = false,
     });
-    var raw_start = test_events.startUnknown("cvParam", &.{}, 20);
-    raw_start.raw_tag = " accession=\"MS:1000001\" cvRef=\"MS\" name=\" \"";
-    try sv.consumeStart(raw_start);
+    try consumeCvParamWithName(&sv, "MS:1000001", "MS", " ", 20);
 
     try expectEqual(@as(usize, 2), diagnostics.items.len);
     for (diagnostics.items) |item| {
@@ -2887,9 +2842,7 @@ test "[unit]: CV value contract violations emit stable diagnostics without seman
     try consumeCvParam(&sv, "MS:1000001", "MS", 10);
     try consumeCvParamValue(&sv, "MS:1000002", "MS", "not checked", 20);
     try consumeCvParamValue(&sv, "MS:1000001", "MS", "2147483648", 30);
-    var raw_start = test_events.startUnknown("cvParam", &.{}, 40);
-    raw_start.raw_tag = " accession=\"MS:1000001\" cvRef=\"MS\" value=\"not-an-int\"";
-    try sv.consumeStart(raw_start);
+    try consumeCvParamValue(&sv, "MS:1000001", "MS", "not-an-int", 40);
 
     try expectEqual(semantic_bytes, sv.resourceUsage().semantic_current_bytes);
     try expectEqual(@as(usize, 4), diagnostics.items.len);
