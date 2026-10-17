@@ -236,3 +236,183 @@ fn isWhitespaceOnly(bytes: []const u8) bool {
     };
     return true;
 }
+
+// --- Unit Tests ---
+
+const mzml_namespace = "http://psi.hupo.org/ms/mzml";
+
+/// Drains `xml` from a slice and returns the first parse error, or null.
+fn firstSliceError(xml: []const u8, attribute_capacity: usize, limits: Limits) !?ParseError {
+    var attributes: [8]Attribute = undefined;
+    var parser = Parser.initSlice(std.testing.allocator, xml, .{
+        .attributes = attributes[0..attribute_capacity],
+        .limits = limits,
+    });
+    defer parser.deinit();
+    while (true) {
+        const event = parser.next() catch |err| return @as(?ParseError, err);
+        if (event == null) return null;
+    }
+}
+
+/// Drains one file through a small-buffer file reader and through a slice in
+/// lockstep, expecting identical events and the same outcome from both.
+fn expectReaderSliceParity(io: std.Io, path: []const u8) !?ParseError {
+    const allocator = std.testing.allocator;
+    const bytes = try std.Io.Dir.cwd().readFileAlloc(io, path, allocator, .limited(1024 * 1024));
+    defer allocator.free(bytes);
+    var file = try std.Io.Dir.cwd().openFile(io, path, .{});
+    defer file.close(io);
+    var read_buffer: [256]u8 = undefined;
+    var file_reader = file.reader(io, &read_buffer);
+
+    var reader_attributes: [64]Attribute = undefined;
+    var slice_attributes: [64]Attribute = undefined;
+    var from_reader = Parser.init(allocator, &file_reader.interface, .{ .attributes = &reader_attributes });
+    defer from_reader.deinit();
+    var from_slice = Parser.initSlice(allocator, bytes, .{ .attributes = &slice_attributes });
+    defer from_slice.deinit();
+
+    while (true) {
+        const reader_event = from_reader.next() catch |reader_err| {
+            try std.testing.expectError(reader_err, from_slice.next());
+            try std.testing.expectEqual(from_slice.byteOffset(), from_reader.byteOffset());
+            return @as(?ParseError, reader_err);
+        };
+        const slice_event = try from_slice.next();
+        const left = reader_event orelse {
+            try std.testing.expect(slice_event == null);
+            return null;
+        };
+        const right = slice_event orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqual(std.meta.activeTag(left), std.meta.activeTag(right));
+        switch (left) {
+            .start_element => |start| {
+                try std.testing.expectEqual(start.byte_offset, right.start_element.byte_offset);
+                try std.testing.expectEqual(start.end_byte_offset, right.start_element.end_byte_offset);
+                try std.testing.expectEqualStrings(start.name.local_name, right.start_element.name.local_name);
+                try std.testing.expectEqual(start.attributes.len, right.start_element.attributes.len);
+                for (start.attributes, right.start_element.attributes) |a, b| {
+                    try std.testing.expectEqualStrings(a.name.local_name, b.name.local_name);
+                    try std.testing.expectEqualStrings(a.value, b.value);
+                }
+            },
+            .end_element => |end| {
+                try std.testing.expectEqual(end.byte_offset, right.end_element.byte_offset);
+                try std.testing.expectEqualStrings(end.name.local_name, right.end_element.name.local_name);
+            },
+            // Reader text can arrive in more pieces than slice text, so only the start must agree.
+            .text => |text| try std.testing.expectEqual(text.byte_offset, right.text.byte_offset),
+        }
+    }
+}
+
+fn fixturePaths(io: std.Io, root: []const u8) !std.ArrayList([]u8) {
+    const allocator = std.testing.allocator;
+    var paths: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (paths.items) |path| allocator.free(path);
+        paths.deinit(allocator);
+    }
+    var dir = try std.Io.Dir.cwd().openDir(io, root, .{ .iterate = true });
+    defer dir.close(io);
+    var walker = try dir.walk(allocator);
+    defer walker.deinit();
+    while (try walker.next(io)) |entry| {
+        if (entry.kind != .file or !std.mem.endsWith(u8, entry.path, ".xml")) continue;
+        const path = try std.fs.path.join(allocator, &.{ root, entry.path });
+        paths.append(allocator, path) catch |err| {
+            allocator.free(path);
+            return err;
+        };
+    }
+    try std.testing.expect(paths.items.len > 0);
+    return paths;
+}
+
+fn freePaths(paths: *std.ArrayList([]u8)) void {
+    for (paths.items) |path| std.testing.allocator.free(path);
+    paths.deinit(std.testing.allocator);
+}
+
+test "parser accepts the valid and corpus XML fixtures from reader and slice" {
+    const io = std.testing.io;
+    for ([_][]const u8{ "fixtures/xml/valid", "fixtures/xml/corpus" }) |root| {
+        var paths = try fixturePaths(io, root);
+        defer freePaths(&paths);
+        for (paths.items) |path| {
+            if (try expectReaderSliceParity(io, path)) |err| {
+                std.debug.print("{s}: {t}\n", .{ path, err });
+                return error.TestUnexpectedResult;
+            }
+        }
+    }
+}
+
+test "parser rejects every invalid XML fixture the same way from reader and slice" {
+    const io = std.testing.io;
+    var paths = try fixturePaths(io, "fixtures/xml/invalid");
+    defer freePaths(&paths);
+    for (paths.items) |path| {
+        if (try expectReaderSliceParity(io, path) == null) {
+            std.debug.print("{s}: accepted\n", .{path});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "parser reader and slice agree on an mzML file across buffer refills" {
+    try std.testing.expectEqual(null, try expectReaderSliceParity(std.testing.io, "fixtures/mzml/valid/tiny.pwiz.1.1.mzML"));
+}
+
+test "parser applies attribute and text limits at their exact boundaries" {
+    const limits: Limits = .{ .max_attribute_bytes = 4, .max_scalar_text_bytes = 4, .max_binary_text_bytes = 8 };
+    try std.testing.expectEqual(null, try firstSliceError("<a x=\"1234\"/>", 8, limits));
+    try std.testing.expectEqual(@as(?ParseError, error.AttributeTooLong), try firstSliceError("<a x=\"12345\"/>", 8, limits));
+    try std.testing.expectEqual(null, try firstSliceError("<a>1234</a>", 8, limits));
+    try std.testing.expectEqual(@as(?ParseError, error.ScalarTextTooLong), try firstSliceError("<a>12345</a>", 8, limits));
+    // Binary text has its own, larger limit.
+    try std.testing.expectEqual(null, try firstSliceError("<binary xmlns=\"" ++ mzml_namespace ++ "\">12345678</binary>", 8, limits));
+    try std.testing.expectEqual(@as(?ParseError, error.BinaryTextTooLong), try firstSliceError("<binary xmlns=\"" ++ mzml_namespace ++ "\">123456789</binary>", 8, limits));
+}
+
+test "parser applies attribute and namespace counts at their exact boundaries" {
+    try std.testing.expectEqual(null, try firstSliceError("<a x=\"1\" y=\"2\"/>", 2, .{}));
+    try std.testing.expectEqual(@as(?ParseError, error.TooManyAttributes), try firstSliceError("<a x=\"1\" y=\"2\" z=\"3\"/>", 2, .{}));
+    const two = "<a xmlns:p=\"urn:p\" xmlns:q=\"urn:q\"/>";
+    const three = "<a xmlns:p=\"urn:p\" xmlns:q=\"urn:q\" xmlns:r=\"urn:r\"/>";
+    try std.testing.expectEqual(null, try firstSliceError(two, 8, .{ .max_namespaces = 2 }));
+    try std.testing.expectEqual(@as(?ParseError, error.TooManyNamespaces), try firstSliceError(three, 8, .{ .max_namespaces = 2 }));
+}
+
+test "parser accepts nesting up to zmz.MAX_DEPTH and rejects one more" {
+    const allocator = std.testing.allocator;
+    for ([_]usize{ zmz.MAX_DEPTH, zmz.MAX_DEPTH + 1 }) |depth| {
+        var xml: std.ArrayList(u8) = .empty;
+        defer xml.deinit(allocator);
+        for (0..depth) |_| try xml.appendSlice(allocator, "<a>");
+        for (0..depth) |_| try xml.appendSlice(allocator, "</a>");
+        const expected: ?ParseError = if (depth > zmz.MAX_DEPTH) error.ElementNestingTooDeep else null;
+        try std.testing.expectEqual(expected, try firstSliceError(xml.items, 8, .{}));
+    }
+}
+
+test "parser skips whitespace-only text and reports text and tag offsets" {
+    const xml = "<a>\n  <b> x </b>\n</a>";
+    var attributes: [8]Attribute = undefined;
+    var parser = Parser.initSlice(std.testing.allocator, xml, .{ .attributes = &attributes });
+    defer parser.deinit();
+
+    const a = (try parser.next()).?.start_element;
+    try std.testing.expectEqual(@as(u64, 0), a.byte_offset);
+    try std.testing.expectEqual(@as(?u64, 2), a.end_byte_offset);
+    const b = (try parser.next()).?.start_element;
+    try std.testing.expectEqualStrings("b", b.name.local_name);
+    try std.testing.expectEqual(@as(u64, 6), b.byte_offset);
+    const text = (try parser.next()).?.text;
+    try std.testing.expectEqualStrings(" x ", text.value);
+    try std.testing.expectEqual(@as(u64, 9), text.byte_offset);
+    try std.testing.expectEqualStrings("b", (try parser.next()).?.end_element.name.local_name);
+    try std.testing.expectEqualStrings("a", (try parser.next()).?.end_element.name.local_name);
+    try std.testing.expectEqual(null, try parser.next());
+}

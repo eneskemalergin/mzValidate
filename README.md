@@ -175,7 +175,7 @@ Every file is checked in one primary forward pass over parser events. Indexed st
 
 ### Structural
 
-The XML parser enforces supported XML 1.0 and 1.1 syntax, legal names and characters, matching tags, namespace bindings, and unique expanded attribute names. It rejects DTD and external-entity declarations. The structural validator requires the mzML namespace, recognizes the mzML and indexed mzML element set, and checks implemented parent, child-order, cardinality, required-child, list-count, required-attribute, unqualified-attribute, and selected attribute-datatype rules.
+The XML parser enforces XML 1.0 syntax and rejects other version declarations. It checks legal names and characters, matching tags, namespace bindings, and unique expanded attribute names. It rejects DTD and external-entity declarations. The structural validator requires the mzML namespace, recognizes the mzML and indexed mzML element set, and checks implemented parent, child-order, cardinality, required-child, list-count, required-attribute, unqualified-attribute, and selected attribute-datatype rules.
 
 This is not a general XSD engine and is not a claim of exhaustive mzML schema conformance. String lexical spaces remain broad, and URI reachability is not checked. URI lexical errors, unknown unqualified attributes, foreign attributes, and unsupported XML Schema instance attributes are reported instead of ignored. Namespace declarations and supported schema-location hints remain accepted.
 

@@ -2,7 +2,7 @@
 
 This tree intentionally vendors a hand-picked XML fixture slice instead of a full upstream corpus.
 
-These fixtures lock down the implemented parser contract. They are not evidence of exhaustive W3C XML conformance.
+These fixtures lock down the implemented parser contract; the tests in `src/xml/parser.zig` read every file here. They are not evidence of exhaustive W3C XML conformance.
 
 Canonical upstream for future expansion:
 
@@ -19,9 +19,9 @@ Curated sourced fixtures added in this pass:
 - `valid/xml10-declaration-basic.xml`
   Source: W3C XML 1.0 Fifth Edition examples.
   Purpose: basic XML 1.0 declaration and element parsing.
-- `valid/xml11-declaration-basic.xml`
+- `invalid/xml11-declaration.xml`
   Source: W3C XML 1.1 Second Edition examples.
-  Purpose: basic XML 1.1 declaration with PI skipping and CDATA text emission.
+  Purpose: reject an XML 1.1 declaration; mzML documents are XML 1.0, and the parser accepts no other version.
 - `invalid/xml11-unclosed-declaration.xml`
   Source: W3C XML declaration shape, reduced to an adversarial malformed case.
   Purpose: lock down EOF handling for an unterminated declaration.
