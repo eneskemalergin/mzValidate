@@ -1664,11 +1664,10 @@ fn inferCvNamespace(id: []const u8, full_name: ?[]const u8, uri: ?[]const u8) ?[
         if (std.ascii.eqlIgnoreCase(value, "Unit Ontology") or
             std.ascii.eqlIgnoreCase(value, "UNIT-ONTOLOGY")) return "UO";
     }
-    if (std.mem.eql(u8, id, "MS") or
-        std.mem.eql(u8, id, "UO") or
-        std.mem.eql(u8, id, "BTO") or
-        std.mem.eql(u8, id, "GO") or
-        std.mem.eql(u8, id, "PATO")) return id;
+    // Return the static name, never `id`: declarations outlive the parser event.
+    for ([_][]const u8{ "MS", "UO", "BTO", "GO", "PATO" }) |namespace| {
+        if (std.mem.eql(u8, id, namespace)) return namespace;
+    }
     return null;
 }
 
@@ -2340,6 +2339,27 @@ test "[unit]: source-file object rule reports forward parameter-group coverage" 
     try expectEqual(@as(usize, 1), diagnostics.items.len);
     try expectEqual(.warning, diagnostics.items[0].severity);
     try expectEqualStrings(RuleId.mzml_cv_source_file, diagnostics.items[0].rule);
+}
+
+test "[unit]: cv namespace inferred from its id outlives the parser buffer" {
+    const allocator = testing.allocator;
+    const obo_text = "[Term]\n" ++ "id: MS:1000001\n" ++ "name: sample name\n" ++ "namespace: MS\n";
+    var cv_table = try CvTable.init(allocator, obo_text);
+    defer cv_table.deinit();
+    var diagnostics: DiagnosticSink = .empty;
+    defer diagnostics.deinit(allocator);
+    var engine = try testEngine(allocator);
+    defer engine.deinit();
+    var sv = SemanticValidator.init(allocator, &cv_table, &engine, &diagnostics, null);
+    defer sv.deinit();
+
+    // Parser events borrow their bytes; the next event reuses the buffer.
+    var id_bytes = "MS".*;
+    try consumeCv(&sv, &id_bytes);
+    id_bytes = "XX".*;
+    try consumeCvParam(&sv, "MS:1000001", "MS", 10);
+
+    try expectEqual(@as(usize, 0), diagnostics.items.len);
 }
 
 test "SemanticValidator: mismatched cvRef/namespace produces error" {
