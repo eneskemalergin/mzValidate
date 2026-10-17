@@ -18,14 +18,14 @@
 
 ---
 
-I built mzValidate as a focused native validator for mzML. It checks XML syntax, mzML structure, binary integrity, index metadata, CV semantics, and references without building an XML tree or DOM. Most work happens in one primary pass over streaming XML events; indexed regular files can require bounded positional reads for offsets and a declared SHA-1 checksum. The default native build embeds libdeflate and links the host C runtime; use `-Denable-libdeflate=false` when you do not want that dependency.
+I built mzValidate as a focused native validator for mzML. It checks XML syntax, mzML structure, binary integrity, index metadata, CV semantics, and references without building an XML tree or DOM. Most work happens in one primary pass over streaming XML events; indexed regular files can require bounded positional reads for offsets and a declared SHA-1 checksum. XML parsing, Base64, zlib, and SHA-1 come from [zmz](https://github.com/eneskemalergin/zmz), a Zig library for mass-spectrometry formats; the executable is pure Zig and links no C runtime.
 
 - No JVM, no Python, no .NET, no libxml2
 - Streaming XML parser in one primary forward pass
 - Regular files use bounded stream input with file-stability checks around validation.
 - Uncompressed arrays validated by counting base64 characters incrementally, without decoding the full payload
 - Zlib arrays validated through bounded compressed and decompressed workspaces
-- Uses CPU vector instructions for faster base64 scanning
+- Picks AVX2 Base64, checksum, and zlib kernels at run time on x86-64 CPUs that support them
 - Unit tests, CLI contract fixtures, and focused adversarial boundary cases
 
 ## Quick start
@@ -59,7 +59,7 @@ cd mzValidate
 ./zig-0.16.0/zig build -Doptimize=ReleaseFast
 ```
 
-The binary is at `zig-out/bin/mzValidate`. The default build bundles libdeflate and links the host C runtime. Use `-Denable-libdeflate=false` for a build with no system C dependency.
+The binary is at `zig-out/bin/mzValidate`. The first build fetches zmz 0.1.0 and its zlib dependency by hash into `zig-pkg/`, so it needs network access once.
 
 If you prefer not to install Zig globally, extract the archive somewhere and keep a local copy in the repo as `./zig-0.16.0/` (that path is gitignored). Then use `./zig-0.16.0/zig` instead of `zig`. This is how I work on Zig projects. It leaves a few compiler copies around, but I always know which version a project uses and can change it without touching the rest of my system.
 
@@ -75,16 +75,16 @@ rm zig-x86_64-linux-0.16.0.tar.xz
 
 ## Supported targets
 
-mzValidate requires targets with 64-bit pointers. The build rejects 32-bit targets during configuration, before compiling Zig or vendored C sources.
+mzValidate requires targets with 64-bit pointers. The build rejects 32-bit targets during configuration, before compiling anything.
 
 The build matrix I currently verify is:
 
 - `x86_64-linux`: native Debug and ReleaseFast builds and runtime tests
 - `aarch64-linux`: Debug and ReleaseFast cross-builds only
 
-Windows targets are explicitly unsupported and rejected during build configuration. Vendored libdeflate is enabled by default on every listed target and links that target's C runtime. `-Denable-libdeflate=false` is also supported on every listed target and removes the vendored C sources and C runtime link. Other non-Windows 64-bit Zig targets may build, but they are not part of the verified matrix. Routine development runs native Debug tests only; run the cross-build smoke checks when target, pointer-width, or vendor integration changes.
+Windows targets are explicitly unsupported and rejected during build configuration. Other non-Windows 64-bit Zig targets may build, but they are not part of the verified matrix. Routine development runs native Debug tests only; run the cross-build smoke checks when target, pointer-width, or dependency integration changes.
 
-The standard `-Dcpu` option specializes Zig modules. Vendored libdeflate remains at the portable architecture baseline and performs its own runtime feature dispatch.
+The default build targets the portable CPU baseline and picks CPU-specific kernels at run time. The standard `-Dcpu` option specializes the whole build.
 
 Focused cross-build smoke commands:
 
@@ -92,8 +92,6 @@ Focused cross-build smoke commands:
 ./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=Debug
 ./zig-0.16.0/zig build -Dtarget=aarch64-linux -Doptimize=ReleaseFast
 ```
-
-Add `-Denable-libdeflate=false` to the relevant command when changing the fallback decompression build path.
 
 ## CLI reference
 
@@ -248,7 +246,7 @@ Category header rows align with the Validation sections above.
 
 ### Streaming XML parser
 
-Hand-rolled in Zig. No external XML libraries. Reads from a stream or a caller-provided byte slice and emits events into caller-provided storage. Comments and processing instructions are skipped. CDATA surfaces as text. Built-in entities and numeric character references are decoded. Namespace-aware with proper prefix cleanup on scope exit.
+zmz's streaming XML reader, written in Zig, checks well-formedness and resolves namespaces; mzValidate adapts its events and applies its own text and attribute limits. No libxml2 or other C XML library. Reads from a stream or a caller-provided byte slice. Comments and processing instructions are skipped. CDATA surfaces as text. Built-in entities and numeric character references are decoded. Namespace-aware with proper prefix cleanup on scope exit.
 
 ### Validation engine
 
@@ -270,7 +268,7 @@ Default text groups repeated findings for one input. Summary mode emits one huma
 
 ## Build steps
 
-The project supports two optimization modes: Debug for development, diagnosis, and correctness work; ReleaseFast for release artifacts and measurement. The ReleaseFast executable uses the portable CPU baseline, full LTO, a single-threaded runtime, stripping, and the optimized vendored libdeflate build by default.
+The project supports two optimization modes: Debug for development, diagnosis, and correctness work; ReleaseFast for release artifacts and measurement. The ReleaseFast executable uses the portable CPU baseline, full LTO, a single-threaded runtime, and stripping by default.
 
 - `./zig-0.16.0/zig build`: routine Debug binary
 - `./zig-0.16.0/zig build test`: routine Debug unit tests with leak detection
