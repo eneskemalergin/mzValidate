@@ -6,7 +6,6 @@
 
 const std = @import("std");
 const elements = @import("../mzml/elements.zig");
-const scan = @import("scan.zig");
 
 pub const ElementId = elements.ElementId;
 
@@ -53,9 +52,6 @@ pub const StartElement = struct {
     element_id: ElementId = .unknown,
     attributes: []const Attribute,
     self_closing: bool,
-    /// Raw bytes after the element name through any self-closing slash.
-    /// Borrows from the parser buffer when eager parsing was skipped.
-    raw_tag: []const u8 = "",
 
     /// Intern ID from the parser when set; otherwise derived from the QName.
     pub fn resolvedId(self: StartElement) ElementId {
@@ -66,12 +62,9 @@ pub const StartElement = struct {
         );
     }
 
-    /// Looks up an attribute by local name, checking eagerly-parsed attributes
-    /// first, then falling back to raw_tag scanning (cvParam/userParam path).
+    /// Looks up an unqualified attribute by local name.
     pub fn attr(self: StartElement, local_name: []const u8) ?[]const u8 {
-        if (attributeByLocalName(self.attributes, local_name)) |value| return value;
-        if (self.raw_tag.len > 0) return rawTagAttributeValue(self.raw_tag, local_name);
-        return null;
+        return attributeByLocalName(self.attributes, local_name);
     }
 };
 
@@ -111,17 +104,6 @@ pub const Event = union(EventKind) {
     end_element: EndElement,
     text: Text,
 };
-
-fn rawTagAttributeValue(tag_bytes: []const u8, local_name: []const u8) ?[]const u8 {
-    var scanner = scan.RawAttributeScanner.init(tag_bytes);
-    while (true) {
-        // Parser-produced raw tags were validated before the event was emitted.
-        const attribute = scanner.next() catch return null;
-        const raw_attribute = attribute orelse return null;
-        if (raw_attribute.is_namespace_declaration) continue;
-        if (std.mem.eql(u8, raw_attribute.name, local_name)) return raw_attribute.value;
-    }
-}
 
 // --- Unit Tests ---
 
@@ -175,18 +157,6 @@ test "StartElement.attr accepts only unqualified attributes" {
     };
 
     try std.testing.expectEqualStrings("plain", start.attr("id").?);
-}
-
-test "StartElement.attr raw fallback ignores prefixed attributes" {
-    const start = StartElement{
-        .byte_offset = 0,
-        .name = .{ .local_name = "cvParam" },
-        .attributes = &.{},
-        .self_closing = true,
-        .raw_tag = " xmlns:p='urn:test' p:accession='foreign' accession='plain' /",
-    };
-
-    try std.testing.expectEqualStrings("plain", start.attr("accession").?);
 }
 
 const diagnostic = @import("../diagnostic.zig");

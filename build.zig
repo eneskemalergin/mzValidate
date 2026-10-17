@@ -19,11 +19,6 @@ pub fn build(b: *std.Build) void {
         b.invalid_user_input = true;
         return;
     }
-    const enable_libdeflate = b.option(
-        bool,
-        "enable-libdeflate",
-        "Use vendored libdeflate for zlib decompression (default: true)",
-    ) orelse true;
     const enable_lto = b.option(
         bool,
         "lto",
@@ -55,18 +50,7 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
-    const mzvalidate_options = b.addOptions();
-    mzvalidate_options.addOption(bool, "enable_libdeflate", enable_libdeflate);
-    const sha1_x86_enabled = target.result.cpu.arch == .x86_64;
-    mzvalidate_options.addOption(bool, "sha1_x86_enabled", sha1_x86_enabled);
-    mzvalidate_mod.addOptions("build_options", mzvalidate_options);
-
-    if (enable_libdeflate) {
-        addVendoredLibdeflateToModule(mzvalidate_mod, b, optimize, target);
-    }
-    if (sha1_x86_enabled) {
-        addSha1X86ToModule(mzvalidate_mod, b, optimize, target);
-    }
+    mzvalidate_mod.addImport("zmz", b.dependency("zmz", .{ .target = target, .optimize = optimize }).module("zmz"));
 
     const exe = b.addExecutable(.{
         .name = "mzValidate",
@@ -242,75 +226,6 @@ fn addCliContractCommand(
     const command = b.addRunArtifact(exe);
     command.step.dependOn(b.getInstallStep());
     return command;
-}
-
-// --- Accelerated dependencies ---
-
-fn addSha1X86ToModule(
-    mod: *std.Build.Module,
-    b: *std.Build,
-    optimize: std.builtin.OptimizeMode,
-    target: std.Build.ResolvedTarget,
-) void {
-    var sha1_target_query = target.query;
-    sha1_target_query.cpu_features_add.addFeatureSet(std.Target.x86.featureSet(&.{ .sha, .ssse3 }));
-    const sha1_target = b.resolveTargetQuery(sha1_target_query);
-    const sha1_object = b.addObject(.{
-        .name = "mzvalidate_sha1_x86",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/checksum/sha1_x86.zig"),
-            .target = sha1_target,
-            .optimize = optimize,
-        }),
-        .use_llvm = true,
-    });
-    mod.addObject(sha1_object);
-}
-
-fn addVendoredLibdeflateToModule(
-    mod: *std.Build.Module,
-    b: *std.Build,
-    optimize: std.builtin.OptimizeMode,
-    target: std.Build.ResolvedTarget,
-) void {
-    mod.linkSystemLibrary("c", .{});
-    mod.addIncludePath(b.path("vendor/libdeflate"));
-    mod.addIncludePath(b.path("vendor/libdeflate/lib"));
-
-    const opt = switch (optimize) {
-        .Debug => "-Og",
-        .ReleaseFast => "-O3",
-        else => @panic("unsupported optimization mode reached libdeflate configuration"),
-    };
-
-    const common_flags: []const []const u8 = switch (target.result.cpu.arch) {
-        .x86_64 => &.{ opt, "-march=x86-64" },
-        .aarch64 => &.{ opt, "-march=armv8-a" },
-        else => &.{opt},
-    };
-
-    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/deflate_decompress.c"), .flags = common_flags });
-    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/zlib_decompress.c"), .flags = common_flags });
-    mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/utils.c"), .flags = common_flags });
-
-    switch (target.result.cpu.arch) {
-        .x86_64 => {
-            const adler32_flags = &.{
-                opt,
-                "-march=x86-64",
-                "-DLIBDEFLATE_ASSEMBLER_DOES_NOT_SUPPORT_AVX512VNNI",
-            };
-            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = adler32_flags });
-            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/x86/cpu_features.c"), .flags = common_flags });
-        },
-        .aarch64 => {
-            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = common_flags });
-            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/arm/cpu_features.c"), .flags = common_flags });
-        },
-        else => {
-            mod.addCSourceFile(.{ .file = b.path("vendor/libdeflate/lib/adler32.c"), .flags = common_flags });
-        },
-    }
 }
 
 // --- Fixture discovery ---

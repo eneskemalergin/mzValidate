@@ -13,7 +13,6 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
     return switch (err) {
         error.UnexpectedEof => "unexpected end of XML input",
         error.InvalidUtf8 => "invalid UTF-8 in XML input",
-        error.TokenTooLong => "XML token exceeds the configured parser buffer",
         error.StartTagTooLong => "XML start tag exceeds the configured start-tag limit",
         error.AttributeTooLong => "XML attribute exceeds the configured attribute limit",
         error.ScalarTextTooLong => "XML scalar text exceeds the configured scalar-text limit",
@@ -23,14 +22,13 @@ pub fn parseErrorMessage(err: ParseError) []const u8 {
         error.UnknownEntity => "unknown XML entity reference",
         error.UnsupportedMarkup => "DTD or unsupported XML construct",
         error.TooManyNamespaces => "XML namespace bindings exceed the configured parser limit",
-        error.NamespaceStorageExceeded => "XML namespace storage exceeds the configured parser limit",
         error.ElementNestingTooDeep => "XML element nesting exceeds the configured parser limit",
-        error.ElementStorageExceeded => "XML element name storage exceeds the configured parser limit",
         error.InvalidCharacterReference => "invalid XML character reference",
         error.InvalidXmlCharacter => "character is not permitted by the XML version",
         error.UnsupportedXmlVersion => "unsupported XML version declaration",
         error.ReadFailed => "failed while reading XML input",
         error.MalformedXml => "malformed XML input",
+        error.OutOfMemory => "out of memory while parsing XML",
     };
 }
 
@@ -58,16 +56,8 @@ test "parse errors preserve limit details" {
         parseErrorMessage(error.TooManyNamespaces),
     );
     try std.testing.expectEqualStrings(
-        "XML namespace storage exceeds the configured parser limit",
-        parseErrorMessage(error.NamespaceStorageExceeded),
-    );
-    try std.testing.expectEqualStrings(
         "XML element nesting exceeds the configured parser limit",
         parseErrorMessage(error.ElementNestingTooDeep),
-    );
-    try std.testing.expectEqualStrings(
-        "XML element name storage exceeds the configured parser limit",
-        parseErrorMessage(error.ElementStorageExceeded),
     );
     try std.testing.expectEqualStrings(
         "character is not permitted by the XML version",

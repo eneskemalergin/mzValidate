@@ -761,15 +761,12 @@ pub const Totals = struct {
 };
 
 /// Per-file owner measurements captured before validation state is released.
-/// Parser bytes cover the eager caller-owned token buffer. Binary scratch bytes
-/// cover allocator-owned compressed, flate, and libdeflate output capacities;
-/// the opaque allocation owned by libdeflate's decompressor is external and
-/// excluded because its ABI does not expose an allocation size. Diagnostic
+/// Binary scratch bytes cover the reused compressed-payload capacity; the
+/// fixed zlib decompressor and Base64 window allocations are excluded. zmz's
+/// parser buffers are bounded by its own limits and not measured. Diagnostic
 /// bytes cover retained records plus aggregation metadata and the group index
 /// at file finalization. Aggregation subfields expose those side allocations.
 pub const ResourceUsage = struct {
-    parser_current_bytes: usize = 0,
-    parser_peak_bytes: usize = 0,
     binary_scratch_current_bytes: usize = 0,
     binary_scratch_peak_bytes: usize = 0,
     index_current_bytes: usize = 0,

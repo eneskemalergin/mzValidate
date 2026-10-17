@@ -194,23 +194,15 @@ fn parseRules(allocator: std.mem.Allocator, xml: []const u8) ![]MappingRule {
         t.deinit(allocator);
     };
 
-    var token: [4096]u8 = undefined;
     var attributes: [16]Attribute = undefined;
-    var namespace_bindings: [16]xml_parser.NamespaceBinding = undefined;
-    var namespace_bytes: [4096]u8 = undefined;
-    var element_stack: [16]xml_parser.ElementFrame = undefined;
-    var element_bytes: [4096]u8 = undefined;
 
     const buffers = xml_parser.Buffers{
-        .token = &token,
         .attributes = &attributes,
-        .namespace_bindings = &namespace_bindings,
-        .namespace_bytes = &namespace_bytes,
-        .element_stack = &element_stack,
-        .element_bytes = &element_bytes,
+        .limits = .{ .max_namespaces = 16 },
     };
 
-    var parser = xml_parser.Parser.initSlice(xml, buffers);
+    var parser = xml_parser.Parser.initSlice(allocator, xml, buffers);
+    defer parser.deinit();
 
     var current_id: ?[]u8 = null;
     var current_path: ?[]u8 = null;
